@@ -188,10 +188,16 @@ builder/
 | **Блок 4: Системный ввод-вывод и итоги** | 34–41 | ✅ Завершен (8/8) | Прерывания, DMA, PCIe, NVMe, Latency Numbers, Mechanical Sympathy, итоговая картина |
 
 ### Раздел 2. 2. Устройство и работа ОС
-- **Статус:** ✅ Завершен (CONVERTED)
+- **Статус:** 🔄 В ПРОЦЕССЕ АВТОРСКОЙ РЕДАКТУРЫ (0/63 лекций вычитано и верифицировано)
 - **Статей:** `63` | **Диаграмм Mermaid:** `44` | **Объем:** `869.1 КБ` | **Подразделов:** `1`
 
-> Единый модуль из 63 последовательных лекций.
+| Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
+|---|:---:|:---:|---|
+| **Блок 1: Архитектура ОС и процессы** | 1–11 | ⏳ В очереди (0/11) | Kernel/User space, Ring 0/3, архитектуры ядер, загрузка, fork/exec, потоки, планировщики CFS/EEVDF, context switch, affinity |
+| **Блок 2: Управление памятью в ОС** | 12–21 | ⏳ В очереди (0/10) | Виртуальная память, Page Tables, TLB, malloc, brk/mmap, COW, Swapping, сегменты (Stack/Heap/Data/Text), защита памяти |
+| **Блок 3: Системные вызовы, файлы и IPC** | 22–34 | ⏳ В очереди (0/13) | Системные вызовы Linux, strace, файловые дескрипторы, Pipes, Unix Domain Sockets, сигналы, демоны, systemd, IPC, shm, futex, deadlocks |
+| **Блок 4: Сеть, IO и файловые системы** | 35–51 | ⏳ В очереди (0/17) | Async IO, select/poll/epoll, kqueue, IOCP, netpoller, VFS, inode, journal, Page Cache, Direct IO, Zero Copy, RAID, Socket API, TCP lifecycle |
+| **Блок 5: Изоляция, безопасность и наблюдаемость** | 52–63 | ⏳ В очереди (0/12) | cgroups v2, namespaces, контейнеры, VM/гипервизоры, capabilities, SELinux/AppArmor, Core Dumps, perf/top/iostat, eBPF, Go runtime & OS, итоги |
 
 ### Раздел 3. 3. Компьютерные сети и сетевой стек
 - **Статус:** ✅ Завершен (CONVERTED)
