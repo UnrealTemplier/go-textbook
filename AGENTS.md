@@ -186,10 +186,10 @@ builder/
     - [x] Блок 2: Философия простоты, композиция, интерфейсы, обработка ошибок (лекции 11–20) — 10/10 (100% верифицировано).
     - [x] Блок 3: Эволюция языка, рантайм и майндсет (лекции 21–31) — 11/11 (100% верифицировано).
   - [ ] Модуль 5 («Учебник по Go (Основы и синтаксис)», 44 лекции):
-    - [ ] Блок 1: Лексическая структура, переменные, типы данных и константы (лекции 1–11) — 0/11.
-    - [ ] Блок 2: Управляющие конструкции, циклы и функции (лекции 12–22) — 0/11.
-    - [ ] Блок 3: Массивы, срезы, карты и структуры (лекции 23–33) — 0/11.
-    - [ ] Блок 4: Указатели, методы, интерфейсы и основы конкурентности (лекции 34–44) — 0/11.
+    - [x] Блок 1: Основы синтаксиса, типы, операторы, управление потоком и функции (лекции 1–11) — 11/11 (100% верифицировано).
+    - [ ] Блок 2: Ошибки, указатели, структуры данных (Slice, Map, String) и методы (лекции 12–22) — 0/11.
+    - [ ] Блок 3: Интерфейсы, модули, ввод-вывод, JSON, время и дженерики (лекции 23–33) — 0/11.
+    - [ ] Блок 4: Конкурентность, планировщик, каналы, примитивы синхронизации и итоги (лекции 34–44) — 0/11.
   - [ ] Последующие модули 6–22.
 
 ---
@@ -242,10 +242,15 @@ builder/
 | **Блок 3: Эволюция языка, рантайм и майндсет** | 21–31 | ✅ Завершен (11/11) | Простота vs абстракции (stack growth, inlining budget, Rule of 3, deletability), Пакеты и project layout (DAG, .a archives, internal/ visibility, domain-driven packaging), Экспортируемость имен (ASCII lexer, package encapsulation, reflect and JSON), Concurrency is not Parallelism (G-M-P, user space context switch, netpoller), Share Memory By Communicating (MESI, Cache Line Bouncing, CSP, hchan/sudog), Стандартная библиотека (Ecosystem Glue, io.Reader, database/sql DIP, zero dependencies), Совместимость Go 1 (GODEBUG, map randomization, bit rot protection), Generics (Russ Cox dilemma, Monomorphization vs Type Erasure, GCShape Stenciling, constraints), ООП-антипаттерны (IUserService, fake embedding inheritance, pointer overuse, getters/setters, Zero Value), Идиоматичный майндсет (Composition root, Line of sight, boring code, mechanical sympathy) |
 
 ### Раздел 5. 5. Учебник по Go (Основы и синтаксис)
-- **Статус:** ✅ Завершен (CONVERTED)
-- **Статей:** `44` | **Диаграмм Mermaid:** `45` | **Объем:** `614.4 КБ` | **Подразделов:** `1`
+- **Статус:** 🔄 В процессе редактуры (11/44 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статей:** `44` | **Диаграмм Mermaid:** `45` | **Объем:** `650 КБ` | **Подразделов:** `1`
 
-> Единый модуль из 44 последовательных лекций.
+| Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
+|---|:---:|:---:|---|
+| **Блок 1: Основы синтаксиса, типы, операторы, управление потоком и функции** | 1–11 | ✅ Завершен (11/11) | Устройство языка, тулчейн go run/build/test, структура программы, переменные, константы, iota, базовые типы, rune, byte, UTF-8, операторы, short-circuit, &^ bit-clear, if с инициализацией, цикл for, семантика Go 1.22 для переменных цикла, switch и Jump-таблицы, Register ABI, multiple return values, named returns, defer (open-coded defers) |
+| **Блок 2: Ошибки, указатели, структуры данных (Slice, Map, String) и методы** | 12–22 | ⏳ Ожидает (0/11) | Errors are values, panic/recover, stack trace, указатели и Escape Analysis, массивы, Slice, SliceHeader, realloc, Map, hmap/bmap, эвакуация бакетов, strings, Struct, padding, memory alignment, методы, Value vs Pointer receivers |
+| **Блок 3: Интерфейсы, модули, ввод-вывод, JSON, время и дженерики** | 23–33 | ⏳ Ожидает (0/11) | Интерфейсы, iface/eface, embedding, структура пакетов, export/unexport, Go модули, io.Reader/Writer, JSON encoding/decoding, time.Time, тикеры, дженерики (Type Parameters, Constraints, GCShape) |
+| **Блок 4: Конкурентность, планировщик, каналы, примитивы синхронизации и итоги** | 34–44 | ⏳ Ожидает (0/11) | Горутины, планировщик G-M-P, work-stealing, netpoller, каналы (hchan, sudog), buffered/unbuffered, select, context.Context, WaitGroup, Mutex, RWMutex, atomic, Cond, sync.Pool, race detector, Go Memory Model, Deadlock, Livelock |
 
 ### Раздел 6. 6. Стандартная библиотека Go
 - **Статус:** ✅ Завершен (CONVERTED)
