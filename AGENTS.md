@@ -191,7 +191,7 @@ builder/
     - [x] Блок 3: Интерфейсы, модули, ввод-вывод, JSON, время и дженерики (лекции 23–33) — 11/11 (100% верифицировано).
     - [x] Блок 4: Конкурентность, планировщик, каналы, примитивы синхронизации и итоги (лекции 34–44) — 11/11 (100% верифицировано).
   - [ ] Модуль 6 («6. Стандартная библиотека Go», 48 лекций):
-    - [ ] Блок 1: Ввод-вывод, форматирование и работа с текстом (лекции 1–10) — 0/10.
+    - [x] Блок 1: Ввод-вывод, форматирование и работа с текстом (лекции 1–10) — 10/10 (100% верифицировано).
     - [ ] Блок 2: Файловая система, ОС, конфигурация и логирование (лекции 11–18) — 0/8.
     - [ ] Блок 3: Рантайм, конкурентность, рефлексия и структуры данных (лекции 19–27) — 0/9.
     - [ ] Блок 4: Сериализация, сеть и HTTP (лекции 28–36) — 0/9.
@@ -259,13 +259,13 @@ builder/
 | **Блок 4: Конкурентность, планировщик, каналы, примитивы синхронизации и итоги** | 34–44 | ✅ Завершен (11/11) | Горутины, планировщик G-M-P, work-stealing, netpoller, каналы (hchan, sudog), buffered/unbuffered, select, context.Context, WaitGroup, Mutex, RWMutex, atomic, Cond, sync.Pool, race detector, Go Memory Model, Deadlock, Livelock |
 
 ### Раздел 6. 6. Стандартная библиотека Go
-- **Статус:** 🔄 В процессе редактуры (0/48 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `48` | **Диаграмм Mermaid:** `45` | **Объем:** `710.3 КБ` | **Подразделов:** `1`
+- **Статус:** 🔄 В процессе редактуры (10/48 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статей:** `48` | **Диаграмм Mermaid:** `55` | **Объем:** `750 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
-| **Блок 1: Ввод-вывод, форматирование и работа с текстом** | 1–10 | ⏳ Ожидает (0/10) | Философия stdlib, fmt (верстки, Sprintf, Fprintf), errors (fmt.Errorf %w, errors.Is/As), io (Reader, Writer, LimitReader, TeeReader, MultiReader), отказ от ioutil (os, io), bufio (Scanner, Reader, Writer, буферы), strings (Builder, Grow, Clone), bytes (Buffer, zero-alloc), strconv (Parse/Format), unicode и utf8 (DecodeRuneInString) |
-| **Блок 2: Файловая система, ОС, конфигурация и логирование** | 11–18 | ⏳ Ожидает (0/8) | os (файлы, окружение, сигналы, Exit), path/filepath (кроссплатформенность), io/fs (абстрактная FS, ReadDirFS), embed (embed.FS), flag (парсинг флагов), log и slog (структурированное логирование, Level, Handler, JSONHandler), context (отмена, таймауты, metadata), time (Time, Duration, Timer, Ticker, монотонные часы) |
+| **Блок 1: Ввод-вывод, форматирование и работа с текстом** | 1–10 | ✅ Завершен (10/10) | Философия stdlib, fmt (верстки, Sprintf, Fprintf), errors (fmt.Errorf %w, errors.Is/As), io (Reader, Writer, LimitReader, TeeReader, MultiReader), отказ от ioutil (os, io), bufio (Scanner, Reader, Writer, буферы), strings (Builder, Grow, Clone), bytes (Buffer, zero-alloc), strconv (Parse/Format), unicode и utf8 (DecodeRuneInString) |
+| **Блок 2: Файловая система, ОС, конфигурация и логирование** | 11–18 | ⏳ В процессе (0/8) | os (файлы, окружение, сигналы, Exit), path/filepath (кроссплатформенность), io/fs (абстрактная FS, ReadDirFS), embed (embed.FS), flag (парсинг флагов), log и slog (структурированное логирование, Level, Handler, JSONHandler), context (отмена, таймауты, metadata), time (Time, Duration, Timer, Ticker, монотонные часы) |
 | **Блок 3: Рантайм, конкурентность, рефлексия и структуры данных** | 19–27 | ⏳ Ожидает (0/9) | sync (Mutex, RWMutex, WaitGroup, Once), sync/atomic (Int64, Pointer, CAS), sync.Pool, runtime (Gosched, GC, ReadMemStats, NumCPU), reflect (Type, Value, Kind, накладные расходы), unsafe (Pointer, StringData, SliceData), sort и slices (дженерики, pdqsort), maps и cmp (diff, Compare), container/list, heap, ring |
 | **Блок 4: Сериализация, сеть и HTTP** | 28–36 | ⏳ Ожидает (0/9) | regexp (линейный парсер RE2, compile), encoding/json (Marshal, Unmarshal, Decoder, stream, tags), xml/csv/gob, net (Listen, Dial, TCP/UDP), net/url (URL, Query, Escaping), net/http (Server, Client, Handler, Middleware), net/http под капотом (Transport, connection pool, Keep-Alive, idle conns), httptest (Server, ResponseRecorder), net/http/pprof и expvar |
 | **Блок 5: Криптография, базы данных, системные утилиты и тестирование** | 37–48 | ⏳ Ожидает (0/12) | crypto/rand (CSPRNG) vs math/rand (v2), crypto (SHA-256, HMAC, AES-GCM, RSA, TLS), database/sql (Driver, connection pooling, Tx, Stmt), archive (zip, tar), compress (gzip, zlib, flate), os/exec (Command, stdin/stdout, pipes), syscall и x/sys, testing (t.Run, Benchmark, Fuzzing), testing/quick, plugin, итоги stdlib |
