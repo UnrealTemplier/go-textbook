@@ -175,13 +175,17 @@ builder/
     - [x] Блок 3: Системные вызовы, файлы и IPC (лекции 22–34) — 13/13 (100% верифицировано).
     - [x] Блок 4: Сеть, IO и файловые системы (лекции 35–51) — 17/17 (100% верифицировано).
     - [x] Блок 5: Изоляция, безопасность и наблюдаемость (лекции 52–63) — 12/12 (100% верифицировано).
-  - [ ] Модуль 3 («Компьютерные сети и сетевой стек», 44 лекции):
+  - [x] Модуль 3 («Компьютерные сети и сетевой стек», 44 лекции) — 100% верифицировано и скомпилировано в Кернигановском стандарте:
     - [x] Блок 1: Сетевой фундамент, канальный и сетевой уровни (лекции 1–9) — 9/9 (100% верифицировано).
     - [x] Блок 2: Транспортный уровень, сокеты и DNS (лекции 10–19) — 10/10 (100% верифицировано).
     - [x] Блок 3: Протоколы прикладного уровня: HTTP/1-3, QUIC, WebSocket, gRPC (лекции 20–26) — 7/7 (100% верифицировано).
     - [x] Блок 4: Проксирование, балансировка и безопасность (лекции 27–33) — 7/7 (100% верифицировано).
-    - [ ] Блок 5: Наблюдаемость, сетевой стек Linux, Go runtime и распределенные сети (лекции 34–44) — 0/11.
-  - [ ] Последующие модули 4–22.
+    - [x] Блок 5: Наблюдаемость, сетевой стек Linux, Go runtime и распределенные сети (лекции 34–44) — 11/11 (100% верифицировано).
+  - [ ] Модуль 4 («История и философия Go», 31 лекция):
+    - [ ] Блок 1: Предпосылки создания, Bell Labs, Rob Pike, Ken Thompson (лекции 1–10) — 0/10.
+    - [ ] Блок 2: Философия простоты, композиция, интерфейсы, обработка ошибок (лекции 11–20) — 0/10.
+    - [ ] Блок 3: Эволюция языка: от Go 1.0 до Go 1.24+, модули, дженерики (лекции 21–31) — 0/11.
+  - [ ] Последующие модули 5–22.
 
 ---
 
@@ -211,8 +215,8 @@ builder/
 | **Блок 5: Изоляция, безопасность и наблюдаемость** | 52–63 | ✅ Завершен (12/12) | cgroups v2, namespaces, контейнеры, VM/гипервизоры, capabilities, SELinux/AppArmor, Core Dumps, perf/top/iostat, eBPF, Go runtime & OS, итоги |
 
 ### Раздел 3. 3. Компьютерные сети и сетевой стек
-- **Статус:** 🔄 В процессе редактуры (33/44 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `44` | **Диаграмм Mermaid:** `142` | **Объем:** `1350 КБ` | **Подразделов:** `1`
+- **Статус:** ✅ Завершен (44/44 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статей:** `44` | **Диаграмм Mermaid:** `156` | **Объем:** `1350 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
@@ -220,7 +224,7 @@ builder/
 | **Блок 2: Транспортный уровень, сокеты и DNS** | 10–19 | ✅ Завершен (10/10) | TCP lifecycle, 3-way handshake, sliding window, flow/congestion control, Reno, Cubic, BBR, UDP, Socket API, BSD syscalls, netpoller, DNS wire format, EDNS0, record types, TTL, TLS 1.3, mTLS, PKI, X.509 |
 | **Блок 3: Протоколы прикладного уровня** | 20–26 | ✅ Завершен (7/7) | HTTP/1.1 (Request/Response, Keep-Alive, Chunked, Pipelining, persistConn), HTTP/2 (Frames, Multiplexing, HPACK), HTTP/3 (QUIC, Loss Recovery, netpoll), WebSocket, SSE, gRPC, Protobuf |
 | **Блок 4: Проксирование, балансировка и безопасность** | 27–33 | ✅ Завершен (7/7) | Forward/Reverse Proxy, API Gateway, Nginx, Envoy (xDS), HAProxy, L4/L7 LB, RR, LC, Consistent Hashing, Service Discovery (DNS/Consul), CDN, Edge, HTTP Caching, Netfilter, iptables, nftables, conntrack, DDoS, Rate Limiting (Token Bucket, Redis Lua), SYN Cookies |
-| **Блок 5: Наблюдаемость, сетевой стек Linux и Go runtime** | 34–44 | 🔄 В очереди (0/11) | tcpdump, Wireshark, netstat, ss, Linux network stack, netpoller, epoll, TIME_WAIT, DDoS, K8s networking, CNI, Service Mesh, итоги |
+| **Блок 5: Наблюдаемость, сетевой стек Linux и Go runtime** | 34–44 | ✅ Завершен (11/11) | tcpdump, Wireshark, netstat, ss, ping, traceroute, dig, curl, mtr, eBPF/XDP, Linux network stack (sk_buff, sock, epoll, zero-copy), net/netpoller (gopark, wakeG, sysmon), TIME_WAIT, port exhaustion, HoL blocking, Slowloris, Kubernetes CNI/Pod/Service/IPVS, Service Mesh (Istio, Linkerd, sidecar, ambient), сетевые паттерны (Request-Reply, PubSub, Circuit Breaker, Idempotency), полная картина сетевого стека для Go |
 
 ### Раздел 4. 4. История и философия Go
 - **Статус:** ✅ Завершен (CONVERTED)
