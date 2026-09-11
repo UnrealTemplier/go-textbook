@@ -178,7 +178,7 @@ builder/
   - [ ] Модуль 3 («Компьютерные сети и сетевой стек», 44 лекции):
     - [x] Блок 1: Сетевой фундамент, канальный и сетевой уровни (лекции 1–9) — 9/9 (100% верифицировано).
     - [x] Блок 2: Транспортный уровень, сокеты и DNS (лекции 10–19) — 10/10 (100% верифицировано).
-    - [ ] Блок 3: Протоколы прикладного уровня: HTTP/1-3, QUIC, WebSocket, gRPC (лекции 20–26) — 0/7.
+    - [x] Блок 3: Протоколы прикладного уровня: HTTP/1-3, QUIC, WebSocket, gRPC (лекции 20–26) — 7/7 (100% верифицировано).
     - [ ] Блок 4: Проксирование, балансировка и безопасность (лекции 27–33) — 0/7.
     - [ ] Блок 5: Наблюдаемость, сетевой стек Linux, Go runtime и распределенные сети (лекции 34–44) — 0/11.
   - [ ] Последующие модули 4–22.
@@ -211,14 +211,14 @@ builder/
 | **Блок 5: Изоляция, безопасность и наблюдаемость** | 52–63 | ✅ Завершен (12/12) | cgroups v2, namespaces, контейнеры, VM/гипервизоры, capabilities, SELinux/AppArmor, Core Dumps, perf/top/iostat, eBPF, Go runtime & OS, итоги |
 
 ### Раздел 3. 3. Компьютерные сети и сетевой стек
-- **Статус:** 🔄 В процессе редактуры (19/44 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `44` | **Диаграмм Mermaid:** `100` | **Объем:** `1100 КБ` | **Подразделов:** `1`
+- **Статус:** 🔄 В процессе редактуры (26/44 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статей:** `44` | **Диаграмм Mermaid:** `123` | **Объем:** `1200 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
 | **Блок 1: Сетевой фундамент, канальный и сетевой уровни** | 1–9 | ✅ Завершен (9/9) | OSI/TCP-IP, Ethernet, MAC, L2/L3 границы, IPv4/IPv6, net/netip, ARP/NDP, neighbour cache, FIB, LPM, BGP/OSPF/RIP, NAT/PAT, Conntrack, VLAN, VXLAN |
 | **Блок 2: Транспортный уровень, сокеты и DNS** | 10–19 | ✅ Завершен (10/10) | TCP lifecycle, 3-way handshake, sliding window, flow/congestion control, Reno, Cubic, BBR, UDP, Socket API, BSD syscalls, netpoller, DNS wire format, EDNS0, record types, TTL, TLS 1.3, mTLS, PKI, X.509 |
-| **Блок 3: Протоколы прикладного уровня** | 20–26 | 🔄 В очереди (0/7) | HTTP/1.1, HTTP/2, HTTP/3 (QUIC), WebSocket, SSE, gRPC, Protobuf |
+| **Блок 3: Протоколы прикладного уровня** | 20–26 | ✅ Завершен (7/7) | HTTP/1.1 (Request/Response, Keep-Alive, Chunked, Pipelining, persistConn), HTTP/2 (Frames, Multiplexing, HPACK), HTTP/3 (QUIC, Loss Recovery, netpoll), WebSocket, SSE, gRPC, Protobuf |
 | **Блок 4: Проксирование, балансировка и безопасность** | 27–33 | 🔄 В очереди (0/7) | Reverse Proxy, API Gateway, Nginx/Envoy/HAProxy, TLS 1.3, mTLS, Service Discovery, Firewall, iptables, nftables |
 | **Блок 5: Наблюдаемость, сетевой стек Linux и Go runtime** | 34–44 | 🔄 В очереди (0/11) | tcpdump, Wireshark, netstat, ss, Linux network stack, netpoller, epoll, TIME_WAIT, DDoS, K8s networking, CNI, Service Mesh, итоги |
 
