@@ -181,11 +181,16 @@ builder/
     - [x] Блок 3: Протоколы прикладного уровня: HTTP/1-3, QUIC, WebSocket, gRPC (лекции 20–26) — 7/7 (100% верифицировано).
     - [x] Блок 4: Проксирование, балансировка и безопасность (лекции 27–33) — 7/7 (100% верифицировано).
     - [x] Блок 5: Наблюдаемость, сетевой стек Linux, Go runtime и распределенные сети (лекции 34–44) — 11/11 (100% верифицировано).
-  - [ ] Модуль 4 («История и философия Go», 31 лекция):
+  - [x] Модуль 4 («История и философия Go», 31 лекция) — 100% верифицировано и скомпилировано в Кернигановском стандарте:
     - [x] Блок 1: Предпосылки создания, Bell Labs, Rob Pike, Ken Thompson (лекции 1–10) — 10/10 (100% верифицировано).
     - [x] Блок 2: Философия простоты, композиция, интерфейсы, обработка ошибок (лекции 11–20) — 10/10 (100% верифицировано).
-    - [ ] Блок 3: Эволюция языка: от Go 1.0 до Go 1.24+, модули, дженерики (лекции 21–31) — 0/11.
-  - [ ] Последующие модули 5–22.
+    - [x] Блок 3: Эволюция языка, рантайм и майндсет (лекции 21–31) — 11/11 (100% верифицировано).
+  - [ ] Модуль 5 («Учебник по Go (Основы и синтаксис)», 44 лекции):
+    - [ ] Блок 1: Лексическая структура, переменные, типы данных и константы (лекции 1–11) — 0/11.
+    - [ ] Блок 2: Управляющие конструкции, циклы и функции (лекции 12–22) — 0/11.
+    - [ ] Блок 3: Массивы, срезы, карты и структуры (лекции 23–33) — 0/11.
+    - [ ] Блок 4: Указатели, методы, интерфейсы и основы конкурентности (лекции 34–44) — 0/11.
+  - [ ] Последующие модули 6–22.
 
 ---
 
@@ -227,14 +232,14 @@ builder/
 | **Блок 5: Наблюдаемость, сетевой стек Linux и Go runtime** | 34–44 | ✅ Завершен (11/11) | tcpdump, Wireshark, netstat, ss, ping, traceroute, dig, curl, mtr, eBPF/XDP, Linux network stack (sk_buff, sock, epoll, zero-copy), net/netpoller (gopark, wakeG, sysmon), TIME_WAIT, port exhaustion, HoL blocking, Slowloris, Kubernetes CNI/Pod/Service/IPVS, Service Mesh (Istio, Linkerd, sidecar, ambient), сетевые паттерны (Request-Reply, PubSub, Circuit Breaker, Idempotency), полная картина сетевого стека для Go |
 
 ### Раздел 4. 4. История и философия Go
-- **Статус:** 🔄 В процессе редактуры (20/31 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `31` | **Диаграмм Mermaid:** `36` | **Объем:** `600 КБ` | **Подразделов:** `1`
+- **Статус:** ✅ Завершен (31/31 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статей:** `31` | **Диаграмм Mermaid:** `37` | **Объем:** `650 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
 | **Блок 1: Предпосылки, Bell Labs и философия языка** | 1–10 | ✅ Завершен (10/10) | Bell Labs, Ken Thompson, Rob Pike, Robert Griesemer, C++/Java pain points, Mechanical Sympathy, Value types vs Pointer arrays, Escape Analysis vs Generational GC, AOT vs JIT, iface/itab, Orthogonality, Line of Sight, Go Proverbs, Errors Are Values, if err != nil, Sentinel/Custom errors, %w, errors.Is/As |
 | **Блок 2: Архитектурные паттерны и ООП по-Goшному** | 11–20 | ✅ Завершен (10/10) | Panic/Recover, Boundary defenses, Composition Over Inheritance, Embedding vs Shadowing, Fat Pointers iface/itab, Static Duck Typing, Pointer vs Value receivers, Small interfaces, SOLID in Go, Data-oriented thinking, Colorless functions, No magic / No ThreadLocal, Zero Value & lazy initialization |
-| **Блок 3: Эволюция языка, рантайм и майндсет** | 21–31 | ⏳ В очереди (0/11) | Обратная совместимость Go 1, Пакеты и структура проекта, Внутренности рантайма, Concurrency vs Parallelism, Share Memory By Communicating, Sync vs Async, Стандартная библиотека, Модули Go, Дженерики, Идиоматичный майндсет, Итоги раздела |
+| **Блок 3: Эволюция языка, рантайм и майндсет** | 21–31 | ✅ Завершен (11/11) | Простота vs абстракции (stack growth, inlining budget, Rule of 3, deletability), Пакеты и project layout (DAG, .a archives, internal/ visibility, domain-driven packaging), Экспортируемость имен (ASCII lexer, package encapsulation, reflect and JSON), Concurrency is not Parallelism (G-M-P, user space context switch, netpoller), Share Memory By Communicating (MESI, Cache Line Bouncing, CSP, hchan/sudog), Стандартная библиотека (Ecosystem Glue, io.Reader, database/sql DIP, zero dependencies), Совместимость Go 1 (GODEBUG, map randomization, bit rot protection), Generics (Russ Cox dilemma, Monomorphization vs Type Erasure, GCShape Stenciling, constraints), ООП-антипаттерны (IUserService, fake embedding inheritance, pointer overuse, getters/setters, Zero Value), Идиоматичный майндсет (Composition root, Line of sight, boring code, mechanical sympathy) |
 
 ### Раздел 5. 5. Учебник по Go (Основы и синтаксис)
 - **Статус:** ✅ Завершен (CONVERTED)
