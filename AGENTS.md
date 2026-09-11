@@ -183,7 +183,7 @@ builder/
     - [x] Блок 5: Наблюдаемость, сетевой стек Linux, Go runtime и распределенные сети (лекции 34–44) — 11/11 (100% верифицировано).
   - [ ] Модуль 4 («История и философия Go», 31 лекция):
     - [x] Блок 1: Предпосылки создания, Bell Labs, Rob Pike, Ken Thompson (лекции 1–10) — 10/10 (100% верифицировано).
-    - [ ] Блок 2: Философия простоты, композиция, интерфейсы, обработка ошибок (лекции 11–20) — 0/10.
+    - [x] Блок 2: Философия простоты, композиция, интерфейсы, обработка ошибок (лекции 11–20) — 10/10 (100% верифицировано).
     - [ ] Блок 3: Эволюция языка: от Go 1.0 до Go 1.24+, модули, дженерики (лекции 21–31) — 0/11.
   - [ ] Последующие модули 5–22.
 
@@ -227,13 +227,13 @@ builder/
 | **Блок 5: Наблюдаемость, сетевой стек Linux и Go runtime** | 34–44 | ✅ Завершен (11/11) | tcpdump, Wireshark, netstat, ss, ping, traceroute, dig, curl, mtr, eBPF/XDP, Linux network stack (sk_buff, sock, epoll, zero-copy), net/netpoller (gopark, wakeG, sysmon), TIME_WAIT, port exhaustion, HoL blocking, Slowloris, Kubernetes CNI/Pod/Service/IPVS, Service Mesh (Istio, Linkerd, sidecar, ambient), сетевые паттерны (Request-Reply, PubSub, Circuit Breaker, Idempotency), полная картина сетевого стека для Go |
 
 ### Раздел 4. 4. История и философия Go
-- **Статус:** 🔄 В процессе редактуры (10/31 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `31` | **Диаграмм Mermaid:** `36` | **Объем:** `520 КБ` | **Подразделов:** `1`
+- **Статус:** 🔄 В процессе редактуры (20/31 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статей:** `31` | **Диаграмм Mermaid:** `36` | **Объем:** `600 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
 | **Блок 1: Предпосылки, Bell Labs и философия языка** | 1–10 | ✅ Завершен (10/10) | Bell Labs, Ken Thompson, Rob Pike, Robert Griesemer, C++/Java pain points, Mechanical Sympathy, Value types vs Pointer arrays, Escape Analysis vs Generational GC, AOT vs JIT, iface/itab, Orthogonality, Line of Sight, Go Proverbs, Errors Are Values, if err != nil, Sentinel/Custom errors, %w, errors.Is/As |
-| **Блок 2: Архитектурные паттерны и ООП по-Goшному** | 11–20 | ⏳ В очереди (0/10) | Panic/Recover, Composition Over Inheritance, Embedding, Small Interfaces, Table-Driven Tests, Subtests, Benchmarks, Profiling, Code Generation, Zero Values |
+| **Блок 2: Архитектурные паттерны и ООП по-Goшному** | 11–20 | ✅ Завершен (10/10) | Panic/Recover, Boundary defenses, Composition Over Inheritance, Embedding vs Shadowing, Fat Pointers iface/itab, Static Duck Typing, Pointer vs Value receivers, Small interfaces, SOLID in Go, Data-oriented thinking, Colorless functions, No magic / No ThreadLocal, Zero Value & lazy initialization |
 | **Блок 3: Эволюция языка, рантайм и майндсет** | 21–31 | ⏳ В очереди (0/11) | Обратная совместимость Go 1, Пакеты и структура проекта, Внутренности рантайма, Concurrency vs Parallelism, Share Memory By Communicating, Sync vs Async, Стандартная библиотека, Модули Go, Дженерики, Идиоматичный майндсет, Итоги раздела |
 
 ### Раздел 5. 5. Учебник по Go (Основы и синтаксис)
