@@ -201,13 +201,19 @@ builder/
     - [x] Блок 2: Рантайм, планировщик и синхронизация (лекции 8–17) — 10/10 (100% верифицировано).
     - [x] Блок 3: Управление памятью, аллокатор и сборщик мусора (лекции 18–28) — 11/11 (100% верифицировано).
     - [x] Блок 4: Внутреннее устройство структур данных и рантайм-механизмов (лекции 29–39, включая 33.1) — 12/12 (100% верифицировано).
-  - [ ] Модуль 8 («8. Инфраструктура языка, Тулинг и CI_CD», 41 лекция):
+  - [x] Модуль 8 («8. Инфраструктура языка, Тулинг и CI_CD», 41 лекция) — 100% верифицировано и скомпилировано в Кернигановском стандарте:
     - [x] Блок 1: Базовый тулинг и команды Go (лекции 1–11, вкл. 7.1) — 12/12 (100% верифицировано).
     - [x] Блок 2: Модули, зависимости и Workspaces (лекции 12–17) — 6/6 (100% верифицировано).
     - [x] Блок 3: Линтинг, автоматизация и сборка: Make, Task, Docker (лекции 18–25) — 8/8 (100% верифицировано).
     - [x] Блок 4: CI/CD пайплайны и автоматизация тестирования (лекции 26–31) — 6/6 (100% верифицировано).
-    - [ ] Блок 5: Продвинутая сборка, релизы и Production Ready Toolchain (лекции 32–40) — 0/9.
-  - [ ] Последующие модули 9–22.
+    - [x] Блок 5: Продвинутая сборка, релизы и Production Ready Toolchain (лекции 32–40) — 9/9 (100% верифицировано).
+  - [ ] Модуль 9 («9. Бэкенд на Go (Практика разработки)», 44 лекции):
+    - [ ] Блок 1: HTTP-сервер, роутинг и обработка запросов (лекции 1–10) — 0/10.
+    - [ ] Блок 2: Конфигурация, архитектура и базовые сервисы (лекции 11–20) — 0/10.
+    - [ ] Блок 3: Хранение данных, кэширование и фоновая обработка (лекции 21–27) — 0/7.
+    - [ ] Блок 4: Надежность, устойчивость и контракт API (лекции 28–33) — 0/6.
+    - [ ] Блок 5: Тестирование, развертывание и Observability (лекции 34–44) — 0/11.
+  - [ ] Последующие модули 10–22.
 
 ---
 
@@ -238,63 +244,63 @@ builder/
 
 ### Раздел 3. 3. Компьютерные сети и сетевой стек
 - **Статус:** ✅ Завершен (44/44 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `44` | **Диаграмм Mermaid:** `156` | **Объем:** `1350 КБ` | **Подразделов:** `1`
+- **Статей:** `44` | **Диаграмм Mermaid:** `68` | **Объем:** `635 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
-| **Блок 1: Сетевой фундамент, канальный и сетевой уровни** | 1–9 | ✅ Завершен (9/9) | OSI/TCP-IP, Ethernet, MAC, L2/L3 границы, IPv4/IPv6, net/netip, ARP/NDP, neighbour cache, FIB, LPM, BGP/OSPF/RIP, NAT/PAT, Conntrack, VLAN, VXLAN |
-| **Блок 2: Транспортный уровень, сокеты и DNS** | 10–19 | ✅ Завершен (10/10) | TCP lifecycle, 3-way handshake, sliding window, flow/congestion control, Reno, Cubic, BBR, UDP, Socket API, BSD syscalls, netpoller, DNS wire format, EDNS0, record types, TTL, TLS 1.3, mTLS, PKI, X.509 |
-| **Блок 3: Протоколы прикладного уровня** | 20–26 | ✅ Завершен (7/7) | HTTP/1.1 (Request/Response, Keep-Alive, Chunked, Pipelining, persistConn), HTTP/2 (Frames, Multiplexing, HPACK), HTTP/3 (QUIC, Loss Recovery, netpoll), WebSocket, SSE, gRPC, Protobuf |
-| **Блок 4: Проксирование, балансировка и безопасность** | 27–33 | ✅ Завершен (7/7) | Forward/Reverse Proxy, API Gateway, Nginx, Envoy (xDS), HAProxy, L4/L7 LB, RR, LC, Consistent Hashing, Service Discovery (DNS/Consul), CDN, Edge, HTTP Caching, Netfilter, iptables, nftables, conntrack, DDoS, Rate Limiting (Token Bucket, Redis Lua), SYN Cookies |
-| **Блок 5: Наблюдаемость, сетевой стек Linux и Go runtime** | 34–44 | ✅ Завершен (11/11) | tcpdump, Wireshark, netstat, ss, ping, traceroute, dig, curl, mtr, eBPF/XDP, Linux network stack (sk_buff, sock, epoll, zero-copy), net/netpoller (gopark, wakeG, sysmon), TIME_WAIT, port exhaustion, HoL blocking, Slowloris, Kubernetes CNI/Pod/Service/IPVS, Service Mesh (Istio, Linkerd, sidecar, ambient), сетевые паттерны (Request-Reply, PubSub, Circuit Breaker, Idempotency), полная картина сетевого стека для Go |
+| **Блок 1: Сетевой фундамент, канальный и сетевой уровни** | 1–9 | ✅ Завершен (9/9) | Модели OSI и TCP/IP, Ethernet, MAC, ARP, IP адресация, маски подсетей, CIDR, маршрутизация, ICMP, MTU, MSS |
+| **Блок 2: Транспортный уровень, сокеты и DNS** | 10–19 | ✅ Завершен (10/10) | UDP, TCP 3-way handshake, скользящее окно, контроль перегрузки, TCP termination, TIME_WAIT, сокеты, DNS, DNS over TLS/HTTPS |
+| **Блок 3: Протоколы прикладного уровня: HTTP/1-3, QUIC, WebSocket, gRPC** | 20–26 | ✅ Завершен (7/7) | HTTP/1.1 (Keep-Alive, pipeline), HTTP/2 (мультиплексирование, HPACK), HTTP/3 (QUIC, UDP, 0-RTT), TLS 1.3 handshake, WebSocket, gRPC и Protobuf |
+| **Блок 4: Проксирование, балансировка и безопасность** | 27–33 | ✅ Завершен (7/7) | Reverse Proxy, Forward Proxy, L4 vs L7 балансировка, алгоритмы балансировки, NAT и PAT, Firewalls, iptables, nftables, DDoS атаки и защита |
+| **Блок 5: Наблюдаемость, сетевой стек Linux, Go runtime и распределенные сети** | 34–44 | ✅ Завершен (11/11) | tcpdump, Wireshark, сокетные буферы Linux, сокетные опции, netfilter, conntrack, netpoller Go, Keep-Alive в Go, P2P, CDN, итоговая картина |
 
 ### Раздел 4. 4. История и философия Go
 - **Статус:** ✅ Завершен (31/31 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `31` | **Диаграмм Mermaid:** `37` | **Объем:** `650 КБ` | **Подразделов:** `1`
+- **Статей:** `31` | **Диаграмм Mermaid:** `35` | **Объем:** `420 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
-| **Блок 1: Предпосылки, Bell Labs и философия языка** | 1–10 | ✅ Завершен (10/10) | Bell Labs, Ken Thompson, Rob Pike, Robert Griesemer, C++/Java pain points, Mechanical Sympathy, Value types vs Pointer arrays, Escape Analysis vs Generational GC, AOT vs JIT, iface/itab, Orthogonality, Line of Sight, Go Proverbs, Errors Are Values, if err != nil, Sentinel/Custom errors, %w, errors.Is/As |
-| **Блок 2: Архитектурные паттерны и ООП по-Goшному** | 11–20 | ✅ Завершен (10/10) | Panic/Recover, Boundary defenses, Composition Over Inheritance, Embedding vs Shadowing, Fat Pointers iface/itab, Static Duck Typing, Pointer vs Value receivers, Small interfaces, SOLID in Go, Data-oriented thinking, Colorless functions, No magic / No ThreadLocal, Zero Value & lazy initialization |
-| **Блок 3: Эволюция языка, рантайм и майндсет** | 21–31 | ✅ Завершен (11/11) | Простота vs абстракции (stack growth, inlining budget, Rule of 3, deletability), Пакеты и project layout (DAG, .a archives, internal/ visibility, domain-driven packaging), Экспортируемость имен (ASCII lexer, package encapsulation, reflect and JSON), Concurrency is not Parallelism (G-M-P, user space context switch, netpoller), Share Memory By Communicating (MESI, Cache Line Bouncing, CSP, hchan/sudog), Стандартная библиотека (Ecosystem Glue, io.Reader, database/sql DIP, zero dependencies), Совместимость Go 1 (GODEBUG, map randomization, bit rot protection), Generics (Russ Cox dilemma, Monomorphization vs Type Erasure, GCShape Stenciling, constraints), ООП-антипаттерны (IUserService, fake embedding inheritance, pointer overuse, getters/setters, Zero Value), Идиоматичный майндсет (Composition root, Line of sight, boring code, mechanical sympathy) |
+| **Блок 1: Предпосылки создания, Bell Labs, Rob Pike, Ken Thompson** | 1–10 | ✅ Завершен (10/10) | Кризис C++ в Google, наследие Unix и Bell Labs, Rob Pike, Ken Thompson, Robert Griesemer, CSP Хоара, ортогональность языка |
+| **Блок 2: Философия простоты, композиция, интерфейсы, обработка ошибок** | 11–20 | ✅ Завершен (10/10) | Принцип наименьшего удивления, явное лучше неявного, композиция вместо наследования, duck typing интерфейсов, errors are values |
+| **Блок 3: Эволюция языка, рантайм и майндсет** | 21–31 | ✅ Завершен (11/11) | Go 1 Compatibility Promise, эволюция GC, модули Go, дженерики, Tooling-first подход, Go vs Rust/Java, ментальная модель gopher |
 
 ### Раздел 5. 5. Учебник по Go (Основы и синтаксис)
 - **Статус:** ✅ Завершен (44/44 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `44` | **Диаграмм Mermaid:** `72` | **Объем:** `872 КБ` | **Подразделов:** `1`
+- **Статей:** `44` | **Диаграмм Mermaid:** `68` | **Объем:** `635 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
-| **Блок 1: Основы синтаксиса, типы, операторы, управление потоком и функции** | 1–11 | ✅ Завершен (11/11) | Устройство языка, тулчейн go run/build/test, структура программы, переменные, константы, iota, базовые типы, rune, byte, UTF-8, операторы, short-circuit, &^ bit-clear, if с инициализацией, цикл for, семантика Go 1.22 для переменных цикла, switch и Jump-таблицы, Register ABI, multiple return values, named returns, defer (open-coded defers) |
-| **Блок 2: Ошибки, указатели, структуры данных (Slice, Map, String) и методы** | 12–22 | ✅ Завершен (11/11) | Errors are values, panic/recover, stack trace, указатели и Escape Analysis, массивы, Slice, SliceHeader, realloc, Map, hmap/bmap, эвакуация бакетов, strings, Struct, padding, memory alignment, методы, Value vs Pointer receivers |
-| **Блок 3: Интерфейсы, модули, ввод-вывод, JSON, время и дженерики** | 23–33 | ✅ Завершен (11/11) | Интерфейсы, iface/eface, embedding, структура пакетов, export/unexport, Go модули, io.Reader/Writer, JSON encoding/decoding, time.Time, тикеры, дженерики (Type Parameters, Constraints, GCShape) |
-| **Блок 4: Конкурентность, планировщик, каналы, примитивы синхронизации и итоги** | 34–44 | ✅ Завершен (11/11) | Горутины, планировщик G-M-P, work-stealing, netpoller, каналы (hchan, sudog), buffered/unbuffered, select, context.Context, WaitGroup, Mutex, RWMutex, atomic, Cond, sync.Pool, race detector, Go Memory Model, Deadlock, Livelock |
+| **Блок 1: Синтаксис, типы, операторы и функции** | 1–11 | ✅ Завершен (11/11) | Структура программы, базовые типы, переменные, константы, iota, if/switch, циклы (вкл. for-range over func Go 1.22+), функции, defer |
+| **Блок 2: Ошибки, указатели, структуры данных и методы** | 12–22 | ✅ Завершен (11/11) | Errors, panic/recover, указатели, массивы, слайсы (slice header, sub-slicing), мапы (runtime structure), строки и руны, структуры, методы |
+| **Блок 3: Интерфейсы, модули, ввод-вывод, JSON, время и дженерики** | 23–33 | ✅ Завершен (11/11) | Интерфейсы (iface/eface), type assertions/switches, пакеты и модули, io.Reader/Writer, encoding/json, time, дженерики (type parameters, constraints) |
+| **Блок 4: Конкурентность, планировщик, каналы, примитивы синхронизации и итоги** | 34–44 | ✅ Завершен (11/11) | Горутины, GMP планировщик, каналы (буферизованные/небуферизованные), select, sync.Mutex/RWMutex, sync.WaitGroup, atomic, context, итоги |
 
 ### Раздел 6. 6. Стандартная библиотека Go
 - **Статус:** ✅ Завершен (48/48 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `48` | **Диаграмм Mermaid:** `58` | **Объем:** `1020 КБ` | **Подразделов:** `1`
+- **Статей:** `48` | **Диаграмм Mermaid:** `52` | **Объем:** `690 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
-| **Блок 1: Ввод-вывод, форматирование и работа с текстом** | 1–10 | ✅ Завершен (10/10) | Философия stdlib, fmt (верстки, Sprintf, Fprintf), errors (fmt.Errorf %w, errors.Is/As), io (Reader, Writer, LimitReader, TeeReader, MultiReader), отказ от ioutil (os, io), bufio (Scanner, Reader, Writer, буферы), strings (Builder, Grow, Clone), bytes (Buffer, zero-alloc), strconv (Parse/Format), unicode и utf8 (DecodeRuneInString) |
-| **Блок 2: Файловая система, ОС, конфигурация и логирование** | 11–18 | ✅ Завершен (8/8) | os (файлы, окружение, сигналы, Exit), path/filepath (кроссплатформенность), io/fs (абстрактная FS, ReadDirFS), embed (embed.FS), flag (парсинг флагов), log и slog (структурированное логирование, Level, Handler, JSONHandler), context (отмена, таймауты, metadata), time (Time, Duration, Timer, Ticker, монотонные часы) |
-| **Блок 3: Рантайм, конкурентность, рефлексия и структуры данных** | 19–27 | ✅ Завершен (9/9) | sync (Mutex, RWMutex, WaitGroup, Once), sync/atomic (Int64, Pointer, CAS), sync.Pool, runtime (Gosched, GC, ReadMemStats, NumCPU), reflect (Type, Value, Kind, накладные расходы), unsafe (Pointer, StringData, SliceData), sort и slices (дженерики, pdqsort), maps и cmp (diff, Compare), container/list, heap, ring |
-| **Блок 4: Сериализация, сеть и HTTP** | 28–36 | ✅ Завершен (9/9) | regexp (линейный парсер RE2, compile), encoding/json (Marshal, Unmarshal, Decoder, stream, tags), xml/csv/gob, net (Listen, Dial, TCP/UDP), net/url (URL, Query, Escaping), net/http (Server, Client, Handler, Middleware), net/http под капотом (Transport, connection pool, Keep-Alive, idle conns), httptest (Server, ResponseRecorder), net/http/pprof и expvar |
-| **Блок 5: Криптография, базы данных, системные утилиты и тестирование** | 37–48 | ✅ Завершен (12/12) | crypto/rand (CSPRNG) vs math/rand (v2), crypto (SHA-256, HMAC, AES-GCM, RSA, TLS), database/sql (Driver, connection pooling, Tx, Stmt), archive (zip, tar), compress (gzip, zlib, flate), os/exec (Command, stdin/stdout, pipes), syscall и x/sys, testing (t.Run, Benchmark, Fuzzing), testing/quick, plugin, итоги stdlib |
+| **Блок 1: Ввод-вывод, форматирование и работа с текстом** | 1–10 | ✅ Завершен (10/10) | io, bufio, fmt, strings, bytes, strconv, unicode, regexp, path/filepath, flag |
+| **Блок 2: Файловая система, ОС, конфигурация и логирование** | 11–18 | ✅ Завершен (8/8) | os, os/exec, io/fs, embed, log, slog (структурированное логирование), sort, slices/maps (Go 1.21+) |
+| **Блок 3: Рантайм, конкурентность, рефлексия и структуры данных** | 19–27 | ✅ Завершен (9/9) | context, sync, sync/atomic, time, runtime, reflect, unsafe, container (list/heap), math/rand (и v2 в Go 1.22+) |
+| **Блок 4: Сериализация, сеть и HTTP** | 28–36 | ✅ Завершен (9/9) | encoding/json, encoding/xml, encoding/csv, net, net/http (клиент и сервер), net/url, html/template, mime |
+| **Блок 5: Криптография, базы данных, системные утилиты и тестирование** | 37–48 | ✅ Завершен (12/12) | crypto (aes, rsa, tls), hash, database/sql, testing, testing/quick, testing/iotest, pprof, trace, expvar, syscall, debug, итоговая картина |
 
 ### Раздел 7. 7. Глубокий Go (Внутреннее устройство)
 - **Статус:** ✅ Завершен (49/49 лекций вычитано и верифицировано в Кернигановском стандарте)
-- **Статей:** `49` | **Диаграмм Mermaid:** `85` | **Объем:** `1250 КБ` | **Подразделов:** `1`
+- **Статей:** `49` | **Диаграмм Mermaid:** `73` | **Объем:** `720 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
-| **Блок 1: Компилятор, ассемблер, ABI и бинарники** | 1–7 | ✅ Завершен (7/7) | Старт программы, устройство компилятора, фазы (Lexer, Parser, TypeCheck, SSA), оптимизации SSA, Go assembler (планарный синтаксис), ABI0 vs ABIInternal (регистровый ABI), структура ELF/Mach-O бинарника Go |
-| **Блок 2: Рантайм, планировщик и синхронизация** | 8–17 | ✅ Завершен (10/10) | Компоненты рантайма, планировщик G-M-P, work stealing, sysmon, netpoller, стек горутины (рост и сжатие, copystack), жизненный цикл горутин, каналы (hchan, sudog), select, Mutex/RWMutex, sync/atomic, Go Memory Model (happens before) |
-| **Блок 3: Управление памятью, аллокатор и сборщик мусора** | 18–28 | ✅ Завершен (11/11) | Escape Analysis (теория и практика), Stack vs Heap, аллокатор (mcache, mcentral, mheap, size classes), Tiny Allocator, sync.Pool, Tricolor Mark & Sweep, Concurrent GC, Stop The World, Write Barrier, тюнинг (GOGC, GOMEMLIMIT, memory ballast) |
-| **Блок 4: Внутреннее устройство структур данных и рантайм-механизмов** | 29–39 (вкл. 33.1) | ✅ Завершен (12/12) | Slice (структура, рост, copy), Map (hmap, bmap, эвакуация, рандомизация итераций, Swiss tables Go 1.24), sync.Map (read/dirty), String (read-only байты), Interfaces (iface/eface, boxing), Reflect, Unsafe.Pointer, defer/panic/recover |
-| **Блок 5: Системные вызовы, cgo, preemption, тулинг и итоги** | 40–48 | ✅ Завершен (9/9) | Обработка syscalls в рантайме, cgo (стоимость переключения стеков), блокирующие вызовы и планировщик, асинхронный preemption (сигналы), Linker и build modes, Plugins и shared libraries, Race Detector (ThreadSanitizer), pprof и execution trace, итоги раздела |
+| **Блок 1: Компилятор, ассемблер, ABI и бинарники** | 1–7 | ✅ Завершен (7/7) | Архитектура gc компилятора, AST, SSA, десахаризация, Go assembler (Plan 9), ABIInternal (регистровый ABI), runtime.morestack, компоновка ELF/Mach-O/PE, DWARF |
+| **Блок 2: Рантайм, планировщик и синхронизация** | 8–17 | ✅ Завершен (10/10) | GMP модель, m0, g0, work-stealing, sysmon, прерывание горутин (safepoints), netpoller, устройство каналов (hchan, sudog, lock-free waitq), sync.Mutex, sync.Pool |
+| **Блок 3: Управление памятью, аллокатор и сборщик мусора** | 18–28 | ✅ Завершен (11/11) | Escape analysis, TCMalloc архитектура (mcache, mcentral, mheap), span classes, Tricolor mark-and-sweep, Write Barrier, GC Pacer, GOMEMLIMIT, Finalizers |
+| **Блок 4: Внутреннее устройство структур данных и рантайм-механизмов** | 29–39 (вкл. 33.1) | ✅ Завершен (12/12) | Slice internals, String internals, Map (hmap, bmap, Swiss Tables в 1.24+), Interfaces (iface, eface, itab), Type Assertions, Defer/Panic/Recover (open-coded defers), Reflect internals, Unsafe (Pointer, uintptr, string/slice conversions), Cgo internals, PGO |
+| **Блок 5: Продвинутые оптимизации, профилирование и рантайм-хаки** | 40–48 | ✅ Завершен (9/9) | Memory layout, alignment, padding, Inlining, Loop unrolling, Bounds Check Elimination (BCE), CPU cache optimization, False sharing, Pprof internals, Execution tracer, Synctest, Итоги |
 
 ### Раздел 8. 8. Инфраструктура языка, Тулинг и CI_CD
-- **Статус:** 🔄 В процессе редактуры (32/41 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статус:** ✅ Завершен (41/41 лекций вычитано и верифицировано в Кернигановском стандарте)
 - **Статей:** `41` | **Диаграмм Mermaid:** `41` | **Объем:** `600 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
@@ -303,13 +309,19 @@ builder/
 | **Блок 2: Модули, зависимости и Workspaces** | 12–17 | ✅ Завершен (6/6) | go.mod и go.sum, MVS (Minimal Version Selection), SemVer, replace и exclude директивы, приватные модули (GOPRIVATE), Go Proxy (GOPROXY, GOSUMDB) и кэширование, go work (Multi-module workspaces) |
 | **Блок 3: Линтинг, автоматизация и сборка: Make, Task, Docker** | 18–25 | ✅ Завершен (8/8) | golangci-lint (архитектура, AST линтеры), конфигурация линтинга, Makefile для Go (PHONY, переменные, таргеты), Taskfile (YAML-альтернатива), Docker для Go, Multi-stage builds, минимизация образов (scratch, distroless), кэширование Docker слоев (go.mod кэш) |
 | **Блок 4: CI/CD пайплайны и автоматизация тестирования** | 26–31 | ✅ Завершен (6/6) | Принципы CI/CD, GitHub Actions для Go (setup-go, кэширование), GitLab CI, матричные тесты, quality gates и линтинг в пайплайне, release pipeline и семантическое версионирование |
-| **Блок 5: Продвинутая сборка, релизы и Production Ready Toolchain** | 32–40 | ⏳ Ожидает (0/9) | Кросс-компиляция (GOOS, GOARCH), сборка под разные платформы, CGO и флаги cgo, strip символов (-s -w), DWARF, профилирование в CI, артефакты сборки, GoReleaser, changelog и semantic release, Production-ready toolchain итоги |
+| **Блок 5: Продвинутая сборка, релизы и Production Ready Toolchain** | 32–40 | ✅ Завершен (9/9) | Кросс-компиляция (GOOS, GOARCH), сборка под разные платформы, CGO и флаги cgo, strip символов (-s -w), DWARF, профилирование в CI, артефакты сборки, GoReleaser, changelog и semantic release, Production-ready toolchain итоги |
 
 ### Раздел 9. 9. Бэкенд на Go (Практика разработки)
-- **Статус:** ✅ Завершен (CONVERTED)
+- **Статус:** 🔄 В процессе редактуры (0/44 лекций вычитано и верифицировано в Кернигановском стандарте)
 - **Статей:** `44` | **Диаграмм Mermaid:** `36` | **Объем:** `564.4 КБ` | **Подразделов:** `1`
 
-> Единый модуль из 44 последовательных лекций.
+| Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
+|---|:---:|:---:|---|
+| **Блок 1: HTTP-сервер, роутинг и обработка запросов** | 1–10 | ⏳ Ожидает (0/10) | Архитектура веб-сервиса, net/http сервер, ServeMux (Go 1.22+ patterns), gin, chi, middleware chains, context в HTTP, обработка запросов/ответов, валидация, JSON API, Graceful shutdown |
+| **Блок 2: Конфигурация, архитектура и базовые сервисы** | 11–20 | ⏳ Ожидает (0/10) | Конфигурация приложения, ENV, CLI flags, config файлы (YAML/TOML), DI в Go (ручной DI, Wire), structured logging (slog), обработка ошибок в слоях, healthchecks (liveness/readiness), Prometheus метрики, rate limiting, Auth (JWT, RBAC) |
+| **Блок 3: Хранение данных, кэширование и фоновая обработка** | 21–27 | ⏳ Ожидает (0/7) | database/sql, пулы соединений, Repository pattern, транзакции и Unit of Work, стратегии кэширования (Cache-Aside), Redis (go-redis), фоновые задачи (workers), очереди задач |
+| **Блок 4: Надежность, устойчивость и контракт API** | 28–33 | ⏳ Ожидает (0/6) | Идемпотентность (Idempotency keys), Retry & Exponential Backoff, Jitter, Circuit Breaker, таймауты и SLA/SLO, версионирование API, документация API (OpenAPI/Swagger) |
+| **Блок 5: Тестирование, развертывание и Observability** | 34–44 | ⏳ Ожидает (0/11) | Тестирование HTTP (httptest), интеграционные тесты (testcontainers), нагрузочное тестирование (k6), Dockerfile, Nginx reverse proxy, деплой в продакшн, Observability (OpenTelemetry), логирование в проде, отладка инцидентов (pprof, core dump), production backend итоги |
 
 ### Раздел 10. 10. Проектирование API и Сетевые протоколы
 - **Статус:** ✅ Завершен (CONVERTED)
