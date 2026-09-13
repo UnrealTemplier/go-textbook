@@ -199,7 +199,7 @@ builder/
   - [ ] Модуль 7 («7. Глубокий Go (Внутреннее устройство)», 49 лекций):
     - [x] Блок 1: Компилятор, ассемблер, ABI и бинарники (лекции 1–7) — 7/7 (100% верифицировано).
     - [x] Блок 2: Рантайм, планировщик и синхронизация (лекции 8–17) — 10/10 (100% верифицировано).
-    - [ ] Блок 3: Управление памятью, аллокатор и сборщик мусора (лекции 18–28) — 0/11.
+    - [x] Блок 3: Управление памятью, аллокатор и сборщик мусора (лекции 18–28) — 11/11 (100% верифицировано).
     - [ ] Блок 4: Внутреннее устройство структур данных и рантайм-механизмов (лекции 29–39, включая 33.1) — 0/12.
     - [ ] Блок 5: Системные вызовы, cgo, preemption, тулинг и итоги (лекции 40–48) — 0/9.
   - [ ] Последующие модули 8–22.
@@ -277,14 +277,14 @@ builder/
 | **Блок 5: Криптография, базы данных, системные утилиты и тестирование** | 37–48 | ✅ Завершен (12/12) | crypto/rand (CSPRNG) vs math/rand (v2), crypto (SHA-256, HMAC, AES-GCM, RSA, TLS), database/sql (Driver, connection pooling, Tx, Stmt), archive (zip, tar), compress (gzip, zlib, flate), os/exec (Command, stdin/stdout, pipes), syscall и x/sys, testing (t.Run, Benchmark, Fuzzing), testing/quick, plugin, итоги stdlib |
 
 ### Раздел 7. 7. Глубокий Go (Внутреннее устройство)
-- **Статус:** 🔄 В процессе редактуры (17/49 лекций вычитано и верифицировано в Кернигановском стандарте)
+- **Статус:** 🔄 В процессе редактуры (28/49 лекций вычитано и верифицировано в Кернигановском стандарте)
 - **Статей:** `49` | **Диаграмм Mermaid:** `53` | **Объем:** `764 КБ` | **Подразделов:** `1`
 
 | Тематический блок | Лекции | Статус редактуры | Ключевые концепции |
 |---|:---:|:---:|---|
 | **Блок 1: Компилятор, ассемблер, ABI и бинарники** | 1–7 | ✅ Завершен (7/7) | Старт программы, устройство компилятора, фазы (Lexer, Parser, TypeCheck, SSA), оптимизации SSA, Go assembler (планарный синтаксис), ABI0 vs ABIInternal (регистровый ABI), структура ELF/Mach-O бинарника Go |
 | **Блок 2: Рантайм, планировщик и синхронизация** | 8–17 | ✅ Завершен (10/10) | Компоненты рантайма, планировщик G-M-P, work stealing, sysmon, netpoller, стек горутины (рост и сжатие, copystack), жизненный цикл горутин, каналы (hchan, sudog), select, Mutex/RWMutex, sync/atomic, Go Memory Model (happens before) |
-| **Блок 3: Управление памятью, аллокатор и сборщик мусора** | 18–28 | ⏳ Ожидает (0/11) | Escape Analysis (теория и практика), Stack vs Heap, аллокатор (mcache, mcentral, mheap, size classes), Tiny Allocator, sync.Pool, Tricolor Mark & Sweep, Concurrent GC, Stop The World, Write Barrier, тюнинг (GOGC, GOMEMLIMIT, memory ballast) |
+| **Блок 3: Управление памятью, аллокатор и сборщик мусора** | 18–28 | ✅ Завершен (11/11) | Escape Analysis (теория и практика), Stack vs Heap, аллокатор (mcache, mcentral, mheap, size classes), Tiny Allocator, sync.Pool, Tricolor Mark & Sweep, Concurrent GC, Stop The World, Write Barrier, тюнинг (GOGC, GOMEMLIMIT, memory ballast) |
 | **Блок 4: Внутреннее устройство структур данных и рантайм-механизмов** | 29–39 (вкл. 33.1) | ⏳ Ожидает (0/12) | Slice (структура, рост, copy), Map (hmap, bmap, эвакуация, рандомизация итераций, Swiss tables Go 1.24), sync.Map (read/dirty), String (read-only байты), Interfaces (iface/eface, boxing), Reflect, Unsafe.Pointer, defer/panic/recover |
 | **Блок 5: Системные вызовы, cgo, preemption, тулинг и итоги** | 40–48 | ⏳ Ожидает (0/9) | Обработка syscalls в рантайме, cgo (стоимость переключения стеков), блокирующие вызовы и планировщик, асинхронный preemption (сигналы), Linker и build modes, Plugins и shared libraries, Race Detector (ThreadSanitizer), pprof и execution trace, итоги раздела |
 
