@@ -2168,46 +2168,102 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Ordering сообщений и его цена</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="paradoks-poryadka-v-raspredelennykh-sistemakh">Парадокс порядка в распределенных системах</h2>
+            <h1>5. Ordering сообщений и его цена</h1>
+<blockquote>
+<p><em>"Time is an illusion. Lunchtime doubly so. And absolute ordering in distributed systems is entirely a figment of human imagination."</em><br />
+— Свободный пересказ Лесли Лэмпорта и Дугласа Адамса</p>
+</blockquote>
+<p>В 1978 году Лесли Лэмпорт опубликовал фундаментальную работу <em>«Time, Clocks, and the Ordering of Events in a Distributed System»</em>, навсегда изменившую понимание распределенных вычислений. Он математически доказал простую истину: в распределенной системе без единых аппаратных часов невозможно определить абсолютный глобальный порядок двух независимых событий, произошедших на разных серверах. Понятия «раньше» и «позже» имеют смысл только тогда, когда между событиями существует прямая причинно-следственная связь (отношение <em>Happens-Before</em>).</p>
+<p>Однако начинающие разработчики, переходя от монолитов с PostgreSQL к микросервисам, часто приносят с собой интуитивное требование: <em>«События в брокере обязаны обрабатываться строго в том порядке, в котором они произошли!»</em></p>
+<p>Это требование — один из самых разрушительных антипаттернов в проектировании высоконагруженных систем. <strong>Тотальный глобальный порядок (Global Ordering) фундаментально убивает масштабируемость, отказоустойчивость и параллелизм.</strong></p>
+<p>В этой главе мы разберем, какую колоссальную физическую цену приходится платить за сохранение порядка, как возникает блокировка начала очереди (Head-of-Line Blocking) и как современная индустрия находит баланс через <strong>частичный порядок (Partial Ordering)</strong>.</p>
+<hr />
+<h2 id="1-paradoks-poryadka-v-raspredelennykh-sistemakh">1. Парадокс порядка в распределенных системах</h2>
 
-<p>В монолитном приложении с одной базой данных (например, PostgreSQL) порядок событий гарантируется транзакциями и блокировками строк. Если пользователь нажал кнопку «Купить», а затем «Отменить», эти два запроса выстроятся в очередь на уровне СУБД, и итоговое состояние будет консистентным.</p>
-<p>Переходя на асинхронную архитектуру с брокерами сообщений, разработчики часто требуют того же: <em>«События должны обрабатываться строго в том порядке, в котором они произошли!»</em> Это логичное бизнес-требование является одним из самых разрушительных антипаттернов в проектировании HighLoad-систем. Строгий порядок (Strict Ordering) фундаментально противоречит идеям параллелизма, масштабируемости и отказоустойчивости.</p>
-<p>В этой статье мы разберем, почему порядок стоит так дорого, как возникает Head-of-Line Blocking, и как лидеры рынка (Kafka и RabbitMQ) решают эту проблему через компромисс <strong>Partial Ordering</strong> (частичного порядка).</p>
-<h2 id="tsena-poryadka-head-of-line-blocking-i-smert-konkurentnosti">Цена порядка: Head-of-Line Blocking и смерть конкурентности</h2>
+<p>В классической реляционной базе данных (PostgreSQL или MySQL) строгий порядок гарантируется блокировками строк, таблиц и сериализацией транзакций через журнал упреждающей записи (WAL). Если клиент сначала нажал кнопку <em>«Создать заказ»</em>, а через 100 миллисекунд — <em>«Отменить заказ»</em>, эти запросы выстроятся в очередь на уровне движка СУБД:</p>
+<pre><code>[ Поток 1: Создать заказ #42 ] ──► [ Блокировка строки #42 ] ──► [ Commit ]
+                                                                     │
+[ Поток 2: Отменить заказ #42 ] ──────────(Ждет снятия Lock)─────────┘
+</code></pre>
+<p>Но что произойдет, когда мы разделим систему на асинхронные микросервисы?<br />
+1. Сервис заказов отправил в сеть событие <code>OrderCreated</code>.<br />
+2. Через 5 миллисекунд пользователь передумал и нажал отмену: ушло событие <code>OrderCancelled</code>.<br />
+3. Пакет <code>OrderCreated</code> наткнулся на временную потерю пакета на коммутаторе (TCP Retransmit) и задержался на 200 мс.<br />
+4. Пакет <code>OrderCancelled</code> долетел до воркера первым! <br />
+5. Воркер пытается отменить заказ, которого в базе данных еще физически не существует. Система падает с логической ошибкой <code>OrderNotFoundException</code>.</p>
+<p>Кажется, что решение очевидно: давайте заставим брокер выстроить все сообщения в одну строгую очередь FIFO и обрабатывать их строго по очереди. И вот тут начинается катастрофа.</p>
+<hr />
+<h2 id="2-tsena-poryadka-head-of-line-blocking-i-smert-konkurentnosti">2. Цена порядка: Head-of-Line Blocking и смерть конкурентности</h2>
 
 <p>Представьте классическую очередь (FIFO — First In, First Out). У вас есть 3 события для одного заказа:<br />
 1. <code>OrderCreated</code><br />
 2. <code>PaymentProcessed</code><br />
 3. <code>OrderShipped</code></p>
-<p>Если мы хотим гарантировать строгий порядок обработки (<strong>Total/Global Ordering</strong>), мы обязаны соблюдать два правила:<br />
-1. Очередь должна иметь только <strong>одного консьюмера</strong> (или один активный поток).<br />
-2. Если при обработке события 1 произошла временная ошибка (моргнула сеть к БД), мы <strong>не имеем права</strong> переходить к событию 2. Мы обязаны ретраить событие 1 до победного конца.</p>
+<p>Если мы хотим гарантировать строгий порядок обработки (<strong>Total / Global Ordering</strong>), мы обязаны соблюдать два беспощадных правила:<br />
+1. Очередь обязана обрабатываться <strong>строго одним консьюмером в один поток</strong>. Никакого параллелизма.<br />
+2. Если при обработке первого сообщения произошел временный сбой (моргнула сеть к базе данных), консьюмер <strong>не имеет права</strong> переходить ко второму сообщению. Он обязан повторять попытку (Retry) до победного конца.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Queue[&quot;Глобальная FIFO очередь&quot;]
+M1[&quot;1. Order #1 (Тормозит на БД!)&quot;]
+M2[&quot;2. Order #2 (Легкий)&quot;]
+M3[&quot;3. Order #3 (Легкий)&quot;]
+M4[&quot;4. Order #4 (Легкий)&quot;]
+end
+
+M1 --&gt; M2 --&gt; M3 --&gt; M4
+M1 --&gt;|&quot;Head-of-Line Blocking&quot;| W[&quot;Один воркер (1 поток CPU)&quot;]
+
+style M1 fill:#f38ba8,stroke:#11111b,color:#11111b
+style W fill:#313244,stroke:#f9e2af,stroke-width:2px
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Потеря Mechanical Sympathy</span>
   </div>
   <div class="callout-body">
-    <p>Что это значит на уровне железа и рантайма Go?<br />
-Вы разворачиваете мощный сервер на 64 ядра CPU. Ваш Go-рантайм инициализирует 64 потока операционной системы (<code>m</code>), готовых параллельно исполнять тысячи горутин (<code>g</code>). <br />
-Но из-за требования Global Ordering, вы запускаете консьюмер в <strong>один поток</strong> (одну горутину). 63 ядра вашего процессора простаивают. Кэши L1/L2 недоиспользуются. </p>
-<p>Более того, возникает <strong>Head-of-Line Blocking (HOL)</strong> — блокировка начала очереди. Если <code>OrderCreated</code> для Заказа №1 завис на таймауте базы данных на 5 секунд, то Заказ №2, Заказ №3 и Заказ №1000 будут покорно ждать эти 5 секунд, даже если они физически никак не связаны с Заказом №1 и могли бы быть обработаны прямо сейчас.</p>
+    <p>Что это означает на уровне аппаратного обеспечения сервера и рантайма Go?</p>
+<p>Вы арендуете современный сервер с процессором на 64 ядра (например, AMD EPYC). Рантайм Go инициализирует 64 системных потока операционной системы (<code>m</code>), привязанных к 64 логическим процессорам (<code>p</code>), готовых параллельно прокачивать через себя сотни тысяч горутин (<code>g</code>).</p>
+<p>Но из-за требования Global Ordering консьюмер запущен в <strong>один-единственный поток</strong> (одну горутину). <br />
+- 63 ядра процессора превращаются в бесполезные кремниевые обогреватели. <br />
+- Кэши инструкций L1i и данных L1d простаивают. <br />
+- Возникает катастрофическое явление — <strong>Head-of-Line Blocking (HOL, блокировка головы очереди)</strong>: если обработка сообщения Заказа №1 зависла на дисковом <code>fsync</code> или таймауте внешнего банка на 5 секунд, то Заказы №2, №3 и №100 000 покорно стоят в заторе эти 5 секунд, даже если они физически никак не связаны с Заказом №1 и могли бы выполниться за микросекунду.</p>
   </div>
 </div>
 
-<p>В итоге пропускная способность (Throughput) вашей системы падает до скорости обработки самого медленного сообщения. Это катастрофа для микросервисов.</p>
-<h2 id="total-order-vs-partial-order">Total Order vs Partial Order</h2>
+<p>Пропускная способность всей вашей распределенной корпоративной платформы падает до скорости обработки <strong>самого медленного сообщения в системе</strong>.</p>
+<hr />
+<h2 id="3-total-order-vs-partial-order-spasitelnyy-kompromiss">3. Total Order vs Partial Order: Спасительный компромисс</h2>
 
-<p>Индустрия решила эту проблему, отказавшись от тотального порядка в пользу <strong>частичного порядка (Partial Order)</strong>, или упорядочивания по ключу (Order by Key).</p>
-<p>Нам не важно, в каком порядке обработаются события Заказа №1 и Заказа №2. Они независимы. Нам важно, чтобы события <em>внутри</em> Заказа №1 шли строго друг за другом.</p>
-<p>Ключ маршрутизации (Routing Key / Partition Key) — это тот самый идентификатор сущности (например, <code>order_id</code> или <code>user_id</code>), в рамках которого мы требуем гарантий порядка.</p>
+<p>Индустрия высоконагруженных систем решила эту проблему отказом от тотального глобального порядка в пользу <strong>частичного порядка (Partial Ordering)</strong>, или упорядочивания по ключу сущности (<strong>Ordering by Key</strong>).</p>
+<p>В реальном бизнесе нам абсолютно безразлично, в каком относительном порядке выполнятся события Заказа Клиента А и Заказа Клиента Б. Они независимы! <br />
+- Заказ А покупает кроссовки в Москве.<br />
+- Заказ Б покупает кофеварку в Новосибирске.</p>
+<p>Единственное, что нам действительно критично — чтобы события <strong>внутри Заказа А</strong> выполнялись строго последовательно: <code>Created</code> $\rightarrow$ <code>Paid</code> $\rightarrow$ <code>Shipped</code>.</p>
+<p>Для этого вводится понятие ключа маршрутизации (<strong>Partition Key / Routing Key</strong>). Это уникальный идентификатор сущности (например, <code>order_id</code> или <code>user_id</code>), определяющий границы причинно-следственной связи:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2222,57 +2278,76 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph Stream[&quot;Входящий поток сообщений&quot;]
-A[&quot;Msg1 - Order:A&quot;]
-B[&quot;Msg2 - Order:B&quot;]
-C[&quot;Msg3 - Order:A&quot;]
-D[&quot;Msg4 - Order:C&quot;]
+subgraph Inbound[&quot;Входящий поток событий (Смешанный трафик)&quot;]
+A[&quot;Msg 1 (order_id: A)&quot;]
+B[&quot;Msg 2 (order_id: B)&quot;]
+C[&quot;Msg 3 (order_id: A)&quot;]
+D[&quot;Msg 4 (order_id: C)&quot;]
 end
 
-A --&gt; E{&quot;Роутинг по ключу &lt;br&gt; Hash-Order_ID&quot;}
-B --&gt; E
-C --&gt; E
-D --&gt; E
+Inbound --&gt; Router{&quot;Хэширование ключа&lt;br&gt;Hash(order_id) % N&quot;}
 
-E --&gt;|Воркер 1| F[&quot;Очередь: Order A &lt;br&gt; Msg1 -&gt; Msg3&quot;]
-E --&gt;|Воркер 2| G[&quot;Очередь: Order B &lt;br&gt; Msg2&quot;]
-E --&gt;|Воркер 3| H[&quot;Очередь: Order C &lt;br&gt; Msg4&quot;]
+subgraph Shards[&quot;Изолированные шарды / партиции&quot;]
+P1[(&quot;Партиция 1&lt;br&gt;Заказ A: Msg 1 -&gt; Msg 3&quot;)]
+P2[(&quot;Партиция 2&lt;br&gt;Заказ B: Msg 2&quot;)]
+P3[(&quot;Партиция 3&lt;br&gt;Заказ C: Msg 4&quot;)]
+end
+
+Router --&gt;|order_id: A| P1
+Router --&gt;|order_id: B| P2
+Router --&gt;|order_id: C| P3
+
+P1 --&gt; C1[&quot;Воркер 1 (Ядро 0)&quot;]
+P2 --&gt; C2[&quot;Воркер 2 (Ядро 1)&quot;]
+P3 --&gt; C3[&quot;Воркер 3 (Ядро 2)&quot;]
+
+style Inbound fill:#1e1e2e,stroke:#89b4fa,stroke-width:1px
+style Router fill:#313244,stroke:#f9e2af,stroke-width:2px
+style Shards fill:#181825,stroke:#a6e3a1,stroke-width:1px
   </pre>
 </div>
 
 
-<p>Разберем, как этот паттерн реализован в главных брокерах.</p>
-<h3 id="podkhod-kafka-partitsirovanie-partitioning">Подход Kafka: Партицирование (Partitioning)</h3>
+<p>Теперь каждое ядро процессора занято своим шардом. Если заказ А завис на банковском шлюзе, блокируется только Воркер 1. Воркеры 2 и 3 продолжают перемалывать заказы Б и В на полной скорости процессора!</p>
+<hr />
+<h2 id="4-kak-chastichnyy-poryadok-ustroen-v-brokerakh">4. Как частичный порядок устроен в брокерах</h2>
 
-<p>Apache Kafka изначально спроектирована вокруг идеи частичного порядка. В Kafka тема (Topic) делится на шарды — <strong>Партиции (Partitions)</strong>. </p>
-<ul>
-<li>Kafka гарантирует строгий порядок сообщений <strong>только внутри одной партиции</strong>. </li>
-<li>Когда Продюсер отправляет сообщение, он указывает <code>Key</code> (например, <code>order_id</code>). Kafka берет хэш от ключа (например, <code>MurmurHash2(key) % num_partitions</code>) и всегда отправляет сообщения с одинаковым ключом в одну и ту же партицию.</li>
-<li>Консьюмер-группа (Consumer Group) в Kafka работает так: одна партиция всегда читается строго <strong>одним консьюмером</strong> (одним процессом/потоком).</li>
-</ul>
-<p>Результат: События Заказа А всегда попадают в Партицию 0. События Заказа Б — в Партицию 1. Вы можете запустить 100 консьюмеров (если у вас 100 партиций), получить огромный параллелизм, но при этом события конкретного заказа никогда не обгонят друг друга. Это мы подробно разберем в <a href="../03-kafka/5-ordering-i-partitioning.html" class="wikilink">5. Ordering и partitioning</a>.</p>
+<h3 id="podkhod-apache-kafka-partitsirovanie-partitioning">Подход Apache Kafka: Партицирование (Partitioning)</h3>
+
+<p>Архитектура Apache Kafka изначально спроектирована вокруг идеи частичного порядка:<br />
+1. <strong>Топик (Topic)</strong> делится на независимые физические шарды — <strong>Партиции (Partitions)</strong>.<br />
+2. Каждая партиция представляет собой строго упорядоченный, неизменяемый Append-only лог. <br />
+3. Kafka гарантирует строгий порядок сообщений <strong>только и исключительно внутри одной партиции</strong>. Между разными партициями порядка нет!<br />
+4. При публикации продюсер вычисляет номер партиции по формуле детерминированного хэша (например, <code>MurmurHash2(key) % num_partitions</code>):<br />
+   $$\text{partition} = \text{MurmurHash2(key)} \pmod{\text{num_partitions}}$$<br />
+   Все события с одинаковым ключом <code>order_id</code> гарантированно попадают в одну и ту же партицию.<br />
+5. <strong>Модель консьюмер-групп:</strong> В рамках одной Consumer Group конкретную партицию всегда читает <strong>строго один инстанс консьюмера</strong>. Если у вас 32 партиции, вы можете запустить 32 параллельных воркера, получив 32-кратный параллелизм при сохранении 100% порядка внутри каждого заказа. (Подробнее в <a href="../03-kafka/5-ordering-i-partitioning.html" class="wikilink">5. Ordering и partitioning</a>).</p>
 <h3 id="podkhod-rabbitmq-consistent-hashing-exchange">Подход RabbitMQ: Consistent Hashing Exchange</h3>
 
-<p>В классическом RabbitMQ очередь — это единая структура данных. Если вы подключите 5 воркеров к одной очереди, RabbitMQ начнет отдавать им сообщения по кругу (Round-Robin). Это полностью <strong>разрушает порядок</strong>. Воркер 1 получит <code>OrderCreated</code>, а Воркер 2 в ту же микросекунду получит <code>OrderShipped</code> и может обработать его быстрее первого!</p>
-<p>Чтобы получить аналог партиций Kafka в RabbitMQ, используют плагин <code>Consistent Hash Exchange</code>. Он хэширует <code>Routing Key</code> сообщения и распределяет сообщения по заранее созданным <em>разным</em> очередям. К каждой такой очереди подключается строго один эксклюзивный консьюмер.</p>
+<p>В классическом RabbitMQ очередь — это единый кольцевой список. Если к одной очереди подключить 5 конкурирующих воркеров (Competing Consumers), RabbitMQ будет раздавать им сообщения по алгоритму Round-Robin. Это <strong>мгновенно уничтожает порядок</strong>: Воркер 1 возьмет <code>OrderCreated</code>, Воркер 2 в ту же миллисекунду возьмет <code>OrderCancelled</code> и завершит его раньше первого!</p>
+<p>Чтобы реализовать аналог партиций в RabbitMQ, используют официальный плагин <strong><code>Consistent Hash Exchange</code></strong>:<br />
+- Продюсер шлет сообщение с <code>Routing Key</code> (например, <code>order_id</code>).<br />
+- Обменник хэширует ключ и маршрутизирует сообщение в одну из $N$ очередей-бакетов.<br />
+- К каждой очереди подключается ровно один эксклюзивный консьюмер (Single Active Consumer).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Изменение количества партиций</span>
+    <span class="callout-title">Ловушка / Gotcha: Катастрофа ре-шардинга (Изменение числа партиций)</span>
   </div>
   <div class="callout-body">
-    <p>Хэш-функция жестко привязана к количеству партиций (или очередей). Если у вас было 10 партиций, события <code>order_id=55</code> летели в партицию 3. Если вы решили отмасштабироваться и увеличили число партиций до 20, хэш <code>order_id=55</code> изменится, и новые события полетят в партицию 14. </p>
-<p>В этот момент гарантия порядка ломается: консьюмер партиции 14 может прочитать новое событие быстрее, чем консьюмер партиции 3 дочитает старые. Поэтому изменение числа партиций в системах со строгим Ordering — это сложнейшая миграционная процедура.</p>
+    <p>Хэш-функция распределения намертво привязана к количеству партиций:<br />
+$$\text{Partition} = \text{Hash}(K) \pmod N$$</p>
+<p>Представьте, что у вас было $N=10$ партиций. Все события для ключа <code>order_id=55</code> стабильно летели в партицию №3. Бизнес вырос, и администратор кластера на лету увеличил количество партиций до $N=20$.</p>
+<p>Теперь формула $\text{Hash}(55) \pmod{20}$ дает партицию №14!</p>
+<p>Новые события заказа <code>order_id=55</code> немедленно начинают записываться в партицию №14 и вычитываться Воркером №14. В то же самое время Воркер №3 еще не успел дочитать старые события этого же заказа из партиции №3! </p>
+<p><strong>Гарантия порядка мгновенно ломается.</strong> Консьюмер №14 обработает отмену заказа раньше, чем Консьюмер №3 создаст его. Добавление партиций в работающий топик со строгим порядком требует сложных процедур полного слива (Drain) старых данных.</p>
   </div>
 </div>
 
-<h2 id="idiomatichnyy-go-konkurentnaya-obrabotka-s-sokhraneniem-poryadka">Идиоматичный Go: Конкурентная обработка с сохранением порядка</h2>
+<hr />
+<h2 id="5-idiomatichnyy-go-konkurentnaya-obrabotka-s-sokhraneniem-poryadka">5. Идиоматичный Go: Конкурентная обработка с сохранением порядка</h2>
 
-<p>Допустим, вы читаете одну партицию Kafka (или одну очередь RabbitMQ) в одном Go-приложении. Партиция гарантирует порядок на уровне брокера. Но как только вы вызываете в Go <code>go handle(msg)</code> для каждого сообщения, <strong>вы ломаете порядок на уровне рантайма!</strong></p>
-<p>Планировщик Go (<code>runtime.scheduler</code>) не гарантирует порядок выполнения горутин. Горутина с событием 2 может быть выполнена до горутины с событием 1.</p>
-<p><strong>Как сохранить порядок, но загрузить все ядра CPU?</strong><br />
-Паттерн: <strong>Dispatcher -&gt; Sharded Worker Pool</strong>.</p>
-<p>Мы создаем один диспетчер, который читает брокер последовательно. Диспетчер хэширует ключ сообщения и отправляет его в определенный <code>channel</code> конкретного воркера.</p>
+<p>Допустим, ваш сервис вычитывает одну партицию Kafka на Go со скоростью 5 000 сообщений в секунду. Каждая партиция гарантирует порядок на диске брокера. Но если в Go-коде консьюмера вы напишете наивный цикл:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2282,77 +2357,162 @@ E --&gt;|Воркер 3| H[&quot;Очередь: Order C &lt;br&gt; Msg4&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">package main
-
-import (
-    &quot;hash/crc32&quot;
-)
-
-// Event - структура нашего сообщения
-type Event struct {
-    OrderID string
-    Payload []byte
-}
-
-// ShardedPool управляет пулом воркеров
-type ShardedPool struct {
-    workers []chan Event
-}
-
-// NewShardedPool инициализирует pool с заданным количеством воркеров
-func NewShardedPool(numWorkers int) *ShardedPool {
-    pool := &amp;ShardedPool{
-        workers: make([]chan Event, numWorkers),
-    }
-    for i := 0; i &lt; numWorkers; i++ {
-        pool.workers[i] = make(chan Event, 100) // Буферизованный канал
-        go pool.workerLoop(i, pool.workers[i])
-    }
-    return pool
-}
-
-// workerLoop - строго последовательный обработчик
-func (p *ShardedPool) workerLoop(id int, tasks &lt;-chan Event) {
-    for msg := range tasks {
-        // Здесь происходит тяжелая бизнес-логика.
-        // События ОДНОГО заказа всегда будут обрабатываться ОДНОЙ горутиной строго по очереди.
-        _ = process(msg)
-    }
-}
-
-// Dispatch - точка входа из консьюмера Kafka/RabbitMQ
-func (p *ShardedPool) Dispatch(msg Event) {
-    // Хэшируем OrderID для выбора воркера
-    hash := crc32.ChecksumIEEE([]byte(msg.OrderID))
-    workerIndex := hash % uint32(len(p.workers))
-
-    // Отправляем сообщение закрепленному вокеру
-    p.workers[workerIndex] &lt;- msg
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: мгновенное разрушение порядка рантаймом Go!
+for msg := range kafkaMessages {
+    go handle(msg) // Каждая горутина живет своей жизнью!
 }
 </code></pre>
 </div>
 
-<p>Этот паттерн позволяет выжать максимум из многоядерных процессоров, сохраняя гарантии частичного порядка.</p>
+<p>Вы мгновенно уничтожите весь порядок! Планировщик Go (<code>runtime.scheduler</code>) распределяет горутины по разным потокам ОС (<code>m</code>) и ядрам CPU. Горутина с событием №2 может получить квант времени от планировщика раньше, чем горутина с событием №1, если поток горутины №1 попал на задержку системного вызова или Page Fault.</p>
+<h3 id="pattern-sharded-worker-pool">Паттерн: Sharded Worker Pool</h3>
+
+<p>Чтобы задействовать все ядра многоядерного процессора и одновременно гарантировать 100% порядок обработки связанных событий, применяется архитектурный паттерн <strong>Sharded Worker Pool</strong>.</p>
+<p>Мы создаем диспетчер, который читает брокер последовательно, хэширует ключ сообщения и отправляет его в определенный изолированный буферизованный <code>channel</code> конкретного воркера:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+K[&quot;Kafka Consumer&lt;br&gt;(1 поток ввода-вывода)&quot;] --&gt; D[&quot;Диспетчер&quot;]
+
+D --&gt;|Hash(ID) % 4 == 0| CH0[&quot;chan Event 0&quot;] --&gt; W0[&quot;Воркер 0 (g)&quot;]
+D --&gt;|Hash(ID) % 4 == 1| CH1[&quot;chan Event 1&quot;] --&gt; W1[&quot;Воркер 1 (g)&quot;]
+D --&gt;|Hash(ID) % 4 == 2| CH2[&quot;chan Event 2&quot;] --&gt; W2[&quot;Воркер 2 (g)&quot;]
+D --&gt;|Hash(ID) % 4 == 3| CH3[&quot;chan Event 3&quot;] --&gt; W3[&quot;Воркер 3 (g)&quot;]
+
+style K fill:#1e1e2e,stroke:#89b4fa,stroke-width:2px
+style D fill:#313244,stroke:#f9e2af,stroke-width:2px
+  </pre>
+</div>
+
+
+<p>Реализуем production-ready структуру пула воркеров на Go:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package workerpool
+
+import (
+    &quot;context&quot;
+    &quot;hash/crc32&quot;
+    &quot;sync&quot;
+)
+
+// Event представляет бизнес-событие с ключом шардирования
+type Event struct {
+    Key     string
+    Payload []byte
+}
+
+// ShardedPool маршрутизирует события в закрепленные горутины по хэшу ключа
+type ShardedPool struct {
+    workers []chan Event
+    wg      sync.WaitGroup
+}
+
+// NewShardedPool создает пул с фиксированным числом изолированных воркеров
+func NewShardedPool(ctx context.Context, numWorkers int, bufferSize int) *ShardedPool {
+    p := &amp;ShardedPool{
+        workers: make([]chan Event, numWorkers),
+    }
+
+    for i := 0; i &lt; numWorkers; i++ {
+        ch := make(chan Event, bufferSize)
+        p.workers[i] = ch
+        p.wg.Add(1)
+
+        go p.runWorker(ctx, i, ch)
+    }
+
+    return p
+}
+
+// runWorker гарантирует СТРОГО ПОСЛЕДОВАТЕЛЬНУЮ обработку внутри одного шарда
+func (p *ShardedPool) runWorker(ctx context.Context, workerID int, tasks &lt;-chan Event) {
+    defer p.wg.Done()
+
+    for {
+        select {
+        case &lt;-ctx.Done():
+            // Завершение по контексту: дочитываем оставшиеся задачи из канала
+            for msg := range tasks {
+                p.handle(msg)
+            }
+            return
+        case msg, ok := &lt;-tasks:
+            if !ok {
+                return
+            }
+            // Все события одного ключа гарантированно попадают сюда
+            // и выполняются строго последовательно
+            p.handle(msg)
+        }
+    }
+}
+
+// Dispatch хэширует ключ и отправляет событие строго определенному воркеру
+func (p *ShardedPool) Dispatch(msg Event) {
+    // IEEE CRC32 вычисляется процессором аппаратной инструкцией (SIMD) за доли наносекунды
+    hash := crc32.ChecksumIEEE([]byte(msg.Key))
+    workerIndex := hash % uint32(len(p.workers))
+
+    p.workers[workerIndex] &lt;- msg
+}
+
+// Close закрывает каналы и дожидается завершения всех воркеров (Graceful Drain)
+func (p *ShardedPool) Close() {
+    for _, ch := range p.workers {
+        close(ch)
+    }
+    p.wg.Wait()
+}
+
+func (p *ShardedPool) handle(msg Event) {
+    // Бизнес-логика обработки события
+}
+</code></pre>
+</div>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Нарушение порядка на продюсере при ретраях</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы используем Kafka. Продюсер отправляет <code>MsgA</code> и <code>MsgB</code> с одним ключом. <code>MsgA</code> упал с сетевой ошибкой, Продюсер делает retry. Тем временем <code>MsgB</code> успешно ушел в брокер. Когда <code>MsgA</code> дойдет со второй попытки, он встанет в лог <em>после</em> <code>MsgB</code>. Порядок нарушен на стороне отправителя! Как это починить?<br />
-<strong>Ответ:</strong> &gt; 1. Установить в Kafka конфигурацию <code>max.in.flight.requests.per.connection = 1</code>. Это блокирует отправку следующих сообщений, пока не получен <code>Ack</code> за предыдущее (сильно режет throughput).<br />
-2. В современных версиях Kafka — включить Идемпотентного Продюсера (<code>enable.idempotence=true</code>). Kafka будет назначать каждому сообщению <code>Sequence Number</code> под капотом, и брокер сам восстановит порядок или отклонит нарушенную последовательность без блокировки окна TCP.</p>
+    <p><strong>Вопрос:</strong> Мы используем Kafka. Наш Go-сервис (Продюсер) отправляет сообщения <code>MsgA</code> и <code>MsgB</code> с одинаковым ключом <code>order_id=42</code>. <br />
+Из-за сетевого сбоя отправка <code>MsgA</code> завершилась таймаутом, и библиотека начала повтор (Retry). Тем временем <code>MsgB</code> успешно ушло в сокет и записалось в партицию. Со второй попытки <code>MsgA</code> наконец-то долетело и легло в лог <em>позади</em> <code>MsgB</code>. Порядок нарушен еще до того, как сообщения попали к консьюмеру! Как это предотвратить?</p>
+<p><strong>Ответ:</strong> <br />
+1. <strong>Классический (устаревший) путь:</strong> Установить <code>max.in.flight.requests.per.connection = 1</code>. Это запретит сетевому клиенту отправлять следующий батч, пока не получен <code>Ack</code> за предыдущий. Это полностью исключает обгон при ретраях, но чудовищно режет пропускную способность (Throughput), так как конвейеризация TCP отключается.<br />
+2. <strong>Современный стандарт:</strong> Включить идемпотентного продюсера (<code>enable.idempotence=true</code>). Продюсер помечает сообщения строгими <code>Sequence Number</code>. Если брокер видит приход сообщения с номером $N+1$ раньше сообщения $N$, брокер отложит коммит или вернет продюсеру статус для восстановления правильной последовательности. Это позволяет безопасно держать до <code>max.in.flight.requests.per.connection = 5</code>, сохраняя максимальный сетевой конвейер.</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Global Ordering</strong> — враг распределенных систем. Он убивает масштабируемость и порождает Head-of-Line Blocking.</li>
-<li><strong>Partial Ordering</strong> (по ключу) — индустриальный стандарт. Брокер (как Kafka) или слой приложения направляет связанные события в один независимый поток (партицию).</li>
-<li><strong>Рантайм Go</strong> не сохраняет порядок при создании горутин. Используйте хэширование ключей и направленные каналы (sharded workers) для безопасного параллелизма.</li>
+<li><strong>Глобальный порядок (Total Ordering)</strong> — враг масштабируемости. Он заставляет систему исполнять логику в один поток, порождает Head-of-Line Blocking и умножает на ноль всю мощь многоядерных процессоров.</li>
+<li><strong>Частичный порядок (Partial Ordering by Key)</strong> — золотой стандарт распределенных систем. Мы сохраняем строгую причинно-следственную связь для одного бизнес-объекта (<code>order_id</code>), но параллельно обрабатываем миллионы разных объектов.</li>
+<li><strong>Рантайм Go не гарантирует FIFO</strong> при обычном вызове <code>go worker(msg)</code>. Для сохранения порядка на консьюмере необходимо использовать шардированные пулы воркеров на базе хэширования (<code>ShardedPool</code>).</li>
 </ol>
-<p>В погоне за порядком мы умышленно снижаем пропускную способность отдельных воркеров. Но что делать, если Продюсеры генерируют сообщения быстрее, чем наши упорядоченные консьюмеры могут их переварить? Очередь начнет расти до бесконечности, пока брокер не упадет по OOM или не исчерпает диск. Об этом мы поговорим в следующей статье: <a href="6-backpressure-i-kontrol-nagruzki.html" class="wikilink">6. Backpressure и контроль нагрузки</a>.</p>
+<p>Но что произойдет, если продюсеры генерируют сообщения со скоростью 50 000 в секунду, а наш упорядоченный консьюмер физически способен обрабатывать только 10 000? Очередь брокера начнет стремительно распухать, пока сервер не исчерпает свободный диск или не упадет по OOM.</p>
+<p>Как защитить систему от цунами данных, мы разберем в следующей лекции: <strong><a href="6-backpressure-i-kontrol-nagruzki.html" class="wikilink">6. Backpressure и контроль нагрузки</a></strong>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2380,7 +2540,7 @@ func (p *ShardedPool) Dispatch(msg Event) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#paradoks-poryadka-v-raspredelennykh-sistemakh">Парадокс порядка в распределенных системах</a></li><li class="toc-item toc-h2"><a href="#tsena-poryadka-head-of-line-blocking-i-smert-konkurentnosti">Цена порядка: Head-of-Line Blocking и смерть конкурентности</a></li><li class="toc-item toc-h2"><a href="#total-order-vs-partial-order">Total Order vs Partial Order</a></li><li class="toc-item toc-h3"><a href="#podkhod-kafka-partitsirovanie-partitioning">Подход Kafka: Партицирование (Partitioning)</a></li><li class="toc-item toc-h3"><a href="#podkhod-rabbitmq-consistent-hashing-exchange">Подход RabbitMQ: Consistent Hashing Exchange</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-konkurentnaya-obrabotka-s-sokhraneniem-poryadka">Идиоматичный Go: Конкурентная обработка с сохранением порядка</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-paradoks-poryadka-v-raspredelennykh-sistemakh">1. Парадокс порядка в распределенных системах</a></li><li class="toc-item toc-h2"><a href="#2-tsena-poryadka-head-of-line-blocking-i-smert-konkurentnosti">2. Цена порядка: Head-of-Line Blocking и смерть конкурентности</a></li><li class="toc-item toc-h2"><a href="#3-total-order-vs-partial-order-spasitelnyy-kompromiss">3. Total Order vs Partial Order: Спасительный компромисс</a></li><li class="toc-item toc-h2"><a href="#4-kak-chastichnyy-poryadok-ustroen-v-brokerakh">4. Как частичный порядок устроен в брокерах</a></li><li class="toc-item toc-h3"><a href="#podkhod-apache-kafka-partitsirovanie-partitioning">Подход Apache Kafka: Партицирование (Partitioning)</a></li><li class="toc-item toc-h3"><a href="#podkhod-rabbitmq-consistent-hashing-exchange">Подход RabbitMQ: Consistent Hashing Exchange</a></li><li class="toc-item toc-h2"><a href="#5-idiomatichnyy-go-konkurentnaya-obrabotka-s-sokhraneniem-poryadka">5. Идиоматичный Go: Конкурентная обработка с сохранением порядка</a></li><li class="toc-item toc-h3"><a href="#pattern-sharded-worker-pool">Паттерн: Sharded Worker Pool</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

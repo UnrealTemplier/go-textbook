@@ -2168,26 +2168,26 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Message durability и persistence</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы обсуждали, как очереди спасают систему от перегрузки по CPU и оперативной памяти, выступая в роли эластичного буфера. Но что произойдет с этим буфером, если в дата-центре внезапно отключат питание? Или если процесс брокера будет убит <code>OOM Killer</code> (Out Of Memory)?</p>
-<p>Если сообщения находились только в оперативной памяти (RAM), они исчезнут навсегда. Для системы обработки заказов интернет-магазина или финансового процессинга потеря хотя бы одного сообщения — это катастрофа. </p>
-<p>Чтобы гарантировать сохранность данных при перезагрузках и сбоях, брокеры используют механизмы <strong>Durability</strong> (долговечности) и <strong>Persistence</strong> (персистентности, записи на диск). В этой статье мы спустимся на уровень файловой системы Linux и разберем, как лидеры рынка балансируют между сохранностью данных и физическими ограничениями железа.</p>
-<h2 id="mechanical-sympathy-illyuziya-zapisi-na-disk">Mechanical Sympathy: Иллюзия записи на диск</h2>
+            <h1>7. Message durability и persistence</h1>
+<blockquote>
+<p><em>"Writing to disk is like mailing a letter. Dropping the envelope into the blue corner mailbox does not mean the recipient has read it; it simply means the postal service has taken custody of the paper."</em><br />
+— Системная аналогия о вводе-выводе</p>
+</blockquote>
+<p>В представлении многих прикладных программистов операция сохранения данных проста и бинарна: если функция <code>producer.Publish()</code> вернула <code>nil</code>, значит байты надежно зафиксированы на кремниевом носителе и переживут даже падение метеорита на дата-центр. </p>
+<p>Реальность операционных систем и серверного железа куда более иронична. Между моментом, когда ваше Go-приложение передало батч байтов сетевому сокету, и моментом, когда электроны физически заперлись в изолированных плавающих затворах ячеек 3D NAND SSD, лежит цепочка из пяти независимых уровней буферизации.</p>
+<p>Если в дата-центре внезапно выбьет главный силовой ввод, процесс брокера будет убит <code>OOM Killer</code> (Out Of Memory) или аварийно перезагрузится физический гипервизор, данные, находившиеся в «быстрых» энергозависимых буферах, исчезнут без следа. Для финтеха, банковских переводов или криптобирж потеря даже одного сообщения недопустима.</p>
+<p>В этой главе мы спустимся на уровень ядра Linux, исследуем физику дисковых контроллеров и разберем, как брокеры сообщений достигают <strong>Durability (долговечности)</strong> и <strong>Persistence (персистентности)</strong> без катастрофического падения производительности.</p>
+<hr />
+<h2 id="1-mechanical-sympathy-illyuziya-zapisi-na-disk">1. Mechanical Sympathy: Иллюзия записи на диск</h2>
 
-<p>Многие разработчики считают, что если их Go-продюсер получил успешный ответ от брокера, значит сообщение надежно записано на жесткий диск. На самом деле, между вызовом функции записи и физическим намагничиванием пластины диска (или сохранением заряда в ячейке NAND-памяти SSD) лежит огромная пропасть.</p>
-<p>Давайте посмотрим, как работает запись в Linux "под капотом":</p>
-<ol>
-<li><strong>User Space:</strong> Брокер (RabbitMQ, Kafka) формирует батч сообщений в своей памяти и вызывает системный вызов <code>write(fd, buffer)</code>.</li>
-<li><strong>Kernel Space (OS Page Cache):</strong> Ядро Linux берет эти данные и копирует их в <strong>Page Cache</strong> — специальную область оперативной памяти. Системный вызов <code>write</code> мгновенно возвращает успех! С точки зрения приложения данные "записаны", хотя физически они всё еще в RAM.</li>
-<li><strong>Flusher Threads:</strong> В фоновом режиме ядро ОС (потоки <code>pdflush</code> или <code>kworker</code>) периодически сканирует "грязные" (dirty) страницы в Page Cache и сбрасывает их на физический накопитель. </li>
-<li><strong>Физический диск:</strong> Данные попадают в аппаратный кэш самого контроллера диска, и только потом — в энергонезависимую память.</li>
-</ol>
+<p>Давайте препарируем анатомию записи байта в современной операционной системе Linux:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2202,71 +2202,129 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Go-продюсер&quot;] --&gt;|&quot;TCP Publish&quot;| B[&quot;Сетевой стек ОС&quot;]
-B --&gt;|&quot;Чтение в User Space&quot;| C[&quot;Процесс Брокера&quot;]
-C --&gt;|&quot;syscall write&lt;br&gt;Мгновенный возврат&quot;| D[&quot;OS Page Cache&lt;br&gt;Оперативная память ядра&quot;]
-D -.-&gt;|&quot;Фоновый flush&lt;br&gt;Может занять секунды&quot;| E[&quot;Физический диск&lt;br&gt;SSD&quot;]
-C --&gt;|&quot;syscall fsync&lt;br&gt;Блокирующий вызов&quot;| E
+A[&quot;Go-продюсер&quot;] --&gt;|&quot;1. TCP socket write&quot;| B[&quot;Сетевой стек ядра Linux&quot;]
+B --&gt;|&quot;2. Чтение в User Space&quot;| C[&quot;Процесс Брокера (User Space)&quot;]
+C --&gt;|&quot;3. syscall write(fd, buffer)&lt;br&gt;(Мгновенный возврат: ~100 нс)&quot;| D[(&quot;OS Page Cache (RAM)&lt;br&gt;Грязные страницы ядра&quot;)]
+D -.-&gt;|&quot;4. Фоновый сброс (Flush)&lt;br&gt;kworker / pdflush (задержка до 30 с)&quot;| E[&quot;Контроллер SSD / NVMe&quot;]
+C ==&gt;|&quot;5. syscall fsync(fd)&lt;br&gt;(Блокировка: 1–10 мс)&quot;| E
+E --&gt;|&quot;6. Запись в флеш-ячейки&quot;| F[(&quot;Энергонезависимая NAND память&quot;)]
+
+style D fill:#313244,stroke:#f9e2af,stroke-width:2px
+style E fill:#1e1e2e,stroke:#89b4fa,stroke-width:1px
+style F fill:#181825,stroke:#a6e3a1,stroke-width:2px
   </pre>
 </div>
 
 
-<p>Если сервер потеряет питание на этапе 3, все "грязные" страницы в Page Cache будут безвозвратно утеряны, несмотря на то, что <code>write</code> вернул успех.</p>
-<h3 id="tsena-komandy-fsync">Цена команды `fsync`</h3>
+<p>Проследим этот путь по шагам:</p>
+<ol>
+<li><strong>User Space приложения:</strong> Процесс брокера (RabbitMQ на Erlang, Kafka на Java или NATS на Go) собирает сообщения в прикладной буфер памяти и вызывает системный вызов <code>write(fd, buffer)</code>.</li>
+<li><strong>Kernel Space (OS Page Cache):</strong> Ядро Linux копирует данные из памяти брокера в <strong>Page Cache</strong> — страницы оперативной памяти, находящиеся под управлением ядра. Для брокера вызов <code>write</code> завершается мгновенно (со скоростью копирования в RAM — десятки гигабайт в секунду). С точки зрения брокера данные «записаны», но физически они всё еще находятся в энергозависимой памяти! Страницы помечаются ядром как «грязные» (<em>dirty pages</em>).</li>
+<li><strong>Фоновые демоны сброса (Flusher Threads):</strong> Специальные фоновые потоки ядра (<code>kworker</code>, а в старых ядрах <code>pdflush</code>) периодически сканируют грязные страницы и инициируют их сброс на диск. Параметры <code>/proc/sys/vm/dirty_background_ratio</code> и <code>dirty_expire_centisecs</code> определяют, как долго грязные данные могут безнаказанно жить в RAM (по умолчанию — до 30 секунд!).</li>
+<li><strong>Кэш дискового контроллера:</strong> Байт покидает оперативную память сервера и попадает в аппаратный DRAM-кэш самого накопителя (SSD/HDD).</li>
+<li><strong>Физическая энергонезависимая память:</strong> И только пройдя через кэш контроллера, данные физически программируются в ячейки NAND.</li>
+</ol>
+<p>Если сервер внезапно потеряет питание на шаге 2 или 3, <strong>все данные в Page Cache испарятся</strong>, несмотря на то, что <code>write(fd, buffer)</code> рапортовал об абсолютном успехе.</p>
+<hr />
+<h2 id="2-tsena-komandy-fsync">2. Цена команды `fsync`</h2>
 
-<p>Чтобы заставить ОС немедленно сбросить данные на диск и дождаться физического подтверждения от контроллера, приложение должно сделать системный вызов <code>fsync()</code>. </p>
-<p>Но <strong><code>fsync</code> — это невероятно дорогая операция</strong>. Переключение контекста, ожидание аппаратного прерывания от диска — всё это занимает миллисекунды. Если брокер будет делать <code>fsync</code> на каждое входящее сообщение, его пропускная способность (Throughput) упадет с сотен тысяч до пары тысяч сообщений в секунду (IOPS диска).</p>
-<p>Именно поэтому разные брокеры используют разные стратегии компромисса между производительностью и надежностью.</p>
-<h2 id="podkhod-rabbitmq-izbiratelnaya-persistentnost">Подход RabbitMQ: Избирательная персистентность</h2>
+<p>Чтобы заставить ядро Linux принудительно вытолкнуть все грязные страницы конкретного файла на физический диск и заблокировать процесс до подтверждения от дискового контроллера, существует системный вызов <strong><code>fsync(fd)</code></strong> (или <code>fdatasync</code>).</p>
+<p>Но какова физическая цена вызова <code>fsync</code>?<br />
+- <strong>Контекстное переключение:</strong> Процесс приостанавливается, уступая ядро CPU.<br />
+- <strong>Ожидание аппаратного прерывания:</strong> Контроллер накопителя обязан завершить электрический цикл записи блоков, сбросить свой внутренний буфер и послать прерывание процессору.<br />
+- <strong>Ограничение по IOPS:</strong> Современный серверный NVMe SSD в режиме случайного синхронного сброса способен выдать от 10 000 до 50 000 синхронных операций в секунду. Если вы будете вызывать <code>fsync()</code> на каждое входящее сообщение, пропускная способность вашего брокера <strong>мгновенно рухнет с 500 000 до пары тысяч сообщений в секунду</strong>.</p>
+<p>Разные брокеры решают эту дилемму принципиально разными инженерными путями.</p>
+<hr />
+<h2 id="3-podkhod-rabbitmq-izbiratelnaya-persistentnost">3. Подход RabbitMQ: Избирательная персистентность</h2>
 
-<p>RabbitMQ проектировался во времена, когда диски (HDD) были крайне медленными, а память — дорогой. По умолчанию RabbitMQ держит сообщения в оперативной памяти (в Erlang-процессах), чтобы обеспечить минимальную задержку (Latency).</p>
-<p>Чтобы заставить RabbitMQ сохранять сообщения на диск, вам нужно выполнить <strong>два независимых условия</strong>.</p>
+<p>RabbitMQ разрабатывался с ориентацией на минимальные сетевые задержки (Sub-millisecond Latency). По умолчанию RabbitMQ держит очереди и сообщения исключительно в оперативной памяти процессов Erlang VM.</p>
+<p>Чтобы заставить RabbitMQ гарантировать выживание данных при рестарте брокера, разработчик обязан выполнить <strong>два независимых условия</strong>:</p>
+<pre><code>[ RabbitMQ Персистентность ]
+            │
+            ├── 1. Durable Queue (Очередь объявлена с durable: true)
+            │      └── Сохраняет саму структуру и биндинги очереди в метаданных
+            │
+            └── 2. Persistent Message (Сообщение отправлено с Delivery Mode = 2)
+                   └── Сохраняет тело сообщения в дисковом хранилище msg_store
+</code></pre>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ложная надежность Durable очередей</span>
   </div>
   <div class="callout-body">
-    <p>Типичная ошибка на Middle-собеседовании:<br />
-<em>«Я объявил очередь с флагом <code>durable: true</code>, почему после рестарта RabbitMQ она оказалась пустой?»</em></p>
+    <p>Самый популярный каверзный вопрос на собеседованиях по RabbitMQ:<br />
+<em>«Я объявил очередь с параметром <code>durable: true</code>. Ночью сервер перезагрузился, очередь осталась на месте, но все 100 000 сообщений из нее исчезли! Почему?»</em></p>
+<p>Ответ кроется в разделении метаданных и полезной нагрузки:<br />
+1. <strong>Durable Queue (<code>durable: true</code>):</strong> Сохраняет на диск исключительно запись о факте существования очереди в схеме RabbitMQ (Mnesia). Если очередь не долговечна (<code>durable: false</code>), после перезапуска брокера она просто удалится. Но этот флаг <strong>не делает сообщения персистентными!</strong><br />
+2. <strong>Persistent Message:</strong> Чтобы сообщение легло на диск, продюсер при публикации обязан выставить заголовок сообщения: <code>Delivery Mode = 2</code> (в официальной Go-библиотеке <code>amqp091-go</code> для этого используется константа <code>amqp.Persistent</code>).</p>
+<p>Сообщение выживет при рестарте <strong>только и исключительно в том случае</strong>, если персистентное сообщение (<code>Delivery Mode = 2</code>) попало в долговечную очередь (<code>durable: true</code>). Если хотя бы одно условие нарушено — данные погибнут.</p>
   </div>
 </div>
 
-<p>В RabbitMQ есть четкое разделение:<br />
-1. <strong>Durable Queue (Долговечная очередь):</strong> Гарантирует, что сама <em>метаинформация</em> об очереди переживет рестарт сервера. Если очередь <code>durable: false</code>, после ребута она просто исчезнет вместе с биндингами. Но <code>durable: true</code> <strong>не гарантирует</strong> сохранность сообщений внутри неё!<br />
-2. <strong>Persistent Message (Персистентное сообщение):</strong> Гарантирует, что само сообщение будет записано на диск. При отправке сообщения продюсер обязан выставить свойство <code>Delivery Mode = 2</code> (в Go-клиенте <code>amqp091-go</code> это константа <code>amqp.Persistent</code>).</p>
-<p>Только персистентное сообщение, попавшее в долговечную очередь, будет записано на диск (в специальный файл <code>msg_store</code>).</p>
-<p><strong>Как RabbitMQ делает <code>fsync</code>?</strong><br />
-RabbitMQ не делает <code>fsync</code> на каждое сообщение. Он накапливает сообщения в буфере и периодически (каждые несколько сотен миллисекунд) сбрасывает их на диск батчем. Если вы используете Publisher Confirms (подтверждения для продюсера), брокер отправит вам <code>Ack</code> <em>только после того</em>, как вызов <code>fsync</code> успешно завершится. Поэтому отправка персистентных сообщений с подтверждениями в RabbitMQ работает ощутимо медленнее транзитных.</p>
-<h2 id="podkhod-kafka-disk-kak-fundament">Подход Kafka: Диск как фундамент</h2>
+<h3 id="kak-rabbitmq-sbrasyvaet-dannye-na-disk">Как RabbitMQ сбрасывает данные на диск?</h3>
+<p>RabbitMQ не делает <code>fsync</code> на каждое сообщение — это убило бы брокер. Он складывает персистентные сообщения в кольцевые буферы и сбрасывает их на диск батчами (раз в несколько сотен миллисекунд) через специальную подсистему <code>msg_store</code>.</p>
+<p>Чтобы продюсер на Go был на 100% уверен, что данные легли на диск, в канале RabbitMQ включают режим <strong>Publisher Confirms</strong> (<code>channel.Confirm(false)</code>). Брокер вернет подтверждение продюсеру только тогда, когда батч сообщений будет физически записан на диск через <code>fsync</code>. Разумеется, задержка публикации при этом возрастает с сотен микросекунд до десятков миллисекунд.</p>
+<hr />
+<h2 id="4-podkhod-kafka-disk-kak-fundament">4. Подход Kafka: Диск как фундамент</h2>
 
-<p>Apache Kafka полностью переворачивает парадигму. Для Kafka жесткий диск — это не "аварийное хранилище на случай сбоя", а основное и единственное место обитания данных. </p>
-<p>Архитектура Kafka построена вокруг концепции <strong>Append-Only Log</strong> (журнал, в который данные только добавляются в конец). </p>
+<p>Apache Kafka совершила революцию в индустрии, полностью перевернув отношение к диску. В архитектуре Kafka диск — это не аварийный сбросник на случай беды, а <strong>первичное и единственное место обитания данных</strong>.</p>
+<p>Вся архитектура Kafka выстроена вокруг структуры <strong>Append-Only Log (Журнал последовательного добавления)</strong>:<br />
+- Новые записи всегда добавляются строго в конец сегментного файла на диске.<br />
+- Последовательная запись (<strong>Sequential I/O</strong>) на современных NVMe SSD или RAID-массивах достигает гигабайтных скоростей, не уступая пропускной способности оперативной памяти.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Zero-Copy и Page Cache в Kafka</span>
   </div>
   <div class="callout-body">
-    <p>Поскольку Kafka всегда пишет строго последовательно (Sequential I/O), современные HDD и SSD показывают фантастическую скорость, сопоставимую с сетью. <br />
-Kafka написана на Java/Scala, но она сознательно избегает хранения сообщений в куче JVM, чтобы не нагружать Garbage Collector. Вместо этого она агрессивно эксплуатирует <strong>OS Page Cache</strong>.<br />
-Когда консьюмер запрашивает данные, Kafka использует системный вызов <code>sendfile</code> (Zero-copy). Ядро ОС берет данные напрямую из Page Cache и копирует их в сетевой сокет, вообще не поднимая их в User Space брокера!</p>
+    <p>Kafka написана на Java/Scala, но в ее архитектуре заложен гениальный отказ от использования памяти кучи (JVM Heap) для кэширования сообщений. <br />
+Если бы Kafka держала гигабайты сообщений в куче JVM, сборщик мусора Java сходил бы с ума от многоминутных пауз Stop-The-World.</p>
+<p>Вместо этого Kafka полностью доверяет операционной системе:<br />
+1. Все входящие сообщения оседают прямо в <strong>OS Page Cache</strong>.<br />
+2. При вычитке данных консьюмером Kafka использует системный вызов Linux <strong><code>sendfile</code> (Zero-Copy)</strong>. Ядро операционной системы перекачивает страницы из Page Cache прямо в сокет сетевой карты через DMA (Direct Memory Access), минуя пространство пользователя (User Space) JVM!</p>
   </div>
 </div>
 
-<h3 id="paradoks-kafka-nadezhnost-bez-fsync">Парадокс Kafka: Надежность без `fsync`</h3>
+<h3 id="paradoks-kafka-bezotkaznost-bez-sinkhronnogo-fsync">Парадокс Kafka: Безотказность без синхронного `fsync`</h3>
 
-<p>Самое шокирующее для многих инженеров: <strong>по умолчанию Kafka не делает <code>fsync</code> для каждого сообщения!</strong></p>
-<p>Kafka полагается на то, что OS Page Cache работает невероятно быстро. А гарантии надежности (Durability) достигаются не локальным сбросом на диск одной машины, а <strong>распределенной репликацией</strong> по сети.</p>
-<p>В Kafka продюсер управляет надежностью через настройку <code>acks</code>:<br />
-* <code>acks=0</code>: Выстрелил и забыл. Максимальная скорость, возможна потеря данных.<br />
-* <code>acks=1</code>: Продюсер ждет подтверждения только от Leader-брокера (он записал данные в свой Page Cache, но не обязательно сделал <code>fsync</code>). Если сервер сразу после этого сгорит — данные потеряны.<br />
-* <code>acks=all</code> (или <code>acks=-1</code>): Leader получает сообщение, ждет, пока все In-Sync Replicas (ISR) скачают это сообщение по сети к себе в Page Cache, и только потом отвечает продюсеру <code>Ack</code>.</p>
-<p>Секрет в том, что вероятность одновременного отключения питания у 3-х независимых серверов в разных стойках дата-центра стремится к нулю. Репликация в памяти 3-х серверов оказывается быстрее и надежнее, чем синхронный <code>fsync</code> на одном HDD.</p>
-<h2 id="idiomatichnyy-go-kak-ne-poteryat-dannye-na-storone-klienta">Идиоматичный Go: Как не потерять данные на стороне клиента</h2>
+<p>Самый поразительный факт об архитектуре Kafka, повергающий в шок многих инженеров:<br />
+<strong>По умолчанию Kafka не вызывает <code>fsync</code> на каждую запись!</strong> </p>
+<p>Параметр <code>flush.messages</code> по умолчанию выставлен в максимальное значение (<code>Long.MAX_VALUE</code>). Kafka отдает управление сбросом грязных страниц фоновым демонам ядра Linux. </p>
+<p>Как же Kafka гарантирует надежность уровня банковских систем (Durability), если локальный сервер может быть обесточен в любой момент?</p>
+<p>Ответ: <strong>Гарантия надежности перенесена с локального диска на распределенный сетевой кворум.</strong></p>
+<pre><code>                                [ Продюсер Go ]
+                                       │
+                                 (acks=all / -1)
+                                       ▼
+        ┌─────────────────────────────────────────────────────────────┐
+        │  Leader Брокер (Стойка A) ── Записал в Page Cache (RAM)     │
+        └─────────────────────────────────────────────────────────────┘
+                         │                           │
+                   (Сетевая репликация)        (Сетевая репликация)
+                         ▼                           ▼
+        ┌─────────────────────────┐         ┌─────────────────────────┐
+        │ Follower 1 (Стойка B)   │         │ Follower 2 (Стойка C)   │
+        │ Записал в Page Cache    │         │ Записал в Page Cache    │
+        └─────────────────────────┘         └─────────────────────────┘
+                         │                           │
+                         └─────────────┬─────────────┘
+                                       ▼
+                     Все In-Sync Replicas (ISR) подтвердили!
+                                       ▼
+                       Leader шлет успешный Ack продюсеру!
+</code></pre>
+<p>В Kafka продюсер управляет надежностью через настройку подтверждений <code>acks</code>:<br />
+- <strong><code>acks=0</code>:</strong> Выстрелил и забыл. Максимальная пропускная способность, нулевые гарантии.<br />
+- <strong><code>acks=1</code>:</strong> Продюсер ждет подтверждения только от лидера партиции (он сохранил данные в свой Page Cache, но на диск они еще не сброшены). Если сервер сгорит прямо сейчас — данные будут утеряны.<br />
+- <strong><code>acks=all</code> (или <code>acks=-1</code>):</strong> Лидер принимает сообщение, реплицирует его по сети на все активные реплики из списка <strong>ISR (In-Sync Replicas)</strong>, каждая реплика сохраняет его в свой Page Cache, и только после этого лидер возвращает <code>Ack</code> продюсеру.</p>
+<p>Вероятность того, что три независимых физических сервера, запитанных от разных подстанций в разных дата-центрах или стойках, одновременно потеряют питание за одну микросекунду, ничтожно мала. <strong>Репликация в Page Cache трех независимых машин по сети оказывается надежнее и на порядки быстрее, чем локальный вызов <code>fsync</code> на одном физическом накопителе!</strong></p>
+<hr />
+<h2 id="5-idiomatichnyy-go-kak-ne-poteryat-dannye-na-storone-klienta">5. Идиоматичный Go: Как не потерять данные на стороне клиента</h2>
 
-<p>Выбор <code>acks=all</code> в Kafka или <code>Publisher Confirms</code> в RabbitMQ имеет серьезные последствия для вашего Go-кода. </p>
-<p>Когда брокер синхронизирует данные на диске или ждет репликации от других узлов, сетевой вызов задерживается (Latency растет с 1 мс до 10-50 мс). Ваша горутина будет заблокирована в ожидании ответа.</p>
+<p>Выбор максимального уровня надежности (<code>acks=all</code> в Kafka или <code>Publisher Confirms</code> в RabbitMQ) радикально влияет на поведение клиентского кода на Go.</p>
+<p>Задержка сетевого вызова <code>producer.SendMessage()</code> вырастает с 0.5 мс до 10–50 мс. Каждая горутина, ожидающая подтверждения от кластера брокеров, удерживает открытый контекст и память.</p>
+<p>Рассмотрим пример надежной отправки сообщений в Apache Kafka с использованием официальной библиотеки <code>sarama</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2276,41 +2334,89 @@ Kafka написана на Java/Scala, но она сознательно из�
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Пример для Kafka (библиотека sarama)
-config := sarama.NewConfig()
-// Требуем подтверждения от всех реплик для максимальной надежности
-config.Producer.RequiredAcks = sarama.WaitForAll 
-config.Producer.Return.Successes = true
+  <pre class="language-go"><code class="language-go">package producer
 
-producer, err := sarama.NewSyncProducer(brokers, config)
-// ...
-// Этот вызов заблокирует горутину, пока все реплики Kafka не подтвердят запись.
-// При пиковой нагрузке (сотни горутин ждут диска/сети брокера) вы можете 
-// получить исчерпание лимита открытых соединений или таймауты контекста.
-partition, offset, err := producer.SendMessage(msg) 
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;time&quot;
+
+    &quot;github.com/IBM/sarama&quot;
+)
+
+// NewReliableKafkaProducer настраивает продюсер с максимальными гарантиями Durability
+func NewReliableKafkaProducer(brokers []string) (sarama.SyncProducer, error) {
+    config := sarama.NewConfig()
+
+    // 1. Требуем подтверждения от ВСЕХ реплик (ISR кворум)
+    config.Producer.RequiredAcks = sarama.WaitForAll // acks=-1 / acks=all
+
+    // 2. Включаем идемпотентность на продюсере (защита от дубликатов при ретраях)
+    config.Producer.Idempotent = true
+    config.Net.MaxOpenRequests = 1 // для строгой совместимости порядка
+
+    // 3. Настройка ретраев при сетевых сбоях
+    config.Producer.Retry.Max = 5
+    config.Producer.Retry.Backoff = 100 * time.Millisecond
+
+    // 4. Обязательно требуем возврата успешных подтверждений
+    config.Producer.Return.Successes = true
+
+    producer, err := sarama.NewSyncProducer(brokers, config)
+    if err != nil {
+        return nil, fmt.Errorf(&quot;failed to create sync producer: %w&quot;, err)
+    }
+
+    return producer, nil
+}
+
+// PublishOrder отправляет критически важное бизнес-сообщение
+func PublishOrder(ctx context.Context, producer sarama.SyncProducer, topic string, orderID string, payload []byte) error {
+    msg := &amp;sarama.ProducerMessage{
+        Topic: topic,
+        Key:   sarama.StringEncoder(orderID),
+        Value: sarama.ByteEncoder(payload),
+    }
+
+    // Вызов SendMessage заблокирует горутину до получения кворумного ответа от кластера.
+    // При проектировании высоконагруженных систем учитывайте эту задержку в контекстах context.Context!
+    partition, offset, err := producer.SendMessage(msg)
+    if err != nil {
+        return fmt.Errorf(&quot;message delivery failed: %w&quot;, err)
+    }
+
+    _ = partition
+    _ = offset
+    return nil
+}
 </code></pre>
 </div>
 
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: acks=all и сетевые таймауты</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Вы настроили <code>acks=all</code> в Kafka. Может ли Продюсер потерять сообщение при сетевом сбое?<br />
-<strong>Ответ:</strong> Да! <code>acks=all</code> гарантирует, что брокер не потеряет сообщение <em>после</em> того, как принял его. Но если сбой сети произошел <em>во время отправки</em> или <em>до получения Ack</em>, Go-продюсер не узнает, записалось ли сообщение. Именно поэтому Продюсер должен уметь делать Retry (повторные попытки), а Консьюмер должен быть Идемпотентным (чтобы не удвоить платеж при ретрае успешной записи).</p>
+    <p><strong>Вопрос:</strong> Мы настроили продюсер с <code>acks=all</code> (<code>sarama.WaitForAll</code>). Значит ли это, что потеря сообщений теперь технически невозможна?</p>
+<p><strong>Ответ:</strong> Нет, потеря сообщений всё еще возможна на границе «Продюсер — Сеть»!</p>
+<p>Настройка <code>acks=all</code> гарантирует только то, что брокер не потеряет сообщение <em>после того, как успешно сохранил его в репликах</em>. </p>
+<p>Но если в момент отправки моргнула сеть, или брокер уже записал данные, но ответный пакет <code>Ack</code> не дошел до Go-сервиса из-за истечения таймаута контекста <code>context.Context</code>, продюсер получит ошибку. Продюсер не знает, зафиксировано ли сообщение в брокере. Чтобы избежать потерь, продюсер <strong>обязан повторять попытку (Retry)</strong>, а консьюмеры обязаны быть <strong>идемпотентными</strong>, чтобы безопасно переварить дубликат.</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Запись в сокет $\neq$ Запись на диск.</strong> Системные вызовы ОС (<code>write</code>) буферизируют данные в RAM.</li>
-<li><strong>RabbitMQ</strong> позволяет тонко настраивать компромисс, делая очереди <code>durable</code> и сообщения <code>persistent</code>, заставляя брокер сбрасывать данные на диск ценой падения производительности.</li>
-<li><strong>Kafka</strong> достигает надежности через распределенную репликацию (<code>acks=all</code>), минимизируя дорогостоящие вызовы <code>fsync</code> и выжимая максимум из OS Page Cache.</li>
-<li>Долговечность на стороне брокера всегда означает <strong>увеличение времени ответа (Latency)</strong> для вашего Go-приложения, к чему нужно быть готовым при расчете пулов горутин и таймаутов <code>context.Context</code>.</li>
+<li><strong>Системный вызов <code>write</code> не пишет на диск.</strong> Он копирует данные в оперативную память (OS Page Cache). Физическая запись отложена во времени.</li>
+<li><strong><code>fsync</code> — дорогая операция</strong>, ограничивающая производительность системы физическими IOPS дискового контроллера.</li>
+<li><strong>RabbitMQ</strong> разделяет персистентность структуры (<code>durable: true</code>) и персистентность тела сообщений (<code>Delivery Mode = 2</code>), используя подтверждения Publisher Confirms.</li>
+<li><strong>Apache Kafka</strong> достигает фантастической скорости за счет последовательного ввода-вывода (Sequential I/O), Page Cache и Zero-Copy (<code>sendfile</code>), перекладывая ответственность за Durability с медленного локального <code>fsync</code> на быстрый сетевой кворум репликации (<code>acks=all</code>).</li>
+<li>Высокая надежность брокера неизбежно приводит к <strong>увеличению задержки (Latency)</strong> для вызывающих горутин Go, требуя внимательной настройки таймаутов <code>context.Context</code> и ограничения конкурентности.</li>
 </ol>
-<p>Мы научились доставлять сообщения, контролировать их поток и гарантировать их сохранение на жестких дисках. Но что делать, если сообщение благополучно дошло до Консьюмера, но его бизнес-логика (например, парсинг JSON) содержит фатальную ошибку, из-за которой сервис падает при каждой попытке обработки? Такие сообщения называются "ядовитыми" (Poison Pills), и для борьбы с ними существует специальный архитектурный паттерн, который мы разберем в следующей статье: <a href="8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a>.</p>
+<p>Мы научились надежно доставлять сообщения и гарантировать их сохранность на дисках. Но что делать, если сообщение благополучно дошло до консьюмера, но в теле сообщения передан некорректный JSON или невалидные данные, из-за которых консьюмер падает в панику при каждой попытке обработки? </p>
+<p>Такие сообщения называют «ядовитыми пилюлями» (Poison Pills). Как изолировать их и спасти очередь от бесконечного цикла аварий, мы разберем в следующей лекции: <strong><a href="8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a></strong>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2338,7 +2444,7 @@ partition, offset, err := producer.SendMessage(msg)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mechanical-sympathy-illyuziya-zapisi-na-disk">Mechanical Sympathy: Иллюзия записи на диск</a></li><li class="toc-item toc-h3"><a href="#tsena-komandy-fsync">Цена команды fsync</a></li><li class="toc-item toc-h2"><a href="#podkhod-rabbitmq-izbiratelnaya-persistentnost">Подход RabbitMQ: Избирательная персистентность</a></li><li class="toc-item toc-h2"><a href="#podkhod-kafka-disk-kak-fundament">Подход Kafka: Диск как фундамент</a></li><li class="toc-item toc-h3"><a href="#paradoks-kafka-nadezhnost-bez-fsync">Парадокс Kafka: Надежность без fsync</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-kak-ne-poteryat-dannye-na-storone-klienta">Идиоматичный Go: Как не потерять данные на стороне клиента</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-mechanical-sympathy-illyuziya-zapisi-na-disk">1. Mechanical Sympathy: Иллюзия записи на диск</a></li><li class="toc-item toc-h2"><a href="#2-tsena-komandy-fsync">2. Цена команды fsync</a></li><li class="toc-item toc-h2"><a href="#3-podkhod-rabbitmq-izbiratelnaya-persistentnost">3. Подход RabbitMQ: Избирательная персистентность</a></li><li class="toc-item toc-h3"><a href="#kak-rabbitmq-sbrasyvaet-dannye-na-disk">Как RabbitMQ сбрасывает данные на диск?</a></li><li class="toc-item toc-h2"><a href="#4-podkhod-kafka-disk-kak-fundament">4. Подход Kafka: Диск как фундамент</a></li><li class="toc-item toc-h3"><a href="#paradoks-kafka-bezotkaznost-bez-sinkhronnogo-fsync">Парадокс Kafka: Безотказность без синхронного fsync</a></li><li class="toc-item toc-h2"><a href="#5-idiomatichnyy-go-kak-ne-poteryat-dannye-na-storone-klienta">5. Идиоматичный Go: Как не потерять данные на стороне клиента</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

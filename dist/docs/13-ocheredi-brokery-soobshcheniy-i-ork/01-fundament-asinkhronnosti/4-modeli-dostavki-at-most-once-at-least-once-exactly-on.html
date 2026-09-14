@@ -2168,58 +2168,122 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~35 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Модели доставки. At most once, at least once, exactly once</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы установили, что асинхронное взаимодействие решает проблемы блокировок и масштабирования. Брокер берет на себя роль буфера и маршрутизатора. Но сеть — это агрессивная среда. TCP-пакеты теряются, роутеры перезагружаются, а процессы-консьюмеры падают с OOM (Out Of Memory) или <code>panic</code> прямо посреди выполнения бизнес-логики.</p>
-<p>В таких условиях возникает главный вопрос распределенных систем: <strong>как гарантировать, что сообщение дойдет от продюсера к консьюмеру и будет корректно обработано?</strong> Ответ кроется в моделях доставки (Delivery Semantics). Их всего три, и выбор одной из них — это всегда компромисс между производительностью (throughput/latency) и надежностью.</p>
-<h2 id="pochemu-dostavka-soobshcheniy-eto-slozhno">Почему доставка сообщений — это сложно?</h2>
-
-<p>Прежде чем разбирать модели, давайте вспомним «Задачу двух генералов» (Two Generals' Problem) — классический мысленный эксперимент, доказывающий, что в сети с ненадежным каналом связи невозможно достичь 100% консенсуса.</p>
-<p>Когда ваш Go-сервис (Продюсер) отправляет данные в Брокер, или когда Брокер отправляет данные Консьюмеру, операция может завершиться тремя способами:<br />
-1. <strong>Успех:</strong> Пакет дошел, обработался, подтверждение (<code>Ack</code>) вернулось.<br />
-2. <strong>Отказ (Failure):</strong> Соединение было явно разорвано (например, <code>RST</code> пакет от TCP), мы точно знаем, что данные не доставлены.<br />
-3. <strong>Таймаут (Неизвестность):</strong> Самый страшный сценарий. Мы отправили пакет и ничего не получили в ответ. Мы не знаем, что произошло:<br />
-   * Запрос потерялся по пути к брокеру?<br />
-   * Брокер сохранил сообщение, но ответный <code>Ack</code> потерялся по пути к нам?<br />
-   * Брокер завис на сборке мусора (GC Pause) и ответит позже?</p>
-<p>Именно из-за «Неизвестности» нам приходится выбирать, как вести себя при таймаутах.</p>
+            <h1>4. Модели доставки. At most once, at least once, exactly once</h1>
+<blockquote>
+<p><em>"There are only two hard things in Computer Science: cache invalidation and naming things. But in distributed systems, there is a third: knowing whether your packet actually arrived or died quietly in the dark."</em><br />
+— Инженерный афоризм</p>
+</blockquote>
+<p>В распределенных системах нет ничего более обманчивого, чем слово «гарантия». Когда разработчик отправляет байты в сокет, он надеется на надежность протокола TCP. Но TCP гарантирует доставку пакетов только в пределах одного физического соединения между двумя живыми процессами. Стоит серверу внезапно потерять питание, сетевому кабелю надломиться, а контейнеру в Kubernetes превысить квоту памяти и словить <code>panic</code> или <code>SIGKILL</code>, как вся стройная иллюзия надежности рассыпается.</p>
+<p>В таких экстремальных условиях перед архитектором встает центральный вопрос: <strong>как обеспечить передачу и обработку сообщения между сервисами, если ни один узел и ни один сегмент сети не застрахованы от катастрофы?</strong></p>
+<p>Математика распределенных систем дает строгий ответ: существует ровно три базовые модели доставки (Delivery Semantics). Каждая из них представляет собой фундаментальный инженерный компромисс между производительностью (Throughput/Latency), сложностью кода и готовностью к потере или дублированию данных.</p>
 <hr />
-<h2 id="1-at-most-once-ne-bolee-odnogo-raza">1. At-most-once (Не более одного раза)</h2>
+<h2 id="1-pochemu-dostavka-soobshcheniy-eto-slozhno">1. Почему доставка сообщений — это сложно?</h2>
 
-<p><strong>Суть:</strong> Fire and forget (Выстрелил и забыл). Сообщение будет доставлено либо один раз, либо ни разу. Дубликаты исключены, но возможна потеря данных.</p>
-<p><strong>Как это работает:</strong><br />
-* <strong>Продюсер:</strong> Отправляет сообщение в TCP-сокет и не ждет подтверждения от брокера (например, <code>acks=0</code> в Kafka).<br />
-* <strong>Консьюмер:</strong> Читает сообщение из брокера, брокер <strong>мгновенно</strong> удаляет его (или сдвигает оффсет), не дожидаясь, пока консьюмер закончит бизнес-логику (Auto-Ack).</p>
+<p>Прежде чем разбирать протоколы, обратимся к классическому мысленному эксперименту computer science — <strong>«Задаче двух генералов» (Two Generals' Problem)</strong>, сформулированной еще в 1975 году.</p>
+<p>Две армии под командованием Генерала 1 и Генерала 2 готовятся штурмовать крепость. Они победят только в том случае, если атакуют одновременно. Единственный способ координации — отправить вестового через вражескую долину, где его могут перехватить. <br />
+- Первый генерал отправляет сообщение: <em>«Атакуем на рассвете»</em>. Дошел ли вестовой? Первый генерал не знает, пока не получит подтверждение.<br />
+- Второй генерал получает письмо и отправляет гонца с ответом: <em>«Вас понял, атакую на рассвете»</em>. Но теперь второй генерал не знает, дошел ли его гонец! Должен ли первый генерал отправить подтверждение на подтверждение?</p>
+<pre><code>[ Генерал 1 ] ──( Вестовой 1: &quot;Атакуем!&quot; )──► [ Долина врага ] ──?──► [ Генерал 2 ]
+     ▲                                                                        │
+     │                                                                        ▼
+     └──────?────── [ Долина врага ] ◄──( Вестовой 2: &quot;Принято!&quot; )────────────┘
+         (И так до бесконечности: 100% консенсус по ненадежному каналу невозможен)
+</code></pre>
+<p>Математически доказано, что в условиях ненадежной среды передачи достичь абсолютной взаимной уверенности за конечное число сообщений <strong>невозможно</strong>.</p>
+<p>Когда сервис на Go отправляет сообщение в Брокер (или Брокер пытается доставить его Консьюмеру), операция может завершиться тремя исходами:<br />
+1. <strong>Явный успех (Success):</strong> Пакет дошел, брокер ответил положительным подтверждением (<code>Ack</code>).<br />
+2. <strong>Явный отказ (Explicit Failure):</strong> Ядро Linux немедленно вернуло ошибку (например, пришел TCP-пакет <code>RST</code> или сокет закрыт — <code>ECONNRESET</code>). Мы точно знаем, что данные отвергнуты.<br />
+3. <strong>Неизвестность (Timeout / Gray Failure):</strong> Самый коварный сценарий. Мы отправили байты в сокет и не получили ответ за отведенный таймаут (Context Deadline Exceeded). Что произошло на самом деле?<br />
+   - Пакет потерялся по пути к брокеру?<br />
+   - Брокер успешно сохранил сообщение, но ответный <code>Ack</code> был уничтожен сбоем сети?<br />
+   - Брокер завис на длинной паузе сборщика мусора (GC Pause) или сбросе страниц на диск (<code>fsync</code>) и ответит через секунду?</p>
+<p>Именно из-за существования состояния «Неизвестности» инженерам приходится выбирать одну из трех семантик доставки.</p>
+<hr />
+<h2 id="2-at-most-once-ne-bolee-odnogo-raza">2. At-most-once (Не более одного раза)</h2>
+
+<blockquote>
+<p><strong>Кредо:</strong> <em>«Выстрелил и забыл (Fire and Forget). Лучше потерять часть данных, чем притормозить хоть на микросекунду»</em>.</p>
+</blockquote>
+<p>При такой семантике сообщение гарантированно обрабатывается либо один раз, либо <strong>не обрабатывается вовсе</strong>. Дубликаты исключены на корню, но потеря данных считается допустимым явлением.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant P as Продюсер (Go)
+participant B as Брокер (RAM)
+participant C as Консьюмер (Go)
+
+P-&gt;&gt;B: 1. Publish (acks=0, без ожидания)
+B-&gt;&gt;C: 2. Push сообщения
+Note over B: Мгновенное удаление из очереди (Auto-Ack)
+Note over C: Сбой! OOM / Panic / Network drop
+Note over B: Сообщение утеряно навсегда
+  </pre>
+</div>
+
+
+<h3 id="mekhanika-raboty">Механика работы</h3>
+<ol>
+<li><strong>На стороне продюсера:</strong> Продюсер сбрасывает сериализованные байты в сетевой буфер сокета и немедленно продолжает выполнение бизнес-логики, не дожидаясь ответа от брокера (режим <code>acks=0</code> в Kafka).</li>
+<li><strong>На стороне брокера:</strong> Брокер не тратит такты на запись в журнал упреждающей записи (WAL) и сброс страниц на диск через <code>fsync</code>. Сообщение держится в оперативной памяти.</li>
+<li><strong>На стороне консьюмера:</strong> Брокер использует стратегию <strong>Auto-Ack</strong>: как только байты отданы в сокет консьюмера, брокер мгновенно удаляет сообщение из своей очереди. Если консьюмер упадет с <code>panic</code> за миллисекунду до записи в базу данных — сообщение утрачено безвозвратно.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Экстремальный Throughput</span>
   </div>
   <div class="callout-body">
-    <p>С инженерной точки зрения это самый быстрый сценарий. Нет необходимости делать дорогие системные вызовы <code>fsync</code> для синхронной записи на диск. Нет сетевого оверхеда на ожидание Ack-пакетов. CPU и сеть используются максимально эффективно. Пропускная способность может достигать миллионов сообщений в секунду на одном узле.</p>
+    <p>Семантика At-most-once демонстрирует самую высокую пропускную способность, которую способно выдать «железо»:<br />
+- Нулевое количество системных вызовов <code>fsync</code> для каждого сообщения.<br />
+- Отсутствие обратных подтверждений: TCP-окно не тормозится ожиданием прикладных ответов.<br />
+- Минимальное использование CPU и контекстных переключений. <br />
+На одном узле скорость может достигать нескольких миллионов событий в секунду, упираясь исключительно в ширину полосы сетевой карты (NIC).</p>
   </div>
 </div>
 
-<p><strong>Где применять:</strong><br />
-Сбор метрик, некритичные логи, стриминг телеметрии (IoT), где потеря 0.1% данных не исказит общую картину, а скорость важнее точности.</p>
+<p><strong>Сфера применения:</strong><br />
+- Сбор высокочастотных метрик и телеметрии (Prometheus / InfluxDB).<br />
+- Логирование действий пользователей (Clickstream).<br />
+- Трассировка запросов (OpenTelemetry спаны).<br />
+- Геолокация курьеров и IoT-датчиков, где свежие координаты, пришедшие через 100 мс, обесценивают предыдущие потерянные точки.</p>
 <hr />
-<h2 id="2-at-least-once-ne-menee-odnogo-raza-industrialnyy-standart">2. At-least-once (Не менее одного раза) — Индустриальный стандарт</h2>
+<h2 id="3-at-least-once-ne-menee-odnogo-raza-industrialnyy-standart">3. At-least-once (Не менее одного раза) — Индустриальный стандарт</h2>
 
-<p><strong>Суть:</strong> Гарантированная доставка. Мы обещаем, что сообщение точно не потеряется, но в случае сбоев оно может быть доставлено 2, 3 или 10 раз.</p>
-<p>Это стандартная модель работы по умолчанию для RabbitMQ, NATS JetStream и Kafka.</p>
-<p><strong>Как это работает:</strong><br />
-1. Продюсер отправляет сообщение и ждет <code>Ack</code> от брокера. Если таймаут — продюсер отправляет сообщение заново (ретрай).<br />
-2. Брокер отдает сообщение Консьюмеру, но <strong>не удаляет его</strong>. Сообщение помечается как «в полете» (in-flight / unacknowledged).<br />
-3. Консьюмер выполняет бизнес-логику (например, пишет в базу данных).<br />
-4. Только после успешного коммита в БД, Консьюмер отправляет <code>Ack</code> брокеру.<br />
-5. Брокер физически удаляет сообщение.</p>
-<p><strong>Анатомия дубликата:</strong><br />
-Проблема возникает на шаге 4. Что если сеть моргнет <em>сразу после</em> коммита в базу, но <em>до</em> отправки <code>Ack</code> брокеру?</p>
+<blockquote>
+<p><strong>Кредо:</strong> <em>«Ни единой потери байтов. Лучше сделать работу трижды, чем забыть сделать её хотя бы раз»</em>.</p>
+</blockquote>
+<p>Это рабочая лошадка современного финтеха, e-commerce и распределенных систем. Данная семантика установлена по умолчанию в RabbitMQ, Apache Kafka, NATS JetStream и AWS SQS.</p>
+<p>Сообщение гарантированно будет доставлено и обработано. Однако в случае сетевых сбоев, таймаутов или перезагрузок консьюмер может получить <strong>одно и то же сообщение два, три или десять раз</strong>.</p>
+<h3 id="kak-eto-rabotaet-protokol-podtverzhdeniy">Как это работает: протокол подтверждений</h3>
+<ol>
+<li><strong>Продюсер:</strong> Публикует сообщение и ожидает явного ответа <code>Ack</code> от брокера. Если истек таймаут или вернулась ошибка, продюсер повторяет отправку (Retry) до победного конца.</li>
+<li><strong>Брокер:</strong> Приняв сообщение, фиксирует его в персистентном хранилище (реплицированный лог или диск) и выдает консьюмеру. Но брокер <strong>не удаляет</strong> сообщение, а помечает его как находящееся в обработке (<em>In-Flight / Unacknowledged</em>).</li>
+<li><strong>Консьюмер:</strong> Вычитывает сообщение, выполняет бизнес-логику (проводит транзакцию в PostgreSQL, списывает баланс, формирует заказ).</li>
+<li><strong>Фиксация:</strong> Исключительно после успешного завершения всех операций консьюмер отправляет брокеру команду <code>Ack</code>.</li>
+<li><strong>Удаление:</strong> Получив <code>Ack</code>, брокер окончательно удаляет запись из очереди или сдвигает оффсет коммита.</li>
+</ol>
+<h3 id="anatomiya-dublikata-rozhdenie-fantoma">Анатомия дубликата: рождение фантома</h3>
+
+<p>Почему дубликаты неизбежны? Проследим типичный сбой на стыке сети и базы данных:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2234,58 +2298,78 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Брокер&quot;] --&gt;|&quot;1 - Отправка сообщения&quot;| B[&quot;Консьюмер на Go&quot;]
-B --&gt;|&quot;2 - Запись данных&quot;| C[&quot;PostgreSQL&quot;]
-B -.-&gt;|&quot;3 - Ack теряется в сети &lt;br&gt; или OOM Killed&quot;| A
-A --&gt;|&quot;4 - Таймаут. Возврат в очередь&quot;| A
-A --&gt;|&quot;5 - Повторная отправка&quot;| B
-B --&gt;|&quot;6 - ДУБЛИКАТ В БД!&quot;| C
+A[(&quot;Брокер&quot;)] --&gt;|&quot;1. Доставка сообщения&lt;br&gt;(Заказ #42)&quot;| B[&quot;Консьюмер (Go)&quot;]
+B --&gt;|&quot;2. SQL BEGIN + COMMIT&quot;| C[(&quot;PostgreSQL&quot;)]
+Note1[&quot;Деньги списаны,&lt;br&gt;заказ сохранен!&quot;] -.-&gt; C
+B -.-&gt;|&quot;3. Сеть моргнула!&lt;br&gt;Ack потерян в полете&quot;| A
+A --&gt;|&quot;4. Таймаут Ack истек!&lt;br&gt;Возврат в очередь&quot;| A
+A --&gt;|&quot;5. Повторная доставка воркеру&quot;| B
+B --&gt;|&quot;6. ОШИБКА: Повторное списание денег!&quot;| C
+
+style A fill:#1e1e2e,stroke:#89b4fa,stroke-width:2px
+style B fill:#313244,stroke:#f9e2af,stroke-width:2px
+style C fill:#181825,stroke:#a6e3a1,stroke-width:2px
   </pre>
 </div>
 
 
-<p>Брокер не получил <code>Ack</code> за отведенное время (timeout). Он решает, что консьюмер умер, возвращает сообщение в очередь и отдает его другому (или этому же) воркеру. Бизнес-логика выполняется во второй раз.</p>
+<p>Воркер выполнил всю работу: записал строку в таблицу базы данных и закоммитил транзакцию. Но в момент отправки подтверждения брокеру сетевой кабель моргнул, или процесс воркера мгновенно уничтожил Kubernetes из-за исчерпания памяти соседней горутины. </p>
+<p>Брокер не получил <code>Ack</code> за отведенный интервал (<code>ack_timeout</code>). С его точки зрения воркер погиб, не успев сделать ничего полезного. Брокер честно возвращает сообщение в очередь и отдает его соседнему воркеру. Второй воркер получает то же самое сообщение и, если код написан наивно, списывает деньги клиента во второй раз!</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Опасность неидемпотентных операций</span>
   </div>
   <div class="callout-body">
-    <p>Вы не можете использовать At-least-once доставку без проектирования <strong>Идемпотентных</strong> консьюмеров. Если ваше сообщение — это «Добавить 100 рублей на счет», дубликат приведет к финансовым потерям. Ваша система обязана уметь распознавать уже обработанные сообщения. Мы детально разберем это в статье <a href="10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>.</p>
+    <p>Использовать семантику At-least-once в продакшене без проектирования <strong>строго идемпотентных консьюмеров</strong> — это гарантированное самоубийство системы.</p>
+<p>Если сообщение приказывает: <em>«Уменьшить баланс счета на 500 рублей»</em> — повторная доставка приведет к двойному списанию и юридическим искам. </p>
+<p>Любая операция в модели At-least-once обязана обладать свойством математической идемпотентности:<br />
+$$f(f(x)) = f(x)$$<br />
+Повторное выполнение одного и того же события должно приводить систему в то же состояние, что и однократное. Подробные инженерные техники мы изучим в лекции <a href="10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>.</p>
   </div>
 </div>
 
 <hr />
-<h2 id="3-exactly-once-rovno-odin-raz-svyatoy-graal">3. Exactly-once (Ровно один раз) — Святой Грааль</h2>
+<h2 id="4-exactly-once-rovno-odin-raz-svyatoy-graal-i-surovaya-realnost">4. Exactly-once (Ровно один раз) — Святой Грааль и суровая реальность</h2>
 
-<p><strong>Суть:</strong> Каждое сообщение доставляется и обрабатывается строго один раз. Никаких потерь, никаких дубликатов.</p>
-<p><strong>Горькая правда:</strong> Математически доказуемо, что в чистом виде Exactly-once в распределенной системе невозможен из-за Задачи двух генералов. То, что вендоры (например, Kafka) называют Exactly-once — это на самом деле <strong>Effectively-once</strong> (Эффективно один раз). </p>
-<p>Это симуляция "ровно одного раза", построенная поверх модели "At-least-once" с использованием дедупликации на стороне инфраструктуры.</p>
+<blockquote>
+<p><strong>Кредо:</strong> <em>«Каждое сообщение доставляется и обрабатывается строго один раз. Ни единого дубликата, ни единой потери»</em>.</p>
+</blockquote>
+<p>Каждый начинающий разработчик мечтает включить в конфигурационном файле волшебный флаг <code>delivery.mode: exactly-once</code> и забыть обо всех проблемах синхронизации.</p>
+<p>Но суровая математическая реальность неумолима: из-за Задачи двух генералов <strong>чистый Exactly-once в произвольной открытой распределенной системе невозможен</strong>. То, что производители брокеров (включая Apache Kafka) гордо именуют Exactly-once Processing — это на самом деле <strong>Effectively-once (Эффективно один раз)</strong>.</p>
+<p>Это хитроумная иллюзия, собранная поверх проверенной модели <strong>At-least-once</strong> при помощи автоматической дедупликации на стороне инфраструктуры.</p>
 <h3 id="kak-dostigaetsya-effectively-once">Как достигается Effectively-once?</h3>
 
-<p>Для полноценного Exactly-once необходимо защитить два участка сети:</p>
-<p><strong>Участок 1: Продюсер -&gt; Брокер (Идемпотентный Продюсер)</strong><br />
-Если Продюсер не получил <code>Ack</code> от брокера и делает ретрай, брокер должен понять, что это не новое сообщение, а копия старого.<br />
-В Kafka это решается так: продюсеру при старте выдается <code>ProducerID</code>. Каждому сообщению присваивается <code>SequenceNumber</code> (0, 1, 2...). Брокер хранит у себя в памяти последний <code>SequenceNumber</code> для каждого <code>ProducerID</code>. Если приходит пакет с уже виденным номером — брокер принимает его, отвечает <code>Ack</code>, но не записывает в лог (дедуплицирует).</p>
-<p><strong>Участок 2: Консьюмер -&gt; База данных (Транзакционность)</strong><br />
-Если Консьюмер прочитал сообщение, изменил состояние в БД, но не успел сдвинуть оффсет в брокере, при рестарте он прочитает его снова.<br />
-Для решения этого используют:<br />
-1. <strong>Распределенные транзакции (2PC):</strong> Kafka Transactions позволяет атомарно записывать данные в выходной топик и коммитить оффсет входного топика. (Подробнее в <a href="../03-kafka/6-exactly-once-v-kafka.html" class="wikilink">6. Exactly once в Kafka</a>).<br />
-2. <strong>Хранение оффсетов в самой БД:</strong> Вы в одной транзакции PostgreSQL обновляете баланс пользователя и записываете ID обработанного сообщения (паттерн Outbox / Inbox).</p>
+<p>Чтобы создать иллюзию однократной обработки, распределенная система обязана защитить два критических участка сетевого пути:</p>
+<pre><code>[ Продюсер ] ──( 1. Идемпотентный продюсер )──► [ Брокер ] ──( 2. Транзакционный процессинг )──► [ База данных ]
+</code></pre>
+<h4 id="uchastok-1-prodyuser-rightarrow-broker-idempotentnyy-prodyuser">Участок 1: Продюсер $\rightarrow$ Брокер (Идемпотентный Продюсер)</h4>
+<p>Что произойдет, если продюсер отправил сообщение, брокер записал его в лог, но ответный <code>Ack</code> растворился в сети? Продюсер выполнит ретрай и пришлет дубликат.<br />
+- В Kafka при включении <code>enable.idempotence=true</code> каждому инстансу продюсера при подключении невидимо назначается уникальный 64-битный идентификатор <code>ProducerID</code> (PID).<br />
+- Каждому сообщению в рамках сессии продюсер присваивает строго монотонный порядковый номер: <code>SequenceNumber</code> (0, 1, 2, ...).<br />
+- Брокер хранит в оперативной памяти последний подтвержденный <code>SequenceNumber</code> для каждой комбинации <code>PID + Partition</code>.<br />
+- Если брокер получает сообщение с номером, который он уже зафиксировал в логе, он <strong>не дописывает дубликат в файл</strong>, но возвращает продюсеру успешный <code>Ack</code>. Продюсер счастлив, а в логе брокера нет мусора.</p>
+<h4 id="uchastok-2-konsyumer-rightarrow-khranilishche-tranzaktsionnyy-barer">Участок 2: Консьюмер $\rightarrow$ Хранилище (Транзакционный барьер)</h4>
+<p>Если консьюмер прочитал данные, изменил состояние базы данных, но упал до сдвига оффсета в брокере, при перезапуске он вычитает то же сообщение. Здесь есть два пути решения:<br />
+1. <strong>Транзакции внутри брокера (Kafka Transactions / 2PC):</strong> Консьюмер вычитывает сообщение из топика <code>A</code>, трансформирует его и атомарно записывает результат в топик <code>B</code>, одновременно фиксируя свой оффсет в служебном топике <code>__consumer_offsets</code> в рамках единой распределенной двухфазной транзакции под контролем Transaction Coordinator. (Подробно в <a href="../03-kafka/6-exactly-once-v-kafka.html" class="wikilink">6. Exactly once в Kafka</a>).<br />
+2. <strong>Транзакционный Inbox/Outbox в базе данных:</strong> Оффсет брокера или бизнес-идентификатор сообщения сохраняется <strong>в ту же самую транзакцию локальной базы данных</strong>, где обновляются бизнес-сущности.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Иллюзия Exactly-once при внешних вызовах</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы настроили Exactly-once семантику в Kafka (transactions = true, idenpotent producer = true). Значит ли это, что теперь наш HTTP API может без проблем дергать внешнюю платежную систему (Stripe/PayPal)?<br />
-<strong>Ответ:</strong> Нет! Гарантии Exactly-once в Kafka работают <strong>только внутри экосистемы Kafka</strong> (прочитал из топика A $\rightarrow$ записал в топик B). Как только ваш консьюмер делает побочный эффект (side-effect) во внешний мир (HTTP-запрос, запись в Redis, отправка Email) — вы выпадаете из транзакционного контекста брокера. Внешний HTTP вызов может отвалиться по таймауту, и вы снова возвращаетесь в реальность At-least-once.</p>
+    <p><strong>Вопрос:</strong> Мы активировали семантику Exactly-once в Kafka (<code>processing.guarantee=exactly_once_v2</code>). Наш сервис вычитывает событие заказа, отправляет HTTP-запрос в платежный шлюз (Stripe / CloudPayments) и отправляет SMS клиенту. Защищены ли мы теперь от двойного списания денег?</p>
+<p><strong>Ответ:</strong> <strong>Категорически нет!</strong> <br />
+Гарантия Exactly-once в любых брокерах действует <strong>исключительно внутри замкнутой экосистемы этого брокера</strong> (схема <em>Read-Process-Write</em>, когда входные и выходные данные находятся в топиках брокера). </p>
+<p>Как только ваша горутина делает побочный эффект (Side-Effect) во внешний мир — отправляет сетевой HTTP-запрос стороннему API, шлет письмо или пишет в нереляционный Redis без поддержки двухфазного коммита — вы мгновенно выпадаете из зоны безопасности брокера. Сетевой вызов к Stripe может зависнуть по таймауту, брокер перезапустит транзакцию, и консьюмер вызовет Stripe повторно. Для внешнего мира вы всегда остаетесь в парадигме <strong>At-least-once</strong>, требующей уникальных ключей идемпотентности (<code>Idempotency-Key</code>).</p>
   </div>
 </div>
 
-<h2 id="pamyatka-po-realizatsii-v-go">Памятка по реализации в Go</h2>
+<hr />
+<h2 id="5-pamyatka-po-realizatsii-v-go-idiomatichnyy-konsyumer">5. Памятка по реализации в Go: Идиоматичный консьюмер</h2>
 
-<p>Правильная обработка сообщений (At-least-once) на Go требует строгого соблюдения порядка действий и грамотной обработки ошибок.</p>
+<p>При реализации консьюмера в модели <strong>At-least-once</strong> на Go крайне важно соблюдать последовательность операций, разграничивать транзиентные и фатальные ошибки, а также правильно управлять контекстами:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2295,43 +2379,142 @@ B --&gt;|&quot;6 - ДУБЛИКАТ В БД!&quot;| C
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Пример идиоматичного консьюмера (псевдокод, применимо к RabbitMQ/NATS)
-func handleMessage(ctx context.Context, msg Message) {
-    // 1. Десериализация (если ошибка - это Poison Message)
-    var data OrderEvent
-    if err := json.Unmarshal(msg.Body, &amp;data); err != nil {
-        // Логируем, отправляем в Dead Letter Queue (DLQ)
-        msg.Nack(false) // false = не возвращать в основную очередь
+  <pre class="language-go"><code class="language-go">package consumer
+
+import (
+    &quot;context&quot;
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
+    &quot;fmt&quot;
+    &quot;log/slog&quot;
+)
+
+// Ошибки бизнес-логики
+var (
+    ErrTransient = errors.New(&quot;transient infrastructure failure (database lock/timeout)&quot;)
+    ErrPoison    = errors.New(&quot;poison message (corrupted payload or business violation)&quot;)
+)
+
+type OrderEvent struct {
+    OrderID string `json:&quot;order_id&quot;`
+    Amount  int64  `json:&quot;amount&quot;`
+}
+
+// Message — интерфейс входящего сообщения от брокера (RabbitMQ / NATS JetStream)
+type Message interface {
+    Payload() []byte
+    Ack() error
+    Nack(requeue bool) error
+}
+
+// ProcessMessage демонстрирует канонический жизненный цикл обработки сообщения
+func ProcessMessage(ctx context.Context, msg Message, logger *slog.Logger) {
+    // 1. ДЕСЕРИАЛИЗАЦИЯ
+    // Если входящие байты повреждены, повторная попытка бессмысленна (Poison Message).
+    var event OrderEvent
+    if err := json.Unmarshal(msg.Payload(), &amp;event); err != nil {
+        logger.ErrorContext(ctx, &quot;failed to unmarshal message, routing to DLQ&quot;, &quot;err&quot;, err)
+        // Nack(false) указывает брокеру НЕ возвращать сообщение в ту же очередь,
+        // а сбросить его или отправить в Dead Letter Queue.
+        _ = msg.Nack(false)
         return
     }
 
-    // 2. Выполнение бизнес-логики (БД, API)
-    err := processOrder(ctx, data)
+    // 2. БИЗНЕС-ЛОГИКА С ПРОВЕРКОЙ ИДЕМПОТЕНТНОСТИ
+    err := handleBusinessLogic(ctx, event)
     if err != nil {
         if errors.Is(err, ErrTransient) {
-            // Временная ошибка (Таймаут БД). Возвращаем в очередь (Retry)
-            msg.Nack(true) 
-        } else {
-            // Фатальная ошибка (Бизнес-валидация не пройдена). В DLQ.
-            msg.Nack(false)
+            // Временная ошибка инфраструктуры (например, таймаут к БД).
+            // Возвращаем сообщение в очередь для последующего повтора (Retry).
+            logger.WarnContext(ctx, &quot;transient error, requeuing message&quot;, &quot;order_id&quot;, event.OrderID, &quot;err&quot;, err)
+            _ = msg.Nack(true)
+            return
         }
+
+        // Фатальная логическая ошибка (например, несуществующий пользователь).
+        // Ретраи не помогут — отправляем в DLQ без повторной постановки в очередь.
+        logger.ErrorContext(ctx, &quot;unrecoverable business error, rejecting&quot;, &quot;order_id&quot;, event.OrderID, &quot;err&quot;, err)
+        _ = msg.Nack(false)
         return
     }
 
-    // 3. Строго после УСПЕШНОГО завершения всех сайд-эффектов!
-    msg.Ack()
+    // 3. ПОДТВЕРЖДЕНИЕ ДОСТАВКИ (ACK)
+    // Отправляется СТРОГО ПОСЛЕ успешного коммита всех побочных эффектов!
+    if err := msg.Ack(); err != nil {
+        logger.ErrorContext(ctx, &quot;failed to acknowledge message to broker&quot;, &quot;order_id&quot;, event.OrderID, &quot;err&quot;, err)
+    }
+}
+
+func handleBusinessLogic(ctx context.Context, event OrderEvent) error {
+    // В реальном коде здесь:
+    // 1. Открытие транзакции БД (tx).
+    // 2. Проверка, не обрабатывался ли event.OrderID ранее (Inbox table).
+    // 3. Выполнение операции и INSERT в Inbox.
+    // 4. tx.Commit().
+    return nil
 }
 </code></pre>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="6-itogovaya-matritsa-sravneniya-semantik-dostavki">6. Итоговая матрица сравнения семантик доставки</h2>
 
-<ol>
-<li><strong>At-most-once:</strong> Максимальная скорость. Окно для потери данных открыто настежь.</li>
-<li><strong>At-least-once:</strong> Стандарт индустрии. Нет потери данных, но система должна быть готова к дубликатам.</li>
-<li><strong>Exactly-once:</strong> Иллюзия, достигаемая за счет жесткой транзакционности инфраструктуры и сильного падения производительности (из-за <code>fsync</code> и координации). Применима только внутри замкнутых систем (например, Kafka Streams).</li>
-</ol>
-<p>Выбирая модель доставки, вы выбираете, какую инженерную проблему вы готовы решать. Но доставка — это лишь половина дела. Вторая фундаментальная проблема брокеров — это порядок, в котором сообщения приходят. В следующей статье мы разберем, почему строгая очередность убивает масштабирование: <a href="5-ordering-soobshcheniy-i-ego-tsena.html" class="wikilink">5. Ordering сообщений и его цена</a>.</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Критерий</th>
+<th>At-most-once</th>
+<th>At-least-once</th>
+<th>Effectively-once (Kafka Streams)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Гарантия потери</strong></td>
+<td>Данные могут теряться</td>
+<td><strong>Потери исключены</strong> (при наличии диска)</td>
+<td><strong>Потери исключены</strong></td>
+</tr>
+<tr>
+<td><strong>Гарантия дубликатов</strong></td>
+<td><strong>Дубликаты исключены</strong></td>
+<td>Возможны дубликаты (при ретраях и сбоях)</td>
+<td>Дубликаты фильтруются брокером</td>
+</tr>
+<tr>
+<td><strong>Требование к коду</strong></td>
+<td>Минимальное</td>
+<td><strong>Обязательная идемпотентность</strong></td>
+<td>Поддержка транзакционного API</td>
+</tr>
+<tr>
+<td><strong>Влияние на Latency</strong></td>
+<td>Минимальное (&lt; 1 мс)</td>
+<td>Умеренное (1–10 мс)</td>
+<td>Заметное (из-за 2PC и коммитов транзакций)</td>
+</tr>
+<tr>
+<td><strong>Влияние на Throughput</strong></td>
+<td>Максимальное (миллионы RPS)</td>
+<td>Высокое (сотни тысяч RPS)</td>
+<td>Среднее (десятки тысяч RPS)</td>
+</tr>
+<tr>
+<td><strong>Типичные брокеры</strong></td>
+<td>Любые с Auto-Ack / UDP</td>
+<td>RabbitMQ, Kafka, NATS JetStream, SQS</td>
+<td>Apache Kafka Transactions</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<h2 id="rezyume">Резюме</h2>
+
+<p>В распределенном мире нет бесплатных гарантий:<br />
+1. <strong>At-most-once</strong> дает предельную скорость ценой риска потери данных.<br />
+2. <strong>At-least-once</strong> дает надежность ценой риска дубликатов, перекладывая бремя обеспечения идемпотентности на плечи разработчика бизнес-логики.<br />
+3. <strong>Exactly-once</strong> — это тщательно сконструированная иллюзия, работающая только внутри закрытого периметра брокера и требующая высокой вычислительной платы.</p>
+<p>Определившись с тем, <em>дойдет ли</em> сообщение, мы обязаны задать следующий ключевой вопрос: <em>в каком порядке оно придет?</em> Если событие создания заказа обгонит событие добавления товара, система рухнет с логической ошибкой. В следующей лекции мы детально исследуем: <strong><a href="5-ordering-soobshcheniy-i-ego-tsena.html" class="wikilink">5. Ordering сообщений и его цена</a></strong>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2359,7 +2542,7 @@ func handleMessage(ctx context.Context, msg Message) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pochemu-dostavka-soobshcheniy-eto-slozhno">Почему доставка сообщений — это сложно?</a></li><li class="toc-item toc-h2"><a href="#1-at-most-once-ne-bolee-odnogo-raza">1. At-most-once (Не более одного раза)</a></li><li class="toc-item toc-h2"><a href="#2-at-least-once-ne-menee-odnogo-raza-industrialnyy-standart">2. At-least-once (Не менее одного раза) — Индустриальный стандарт</a></li><li class="toc-item toc-h2"><a href="#3-exactly-once-rovno-odin-raz-svyatoy-graal">3. Exactly-once (Ровно один раз) — Святой Грааль</a></li><li class="toc-item toc-h3"><a href="#kak-dostigaetsya-effectively-once">Как достигается Effectively-once?</a></li><li class="toc-item toc-h2"><a href="#pamyatka-po-realizatsii-v-go">Памятка по реализации в Go</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-pochemu-dostavka-soobshcheniy-eto-slozhno">1. Почему доставка сообщений — это сложно?</a></li><li class="toc-item toc-h2"><a href="#2-at-most-once-ne-bolee-odnogo-raza">2. At-most-once (Не более одного раза)</a></li><li class="toc-item toc-h3"><a href="#mekhanika-raboty">Механика работы</a></li><li class="toc-item toc-h2"><a href="#3-at-least-once-ne-menee-odnogo-raza-industrialnyy-standart">3. At-least-once (Не менее одного раза) — Индустриальный стандарт</a></li><li class="toc-item toc-h3"><a href="#kak-eto-rabotaet-protokol-podtverzhdeniy">Как это работает: протокол подтверждений</a></li><li class="toc-item toc-h3"><a href="#anatomiya-dublikata-rozhdenie-fantoma">Анатомия дубликата: рождение фантома</a></li><li class="toc-item toc-h2"><a href="#4-exactly-once-rovno-odin-raz-svyatoy-graal-i-surovaya-realnost">4. Exactly-once (Ровно один раз) — Святой Грааль и суровая реальность</a></li><li class="toc-item toc-h3"><a href="#kak-dostigaetsya-effectively-once">Как достигается Effectively-once?</a></li><li class="toc-item toc-h4"><a href="#uchastok-1-prodyuser-rightarrow-broker-idempotentnyy-prodyuser">Участок 1: Продюсер $\rightarrow$ Брокер (Идемпотентный Продюсер)</a></li><li class="toc-item toc-h4"><a href="#uchastok-2-konsyumer-rightarrow-khranilishche-tranzaktsionnyy-barer">Участок 2: Консьюмер $\rightarrow$ Хранилище (Транзакционный барьер)</a></li><li class="toc-item toc-h2"><a href="#5-pamyatka-po-realizatsii-v-go-idiomatichnyy-konsyumer">5. Памятка по реализации в Go: Идиоматичный консьюмер</a></li><li class="toc-item toc-h2"><a href="#6-itogovaya-matritsa-sravneniya-semantik-dostavki">6. Итоговая матрица сравнения семантик доставки</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

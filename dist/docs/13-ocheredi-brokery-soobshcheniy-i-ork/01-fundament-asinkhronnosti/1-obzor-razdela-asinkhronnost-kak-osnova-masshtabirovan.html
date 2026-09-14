@@ -2168,44 +2168,99 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Обзор раздела. Асинхронность как основа масштабирования</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Введение в распределенные системы часто начинается с боли. Когда бэкенд-разработчик впервые выходит за рамки монолита и начинает строить микросервисы, его первый инстинкт — заменить вызовы локальных функций на синхронные HTTP или gRPC запросы. </p>
-<p>На первых порах это работает. Сервис <code>A</code> делает HTTP-вызов к сервису <code>B</code>, дожидается ответа и возвращает результат пользователю. Но по мере роста нагрузки, усложнения бизнес-логики и увеличения количества сервисов, эта иллюзия простоты рушится. Архитектура превращается в хрупкий карточный домик, где отказ одного узла вызывает каскадное падение всей системы.</p>
-<p>В этом разделе мы разберем фундамент построения отказоустойчивых, масштабируемых HighLoad-систем — <strong>асинхронное взаимодействие</strong>. Мы пройдем путь от теории очередей до сурового продакшена с использованием Kafka, RabbitMQ, NATS и оркестраторов вроде Temporal. Но для начала давайте разберемся, почему синхронный мир так быстро перестает масштабироваться с инженерной точки зрения.</p>
-<h2 id="anatomiya-kaskadnogo-sboya">Анатомия каскадного сбоя</h2>
+            <h1>1. Обзор раздела. Асинхронность как основа масштабирования</h1>
+<blockquote>
+<p><em>"The purpose of computing is insight, not numbers. And the purpose of asynchronous architecture is survival, not fashion."</em><br />
+— Вольная инженерная мудрость</p>
+</blockquote>
+<p>Знакомство с распределенными системами у большинства инженеров начинается с обманчиво простого шага. Разработчик берет аккуратный монолит, распиливает его на десяток микросервисов и... заменяет обычные вызовы функций языка Go (<code>result, err := service.DoWork()</code>) на сетевые синхронные вызовы HTTP/REST или gRPC. </p>
+<p>Первые несколько недель в тестовой среде всё выглядит сказочно. Сервис <code>A</code> вызывает сервис <code>B</code>, дожидается ответа за 15 миллисекунд и рапортует клиенту об успехе. Но как только проект выходит в реальный мир с миллионами пользователей, рекламными акциями и неизбежными сетевыми сбоями, эта идиллия мгновенно рушится. Архитектура превращается в хрупкий карточный домик: стоит одной удаленной базе данных задуматься на 5 секунд, как вся система складывается по принципу домино.</p>
+<p>В этом разделе мы заложим несокрушимый фундамент проектирования отказоустойчивых, масштабируемых HighLoad-систем — <strong>асинхронное взаимодействие</strong>. Мы разберем теорию очередей, анатомию брокеров (RabbitMQ, Kafka, NATS) и оркестрацию бизнес-процессов на платформе Temporal. </p>
+<p>Но прежде чем настраивать кластеры, почему синхронный мир неизбежно упирается в потолок при масштабировании?</p>
+<hr />
+<h2 id="1-anatomiya-kaskadnogo-sboya-cascading-failure">1. Анатомия каскадного сбоя (Cascading Failure)</h2>
 
-<p>Представим классическую синхронную цепочку: <strong>API Gateway</strong> $\rightarrow$ <strong>Сервис Заказов</strong> $\rightarrow$ <strong>Сервис Склада</strong> $\rightarrow$ <strong>Сервис Оплаты</strong>.</p>
-<p>Если "Сервис Оплаты" внезапно начинает отвечать не за 50 мс, а за 5 секунд (например, из-за медленного ответа эквайринга или блокировки в БД), что происходит под капотом во всей этой цепочке?</p>
+<p>Представим классическую синхронную цепочку интернет-магазина в момент распродажи:</p>
+<pre><code>[ Клиент / Браузер ]
+         │
+         ▼ (HTTP)
+   [ API Gateway ]
+         │
+         ▼ (gRPC)
+ [ Сервис Заказов ] ───────► [ Сервис Склада ]
+                                    │
+                                    ▼ (HTTP)
+                            [ Сервис Оплаты ]
+                                    │
+                                    ▼ (REST)
+                        [ Внешний Шлюз Банка ] ──⏳ (Тормозит 5 секунд)
+</code></pre>
+<p>Что произойдет, если партнерский банковский шлюз под нагрузкой увеличит время ответа с нормальных 50 мс до 5 секунд? </p>
+<p>С точки зрения бизнес-логики — платежи просто идут медленнее. Но с точки зрения архитектуры рантайма Go и ядра Linux на серверах разворачивается настоящая катастрофа.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor User as Клиент
+participant GW as API Gateway
+participant Order as Сервис Заказов
+participant Pay as Сервис Оплаты
+participant Bank as Банковский Шлюз
+
+User-&gt;&gt;GW: POST /checkout (RPS растет!)
+GW-&gt;&gt;Order: gRPC CreateOrder()
+Order-&gt;&gt;Pay: gRPC ProcessPayment()
+Pay-&gt;&gt;Bank: HTTP POST /v1/charge
+Note over Bank: Задержка 5000 мс (зависание)
+Note over Pay: Горутины паркуются в netpoller
+Note over Order: Соединения и память забиваются
+Note over GW: 504 Gateway Timeout!
+Note over Order: OOM Killer / Too many open files
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Смерть от исчерпания ресурсов (Resource Exhaustion)</span>
   </div>
   <div class="callout-body">
-    <p><strong>Смерть от исчерпания ресурсов (Resource Exhaustion)</strong><br />
-В Go каждый входящий HTTP/gRPC запрос обычно обрабатывается в отдельной горутине. Горутина — это легковесный поток управления (структура <code>g</code> в рантайме Go), которая изначально занимает около 2 КБ памяти.</p>
-<p>Когда "Сервис Оплаты" тормозит, горутины в "Сервисе Склада" и "Сервисе Заказов" блокируются в ожидании сетевого ответа. Рантайм Go паркует эти горутины в <code>netpoller</code> (в Linux это обертка над системным вызовом <code>epoll</code>). </p>
-<ol>
-<li><strong>Память:</strong> Количество заблокированных горутин начинает лавинообразно расти пропорционально входящему трафику (RPS). 100,000 зависших горутин — это уже гигабайты аллоцированной в куче памяти (учитывая переменные в стеке горутины, которые утекли в кучу из-за Escape Analysis).</li>
-<li><strong>GC Pressure:</strong> Сборщик мусора (GC) начинает задыхаться, пытаясь сканировать огромный граф живых объектов в памяти.</li>
-<li><strong>Сетевые ресурсы:</strong> Каждый ожидающий HTTP-запрос удерживает открытый файловый дескриптор (File Descriptor, FD) и TCP-сокет. В Linux лимит FD ограничен (ulimit), а количество эфемерных портов для исходящих соединений не бесконечно. Возникает проблема <code>port exhaustion</code>.</li>
-</ol>
-<p>В итоге "Сервис Заказов", который был абсолютно здоров, падает по OOM (Out Of Memory) или начинает сыпать ошибками <code>too many open files</code>.</p>
+    <p>В Go сетевой ввод-вывод кажется блокирующим («синхронным»), но рантайм исполняет его кооперативно. На каждый входящий HTTP или gRPC запрос рантайм порождает горутину — легковесную структуру <code>g</code> размером от 2 КБ.</p>
+<p>Когда удаленный сервис перестает отвечать:<br />
+1. <strong>Зависание в netpoller:</strong> Рантайм паркует горутины в подсистеме <code>netpoller</code> (в Linux это механизм ядра <code>epoll</code>, в macOS/BSD — <code>kqueue</code>). Сами горутины не сжигают кванты CPU в пустых циклах, но остаются живыми в памяти.<br />
+2. <strong>Лавинообразный рост памяти:</strong> При трафике всего в 5 000 RPS пятисекундная задержка означает, что одновременно зависает $5\,000 \times 5 = 25\,000$ горутин. С учетом стеков, буферов запроса и структур, попавших в кучу (Heap) из-за Escape Analysis, это десятки гигабайт памяти.<br />
+3. <strong>Удушье GC (Garbage Collection):</strong> Сборщик мусора в Go обязан сканировать все живые указатели на стеках приостановленных горутин. Фаза Mark начинает отнимать до 25% всех ядер CPU только на проверку замороженных запросов.<br />
+4. <strong>Сетевой паралич (Port &amp; FD Exhaustion):</strong> Каждый открытый сетевой сокет — это файловый дескриптор в ядре Linux. Рано или поздно сервис упирается в лимит процесса <code>ulimit -n</code> (<code>too many open files</code>) или исчерпывает диапазон локальных эфемерных портов (<code>/proc/sys/net/ipv4/ip_local_port_range</code>), порождая проблему <code>port exhaustion</code>, после чего сервер теряет способность даже подключиться к базе данных.<br />
+5. <strong>OOM Killer:</strong> Ядро Linux видит критическое падение свободной памяти и хладнокровно присылает сигнал <code>SIGKILL</code> процессу «Сервиса Заказов», который сам по себе был абсолютно исправен.</p>
   </div>
 </div>
 
-<p>Синхронная архитектура создает жесткую связность (Coupling) по двум осям:<br />
-1. <strong>Связанность во времени (Temporal Coupling):</strong> Оба сервиса должны быть доступны в одну и ту же миллисекунду.<br />
-2. <strong>Связанность в пространстве (Spatial Coupling):</strong> Сервис <code>A</code> должен знать сетевой адрес (IP/DNS) сервиса <code>B</code>.</p>
-<h2 id="asinkhronnost-kak-instrument-izolyatsii">Асинхронность как инструмент изоляции</h2>
+<p>Синхронное межсервисное взаимодействие намертво сковывает систему двумя видами жесткой связанности (Coupling):<br />
+- <strong>Связанность во времени (Temporal Coupling):</strong> Все участники транзакции обязаны находиться в работоспособном состоянии и отвечать в одну и ту же миллисекунду. Если хотя бы один узел из цепочки упал или залагал — падает вся операция.<br />
+- <strong>Связанность в пространстве (Spatial Coupling):</strong> Сервис-отправитель <code>A</code> обязан знать конкретный сетевой адрес (IP-адрес или DNS-имя) сервиса <code>B</code>, формат его сокета и следить за балансировкой нагрузки на конкретные инстансы.</p>
+<hr />
+<h2 id="2-asinkhronnost-kak-instrument-izolyatsii">2. Асинхронность как инструмент изоляции</h2>
 
-<p>Главная цель асинхронной архитектуры и использования брокеров сообщений — разорвать эти связи. Мы вводим промежуточное звено — <strong>очередь (Queue)</strong> или <strong>лог (Log)</strong>.</p>
+<p>Главная цель внедрения брокеров сообщений — разорвать временную и пространственную связность. Сервисы больше не звонят друг другу напрямую по «телефону», рискуя нарваться на гудки «занято». Вместо этого они обмениваются письмами через надежное «почтовое отделение» — <strong>очередь (Queue)</strong> или <strong>распределенный лог (Append-only Log)</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2220,71 +2275,195 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph Synchronous[&quot;Синхронная архитектура&quot;]
-A[&quot;Сервис Заказов&quot;]--&gt;|&quot;HTTP POST&lt;br&gt;Ожидание ответа&quot;|B[&quot;Сервис Оплаты&quot;]
-B--&gt;|&quot;Задержка 5 сек&quot;|A
+subgraph Synchronous[&quot;Синхронный подход (Прямой вызов)&quot;]
+direction TB
+A[&quot;Сервис Заказов&quot;] --&gt;|&quot;HTTP / gRPC&lt;br&gt;Жесткая блокировка&quot;| B[&quot;Сервис Оплаты&quot;]
+B -.-&gt;|&quot;Задержка 5 секунд&quot;| A
 end
 
-subgraph Asynchronous[&quot;Асинхронная архитектура&quot;]
-C[&quot;Сервис Заказов&quot;]--&gt;|&quot;Publish&lt;br&gt;события&quot;|D{&quot;Брокер сообщений&quot;}
-D--&gt;|&quot;Poll/Push&lt;br&gt;в своем темпе&quot;|E[&quot;Сервис Оплаты&quot;]
+subgraph Asynchronous[&quot;Асинхронный подход (Через брокер)&quot;]
+direction TB
+C[&quot;Сервис Заказов&quot;] --&gt;|&quot;1. Быстрый Publish&lt;br&gt;(&lt; 2 мс)&quot;| D[(&quot;Брокер сообщений&lt;br&gt;Kafka / RabbitMQ / NATS&quot;)]
+D --&gt;|&quot;2. Независимый Fetch / Push&lt;br&gt;со скоростью БД&quot;| E[&quot;Сервис Оплаты&quot;]
 end
+
+style Synchronous fill:#1e1e2e,stroke:#f38ba8,stroke-width:2px
+style Asynchronous fill:#181825,stroke:#a6e3a1,stroke-width:2px
+style D fill:#313244,stroke:#89b4fa,stroke-width:2px
   </pre>
 </div>
 
 
-<h3 id="mechanical-sympathy-buferizatsiya-nagruzki-backpressure">Mechanical Sympathy: Буферизация нагрузки (Backpressure)</h3>
+<p>В асинхронной схеме «Сервису Заказов» безразлично, жив ли сейчас «Сервис Оплаты», обновляется ли он деплоем или его база данных перестраивает тяжелые индексы:<br />
+1. Заказ валидируется и сохраняется локально.<br />
+2. В брокер отправляется событие: <code>OrderCreated</code>. Брокер подтверждает запись за доли миллисекунды.<br />
+3. Сервис Заказов немедленно возвращает клиенту ответ: <code>202 Accepted</code> («Заказ принят в обработку»).<br />
+4. Пользователь видит быстрый отклик интерфейса, а «Сервис Оплаты» вычитает событие из очереди ровно тогда, когда освободит ресурсы.</p>
+<hr />
+<h2 id="3-mechanical-sympathy-buferizatsiya-i-backpressure">3. Mechanical Sympathy: Буферизация и Backpressure</h2>
 
-<p>Посмотрим на асинхронность через призму железа. Процессор (CPU) работает на частоте в несколько гигагерц. Оперативная память работает медленнее. Диск — еще на порядки медленнее. Чтобы CPU не простаивал в ожидании данных, архитекторы железа придумали кэши (L1/L2/L3) и буферы. </p>
-<p>Брокер сообщений — это, по сути, огромный, распределенный по сети <strong>буфер (L4 кэш системы)</strong>, который позволяет сглаживать пики нагрузки (Spiky Load).</p>
-<p>Если к вам внезапно придет в 10 раз больше пользователей (например, "Черная пятница"), синхронный сервис упадет, так как не сможет аллоцировать ресурсы CPU и RAM для мгновенной обработки всех запросов. В асинхронной системе "Сервис Заказов" просто сложит миллион сообщений в брокер. Это очень дешевая операция — быстрая сериализация (например, Protobuf) и асинхронная запись в TCP-сокет без ожидания бизнес-логики.</p>
-<p>А "Сервис Оплаты" будет читать сообщения из брокера с той скоростью, с которой ему позволяет его БД или внешнее API. Это называется <strong>Backpressure (Обратное давление)</strong>. Брокер защищает консьюмера от перегрузки, так же как буферизованные каналы <code>chan</code> в Go защищают горутину-воркера от переполнения.</p>
+<p>Посмотрим на асинхронность глазами системного инженера, помнящего об устройстве физического кремния:</p>
+<pre><code>[ Регистры CPU ]  ~0.5 нс   ═════╗
+[ L1/L2 Кэши   ]  ~1–4 нс        ║  Аппаратные буферы и очереди
+[ L3 Кэш       ]  ~10–20 нс      ║  (сглаживают колоссальную
+[ RAM          ]  ~60–100 нс     ║   разницу в скорости шин)
+[ SSD (NVMe)   ]  ~20–100 мкс    ║
+[ Сеть (LAN)   ]  ~0.5–2 мс ═════╝
+</code></pre>
+<p>Процессор в миллиарды раз быстрее диска и сети. Чтобы вычислительные ядра не простаивали в постоянных ожиданиях, инженеры кремния придумали многоуровневую буферизацию: Store Buffers, Line Fill Buffers, кэши L1–L3.</p>
+<p>Брокер сообщений в распределенной системе выполняет абсолютно ту же роль — это <strong>гигантский системный буфер (амортизатор ударов)</strong>, вынесенный на уровень архитектуры приложений.</p>
+<pre><code>       Пиковый всплеск (Spiky Load)
+             30 000 RPS
+                 │││││
+                 ▼▼▼▼▼
+        ┌─────────────────────┐
+        │   Брокер (Буфер)    │ ─── Проглатывает пик за счет быстрой записи
+        │  [■■■■■■■■■■■■■■■]  │     (в Page Cache или RAM)
+        └─────────────────────┘
+                 │
+                 ▼ (Ровный поток: 1 500 RPS)
+        ┌─────────────────────┐
+        │  Консьюмер (Сервис) │ ─── Обрабатывает данные комфортно,
+        │       + База        │     без троттлинга, зависаний и OOM
+        └─────────────────────┘
+</code></pre>
+<p>Когда наступает «Черная пятница» или выходит долгожданный релиз, трафик возрастает скачкообразно (Spiky Load). Синхронный сервис под таким цунами гарантированно падает: база данных захлебывается в пуле соединений, потоки блокируются, CPU уходит в 100% троттлинг.</p>
+<p>В асинхронной системе брокер берет кинетическую энергию этого удара на себя:<br />
+- Продьюсер выполняет сверхдешевую операцию: сериализует сообщение (например, бинарный Protobuf) и отправляет пакет в TCP-сокет брокера.<br />
+- Консьюмер забирает сообщения <strong>с той скоростью, с которой способна работать его подсистема хранения</strong> (например, 1 500 транзакций в секунду). </p>
+<p>Это фундаментальный принцип <strong>Backpressure (Обратного давления)</strong>: консьюмер сам управляет своим темпом и никогда не захлебнется входящим потоком.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Go-каналы (`chan`) против брокеров сообщений</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Зачем нам RabbitMQ/Kafka, если в Go есть каналы (<code>chan</code>)? Почему не гонять данные между горутинами?<br />
-<strong>Ответ:</strong> Каналы существуют только в оперативной памяти <strong>одного процесса</strong>. Если процесс (контейнер) упадет из-за <code>panic</code> или будет убит оркестратором (OOM-Killed в Kubernetes), все сообщения в канале будут безвозвратно потеряны. Брокеры сообщений обеспечивают <strong>Durability</strong> — данные сохраняются на диск и реплицируются между серверами. Брокер — это персистентный, распределенный канал.</p>
+    <p><strong>Вопрос:</strong> В стандартной библиотеке Go есть прекрасные буферизованные каналы (<code>chan Message</code>, <code>sync.Pool</code>). Зачем тащить в проект тяжелую инфраструктуру вроде Kafka или RabbitMQ, если можно распределять задачи между горутинами через каналы?</p>
+<p><strong>Ответ:</strong> <br />
+1. <strong>Границы адресного пространства и изоляция процесса:</strong> Канал Go живет исключительно в оперативной памяти <strong>одного процесса ОС</strong>. Если приложение упадет из-за критической <code>panic</code>, сегфолта в cgo или будет уничтожено <code>OOM Killer</code> в Kubernetes-поде, абсолютно все данные в буфере канала будут стерты без следа.<br />
+2. <strong>Персистентность и Durability:</strong> Брокеры сообщений сбрасывают данные на диск (FSync / Page Cache) и реплицируют их между независимыми серверами кластера по сети (через консенсусы Raft или KRaft). Смерть одного узла не приводит к потере ни единого байта.<br />
+3. <strong>Независимое масштабирование:</strong> Канал ограничен ресурсами одной виртуальной машины. Брокер позволяет распределять сообщения между сотнями независимых инстансов-обработчиков (Consumer Groups), динамически масштабируемых через HPA (Horizontal Pod Autoscaler).</p>
   </div>
 </div>
 
-<h2 id="izmenenie-paradigmy-ot-request-driven-k-event-driven">Изменение парадигмы: От Request-Driven к Event-Driven</h2>
+<hr />
+<h2 id="4-smena-paradigmy-ot-request-driven-k-event-driven">4. Смена парадигмы: От Request-Driven к Event-Driven</h2>
 
-<p>Переход к асинхронности требует изменения ментальной модели инженера:</p>
-<ol>
-<li><strong>Request-Driven (Команды):</strong> "Сделай это прямо сейчас и скажи результат". Сервис-инициатор знает, <em>кто</em> должен выполнить работу. Это RPC-подход.</li>
-<li><strong>Event-Driven (События):</strong> "Произошел вот такой факт (Пользователь зарегистрировался). Кому интересно — реагируйте". Сервис-инициатор не знает и не должен знать, какие сервисы будут обрабатывать это событие (может только отправка email, а может еще и расчет скоринга + запись в Data Lake).</li>
-</ol>
-<p>Это приводит нас к паттернам <strong>Pub/Sub</strong>, <strong>Event Sourcing</strong> и <strong>CQRS</strong>, которые мы будем глубоко разбирать в этом разделе.</p>
+<p>Переход к асинхронности — это не просто смена сетевого протокола с HTTP на AMQP. Это тектонический сдвиг в мышлении разработчика:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Критерий</th>
+<th>Request-Driven (RPC / Команды)</th>
+<th>Event-Driven (Событийная модель)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Семантика</strong></td>
+<td>Повелительное наклонение: <em>«Сделай это!»</em></td>
+<td>Совершенный вид: <em>«Это произошло!»</em></td>
+</tr>
+<tr>
+<td><strong>Знание адресата</strong></td>
+<td>Отправитель знает, кто именно должен выполнить команду.</td>
+<td>Отправитель публикует факт в мир и не знает, кто его слушает.</td>
+</tr>
+<tr>
+<td><strong>Связность</strong></td>
+<td>Высокая (добавление нового шага требует правки вызывающего кода).</td>
+<td>Минимальная (новые сервисы просто подписываются на топик).</td>
+</tr>
+<tr>
+<td><strong>Масштабирование</strong></td>
+<td>Ограничено самым медленным сервисом в цепочке.</td>
+<td>Каждый консьюмер масштабируется независимо.</td>
+</tr>
+</tbody>
+</table></div>
+<p>В событийной архитектуре (Event-Driven Architecture) событие становится фактом истории: <em>«Заказ №42 оплачен»</em>. Сервису доставки, сервису аналитики и сервису отправки SMS больше не нужно просить «Сервис Оплаты» уведомить их лично. Они независимо подписываются на события топика. </p>
+<p>Это открывает путь к фундаментальным паттернам корпоративных систем: <strong>Pub/Sub</strong>, <strong>Event Sourcing</strong> и <strong>CQRS (Command Query Responsibility Segregation)</strong>, детально изучаемым в следующих главах.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Иллюзия бесплатного сыра</span>
   </div>
   <div class="callout-body">
-    <p>Асинхронность — не серебряная пуля. Она решает проблемы инфраструктурного масштабирования, но приносит колоссальные проблемы консистентности данных. <br />
-В асинхронном мире вы теряете распределенные транзакции ACID. Что если мы записали заказ в локальную PostgreSQL, но при отправке события в Kafka моргнула сеть? Возникает проблема Dual Write. На смену ACID приходит <strong>Eventual Consistency</strong> (согласованность в конечном счете) и паттерны вроде Outbox и Saga. </p>
+    <p>Асинхронность элегантно лечит инфраструктурную перегрузку, но взамен приносит <strong>проблемы консистентности данных (Data Consistency)</strong>.</p>
+<p>В синхронном мире на одной базе вы имели строгий ACID. В асинхронном мире распределенные двухфазные транзакции (2PC) в продакшене практически неприменимы из-за гигантских задержек и риска глобальных блокировок. </p>
+<p>На сцену выходит <strong>Eventual Consistency (согласованность в конечном счете)</strong>:<br />
+1. <strong>Проблема двойной записи (Dual Write):</strong> Что произойдет, если мы записали строку заказа в PostgreSQL, но перед вызовом брокера сеть моргнула или упал под? Данные в базе есть, а сообщения в Kafka нет. Или наоборот. Решать это приходится паттернами <strong>Transactional Outbox</strong> и Change Data Capture (Debezium).<br />
+2. <strong>Потеря порядка и дублирование:</strong> Сеть ненадежна. Сообщения могут приходить не по порядку или дублироваться при сетевых таймаутах. Ваша бизнес-логика обязана быть строго <strong>идемпотентной</strong>.</p>
   </div>
 </div>
 
-<h2 id="chto-zhdet-nas-v-etom-razdele">Что ждет нас в этом разделе?</h2>
+<hr />
+<h2 id="5-dorozhnaya-karta-razdela-13-chto-zhdet-nas-vperedi">5. Дорожная карта Раздела 13: Что ждет нас впереди?</h2>
 
-<p>Данный раздел спроектирован так, чтобы провести вас от базовой теории до настройки продакшен-решений. Вот карта нашего пути:</p>
-<ul>
-<li><strong>Фундамент асинхронности:</strong> Начнем с базы. Разберем гарантии доставки (At-most/At-least/Exactly-once), стратегии ретраев, упорядочивание сообщений (Ordering) и концепцию <a href="8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a>. Обязательно погрузимся в то, как сделать обработку идемпотентной.</li>
-<li><strong>Брокеры под капотом:</strong> Мы не просто выучим API. Мы разберем внутреннюю архитектуру лидеров рынка.<ul>
-<li><a href="../02-rabbitmq/1-rabbitmq-arkhitektura-i-kontseptsii.html" class="wikilink">1. RabbitMQ. Архитектура и концепции</a>: Smart Broker / Dumb Consumer. Модель роутинга через Exchange.</li>
-<li><a href="../03-kafka/1-kafka-arkhitektura-i-model-log-based-sistemy.html" class="wikilink">1. Kafka. Архитектура и модель log based системы</a>: Dumb Broker / Smart Consumer. Как Kafka использует <code>sendfile</code> (Zero-copy) и Page Cache ОС для достижения пропускной способности в миллионы сообщений в секунду.</li>
-<li><a href="../04-nats/1-nats-legkovesnyy-broker.html" class="wikilink">1. NATS. Легковесный брокер</a>: Когда нужна минимальная задержка (latency) и почему JetStream меняет правила игры.</li>
-</ul>
-</li>
-<li><strong>Паттерны проектирования:</strong> Как правильно выстроить архитектуру взаимодействия сервисов, чтобы не создать "распределенный монолит".</li>
-<li><strong>Оркестрация процессов:</strong> Когда хореография событий превращается в хаос (Event Hell), на помощь приходят решения вроде Temporal. Разберем <a href="../06-orkestratsiya-protsessov/1-chto-takoe-workflow-orchestration.html" class="wikilink">1. Что такое workflow orchestration</a> и парадигму Durable Execution.</li>
-<li><strong>Практика на Go:</strong> Напишем production-ready консьюмеры с Graceful Shutdown, настроим batch-процессинг и научимся тестировать асинхронные системы.</li>
-</ul>
-<p>В следующей статье мы проведем четкую границу и разберем компромиссы двух подходов: <a href="2-sinkhronnoe-vs-asinkhronnoe-vzaimodeystvie.html" class="wikilink">2. Синхронное vs асинхронное взаимодействие</a>.</p>
+<p>Этот раздел спроектирован как цельный практический курс: от математических основ теории доставки до исходного кода на Go, готового к суровым реалиям Production.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph S1[&quot;1. Фундамент асинхронности&quot;]
+F1[&quot;Синхронность vs Асинхронность&quot;] --&gt; F2[&quot;Модели доставки: At-least / Exactly-once&quot;]
+F2 --&gt; F3[&quot;Ordering &amp; Backpressure&quot;]
+F3 --&gt; F4[&quot;DLQ, Retry &amp; Идемпотентность&quot;]
+end
+
+subgraph S2[&quot;2. Брокеры под капотом&quot;]
+B1[&quot;RabbitMQ: Exchanges &amp; Queues&quot;]
+B2[&quot;Kafka: Partitions, Log &amp; Zero-Copy&quot;]
+B3[&quot;NATS: In-memory &amp; JetStream&quot;]
+end
+
+subgraph S3[&quot;3. Паттерны и Оркестрация&quot;]
+P1[&quot;Outbox &amp; Inbox Pattern&quot;]
+P2[&quot;Event Sourcing &amp; Saga&quot;]
+P3[&quot;Temporal: Durable Execution&quot;]
+end
+
+subgraph S4[&quot;4. Практика на Go&quot;]
+G1[&quot;Graceful Shutdown консьюмеров&quot;]
+G2[&quot;Батчинг, ретраи и каналы&quot;]
+G3[&quot;Интеграционное тестирование с Testcontainers&quot;]
+end
+
+S1 --&gt; S2 --&gt; S3 --&gt; S4
+
+style S1 fill:#1e1e2e,stroke:#89b4fa,stroke-width:1px
+style S2 fill:#181825,stroke:#a6e3a1,stroke-width:1px
+style S3 fill:#1e1e2e,stroke:#f9e2af,stroke-width:1px
+style S4 fill:#181825,stroke:#cba6f7,stroke-width:1px
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>Фундамент асинхронности (текущий блок):</strong><br />
+   - Разберем компромиссы в <a href="2-sinkhronnoe-vs-asinkhronnoe-vzaimodeystvie.html" class="wikilink">2. Синхронное vs асинхронное взаимодействие</a> и анатомию очередей в <a href="3-ocheredi-soobshcheniy-zachem-oni-nuzhny.html" class="wikilink">3. Очереди сообщений. Зачем они нужны</a>.<br />
+   - Досконально исследуем гарантии доставки в <a href="4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a> и цену сохранения строгой последовательности в <a href="5-ordering-soobshcheniy-i-ego-tsena.html" class="wikilink">5. Ordering сообщений и его цена</a>.<br />
+   - Научимся защищать сервисы в <a href="6-backpressure-i-kontrol-nagruzki.html" class="wikilink">6. Backpressure и контроль нагрузки</a> и гарантировать сохранность байтов в <a href="7-message-durability-i-persistence.html" class="wikilink">7. Message durability и persistence</a>.<br />
+   - Настроим спасательные круги инфраструктуры: <a href="8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a>, стратегии повторов в <a href="9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a> и математическую строгость в <a href="10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>.</li>
+<li><strong>Брокеры под капотом:</strong><br />
+   - <strong><a href="../02-rabbitmq/1-rabbitmq-arkhitektura-i-kontseptsii.html" class="wikilink">1. RabbitMQ. Архитектура и концепции</a>:</strong> Философия <em>Smart Broker / Dumb Consumer</em>, обменники (Exchanges), биндинги и протокол AMQP 0-9-1.<br />
+   - <strong><a href="../03-kafka/1-kafka-arkhitektura-i-model-log-based-sistemy.html" class="wikilink">1. Kafka. Архитектура и модель log based системы</a>:</strong> Философия <em>Dumb Broker / Smart Consumer</em>, партиции, коммит смещений (Offsets), системный вызов <code>sendfile</code> (Zero-copy) ядра Linux и магия Page Cache, выдающая миллионы сообщений в секунду.<br />
+   - <strong><a href="../04-nats/1-nats-legkovesnyy-broker.html" class="wikilink">1. NATS. Легковесный брокер</a>:</strong> Экстремально низкие задержки, легковесный Pub/Sub и персистентный движок JetStream.</li>
+<li><strong>Паттерны и архитектура:</strong> Разрешение дуальных записей через Transactional Outbox, транзакционные саги и борьба со спагетти из событий.</li>
+<li><strong>Оркестрация процессов:</strong> Когда хореография превращается в неуправляемый хаос, мы разберем <a href="../06-orkestratsiya-protsessov/1-chto-takoe-workflow-orchestration.html" class="wikilink">1. Что такое workflow orchestration</a> и платформу Temporal на базе парадигмы Durable Execution.</li>
+<li><strong>Практика на Go:</strong> Написание надежных воркеров, батчинг с контролем контекстов (<code>context.Context</code>), перехват сигналов завершения ОС и тестирование асинхронных контуров без «костылей» со сном (<code>time.Sleep</code>).</li>
+</ol>
+<p>Переходим к первому практическому сравнению архитектур: <strong><a href="2-sinkhronnoe-vs-asinkhronnoe-vzaimodeystvie.html" class="wikilink">2. Синхронное vs асинхронное взаимодействие</a></strong>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2312,7 +2491,7 @@ end
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-kaskadnogo-sboya">Анатомия каскадного сбоя</a></li><li class="toc-item toc-h2"><a href="#asinkhronnost-kak-instrument-izolyatsii">Асинхронность как инструмент изоляции</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-buferizatsiya-nagruzki-backpressure">Mechanical Sympathy: Буферизация нагрузки (Backpressure)</a></li><li class="toc-item toc-h2"><a href="#izmenenie-paradigmy-ot-request-driven-k-event-driven">Изменение парадигмы: От Request-Driven к Event-Driven</a></li><li class="toc-item toc-h2"><a href="#chto-zhdet-nas-v-etom-razdele">Что ждет нас в этом разделе?</a></li>
+    <li class="toc-item toc-h2"><a href="#1-anatomiya-kaskadnogo-sboya-cascading-failure">1. Анатомия каскадного сбоя (Cascading Failure)</a></li><li class="toc-item toc-h2"><a href="#2-asinkhronnost-kak-instrument-izolyatsii">2. Асинхронность как инструмент изоляции</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-buferizatsiya-i-backpressure">3. Mechanical Sympathy: Буферизация и Backpressure</a></li><li class="toc-item toc-h2"><a href="#4-smena-paradigmy-ot-request-driven-k-event-driven">4. Смена парадигмы: От Request-Driven к Event-Driven</a></li><li class="toc-item toc-h2"><a href="#5-dorozhnaya-karta-razdela-13-chto-zhdet-nas-vperedi">5. Дорожная карта Раздела 13: Что ждет нас впереди?</a></li>
   </ul>
 </aside>
 

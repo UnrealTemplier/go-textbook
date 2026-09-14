@@ -2168,45 +2168,68 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">10. Idempotency в message processing</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="neizbezhnost-dvoynika">Неизбежность двойника</h2>
+            <h1>10. Idempotency в message processing</h1>
+<blockquote>
+<p><em>"In mathematics, an operation is idempotent if applying it multiple times produces the exact same result as applying it once: $f(f(x)) = f(x)$. An elevator call button is delightfully idempotent: pressing it twenty times will not summon twenty elevators, nor will it make the car arrive twenty times faster."</em><br />
+— Архитектурная аналогия</p>
+</blockquote>
+<p>На протяжении всего вводного подраздела «Фундамент асинхронности» мы последовательно возводили здание отказоустойчивой распределенной архитектуры:<br />
+- Мы выбрали семантику гарантированной доставки <strong>At-least-once</strong> (<a href="4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a>), чтобы ни один байт не потерялся при сбоях сети.<br />
+- Мы внедрили <strong>Exponential Backoff с Jitter</strong> (<a href="9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>), чтобы переживать временную недоступность баз данных.</p>
+<p>Но за эту неуязвимость мы заплатили неизбежную цену: <strong>наши консьюмеры гарантированно и регулярно будут получать дубликаты сообщений</strong>.</p>
+<p>Сеть может моргнуть ровно через одну миллисекунду после того, как база данных закоммитила транзакцию списания денег, но за миллисекунду <em>до</em> того, как пакет подтверждения <code>Ack</code> от Go-сервиса долетит до брокера. Брокер сочтет консьюмер погибшим и немедленно перешлет это же сообщение соседнему воркеру.</p>
+<p>Если ваша бизнес-логика выполняет наивный запрос <code>UPDATE balance = balance - 100</code>, клиент потеряет деньги дважды, а бизнес понесет финансовые и репутационные убытки.</p>
+<p>Единственный математический способ выжить и обеспечить целостность данных в модели At-least-once — сделать абсолютно все операции <strong>идемпотентными</strong>.</p>
+<hr />
+<h2 id="neizbezhnost-dvoynika">Неизбежность двойника</h2>
 
-<p>На протяжении раздела "Фундамент асинхронности" мы шаг за шагом строили отказоустойчивую систему. Мы выбрали модель At-least-once (<a href="4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a>), чтобы не терять данные. Мы добавили повторные попытки (<a href="9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>), чтобы переживать падения базы данных. </p>
-<p>Но за эту надежность мы заплатили суровую цену: <strong>наш консьюмер гарантированно будет получать дубликаты сообщений</strong>.</p>
-<p>Сеть может моргнуть <em>после</em> того, как вы списали деньги со счета, но <em>до</em> того, как ваш Go-сервис отправил <code>Ack</code> брокеру. Брокер решит, что вы упали, и пошлет это же сообщение о списании денег второму воркеру. Если ваша бизнес-логика просто выполнит <code>UPDATE balance = balance - 100</code>, клиент потеряет деньги, а вы — репутацию.</p>
-<p>Единственный способ выжить в мире At-least-once — сделать все операции <strong>идемпотентными</strong>.</p>
-<h2 id="chto-takoe-idempotentnost">Что такое Идемпотентность?</h2>
+<p>Любая надежная асинхронная архитектура вынуждена мириться с тем, что сеть ненадежна, а повторные попытки (ретраи) неизбежно порождают дубликаты. Прежде чем проектировать защиту, разберем математическую суть этого явления.</p>
+<hr />
+<h2 id="1-chto-takoe-idempotentnost">1. Что такое Идемпотентность?</h2>
 
-<p>В математике идемпотентность — это свойство операции, при котором многократное применение функции дает тот же результат, что и однократное: $f(f(x)) = f(x)$.</p>
-<p>В распределенных системах это означает: <strong>обработка одного и того же сообщения 1, 2 или 100 раз приведет систему к одному и тому же конечному состоянию</strong>.</p>
-<h3 id="1-estestvennaya-idempotentnost-natural-idempotency">1. Естественная идемпотентность (Natural Idempotency)</h3>
-<p>Некоторые операции идемпотентны по своей природе. <br />
-* <em>Не идемпотентно:</em> Увеличить счетчик просмотров на 1 (<code>UPDATE views = views + 1</code>).<br />
-* <em>Идемпотентно:</em> Установить статус заказа в "Оплачен" (<code>UPDATE orders SET status = 'paid' WHERE id = 123</code>). Сколько бы раз вы ни выполняли этот запрос, статус останется 'paid'.</p>
-<p>К сожалению, большинство бизнес-операций (списание средств, отправка email, создание новой сущности) естественно не идемпотентны. Их нужно делать такими искусственно.</p>
-<h2 id="mekhanika-dublikatov-sostoyanie-gonki-race-condition">Механика дубликатов: Состояние гонки (Race Condition)</h2>
+<p>В распределенных вычислениях идемпотентность формулируется так: <strong>многократная обработка одного и того же сообщения (1, 2, 10 или 100 раз) приводит систему ровно к тому же результирующему состоянию, что и однократная.</strong></p>
+<h3 id="estestvennaya-idempotentnost-natural-idempotency">Естественная идемпотентность (Natural Idempotency)</h3>
 
-<p>Самая большая ошибка при реализации идемпотентности — игнорирование параллелизма. <br />
-Многие джуниоры пишут такой код:<br />
+<p>Некоторые операции в архитектуре обладают идемпотентностью от природы:<br />
+- <strong>Не идемпотентно (дельта-мутация):</strong><br />
+  Увеличить счетчик просмотров статьи: <code>UPDATE views = views + 1</code>.<br />
+  Списать деньги: <code>UPDATE balance = balance - 100</code>.<br />
+  Каждое повторное выполнение искажает реальность.<br />
+- <strong>Естественно идемпотентно (фиксация состояния):</strong><br />
+  Установить финальный статус сущности: <code>UPDATE orders SET status = 'paid' WHERE id = 123</code>.<br />
+  Сколько бы сотен раз мы ни повторяли этот запрос, статус заказа в базе останется <code>'paid'</code>.<br />
+  Удалить запись по первичному ключу: <code>DELETE FROM users WHERE id = 42</code>. После первого удаления запись исчезнет, а повторные вызовы завершатся успехом без изменения состояния мира.</p>
+<p>К сожалению, большинство реальных бизнес-операций (списание денег, начисление бонусов, генерация инвойсов, отправка SMS) по своей сути не являются естественно идемпотентными. Их необходимо проектировать таковыми искусственно.</p>
+<hr />
+<h2 id="2-mekhanika-dublikatov-sostoyanie-gonki-race-condition">2. Механика дубликатов: Состояние гонки (Race Condition)</h2>
+
+<p>Самая коварная ловушка для инженера — иллюзия того, что дубликаты приходят строго последовательно с большой паузой во времени.</p>
+<p>Начинающие разработчики часто пишут наивную проверку:<br />
 1. <code>SELECT * FROM processed_messages WHERE msg_id = 123</code><br />
-2. Если нашли $\rightarrow$ <code>return nil</code> (уже обработано).<br />
-3. Иначе $\rightarrow$ выполняем бизнес-логику.<br />
+2. Если запись найдена $\rightarrow$ <code>return nil</code> (сообщение уже обработано, выходим).<br />
+3. Иначе $\rightarrow$ списываем деньги с баланса клиента.<br />
 4. <code>INSERT INTO processed_messages (msg_id) VALUES (123)</code></p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Катастрофа Check-Then-Act</span>
   </div>
   <div class="callout-body">
-    <p>Этот код сломается при первой же серьезной нагрузке.<br />
-В распределенной системе дубликат часто приходит <em>в тот же момент</em>, когда обрабатывается оригинал (например, из-за сетевого сплита, когда брокер думает, что первый консьюмер мертв, хотя он просто завис на долгой сборке мусора — GC Pause).<br />
-Два ваших Go-воркера параллельно выполнят <code>SELECT</code>, оба увидят, что сообщения нет, оба выполнят бизнес-логику (спишут деньги) и оба попытаются сделать <code>INSERT</code>. </p>
+    <p>Этот код неизбежно сломается под нагрузкой в HighLoad-системе!</p>
+<p>В распределенной сети дубликат сообщения очень часто прилетает <strong>в ту же самую миллисекунду</strong>, что и оригинал. Например:<br />
+- Воркер №1 вычитывает оригинал и зависает на длинной паузе сборщика мусора (GC Pause) или сбросе дискового Page Cache.<br />
+- Брокер решает, что Воркер №1 умер, и пересылает сообщение Воркеру №2.<br />
+- Воркер №1 просыпается, и оба воркера <strong>одновременно</strong> выполняют запрос <code>SELECT</code> к базе данных.<br />
+- Оба воркера видят пустой результат!<br />
+- Оба воркера списывают по 100 рублей с баланса клиента!<br />
+- И оба воркера пытаются сделать <code>INSERT</code>.</p>
   </div>
 </div>
 
@@ -2224,32 +2247,42 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
+autonumber
 participant B as Брокер
 participant W1 as Go Воркер 1
 participant W2 as Go Воркер 2
-participant DB as База Данных
+participant DB as База Данных (PostgreSQL)
 
-B-&gt;&gt;W1: Заказ 123
-Note over W1: Зависание горутины &lt;br&gt; GC Pause
-B-&gt;&gt;W2: Заказ 123 -Дубликат-
-W2-&gt;&gt;DB: SELECT проверил - пусто
-W1-&gt;&gt;DB: SELECT проверил - пусто
-W2-&gt;&gt;DB: Списание 100 рублей
-W1-&gt;&gt;DB: Списание 100 рублей
-Note over DB: Двойное списание!
+B-&gt;&gt;W1: Доставка: Заказ #123
+Note over W1: Зависание на паузе GC / Net
+Note over B: Таймаут Ack! Ределивери
+B-&gt;&gt;W2: Доставка: Заказ #123 (Дубликат)
+W1-&gt;&gt;DB: 1. SELECT WHERE msg_id=123 (Пусто)
+W2-&gt;&gt;DB: 2. SELECT WHERE msg_id=123 (Пусто)
+W1-&gt;&gt;DB: 3. UPDATE balance = balance - 100
+W2-&gt;&gt;DB: 4. UPDATE balance = balance - 100
+Note over DB: КАТАСТРОФА: Двойное списание денег!
+W1-&gt;&gt;DB: 5. INSERT INTO processed_messages
+W2-&gt;&gt;DB: 6. INSERT INTO processed_messages (Конфликт!)
   </pre>
 </div>
 
 
-<h2 id="patterny-realizatsii-idempotentnosti">Паттерны реализации Идемпотентности</h2>
+<p>Паттерн <em>«Проверь, затем действуй» (Check-Then-Act)</em> в распределенных системах без атомарных блокировок абсолютно несостоятелен.</p>
+<hr />
+<h2 id="3-patterny-realizatsii-idempotentnosti">3. Паттерны реализации Идемпотентности</h2>
 
-<p>Чтобы избежать состояния гонки, проверка на дубликат и фиксация факта обработки должны быть <strong>атомарными</strong>.</p>
+<p>Чтобы полностью исключить состояние гонки, <strong>проверка на дубликат и мутация бизнес-данных обязаны быть строго атомарными</strong>.</p>
 <h3 id="pattern-1-idempotency-key-i-unikalnye-indeksy-bd">Паттерн 1: Idempotency Key и Уникальные Индексы (БД)</h3>
 
-<p>Это самый надежный способ. Продюсер (тот, кто отправляет сообщение) обязан сгенерировать уникальный идентификатор бизнес-операции — <code>Idempotency-Key</code> (часто это UUID), и передать его в заголовках (Headers) или теле сообщения.</p>
-<p>Консьюмер использует этот ключ в связке с уникальными ограничениями (<code>UNIQUE CONSTRAINT</code>) базы данных.</p>
-<p><strong>Идиоматичный Go и PostgreSQL (<code>ON CONFLICT</code>):</strong><br />
-Вместо связки SELECT + INSERT, мы заставляем саму СУБД разруливать параллельные запросы с помощью блокировок строк на уровне движка хранения.</p>
+<p>Это самый надежный, проверенный временем золотой стандарт индустрии.</p>
+<ol>
+<li><strong>Генерация ключа:</strong> Продюсер при формировании бизнес-события генерирует детерминированный или уникальный ключ — <code>Idempotency-Key</code> (например, строковый UUIDv4 или составной ключ <code>order-create-user42-cart99</code>).</li>
+<li>Этот ключ передается в метаданных (заголовках сообщения или теле JSON).</li>
+<li>В базе данных консьюмера создается таблица входящих сообщений (Inbox / Processed Events) с ограничением уникальности: <code>UNIQUE CONSTRAINT (idempotency_key)</code>.</li>
+</ol>
+<h4 id="idiomatichnyy-go-i-postgresql-on-conflict">Идиоматичный Go и PostgreSQL (`ON CONFLICT`):</h4>
+<p>Вместо связки SELECT + INSERT мы перекладываем разрешение гонки на ядро реляционной СУБД:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2264,44 +2297,61 @@ Note over DB: Двойное списание!
 import (
     &quot;context&quot;
     &quot;database/sql&quot;
+    &quot;errors&quot;
     &quot;fmt&quot;
 )
 
+type Message struct {
+    IdempotencyKey string
+    UserID         int64
+    Amount         int64
+}
+
+// ProcessPayment атомарно проверяет ключ идемпотентности и обновляет баланс
 func ProcessPayment(ctx context.Context, db *sql.DB, msg Message) error {
-    // Начинаем транзакцию
-    tx, err := db.BeginTx(ctx, nil)
+    // 1. Открываем транзакцию базы данных
+    tx, err := db.BeginTx(ctx, &amp;sql.TxOptions{Isolation: sql.LevelReadCommitted})
     if err != nil {
-        return err
+        return fmt.Errorf(&quot;begin tx: %w&quot;, err)
     }
     defer tx.Rollback()
 
-    // 1. Атомарная проверка и блокировка ключа идемпотентности.
-    // Если такой ключ уже есть, ON CONFLICT DO NOTHING вернет 0 затронутых строк.
-    var id string
+    // 2. Атомарная вставка с блокировкой на уровне индекса:
+    // Если idempotency_key уже существует, ON CONFLICT DO NOTHING не вставит строку,
+    // и RETURNING ничего не вернет (sql.ErrNoRows).
+    var returnedKey string
     err = tx.QueryRowContext(ctx, `
         INSERT INTO processed_events (idempotency_key, created_at)
         VALUES ($1, NOW())
         ON CONFLICT (idempotency_key) DO NOTHING
         RETURNING idempotency_key
-    `, msg.IdempotencyKey).Scan(&amp;id)
+    `, msg.IdempotencyKey).Scan(&amp;returnedKey)
 
     if err != nil {
-        if err == sql.ErrNoRows {
-            // RETURNING ничего не вернул -&gt; конфликт -&gt; дубликат!
-            // Мягко завершаем работу, возвращаем nil, чтобы брокер получил Ack
-            return nil 
+        if errors.Is(err, sql.ErrNoRows) {
+            // RETURNING вернул пустоту -&gt; ключ уже был вставлен ранее -&gt; ДУБЛИКАТ!
+            // Мы мягко завершаем работу и возвращаем nil (для отправки брокеру Ack)
+            return nil
         }
-        return fmt.Errorf(&quot;check idempotency: %w&quot;, err)
+        return fmt.Errorf(&quot;check idempotency key: %w&quot;, err)
     }
 
-    // 2. Безопасное выполнение бизнес-логики
-    _, err = tx.ExecContext(ctx, `UPDATE balances SET amount = amount - $1 WHERE user_id = $2`, msg.Amount, msg.UserID)
+    // 3. Выполняем бизнес-логику строго внутри ТОЙ ЖЕ САМОЙ транзакции
+    _, err = tx.ExecContext(ctx, `
+        UPDATE balances 
+        SET amount = amount - $1 
+        WHERE user_id = $2
+    `, msg.Amount, msg.UserID)
     if err != nil {
-        return fmt.Errorf(&quot;update balance: %w&quot;, err)
+        return fmt.Errorf(&quot;deduct balance: %w&quot;, err)
     }
 
-    // 3. Коммит транзакции
-    return tx.Commit()
+    // 4. Фиксируем транзакцию: и факт списания, и факт обработки ключа
+    if err := tx.Commit(); err != nil {
+        return fmt.Errorf(&quot;commit payment: %w&quot;, err)
+    }
+
+    return nil
 }
 </code></pre>
 </div>
@@ -2312,21 +2362,36 @@ func ProcessPayment(ctx context.Context, db *sql.DB, msg Message) error {
     <span class="callout-title">Под капотом: Транзакции и блокировки</span>
   </div>
   <div class="callout-body">
-    <p>Когда два консьюмера одновременно пытаются сделать <code>INSERT ... ON CONFLICT</code>, база данных (PostgreSQL) захватывает блокировку (Row-level lock) на индекс. Один запрос проходит и записывает строку. Второй запрос блокируется на уровне ядра СУБД, ожидая завершения транзакции первого. Если первая транзакция успешна (Commit), второй запрос "просыпается", видит конфликт и возвращает 0 строк. Никакого состояния гонки на уровне приложения (Go) не возникает.</p>
+    <p>Что происходит внутри ядра PostgreSQL, когда два консьюмера одновременно пытаются сделать <code>INSERT ... ON CONFLICT</code>?<br />
+Первый запрос захватывает эксклюзивную блокировку на уникальную страницу индекса (B-Tree). Второй запрос блокируется на уровне ядра СУБД, ожидая завершения транзакции первого воркера.<br />
+- Если первая транзакция завершается успехом (<code>Commit</code>), второй запрос просыпается, видит запись, срабатывает <code>DO NOTHING</code>, и запрос возвращает 0 строк.<br />
+- Если первая транзакция аварийно откатилась (<code>Rollback</code>), второй запрос просыпается и беспрепятственно вставляет ключ, завершая бизнес-логику.</p>
+<p>Никакого состояния гонки на уровне прикладного Go-кода не возникает физически!</p>
   </div>
 </div>
 
+<hr />
 <h3 id="pattern-2-optimistichnye-blokirovki-optimistic-concurrency-control">Паттерн 2: Оптимистичные блокировки (Optimistic Concurrency Control)</h3>
 
-<p>Если вы используете Event Sourcing или обновляете сложный агрегат, вы можете опираться на версии записей.</p>
-<p>Вместо <code>Idempotency-Key</code> сообщение содержит <code>ExpectedVersion</code>.<br />
-Ваш SQL-запрос выглядит так:<br />
-<code>UPDATE orders SET status = 'shipped', version = 3 WHERE id = 123 AND version = 2</code></p>
-<p>Затем в Go вы проверяете количество затронутых строк (<code>RowsAffected</code>). Если оно равно 0, это значит, что либо заказа нет, либо его версия уже изменилась (дубликат уже обработан). Это сверхбыстрый метод, не требующий создания дополнительных таблиц для ключей идемпотентности.</p>
-<h3 id="pattern-3-kesh-redis-setnx">Паттерн 3: Кэш (Redis SETNX)</h3>
+<p>Если вы проектируете Event Sourcing или обновляете агрегаты со строгой историей изменений, вы можете опираться на монотонные версии сущностей.</p>
+<p>Вместо отдельной таблицы ключей сообщение содержит ожидаемую версию: <code>ExpectedVersion</code>.</p>
+<p>SQL-запрос выглядит следующим образом:</p>
 
-<p>Иногда бизнес-логика не требует транзакционной базы данных (например, отправка push-уведомлений). В таких случаях использовать PostgreSQL для дедупликации слишком "дорого" по ресурсам.</p>
-<p>Используется Redis и атомарная команда <code>SETNX</code> (Set if Not eXists).</p>
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">UPDATE orders 
+SET status = 'shipped', version = version + 1 
+WHERE id = 123 AND version = 2;
+</code></pre>
+</div>
+
+<p>В коде на Go вы проверяете количество обновленных строк через метод <code>result.RowsAffected()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2336,56 +2401,149 @@ func ProcessPayment(ctx context.Context, db *sql.DB, msg Message) error {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Псевдокод с использованием go-redis
-acquired, err := redisClient.SetNX(ctx, &quot;idemp_key:&quot;+msg.ID, &quot;processing&quot;, 24*time.Hour).Result()
+  <pre class="language-go"><code class="language-go">res, err := tx.ExecContext(ctx, query, orderID, expectedVersion)
 if err != nil {
-    return err // Сетевая ошибка Redis (Transient)
-}
-if !acquired {
-    return nil // Дубликат, уже обрабатывается или обработан. Делаем Ack.
+    return err
 }
 
-// Отправляем Push...
+affected, err := res.RowsAffected()
+if err != nil {
+    return err
+}
+
+if affected == 0 {
+    // Версия уже изменилась (дубликат уже был применен) либо сущность отсутствует.
+    // Завершаем обработку как успешную.
+    return nil
+}
+</code></pre>
+</div>
+
+<p>Это сверхбыстрый способ, не требующий создания вспомогательных таблиц и накладных расходов на хранение миллионов ключей.</p>
+<hr />
+<h3 id="pattern-3-deduplikatsiya-cherez-raspredelennyy-kesh-redis-setnx">Паттерн 3: Дедупликация через распределенный кэш (Redis SETNX)</h3>
+
+<p>Иногда бизнес-логика не работает с реляционной базой данных (например, отправка push-уведомлений, генерация превью видео или отправка вебхуков). В таких сценариях поднимать транзакцию в PostgreSQL для каждого события слишком накладно по IOPS.</p>
+<p>В качестве легковесного фильтра дубликатов используется Redis и атомарная команда <strong><code>SETNX</code> (Set if Not eXists)</strong>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package deduplicator
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;time&quot;
+
+    &quot;github.com/redis/go-redis/v9&quot;
+)
+
+type RedisDeduplicator struct {
+    client *redis.Client
+}
+
+func (d *RedisDeduplicator) TryAcquire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+    // SETNX возвращает true, если ключ был успешно установлен.
+    // Если ключ уже существовал, возвращается false.
+    acquired, err := d.client.SetNX(ctx, &quot;idemp:&quot;+key, &quot;processing&quot;, ttl).Result()
+    if err != nil {
+        return false, fmt.Errorf(&quot;redis setnx: %w&quot;, err)
+    }
+
+    return acquired, nil
+}
 </code></pre>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Иллюзия надежности дедупликации в Redis</span>
   </div>
   <div class="callout-body">
-    <p>Дедупликация через Redis не гарантирует строгую консистентность. <br />
-Что если консьюмер сделал <code>SETNX</code> в Redis, начал отправлять Push-уведомление через Firebase, и в этот момент его убил OOM Killer? <br />
-Брокер вернет сообщение в очередь (так как не было <code>Ack</code>). Другой консьюмер прочитает его, пойдет в Redis, увидит, что ключ занят, и отбросит сообщение как дубликат! Бизнес-логика так и не выполнится. <br />
-Поэтому для критичных данных (финансы, заказы) Idempotency Key <strong>обязан</strong> лежать в той же транзакционной базе данных, что и обновляемые бизнес-сущности.</p>
+    <p>Дедупликация через Redis <strong>не гарантирует строгой консистентности</strong>!</p>
+<p>Представьте сценарий:<br />
+1. Воркер успешно выполнил <code>SETNX</code> в Redis с TTL 24 часа.<br />
+2. Воркер начал отправку Push-уведомления через внешний шлюз Firebase (FCM).<br />
+3. В этот момент процесс падает из-за <code>OOM Killer</code> ядра Linux.<br />
+4. Брокер не получил <code>Ack</code> и пересылает сообщение другому воркеру.<br />
+5. Второй воркер делает <code>SETNX</code> в Redis, видит, что ключ уже занят, и... <strong>отбрасывает сообщение как дубликат!</strong></p>
+<p>В итоге push-уведомление не ушло, а система считает его отправленным.</p>
+<p><strong>Фундаментальное правило:</strong> Дедупликация через Redis допустима только для некритичных операций (уведомления, аналитика). Для финансовых транзакций и критических данных ключ идемпотентности <strong>обязан сохраняться в ту же транзакционную базу данных в рамках единого ACID-коммита</strong>, что и обновляемые бизнес-сущности!</p>
   </div>
 </div>
 
-<h2 id="idempotentnost-i-vneshnie-api">Идемпотентность и внешние API</h2>
+<hr />
+<h2 id="4-idempotentnost-i-vneshnie-api-pass-through-idempotency">4. Идемпотентность и внешние API (Pass-Through Idempotency)</h2>
 
-<p>Самый сложный сценарий на собеседованиях уровня Senior: ваш Go-сервис читает из RabbitMQ и должен сделать вызов к внешнему платежному шлюзу (например, Stripe) по HTTP. Вы не можете открыть транзакцию в Stripe и откатить её!</p>
-<p><strong>Решение:</strong> Вы обязаны пробрасывать (pass-through) ваш <code>Idempotency-Key</code> во внешнюю систему. <br />
-Все современные платежные системы поддерживают HTTP-заголовок <code>Idempotency-Key</code>. Если вы вызовете API Stripe дважды с одним ключом, Stripe сам дедуплицирует запрос на своей стороне и вернет вам закэшированный успешный ответ от первой попытки.</p>
+<p>Самый популярный архитектурный вопрос на системных интервью: <em>«Наш Go-консьюмер читает событие из очереди и обязан списать деньги через внешний HTTP API платежного шлюза (Stripe, Adyen, CloudPayments). Мы не можем открыть распределенную транзакцию с чужим сервером в интернете! Как обеспечить идемпотентность?»</em></p>
+<p><strong>Решение: Сквозной ключ идемпотентности (Pass-Through Idempotency Key).</strong></p>
+<p>Все современные финансовые API поддерживают стандартизированный HTTP-заголовок: <code>Idempotency-Key</code>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Q as Очередь (Kafka / RabbitMQ)
+participant C as Go Консьюмер
+participant Ext as Платежный шлюз (Stripe)
+
+Q-&gt;&gt;C: Сообщение: Charge #42 (IdempotencyKey: &quot;uuid-abc&quot;)
+C-&gt;&gt;Ext: POST /v1/charges (Header: Idempotency-Key: &quot;uuid-abc&quot;)
+Note over Ext: Списание $50, кэширование ответа
+Note over C: Сбой сети! Таймаут чтения сокета
+Note over Q: Redelivery сообщения воркеру
+Q-&gt;&gt;C: Сообщение: Charge #42 (IdempotencyKey: &quot;uuid-abc&quot;)
+C-&gt;&gt;Ext: POST /v1/charges (Header: Idempotency-Key: &quot;uuid-abc&quot;)
+Note over Ext: Ключ найден в кэше! Списание НЕ повторяется
+Ext--&gt;&gt;C: 200 OK (Возврат закэшированного ответа)
+C-&gt;&gt;Q: Ack
+  </pre>
+</div>
+
+
+<p>Если по вине сетевого таймаута консьюмер повторит HTTP-запрос с тем же самым <code>Idempotency-Key</code>, шлюз Stripe не станет списывать деньги во второй раз: он достанет из своего распределенного хранилища закэшированный результат первой успешной операции и вернет его консьюмеру.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Зачем таблица ключей в БД, если есть брокер?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Если мы используем <code>Idempotency-Key</code> при каждом вызове Консьюмера, зачем нам вообще таблица для ключей в нашей БД? Почему нельзя просто надеяться на базу брокера или внешний API?<br />
-<strong>Ответ:</strong> Брокер (как RabbitMQ) удаляет сообщение после <code>Ack</code>, он не хранит историю. Если из-за сбоя внешней системы (двойная публикация) Продюсер отправит два одинаковых сообщения с одним ключом идемпотентности (с интервалом в час), они оба придут к нам как новые. Только наша БД с <code>UNIQUE</code> индексом по ключу идемпотентности способна защитить систему от двойной обработки на длинной дистанции.</p>
+    <p><strong>Вопрос:</strong> Если мы передаем <code>Idempotency-Key</code> при каждом сообщении, зачем нам вообще заводить таблицу для ключей в нашей реляционной базе данных? Разве брокер не может сам фильтровать дубликаты?</p>
+<p><strong>Ответ:</strong> <br />
+Брокеры сообщений (как RabbitMQ) удаляют подтвержденные сообщения из памяти сразу после получения <code>Ack</code> — они не хранят бесконечную историю всех событий за прошлый год. </p>
+<p>Если из-за сбоя в стороннем сервисе произойдет двойная публикация одного и того же заказа с интервалом в 2 часа, брокер воспримет второе сообщение как абсолютно новое! И только наша база данных с постоянным <code>UNIQUE</code> ограничением по <code>idempotency_key</code> способна защитить бизнес от повторного списания средств на длинной дистанции.</p>
   </div>
 </div>
 
-<h2 id="itog-razdela">Итог раздела</h2>
+<hr />
+<h2 id="5-itog-razdela-fundament-asinkhronnosti">5. Итог раздела «Фундамент асинхронности»</h2>
 
-<p>Этой статьей мы закрываем фундаментальный блок по архитектуре асинхронных систем. Мы поняли, что распределенные системы полны компромиссов:<br />
-1. За масштабируемость мы платим отказом от строгих транзакций.<br />
-2. За гарантированную доставку (At-least-once) мы платим необходимостью обрабатывать дубликаты.<br />
-3. За скорость обработки (Parallelism) мы платим отказом от строгого порядка (Partial Ordering).<br />
-4. За защиту от перегрузки мы платим настройкой Backpressure и DLQ.</p>
-<p>Теперь, когда у нас есть прочная теоретическая база и понимание паттернов, мы готовы спуститься на уровень конкретных инструментов. В следующей статье мы начнем глубокое погружение в первый из них, разобрав его внутреннее устройство, обменники (Exchanges) и маршрутизацию: <a href="../02-rabbitmq/1-rabbitmq-arkhitektura-i-kontseptsii.html" class="wikilink">1. RabbitMQ. Архитектура и концепции</a>.</p>
+<p>Этой статьей мы завершаем первый, фундаментальный модуль нашего раздела. Мы исследовали архитектуру распределенного взаимодействия и осознали четыре главных компромисса:</p>
+<ol>
+<li><strong>Масштабируемость:</strong> За высокую производительность и разрыв временной связности мы платим отказом от привычных локальных транзакций в пользу Eventual Consistency.</li>
+<li><strong>Надежность доставки:</strong> Выбирая модель <strong>At-least-once</strong>, мы гарантируем сохранность данных, но берем на себя обязанность делать каждый обработчик строго <strong>идемпотентным</strong>.</li>
+<li><strong>Параллелизм:</strong> За отказ от Head-of-Line Blocking и использование всех ядер процессора мы платим переходом от глобального порядка к <strong>частичному порядку по ключу (Partial Ordering)</strong>.</li>
+<li><strong>Устойчивость к катастрофам:</strong> Защита от перегрузок требует согласованной работы механизмов <strong>Backpressure</strong>, очередей <strong>DLQ</strong> и экспоненциальных ретраев с <strong>Jitter</strong>.</li>
+</ol>
+<p>Фундаментальные концепции заложены. Теперь мы вооружены математическим аппаратом и готовы спуститься в машинное отделение конкретных лидеров индустрии. </p>
+<p>В следующей лекции мы начинаем детальный разбор внутреннего устройства легендарного AMQP-брокера: <strong><a href="../02-rabbitmq/1-rabbitmq-arkhitektura-i-kontseptsii.html" class="wikilink">1. RabbitMQ. Архитектура и концепции</a></strong>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2413,7 +2571,7 @@ if !acquired {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#neizbezhnost-dvoynika">Неизбежность двойника</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-idempotentnost">Что такое Идемпотентность?</a></li><li class="toc-item toc-h3"><a href="#1-estestvennaya-idempotentnost-natural-idempotency">1. Естественная идемпотентность (Natural Idempotency)</a></li><li class="toc-item toc-h2"><a href="#mekhanika-dublikatov-sostoyanie-gonki-race-condition">Механика дубликатов: Состояние гонки (Race Condition)</a></li><li class="toc-item toc-h2"><a href="#patterny-realizatsii-idempotentnosti">Паттерны реализации Идемпотентности</a></li><li class="toc-item toc-h3"><a href="#pattern-1-idempotency-key-i-unikalnye-indeksy-bd">Паттерн 1: Idempotency Key и Уникальные Индексы (БД)</a></li><li class="toc-item toc-h3"><a href="#pattern-2-optimistichnye-blokirovki-optimistic-concurrency-control">Паттерн 2: Оптимистичные блокировки (Optimistic Concurrency Control)</a></li><li class="toc-item toc-h3"><a href="#pattern-3-kesh-redis-setnx">Паттерн 3: Кэш (Redis SETNX)</a></li><li class="toc-item toc-h2"><a href="#idempotentnost-i-vneshnie-api">Идемпотентность и внешние API</a></li><li class="toc-item toc-h2"><a href="#itog-razdela">Итог раздела</a></li>
+    <li class="toc-item toc-h2"><a href="#neizbezhnost-dvoynika">Неизбежность двойника</a></li><li class="toc-item toc-h2"><a href="#1-chto-takoe-idempotentnost">1. Что такое Идемпотентность?</a></li><li class="toc-item toc-h3"><a href="#estestvennaya-idempotentnost-natural-idempotency">Естественная идемпотентность (Natural Idempotency)</a></li><li class="toc-item toc-h2"><a href="#2-mekhanika-dublikatov-sostoyanie-gonki-race-condition">2. Механика дубликатов: Состояние гонки (Race Condition)</a></li><li class="toc-item toc-h2"><a href="#3-patterny-realizatsii-idempotentnosti">3. Паттерны реализации Идемпотентности</a></li><li class="toc-item toc-h3"><a href="#pattern-1-idempotency-key-i-unikalnye-indeksy-bd">Паттерн 1: Idempotency Key и Уникальные Индексы (БД)</a></li><li class="toc-item toc-h4"><a href="#idiomatichnyy-go-i-postgresql-on-conflict">Идиоматичный Go и PostgreSQL (ON CONFLICT):</a></li><li class="toc-item toc-h3"><a href="#pattern-2-optimistichnye-blokirovki-optimistic-concurrency-control">Паттерн 2: Оптимистичные блокировки (Optimistic Concurrency Control)</a></li><li class="toc-item toc-h3"><a href="#pattern-3-deduplikatsiya-cherez-raspredelennyy-kesh-redis-setnx">Паттерн 3: Дедупликация через распределенный кэш (Redis SETNX)</a></li><li class="toc-item toc-h2"><a href="#4-idempotentnost-i-vneshnie-api-pass-through-idempotency">4. Идемпотентность и внешние API (Pass-Through Idempotency)</a></li><li class="toc-item toc-h2"><a href="#5-itog-razdela-fundament-asinkhronnosti">5. Итог раздела «Фундамент асинхронности»</a></li>
   </ul>
 </aside>
 
