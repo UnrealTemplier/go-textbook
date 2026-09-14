@@ -60,6 +60,44 @@ def extract_headings(content: str) -> List[Tuple[int, str, str]]:
             headings.append((level, raw_title, anchor))
     return headings
 
+def canonicalize_title(title: str) -> str:
+    """Преобразует устаревшие суррогаты имен файлов (из Obsidian/файловой системы) в каноническую типографику."""
+    # CI/CD
+    title = re.sub(r'\bCI_CD\b', 'CI/CD', title)
+    # TCP/IP
+    title = re.sub(r'\bTCP_IP\b', 'TCP/IP', title)
+    # I/O
+    title = re.sub(r'\bI_O\b', 'I/O', title)
+    # Go стандартная библиотека и пакеты
+    title = re.sub(r'\bnet_http_httptest\b', 'net/http/httptest', title)
+    title = re.sub(r'\bnet_http_pprof\b', 'net/http/pprof', title)
+    title = re.sub(r'\bnet_http\b', 'net/http', title)
+    title = re.sub(r'\bio_ioutil\b', 'io/ioutil', title)
+    title = re.sub(r'\bunicode_utf8\b', 'unicode/utf8', title)
+    title = re.sub(r'\bpath_filepath\b', 'path/filepath', title)
+    title = re.sub(r'\bio_fs\b', 'io/fs', title)
+    title = re.sub(r'\blog_slog\b', 'log/slog', title)
+    title = re.sub(r'\bsync_atomic\b', 'sync/atomic', title)
+    title = re.sub(r'\bsync_pool\b', 'sync.Pool', title)
+    title = re.sub(r'\bsync_map\b', 'sync.Map', title)
+    title = re.sub(r'\bcontainer_list\b', 'container/list', title)
+    title = re.sub(r'\bcontainer_heap\b', 'container/heap', title)
+    title = re.sub(r'\bcontainer_ring\b', 'container/ring', title)
+    title = re.sub(r'\bencoding_json\b', 'encoding/json', title)
+    title = re.sub(r'\bencoding_xml\b', 'encoding/xml', title)
+    title = re.sub(r'\bencoding_csv\b', 'encoding/csv', title)
+    title = re.sub(r'\bencoding_gob\b', 'encoding/gob', title)
+    title = re.sub(r'\bnet_url\b', 'net/url', title)
+    title = re.sub(r'\bcrypto_rand\b', 'crypto/rand', title)
+    title = re.sub(r'\bmath_rand\b', 'math/rand', title)
+    title = re.sub(r'\bdatabase_sql\b', 'database/sql', title)
+    title = re.sub(r'\barchive_zip\b', 'archive/zip', title)
+    title = re.sub(r'\bcompress_gzip\b', 'compress/gzip', title)
+    title = re.sub(r'\bos_exec\b', 'os/exec', title)
+    title = re.sub(r'\bgolang_org_x_sys\b', 'golang.org/x/sys', title)
+    title = re.sub(r'\btesting_quick\b', 'testing/quick', title)
+    return title
+
 class Article:
     def __init__(
         self,
@@ -68,10 +106,12 @@ class Article:
         rel_output_path: str,
         module_num: int,
         module_name: str,
+        raw_filename: str = "",
         subsection_name: str = "",
         global_order: int = 0
     ):
         self.title = title
+        self.raw_filename = raw_filename or title
         self.source_path = source_path
         self.rel_output_path = rel_output_path
         self.module_num = module_num
@@ -126,12 +166,13 @@ class KnowledgeBaseScanner:
                 module_clean_title = top_dir
 
             mod_slug = f"{module_num:02d}-{slugify(module_clean_title, 35)}"
+            module_canonical_title = canonicalize_title(module_clean_title)
             full_mod_path = os.path.join(self.sources_dir, top_dir)
             
             module_node = {
                 "num": module_num,
                 "raw_name": top_dir,
-                "title": module_clean_title,
+                "title": module_canonical_title,
                 "slug": mod_slug,
                 "subsections": [],
                 "articles": []
@@ -147,15 +188,17 @@ class KnowledgeBaseScanner:
                     global_order += 1
                     file_src = os.path.join(full_mod_path, rf)
                     raw_title = rf[:-3] if rf.endswith(".md") else rf
+                    canonical_title = canonicalize_title(raw_title)
                     file_slug = slugify(raw_title, 55)
                     rel_out = f"docs/{mod_slug}/{file_slug}.html"
 
                     art = Article(
-                        title=raw_title,
+                        title=canonical_title,
                         source_path=file_src,
                         rel_output_path=rel_out,
                         module_num=module_num,
-                        module_name=top_dir,
+                        module_name=module_canonical_title,
+                        raw_filename=raw_title,
                         subsection_name="",
                         global_order=global_order
                     )
@@ -188,15 +231,17 @@ class KnowledgeBaseScanner:
                             global_order += 1
                             file_src = os.path.join(ssd_path, sf)
                             raw_title = sf[:-3] if sf.endswith(".md") else sf
+                            canonical_title = canonicalize_title(raw_title)
                             file_slug = slugify(raw_title, 55)
                             rel_out = f"docs/{mod_slug}/{sub_slug}/{file_slug}.html"
 
                             art = Article(
-                                title=raw_title,
+                                title=canonical_title,
                                 source_path=file_src,
                                 rel_output_path=rel_out,
                                 module_num=module_num,
-                                module_name=top_dir,
+                                module_name=module_canonical_title,
+                                raw_filename=raw_title,
                                 subsection_name=sub_sec_name,
                                 global_order=global_order
                             )
@@ -217,15 +262,17 @@ class KnowledgeBaseScanner:
                         global_order += 1
                         file_src = os.path.join(sd_path, sf)
                         raw_title = sf[:-3] if sf.endswith(".md") else sf
+                        canonical_title = canonicalize_title(raw_title)
                         file_slug = slugify(raw_title, 55)
                         rel_out = f"docs/{mod_slug}/{sub_slug}/{file_slug}.html"
 
                         art = Article(
-                            title=raw_title,
+                            title=canonical_title,
                             source_path=file_src,
                             rel_output_path=rel_out,
                             module_num=module_num,
-                            module_name=top_dir,
+                            module_name=module_canonical_title,
+                            raw_filename=raw_title,
                             subsection_name=sd,
                             global_order=global_order
                         )
@@ -260,6 +307,7 @@ class KnowledgeBaseScanner:
 
     def _build_wikilink_index(self) -> None:
         for art in self.articles:
+            # 1. По каноническому заголовку
             self.wikilink_index[art.title] = art
             self.wikilink_index[art.title + ".md"] = art
 
@@ -271,6 +319,18 @@ class KnowledgeBaseScanner:
                 clean = m.group(1).strip()
                 self.wikilink_index[clean] = art
                 self.wikilink_index[normalize_key(clean)] = art
+
+            # 2. По физическому имени файла на диске (если отличается)
+            if art.raw_filename and art.raw_filename != art.title:
+                self.wikilink_index[art.raw_filename] = art
+                self.wikilink_index[art.raw_filename + ".md"] = art
+                norm_raw = normalize_key(art.raw_filename)
+                self.wikilink_index[norm_raw] = art
+                m_raw = re.match(r"^\d+\.\s*(.+)$", art.raw_filename)
+                if m_raw:
+                    clean_raw = m_raw.group(1).strip()
+                    self.wikilink_index[clean_raw] = art
+                    self.wikilink_index[normalize_key(clean_raw)] = art
 
     def resolve_wikilink(self, link_raw: str, current_output_rel: str) -> Tuple[Optional[str], str]:
         if "|" in link_raw:
