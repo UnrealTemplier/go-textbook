@@ -38,9 +38,52 @@
   }
 
   // -------------------------------------------------------------------------
-  // Вспомогательные функции центрирования сайдбара
+  // Вспомогательные функции центрирования и плавной прокрутки сайдбара
   // -------------------------------------------------------------------------
-  function centerElementInContainer(container, element, smooth) {
+  function smoothScroll(container, targetScrollTop, duration = 480) {
+    if (!container) return;
+
+    const startScrollTop = container.scrollTop;
+    const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+    const clampedTarget = Math.max(0, Math.min(maxScroll, Math.round(targetScrollTop)));
+    const distance = clampedTarget - startScrollTop;
+
+    if (Math.abs(distance) < 2 || duration <= 0) {
+      container.scrollTop = clampedTarget;
+      return;
+    }
+
+    if (container._scrollAnimId) {
+      cancelAnimationFrame(container._scrollAnimId);
+      container._scrollAnimId = null;
+    }
+
+    const startTime = performance.now();
+
+    // easeOutQuart: мягкое, размеренное и плавное замедление
+    function easeOutQuart(t) {
+      return 1 - Math.pow(1 - t, 4);
+    }
+
+    function step(currentTime) {
+      const elapsed = currentTime - startTime;
+      const progress = Math.min(1, elapsed / duration);
+      const ease = easeOutQuart(progress);
+
+      container.scrollTop = Math.round(startScrollTop + distance * ease);
+
+      if (progress < 1) {
+        container._scrollAnimId = requestAnimationFrame(step);
+      } else {
+        container.scrollTop = clampedTarget;
+        container._scrollAnimId = null;
+      }
+    }
+
+    container._scrollAnimId = requestAnimationFrame(step);
+  }
+
+  function centerElementInContainer(container, element, smooth = false) {
     if (!container || !element) return;
 
     const containerRect = container.getBoundingClientRect();
@@ -52,10 +95,12 @@
     const elementTopInContent = (elementRect.top - containerRect.top) + currentScrollTop;
     const targetScrollTop = elementTopInContent + (elementRect.height / 2) - (container.clientHeight / 2);
 
-    container.scrollTo({
-      top: Math.max(0, Math.round(targetScrollTop)),
-      behavior: smooth ? 'smooth' : 'auto'
-    });
+    if (smooth) {
+      smoothScroll(container, targetScrollTop, 480);
+    } else {
+      const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+      container.scrollTop = Math.max(0, Math.min(maxScroll, Math.round(targetScrollTop)));
+    }
   }
 
   function centerActiveLecture(smooth = false) {
@@ -452,19 +497,33 @@
   }
 
   // -------------------------------------------------------------------------
-  // 9. Автоцентрирование сайдбара (активная лекция и заголовок модуля)
+  // 9. Автоцентрирование сайдбара и плавная размеренная анимация аккордеона
   // -------------------------------------------------------------------------
   function initSidebarCentering() {
     const container = document.getElementById('sidebar-content');
     if (!container) return;
 
+    // Отмена анимации программного скролла при ручной прокрутке колесиком или тачем
+    container.addEventListener('wheel', function () {
+      if (container._scrollAnimId) {
+        cancelAnimationFrame(container._scrollAnimId);
+        container._scrollAnimId = null;
+      }
+    }, { passive: true });
+    container.addEventListener('touchmove', function () {
+      if (container._scrollAnimId) {
+        cancelAnimationFrame(container._scrollAnimId);
+        container._scrollAnimId = null;
+      }
+    }, { passive: true });
+
     let userHasScrolled = false;
     container.addEventListener('wheel', function () {
       userHasScrolled = true;
-    }, { passive: true });
+    }, { passive: true, once: true });
     container.addEventListener('touchmove', function () {
       userHasScrolled = true;
-    }, { passive: true });
+    }, { passive: true, once: true });
 
     // 1. Всегда центрируем сайдбар на текущей выбранной лекции при открытии страницы
     centerActiveLecture(false);
@@ -485,7 +544,10 @@
       centerActiveLecture(false);
     });
 
-    // 2. Если модуль свёрнут кликом по заголовку — центрируем сайдбар на заголовке модуля
+    // 2. Плавная и более медленная анимация аккордеона (сворачивание/разворачивание)
+    const ANIMATION_DURATION = 480; // комфортная, плавная длительность (0.48с)
+    const EASING = 'cubic-bezier(0.22, 1, 0.36, 1)';
+
     container.addEventListener('click', function (e) {
       const summary = e.target.closest('.nav-module-title, .nav-submodule-title');
       if (!summary) return;
@@ -493,23 +555,129 @@
       const details = summary.closest('details');
       if (!details) return;
 
-      const wasOpen = details.hasAttribute('open');
+      const content = details.querySelector('.nav-module-content') || details.querySelector('.sub-list') || details.children[1];
+      if (!content) return;
 
-      requestAnimationFrame(function () {
-        setTimeout(function () {
-          const isNowOpen = details.hasAttribute('open');
-          if (wasOpen && !isNowOpen) {
-            // Модуль свёрнут кликом по заголовку — центрируем сайдбар на заголовке модуля
-            centerElementInContainer(container, summary, true);
-          } else if (!wasOpen && isNowOpen) {
-            // Если модуль был развернут и в нем находится активная лекция — центрируем на ней
-            const activeItem = details.querySelector('.nav-item.active');
-            if (activeItem) {
-              centerElementInContainer(container, activeItem, true);
-            }
-          }
-        }, 15);
-      });
+      e.preventDefault();
+      e.stopPropagation();
+
+      const isOpen = details.hasAttribute('open');
+
+      // Прерываем предыдущую анимацию этого блока, если пользователь кликает повторно
+      if (content._anim) {
+        content._anim.cancel();
+        content._anim = null;
+      }
+
+      if (isOpen) {
+        // --- СВОРАЧИВАНИЕ МОДУЛЯ ---
+        const startHeight = content.offsetHeight;
+        if (startHeight <= 0) {
+          details.removeAttribute('open');
+          return;
+        }
+
+        // Вычисляем целевой скролл для центрирования заголовка модуля
+        const containerRect = container.getBoundingClientRect();
+        const summaryRect = summary.getBoundingClientRect();
+        const summaryTopInContent = (summaryRect.top - containerRect.top) + container.scrollTop;
+
+        // В свёрнутом состоянии максимальный скролл уменьшится на startHeight
+        const finalMaxScroll = Math.max(0, (container.scrollHeight - startHeight) - container.clientHeight);
+        const desiredScrollTop = summaryTopInContent + (summaryRect.height / 2) - (container.clientHeight / 2);
+        const targetScrollTop = Math.max(0, Math.min(finalMaxScroll, Math.round(desiredScrollTop)));
+
+        // Плавно и медленно скроллим сайдбар к центру заголовка
+        smoothScroll(container, targetScrollTop, ANIMATION_DURATION);
+
+        // Плавно анимируем схлопывание высоты и прозрачности контента
+        content.style.overflow = 'hidden';
+        const anim = content.animate([
+          { height: startHeight + 'px', opacity: 1 },
+          { height: '0px', opacity: 0 }
+        ], {
+          duration: ANIMATION_DURATION,
+          easing: EASING
+        });
+
+        content._anim = anim;
+
+        anim.onfinish = function () {
+          content._anim = null;
+          details.removeAttribute('open');
+          content.style.overflow = '';
+          content.style.height = '';
+          content.style.opacity = '';
+        };
+
+        anim.oncancel = function () {
+          content._anim = null;
+          content.style.overflow = '';
+          content.style.height = '';
+          content.style.opacity = '';
+        };
+
+      } else {
+        // --- РАЗВОРАЧИВАНИЕ МОДУЛЯ ---
+        details.setAttribute('open', '');
+        content.style.height = 'auto';
+        content.style.overflow = 'hidden';
+        const fullHeight = content.offsetHeight;
+
+        if (fullHeight <= 0) {
+          content.style.overflow = '';
+          return;
+        }
+
+        // Вычисляем целевой скролл
+        const activeItem = details.querySelector('.nav-item.active');
+        const containerRect = container.getBoundingClientRect();
+
+        let targetScrollTop;
+        if (activeItem) {
+          // Если внутри находится активная лекция — центрируемся на ней
+          const itemRect = activeItem.getBoundingClientRect();
+          const itemTopInContent = (itemRect.top - containerRect.top) + container.scrollTop;
+          const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+          const desired = itemTopInContent + (itemRect.height / 2) - (container.clientHeight / 2);
+          targetScrollTop = Math.max(0, Math.min(maxScroll, Math.round(desired)));
+        } else {
+          // Иначе центрируемся на заголовке развернутого модуля
+          const summaryRect = summary.getBoundingClientRect();
+          const summaryTopInContent = (summaryRect.top - containerRect.top) + container.scrollTop;
+          const desired = summaryTopInContent + (summaryRect.height / 2) - (container.clientHeight / 2);
+          const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+          targetScrollTop = Math.max(0, Math.min(maxScroll, Math.round(desired)));
+        }
+
+        // Плавно скроллим контейнер синхронно с разворачиванием
+        smoothScroll(container, targetScrollTop, ANIMATION_DURATION);
+
+        // Плавно анимируем раскрытие высоты и появление контента
+        const anim = content.animate([
+          { height: '0px', opacity: 0 },
+          { height: fullHeight + 'px', opacity: 1 }
+        ], {
+          duration: ANIMATION_DURATION,
+          easing: EASING
+        });
+
+        content._anim = anim;
+
+        anim.onfinish = function () {
+          content._anim = null;
+          content.style.overflow = '';
+          content.style.height = '';
+          content.style.opacity = '';
+        };
+
+        anim.oncancel = function () {
+          content._anim = null;
+          content.style.overflow = '';
+          content.style.height = '';
+          content.style.opacity = '';
+        };
+      }
     });
   }
 
