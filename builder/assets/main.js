@@ -565,7 +565,7 @@
       e.preventDefault();
       e.stopPropagation();
 
-      const isOpen = details.hasAttribute('open');
+      const isOpen = details.hasAttribute('open') && !details.classList.contains('closing');
 
       // Прерываем предыдущую анимацию этого блока, если пользователь кликает повторно
       if (content._anim) {
@@ -578,8 +578,12 @@
         const startHeight = content.offsetHeight;
         if (startHeight <= 0) {
           details.removeAttribute('open');
+          details.classList.remove('closing');
           return;
         }
+
+        // Помечаем блок как закрывающийся, чтобы шеврон и стили сразу начали синхронную анимацию закрытия
+        details.classList.add('closing');
 
         // Вычисляем целевой скролл для центрирования заголовка модуля
         const containerRect = container.getBoundingClientRect();
@@ -609,6 +613,7 @@
         anim.onfinish = function () {
           content._anim = null;
           details.removeAttribute('open');
+          details.classList.remove('closing');
           content.style.overflow = '';
           content.style.height = '';
           content.style.opacity = '';
@@ -616,6 +621,7 @@
 
         anim.oncancel = function () {
           content._anim = null;
+          details.classList.remove('closing');
           content.style.overflow = '';
           content.style.height = '';
           content.style.opacity = '';
@@ -623,6 +629,7 @@
 
       } else {
         // --- РАЗВОРАЧИВАНИЕ МОДУЛЯ ---
+        details.classList.remove('closing');
         details.setAttribute('open', '');
         content.style.height = 'auto';
         content.style.overflow = 'hidden';
