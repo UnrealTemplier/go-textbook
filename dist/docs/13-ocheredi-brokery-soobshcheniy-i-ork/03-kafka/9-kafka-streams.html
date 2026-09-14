@@ -2168,14 +2168,19 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~35 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">9. Kafka Streams</h1>
           </header>
 
           <div class="article-markdown">
-            <div class="callout callout-note">
+            <h1>9. Kafka Streams: потоковая топология, дуализм потоков и таблиц и локальное состояние</h1>
+<blockquote>
+<p><em>"Programs that transform a stream of inputs into a stream of outputs are the cleanest, most composable abstractions in computing."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
   <div class="callout-header">
     <span class="callout-icon">📝</span>
     <span class="callout-title">Заметка</span>
@@ -2185,14 +2190,23 @@
   </div>
 </div>
 
+<hr />
 <h2 id="chto-takoe-kafka-streams">Что такое Kafka Streams</h2>
 
-<p><strong>Kafka Streams</strong> — это клиентская библиотека для построения потоковых приложений и микросервисов, работающих непосредственно с данными в Apache Kafka. В отличие от тяжёлых распределённых движков (Apache Flink, Spark Streaming), Kafka Streams не требует отдельного кластера: это обычное Java-приложение, которое масштабируется так же, как обычные консьюмеры — добавлением экземпляров в Consumer Group.</p>
-<p>Ключевая философия: <strong>потоковая обработка как распределённое приложение, а не как джоб в кластере</strong>. Приложение на Kafka Streams само управляет своим жизненным циклом, состоянием, восстановлением после сбоев и перебалансировкой, используя саму же Kafka как инфраструктуру для координации и хранения.</p>
-<p>С точки зрения Go-разработчика, понимание Kafka Streams необходимо не столько для написания кода на Java, сколько для усвоения паттернов потоковой обработки, которые затем можно воспроизвести на родном языке с помощью нативных клиентов и state store.</p>
+<p>Исторически потоковая обработка больших данных (Stream Processing) ассоциировалась с громоздкими распределенными кластерами: Apache Storm, Apache Spark Streaming, Apache Flink. Развертывание таких систем требовало выделенного кластера, отдельных узлов-мастеров (Master/JobManager), пулов воркеров (TaskManagers), интеграции с YARN или Kubernetes, а также отдельной команды инженеров по эксплуатации.</p>
+<p><strong>Kafka Streams</strong> предложила радикально иную, прорывную парадигму: <strong>потоковая обработка как обычный микросервис, а не тяжеловесный джоб в кластере</strong>.</p>
+<p>Kafka Streams — это клиентская библиотека (первоначально реализованная для Java, но породившая аналоги во всех языках, включая Go), которая превращает ваше стандартное приложение в масштабируемый, отказоустойчивый потоковый процессор. </p>
+<p>Ключевые свойства архитектуры:<br />
+- <strong>Никаких дополнительных кластеров:</strong> Приложение запускается как обычный контейнер в Kubernetes или процесс на виртуальной машине.<br />
+- <strong>Инфраструктура Kafka как координатор:</strong> Масштабирование, обнаружение сбоев, шардирование задач и эластичность строятся на базе стандартного протокола <strong>Consumer Group</strong> (<a href="4-consumer-groups.html" class="wikilink">4. Consumer groups</a>).<br />
+- <strong>Встроенное шардированное состояние (Embedded State Store):</strong> Приложение хранит промежуточные агрегаты не во внешней базе данных, а локально на NVMe-диске (по умолчанию в embedded движке RocksDB), реплицируя изменения в компактные changelog-топики Kafka.</p>
+<p>С точки зрения Go-разработчика, понимание Kafka Streams необходимо не столько для написания кода на Java, сколько для усвоения фундаментальных паттернов потоковой обработки (Stream-Table Duality, Windowing, Local State Stores, Interactive Queries), которые ежедневно применяются при проектировании распределенных систем на Go.</p>
+<hr />
 <h2 id="osnovnye-abstraktsii-graf-protsessorov">Основные абстракции: граф процессоров</h2>
 
-<p>Kafka Streams моделирует обработку как <strong>топологию (topology)</strong> — направленный ациклический граф, в котором узлы являются процессорами, а рёбра — потоками данных. Топология описывает, как сообщения из одного или нескольких входных топиков проходят через цепочку операций и попадают в выходные топики.</p>
+<p>Kafka Streams моделирует вычисления в виде <strong>топологии процессоров (Processor Topology)</strong> — направленного ациклического графа (DAG), где:<br />
+- <strong>Узлы (Nodes):</strong> Процессоры потока (Stream Processors) — чистые функции трансформации, фильтрации или агрегации.<br />
+- <strong>Рёбра (Edges):</strong> Непрерывные потоки событий (Streams), связывающие процессоры между собой.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2207,67 +2221,166 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-IT[&quot;Входной топик&lt;br&gt;user-events&quot;] --&gt; Source[&quot;Source Processor&quot;]
-Source --&gt; Filter[&quot;Filter&lt;br&gt;только активные&quot;]
-Filter --&gt; Map[&quot;Map&lt;br&gt;обогащение гео-данными&quot;]
-Map --&gt; Agg[&quot;Aggregate&lt;br&gt;счётчики по регионам&quot;]
-Agg --&gt; Sink[&quot;Sink Processor&quot;]
+IT[&quot;Входной топик&lt;br&gt;user-events&quot;] --&gt; Source[&quot;Source Processor&lt;br&gt;(Чтение из Kafka)&quot;]
+Source --&gt; Filter[&quot;Filter&lt;br&gt;(только активные сессии)&quot;]
+Filter --&gt; Map[&quot;Map / Enrich&lt;br&gt;(добавление гео-данных)&quot;]
+Map --&gt; Agg[&quot;Aggregate / Window&lt;br&gt;(подсчет кликов за 5 минут)&quot;]
+Agg --&gt; Sink[&quot;Sink Processor&lt;br&gt;(Запись в топик)&quot;]
 Sink --&gt; OT[&quot;Выходной топик&lt;br&gt;regional-stats&quot;]
   </pre>
 </div>
 
 
-<p>Основные типы потоков:</p>
-<ul>
-<li><strong>KStream</strong> — непрерывный поток записей, каждая запись независима. Аналогичен таблице без первичного ключа: могут быть дубликаты, все записи просто следуют одна за другой.</li>
-<li><strong>KTable</strong> — поток изменений, где каждая запись означает обновление или удаление значения по ключу. Эквивалентно компактифицированному топику (<a href="8-retention-i-compaction.html" class="wikilink">8. Retention и compaction</a>): новое значение по ключу заменяет старое. При агрегации KStream порождает KTable.</li>
-<li><strong>GlobalKTable</strong> — полная реплика компактифицированного топика на все экземпляры приложения. Используется для обогащения потока данными справочников (например, справочник стран), к которым нужен доступ из любого экземпляра без перераспределения по ключу.</li>
-</ul>
+<h3 id="dualizm-potokov-i-tablits-stream-table-duality">Дуализм потоков и таблиц (Stream-Table Duality)</h3>
+
+<p>Краеугольный камень потоковой обработки — это математический дуализм между потоком изменений и таблицей состояний.</p>
+<blockquote>
+<p><strong>Поток (Stream) — это история изменений. Таблица (Table) — это текущий снимок состояния.</strong><br />
+Если воспроизвести весь поток изменений с начала — вы получите таблицу.<br />
+Если отслеживать все модификации строк таблицы — вы получите поток изменений (CDC).</p>
+</blockquote>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Duality[&quot;Дуализм Stream ↔ Table&quot;]
+S[&quot;KStream: Поток событий&lt;br&gt;[k: Alice, +$10], [k: Bob, +$50], [k: Alice, -$5]&quot;]
+T[&quot;KTable: Текущее состояние&lt;br&gt;Alice = $5, Bob = $50&quot;]
+end
+
+S --&gt;|&quot;Агрегация (Aggregate)&quot;| T
+T --&gt;|&quot;Поток изменений (Changelog Stream)&quot;| S
+  </pre>
+</div>
+
+
+<p>В Kafka Streams этот дуализм выражен тремя базовыми абстракциями:</p>
+<ol>
+<li><strong><code>KStream</code> (Поток записей):</strong> Представляет собой непрерывную последовательность независимых фактов. Каждое сообщение — это новое событие в мире. Дубликаты ключей не заменяют друг друга, а дописываются в лог. (Аналог в SQL: таблица логов аудита <code>INSERT INTO audit_log ...</code>).</li>
+<li><strong><code>KTable</code> (Материализованная таблица):</strong> Представляет собой поток обновлений состояния (Changelog). Новая запись с ключом <code>K</code> интерпретируется как <code>UPSERT</code> (обновление), перезаписывая предыдущее значение. Запись со значением <code>null</code> (Tombstone) интерпретируется как <code>DELETE</code>. Каждая партиция KTable представляет собой локальный срез таблицы, шардированный по ключу.</li>
+<li><strong><code>GlobalKTable</code> (Глобальная таблица справочников):</strong> В отличие от KTable, которая шардируется между инстансами консьюмеров, GlobalKTable <strong>полностью реплицируется на каждый экземпляр приложения</strong>. Она вычитывает все партиции топика и идеально подходит для справочников (страны, валюты, тарифные сетки), позволяя выполнять быстрые локальные соединения (joins) без дорогостоящего перераспределения входного потока (re-keying / shuffling).</li>
+</ol>
+<hr />
 <h2 id="stateless-i-stateful-operatsii">Stateless и stateful операции</h2>
 
-<h3 id="stateless-bez-sostoyaniya">Stateless (без состояния)</h3>
+<h3 id="stateless-bez-sokhraneniya-sostoyaniya">Stateless (без сохранения состояния)</h3>
 
-<p>Каждое сообщение обрабатывается изолированно, состояние не требуется:<br />
-- <code>map</code> — преобразование один-к-одному.<br />
-- <code>filter</code> — пропустить или отбросить.<br />
-- <code>flatMap</code> — одно ко многим.<br />
-- <code>branch</code> — разделение потока на несколько ветвей по предикатам.</p>
-<p>Эти операции лёгкие, не требуют восстановления и не создают changelog-топиков.</p>
-<h3 id="stateful-s-sostoyaniem">Stateful (с состоянием)</h3>
-
-<p>Здесь обработка зависит от истории, и Kafka Streams управляет состоянием прозрачно для разработчика:</p>
+<p>Операции, не зависящие от истории предшествующих сообщений. Каждое событие обрабатывается изолированно в оперативной памяти:</p>
 <ul>
-<li><strong>Агрегация (aggregate, count, reduce):</strong> по ключу накапливается аккумулятор. Например, количество событий по каждому региону.</li>
-<li><strong>Соединения (join):</strong> объединение нескольких потоков. <code>KStream-KStream</code> — join по временному окну, <code>KStream-KTable</code> — обогащение потока таблицей, <code>KStream-GlobalKTable</code> — обогащение без ограничений по времени.</li>
-<li><strong>Оконные операции (windowing):</strong> группировка по ключу и временному окну, после чего агрегация.</li>
+<li><strong><code>filter</code> / <code>filterNot</code>:</strong> Пропуск или отсеивание сообщений по предикату;</li>
+<li><strong><code>map</code> / <code>mapValues</code>:</strong> Преобразование ключа или полезной нагрузки;</li>
+<li><strong><code>flatMap</code> / <code>flatMapValues</code>:</strong> Преобразование одного входящего сообщения в ноль, один или список исходящих сообщений;</li>
+<li><strong><code>branch</code>:</strong> Разделение одного входящего потока на несколько независимых ветвей в зависимости от бизнес-условий.</li>
 </ul>
-<p>Состояние хранится локально в embedded key-value store (по умолчанию RocksDB) и реплицируется в changelog-топик Kafka, что обеспечивает долговечность и восстановление.</p>
+<p>Stateless-операции тривиальны в эксплуатации: они не требуют дисковой памяти, не создают changelog-топиков и мгновенно перебалансируются при перезапуске подов.</p>
+<h3 id="stateful-s-sokhraneniem-sostoyaniya">Stateful (с сохранением состояния)</h3>
+
+<p>Операции, результат которых зависит от накопленного исторического контекста:</p>
+<ul>
+<li><strong>Агрегация (<code>aggregate</code>, <code>count</code>, <code>reduce</code>):</strong> Накопление сумм, счетчиков, средних значений по каждому ключу.</li>
+<li><strong>Оконные вычисления (<code>windowedBy</code>):</strong> Группировка событий по временным интервалам (например, число запросов от пользователя за последние 60 секунд).</li>
+<li><strong>Потоковые соединения (<code>join</code>):</strong></li>
+<li><code>KStream-KStream Join</code> — соединение двух потоков событий в пределах скользящего временного окна (например, соединение клика по рекламе с последующей покупкой в течение 30 минут).</li>
+<li><code>KStream-KTable Join</code> — обогащение входящего потока событий актуальным состоянием сущности из таблицы (например, обогащение заказа текущим адресом пользователя).</li>
+<li><code>KStream-GlobalKTable Join</code> — обогащение потока глобальным справочником без ограничений по партиционированию.</li>
+</ul>
+<hr />
 <h2 id="okna-kak-pridat-vremeni-strukturu">Окна: как придать времени структуру</h2>
 
-<p>Ключевой элемент потоковой обработки — управление окнами. Kafka Streams поддерживает несколько типов окон, радикально влияющих на потребление памяти и семантику.</p>
-<ul>
-<li><strong>Hopping window (скользящее окно):</strong> фиксированный размер окна и шаг сдвига. Окна перекрываются, запись может принадлежать нескольким окнам.</li>
-<li><strong>Tumbling window (перекатывающееся окно):</strong> частный случай hopping, где шаг равен размеру, окна не перекрываются. Проще, но менее гибко.</li>
-<li><strong>Session window (сессионное окно):</strong> динамическое окно, которое расширяется, пока приходят сообщения с одинаковым ключом в пределах <code>inactivity.gap</code>. Идеально для пользовательских сессий.</li>
-<li><strong>Sliding window (скользящий join):</strong> для операций соединения, где важно не абсолютное время, а разница между временными метками записей из двух потоков.</li>
-</ul>
-<p>Каждое окно порождает независимый аккумулятор в хранилище состояний. Количество окон может быть огромным, и именно RocksDB обеспечивает эффективное управление этими данными без переполнения кучи JVM/Go-приложения.</p>
+<p>В бесконечном потоке данных невозможно вычислить агрегат «для всех записей», потому что поток никогда не завершится. Единственный способ агрегировать данные — нарезать непрерывное время на дискретные <strong>окна (Windows)</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Tumbling[&quot;Tumbling Window (Перекатывающееся, 5 мин)&quot;]
+direction LR
+TW1[&quot;00:00 - 00:05&quot;] --&gt; TW2[&quot;00:05 - 00:10&quot;] --&gt; TW3[&quot;00:10 - 00:15&quot;]
+end
+
+subgraph Hopping[&quot;Hopping Window (Скользящее: размер 5 мин, шаг 1 мин)&quot;]
+direction LR
+HW1[&quot;00:00 - 00:05&quot;]
+HW2[&quot;00:01 - 00:06&quot;]
+HW3[&quot;00:02 - 00:07&quot;]
+end
+
+subgraph Session[&quot;Session Window (Сессионное, gap = 15 мин)&quot;]
+direction LR
+SW1[&quot;User Activity (12:00..12:10)&quot;]
+SW2[&quot;Inactive &gt; 15m&quot;]
+SW3[&quot;New Session (13:00..13:05)&quot;]
+end
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>Tumbling window (перекатывающееся окно):</strong> Окна фиксированной длительности, следующие друг за другом встык без перекрытия (<code>[00:00-00:05]</code>, <code>[00:05-00:10]</code>). Каждое событие попадает строго в одно окно. Идеально для периодических отчетов.</li>
+<li><strong>Hopping window (скользящее окно):</strong> Окна фиксированной длины, сдвигающиеся на шаг, меньший размера окна (например, окно 5 минут с шагом 1 минута). Окна перекрываются; одно событие попадает сразу в несколько окон. Применяется для скользящих средних и алертинга.</li>
+<li><strong>Session window (сессионное окно):</strong> Динамическое окно, границы которого определяются активностью пользователя. Окно открывается с первым событием и расширяется, пока интервал между событиями не превышает порог неактивности (<code>inactivity.gap</code>). Как только наступает пауза дольше порога — сессия запечатывается.</li>
+<li><strong>Sliding window (скользящий join):</strong> Окно, привязанное не к фиксированной временной сетке, а к временной метке конкретной записи. Используется в операциях соединения двух потоков.</li>
+</ol>
+<hr />
 <h2 id="khranenie-sostoyaniya-rocksdb-changelog-i-vosstanovlenie">Хранение состояния: RocksDB, changelog и восстановление</h2>
 
-<p>В stateful-приложениях Kafka Streams управляет локальным состоянием автоматически. Факты, которые нужно знать архитектору:</p>
+<p>В чем состоит главная архитектурная слабость наивных микросервисов потоковой обработки?<br />
+Они пытаются хранить агрегаты во внешней базе данных: Redis, PostgreSQL, Cassandra. При потоке в 200 000 RPS каждый апдейт счетчика означает сетевой round-trip к Redis. Сеть перегружается, задержки взлетают до десятков миллисекунд, а внешняя база данных деградирует под нагрузкой.</p>
+<p>Kafka Streams решает эту проблему через <strong>Embedded Local State Store</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph StreamApp[&quot;Инстанс потокового приложения&quot;]
+P[&quot;Stream Processor (CPU)&quot;]
+R[(&quot;Embedded RocksDB (NVMe SSD)&lt;br&gt;Задержка 5-15 мкс!&quot;)]
+P &lt;--&gt;|&quot;Локальные Get/Put без сети&quot;| R
+end
+
+subgraph KafkaBroker[&quot;Кластер Kafka&quot;]
+CL[(&quot;Changelog Topic&lt;br&gt;(cleanup.policy=compact)&quot;)]
+end
+
+P -.-&gt;|&quot;Асинхронная репликация батчами&quot;| CL
+  </pre>
+</div>
+
+
+<p>Ключевые элементы подсистемы состояния:</p>
 <ul>
-<li>
-<p><strong>Локальное хранилище (state store):</strong> по умолчанию RocksDB — LSM-движок, оптимизированный под быструю запись и эффективное использование SSD. Данные хранятся в томах, привязанных к экземпляру (обычно <code>/var/lib/kafka-streams</code>). В Go-реализациях аналогами могут быть Badger, BoltDB, Pebble.</p>
-</li>
-<li>
-<p><strong>Changelog-топик:</strong> все изменения в state store дублируются в отдельный топик Kafka с политикой compaction. Если экземпляр падает и перезапускается, он восстанавливает своё состояние, перечитывая changelog, как это делает консьюмер компактифицированного топика (<a href="8-retention-i-compaction.html" class="wikilink">8. Retention и compaction</a>).</p>
-</li>
-<li>
-<p><strong>Ребалансировка и перемещение состояния:</strong> при изменении числа партиций или членов группы, партиции переезжают. Kafka Streams использует протокол Sticky Assignor и, начиная с версии 2.x, инкрементальную ребалансировку (Cooperative Sticky), чтобы минимизировать простои. Состояние для мигрировавшей партиции восстанавливается на новом экземпляре из changelog-топика, а на старом — удаляется.</p>
-</li>
-<li>
-<p><strong>Standby-реплики:</strong> для ускорения восстановления можно настроить <code>num.standby.replicas</code>. Тогда теневые экземпляры пассивно читают changelog и поддерживают горячую копию состояния. При сбое основного экземпляра один из standby моментально занимает его место без перечитывания лога.</p>
-</li>
+<li><strong>Локальное хранилище (state store):</strong> По умолчанию каждый экземпляр запускает в своем процессе высокопроизводительный встраиваемый LSM-движок <strong>RocksDB</strong> (разработанный в Meta на базе LevelDB от Google). Данные хранятся в томах, привязанных к экземпляру (обычно <code>/var/lib/kafka-streams</code>). Запись в локальный RocksDB занимает <strong>микросекунды</strong>, так как не требует выхода в сеть. В Go-реализациях аналогами могут быть Badger, BoltDB, Pebble.</li>
+<li><strong>Changelog-топик:</strong> Чтобы локальное состояние не потерялось при гибели сервера, все изменения RocksDB непрерывно реплицируются в специальный внутренний топик Kafka — <strong>Changelog Topic</strong> с политикой уплотнения <code>cleanup.policy=compact</code> (<a href="8-retention-i-compaction.html" class="wikilink">8. Retention и compaction</a>). Настройка параметров компактификации <code>min.cleanable.dirty.ratio</code> и <code>delete.retention.ms</code> критична для быстрого восстановления.</li>
+<li><strong>Восстановление после сбоев:</strong> Если инстанс падает, Kubernetes перезапускает его на другой ноде. Новый процесс консьюмера назначается на те же партиции и вычитывает компактный changelog-топик с диска брокера, восстанавливая локальную базу RocksDB до актуального состояния.</li>
+<li><strong>Standby Replicas (<code>num.standby.replicas</code>):</strong> Чтобы многогигабайтное состояние не восстанавливалось с нуля минутами при редеплое, Kafka Streams поддерживает горячие резервные копии. Standby-инстансы пассивно вычитывают changelog-топик в фоновом режиме. При отказе основного воркера Standby-узел мгновенно перехватывает обработку без задержки на холодный прогрев кэша.</li>
 </ul>
 <div class="callout callout-info">
   <div class="callout-header">
@@ -2275,51 +2388,111 @@ Sink --&gt; OT[&quot;Выходной топик&lt;br&gt;regional-stats&quot;]
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>RocksDB внутри использует MemTable (write buffer в оперативной памяти) и фоновую компактификацию SST-файлов. При записи данные сначала попадают в MemTable и WAL на диске, затем асинхронно сливаются в отсортированные строковые таблицы (SST). Это идеально ложится на модель Kafka Streams: быстрая аккумуляция обновлений, периодическое слияние. Страничный кеш Linux активно используется при чтении SST-файлов, а Go-аналоги Badger/Pebble работают по тем же принципам.</p>
+    <p>RocksDB внутри использует MemTable (буфер записи в оперативной памяти) и фоновую компактификацию SST-файлов. При записи данные сначала попадают в MemTable и WAL на диске, затем асинхронно сливаются в отсортированные строковые таблицы (SST). Это идеально ложится на модель Kafka Streams: быстрая аккумуляция обновлений, периодическое слияние. Страничный кеш Linux активно используется при чтении SST-файлов, а Go-аналоги Badger/Pebble работают по тем же принципам.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="exactly-once-semantika">Exactly-once семантика</h2>
 
-<p>Kafka Streams гарантирует exactly-once для операций, замыкающихся внутри экосистемы Kafka: чтение из топиков, обработку с состоянием и запись в выходные топики. Достигается это за счёт транзакционного продюсера и изолированного чтения (<a href="6-exactly-once-v-kafka.html" class="wikilink">6. Exactly once в Kafka</a>):</p>
-<ol>
-<li>Приложение начинает транзакцию Kafka.</li>
-<li>Внутри транзакции записываются результаты обработки в выходные топики и коммитятся оффсеты входных топиков (через <code>sendOffsetsToTransaction</code>).</li>
-<li>Транзакция коммитится, и все side-эффекты становятся видны атомарно.</li>
-</ol>
-<p>Это гарантирует, что даже при крахе и перезапуске одно и то же сообщение не породит дублирующихся записей. Однако, как и в любых exactly-once гарантиях Kafka, внешние сайд-эффекты (отправка email, запись в стороннюю БД) требуют дополнительных паттернов (<a href="../05-patterny-i-arkhitektura/6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>, <a href="../05-patterny-i-arkhitektura/8-saga-cherez-brokery.html" class="wikilink">8. Saga через брокеры</a>, <a href="../06-orkestratsiya-protsessov/2-temporal-arkhitektura-i-kontseptsii.html" class="wikilink">2. Temporal. Архитектура и концепции</a>).</p>
-<h2 id="interaktivnye-zaprosy">Интерактивные запросы</h2>
+<p>Kafka Streams реализует полноценную семантику <strong>Exactly-Once Processing (EOS)</strong> внутри замкнутого цикла Kafka $\to$ Обработка $\to$ Kafka.</p>
+<p>Это достигается благодаря двухфазному коммиту транзакций Kafka (<a href="6-exactly-once-v-kafka.html" class="wikilink">6. Exactly once в Kafka</a>):<br />
+1. Процессор начинает транзакцию.<br />
+2. Промежуточные результаты пишутся в выходной топик.<br />
+3. Изменения локального состояния отправляются в changelog-топик.<br />
+4. Смещения входящего топика фиксируются через вызов <code>sendOffsetsToTransaction</code>.<br />
+5. Координатор фиксирует транзакцию: данные на выходе, смещения на входе и локальное состояние фиксируются <strong>строго атомарно</strong>.</p>
+<p>Если в процессе падает контейнер — незавершенная транзакция прерывается (aborted), а состояние RocksDB откатывается к точке последней зафиксированной контрольной точки (checkpoint).</p>
+<hr />
+<h2 id="interaktivnye-zaprosy-interactive-queries">Интерактивные запросы (Interactive Queries)</h2>
 
-<p>Одно из мощных, но недооценённых свойств Kafka Streams — возможность обращаться к локальному состоянию извне через REST API. Поскольку каждое приложение владеет частью глобального состояния (шардированной по партициям), можно реализовать распределённый key-value store с миллисекундными задержками, без внешней базы данных.</p>
-<p>При запросе клиента экземпляр либо обслуживает его локально (если ключ принадлежит его партициям), либо проксирует запрос на нужный экземпляр через механизм <code>StreamsMetadata</code>. Это классический паттерн <a href="../05-patterny-i-arkhitektura/5-cqrs-i-brokery.html" class="wikilink">5. CQRS и брокеры</a>, где команды обрабатываются через поток, а запросы — через интерактивные запросы к материализованным представлениям.</p>
+<p>Обычно потоковые приложения воспринимают как «черный ящик»: на вход поступают события, на выходе генерируются другие события.</p>
+<p>Однако Kafka Streams предлагает революционную возможность: <strong>Interactive Queries</strong> (интерактивные запросы). Поскольку каждый инстанс держит в RocksDB материализованное состояние назначенных ему партиций (например, актуальные балансы пользователей), приложение может поднять локальный HTTP/gRPC API и отвечать на внешние запросы на чтение прямо из RocksDB!</p>
+<p>Если запрос от пользователя приходит на Инстанс 1, а данные ключа лежат в партиции Инстанса 2, библиотека предоставляет метаданные <code>StreamsMetadata</code>: Инстанс 1 узнает сетевой адрес коллеги (<code>http://worker-2:8080</code>) и прозрачно проксирует запрос к нему. </p>
+<p>Таким образом, Kafka Streams превращается в <strong>полноценную распределенную NoSQL базу данных с шардированием по партициям</strong>, материализующую состояние из лога событий!</p>
+<hr />
 <h2 id="mechanical-sympathy-pochemu-lokalnoe-sostoyanie-effektivnee-udalyonnogo">Mechanical Sympathy: почему локальное состояние эффективнее удалённого</h2>
 
-<p>Главный инженерный выигрыш Kafka Streams — колокация вычислений и состояния на одной машине. Это резко снижает задержки (нет сетевого round-trip к внешнему хранилищу), но предъявляет требования к локальным дискам и памяти.</p>
-<ul>
-<li><strong>Локальный SSD/NVMe критичен:</strong> RocksDB активно использует fsync для WAL и случайное чтение SST-файлов. На HDD throughput будет плачевным. Использование локальных NVMe-дисков (как в инстансах AWS i3) позволяет получить задержки менее миллисекунды.</li>
-<li><strong>Страничный кеш и off-heap:</strong> RocksDB использует off-heap память для блоков кеша, минуя сборщик мусора JVM (или Go GC). Это позволяет утилизировать большие объёмы RAM без негативного влияния на паузы.</li>
-<li><strong>Сегментированность и компактификация:</strong> changelog-топики для state store — это компактифицированные топики. Log Cleaner Kafka удаляет дублирующиеся ключи, сокращая объём данных, который необходимо перечитывать при восстановлении. Настройка <code>min.cleanable.dirty.ratio</code> и <code>delete.retention.ms</code> критична для быстрого восстановления.</li>
-</ul>
+<p>Сравним физику выполнения операции:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Параметр</th>
+<th style="text-align: center;">Обращение к удаленному Redis/PostgreSQL</th>
+<th style="text-align: center;">Чтение из Local Embedded RocksDB/Badger</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Физический путь</strong></td>
+<td style="text-align: center;">CPU $\to$ TCP Socket $\to$ Маршрутизатор $\to$ Сервер БД $\to$ Диск/RAM БД $\to$ Ответ TCP</td>
+<td style="text-align: center;">CPU $\to$ L3 Cache / DRAM (MemTable) $\to$ PCIe NVMe (SST file)</td>
+</tr>
+<tr>
+<td><strong>Задержка (Latency)</strong></td>
+<td style="text-align: center;"><strong>1 000 – 5 000 микросекунд</strong> (1–5 мс)</td>
+<td style="text-align: center;"><strong>5 – 20 микросекунд</strong> (0.005–0.020 мс)</td>
+</tr>
+<tr>
+<td><strong>Точка отказа</strong></td>
+<td style="text-align: center;">Падение кластера БД останавливает все сервисы</td>
+<td style="text-align: center;">Изолировано: падение одной ноды задевает только её партиции</td>
+</tr>
+<tr>
+<td><strong>Сетевой трафик</strong></td>
+<td style="text-align: center;">$2 \times \text{RPS} \times \text{MsgSize}$ в локальной сети</td>
+<td style="text-align: center;">0 сетевых пакетов на чтение!</td>
+</tr>
+</tbody>
+</table></div>
+<p>Локальный SSD/NVMe критичен: RocksDB активно использует fsync для WAL и случайное чтение SST-файлов. На HDD throughput будет плачевным. Использование локальных NVMe-дисков (как в инстансах AWS i3) позволяет получить задержки менее миллисекунды.</p>
+<hr />
 <h2 id="go-i-potokovaya-obrabotka-alternativy-kafka-streams">Go и потоковая обработка: альтернативы Kafka Streams</h2>
 
-<p>В мире Go нет официальной библиотеки Kafka Streams, но есть несколько путей реализации потоковой обработки:</p>
+<p>В экосистеме Go нет официальной библиотеки от команды Kafka, но сообщество разработало мощные архитектурные решения:</p>
 <h3 id="1-goka-biblioteka-vdokhnovlyonnaya-kafka-streams">1. Goka — библиотека, вдохновлённая Kafka Streams</h3>
 
-<p><a href="https://github.com/lovoo/goka">Goka</a> предоставляет похожую модель: группы, процессоры, локальное состояние в Badger (LSM-движок на Go), changelog-топики, автоматическое восстановление. Однако библиотека менее зрелая и требует аккуратного продакшен-использования.</p>
+<p><a href="https://github.com/lovoo/goka">Goka</a> — зрелая библиотека от инженеров Lovoo, повторяющая философию Kafka Streams на чистом Go:<br />
+- Абстракция <code>Emitter</code>, <code>Processor</code>, <code>View</code>;<br />
+- Локальное шардированное состояние на движках <strong>Badger</strong> (LSM-хранилище на Go) или LevelDB;<br />
+- Автоматическая репликация в changelog-топики и восстановление состояния при ребалансировках;<br />
+- Потокобезопасные представления (Views) для интерактивных запросов.</p>
 <h3 id="2-ruchnaya-realizatsiya-s-franz-go">2. Ручная реализация с franz-go</h3>
 
-<p>Можно построить потоковый процессор, используя <code>kgo.Client</code>, горутины и собственное локальное хранилище (например, Badger или Bolt). Типичный паттерн:</p>
-<ul>
-<li>Консьюмер читает входной топик, обогащает или агрегирует данные, обращаясь к локальному Badger по ключу.</li>
-<li>Результат пишется транзакционным продюсером в выходной топик.</li>
-<li>Все изменения локального хранилища дублируются в компактифицированный changelog-топик вручную (для восстановления).</li>
-<li>При ребалансировке партиций используется <code>revoke</code> callback, чтобы закрыть локальное хранилище, и <code>assign</code> callback, чтобы восстановить состояние из changelog.</li>
-</ul>
-<p>Это даёт полный контроль, но требует написания значительного объёма шаблонного кода.</p>
+<p>Можно построить потоковый процессор, используя <code>kgo.Client</code>, горутины и собственное локальное хранилище (например, Badger, Bolt или Pebble):<br />
+- Горутины консьюмера вычитывают батчи через <code>PollFetches</code>.<br />
+- Обработчик выполняет быстрые <code>Get/Put</code> в локальный Pebble Store.<br />
+- Изменения состояния пакуются в батчи и отправляются в changelog-топик через транзакционный продюсер <code>cl.BeginTransaction()</code>.<br />
+- Ребалансировки отслеживаются через коллбеки <code>OnPartitionsRevoked</code> (сброс WAL Pebble) и <code>OnPartitionsAssigned</code> (прогрев из changelog).</p>
 <h3 id="3-ispolzovanie-vneshnikh-freymvorkov">3. Использование внешних фреймворков</h3>
 
-<p>Для сложных потоковых топологий может быть оправдано использование Flink или Spark Streaming, вызываемых из Go через API, но это уводит от простоты и легковесности.</p>
-<p>Принципиальное понимание Kafka Streams позволяет Go-разработчику принимать взвешенные архитектурные решения, а при необходимости — воспроизводить ключевые паттерны на родном языке, сохраняя механическую симпатию и используя сильные стороны экосистемы Go (горутины, низкие накладные расходы, отличные LSM-движки).</p>
+<p>Для особо масштабных потоковых топологий с экстремально сложными соединениями десятков потоков может быть оправдано использование Apache Flink или Spark Streaming, вызываемых из Go через API, но это уводит от простоты и легковесности микросервисной архитектуры.</p>
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> В чем заключается фундаментальная разница между <code>KStream</code> и <code>KTable</code>?<br />
+<strong>Ответ:</strong> <code>KStream</code> моделирует поток фактов (фактологический лог, где каждая запись независима, дубликаты сохраняются, а семантика добавления — append-only). <code>KTable</code> моделирует поток обновлений состояния (Changelog / Materialized View), где каждая запись с существующим ключом перезаписывает старое значение (UPSERT), а запись с пустым значением (<code>null</code>) удаляет ключ (DELETE).</p>
+  </div>
+</div>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Как Kafka Streams обеспечивает восстановление состояния при перезапуске инстанса, и что такое <code>standby replicas</code>?<br />
+<strong>Ответ:</strong> Каждое локальное состояние (RocksDB) дублируется в служебный компактифицированный changelog-топик Kafka. При падении инстанса новый узел вычитывает changelog и восстанавливает базу на диске. Чтобы этот процесс не вызывал задержек при терабайтных базах, включают <code>num.standby.replicas</code>: теневые узлы непрерывно читают changelog в фоновом режиме, держа локальную базу теплой. При аварии standby мгновенно становится активным лидером без перечитывания лога.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</h2>
 
 <p>Kafka Streams — это кульминация проектирования потоковых систем на основе лога: она превращает партицированный, реплицированный журнал в платформу для stateful-обработки, сохраняя простоту и горизонтальную масштабируемость обычного консьюмера. Понимание её внутреннего устройства и компромиссов критически важно для системного архитектора, даже если реализация будет на Go.</p>
@@ -2351,7 +2524,7 @@ Sink --&gt; OT[&quot;Выходной топик&lt;br&gt;regional-stats&quot;]
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#chto-takoe-kafka-streams">Что такое Kafka Streams</a></li><li class="toc-item toc-h2"><a href="#osnovnye-abstraktsii-graf-protsessorov">Основные абстракции: граф процессоров</a></li><li class="toc-item toc-h2"><a href="#stateless-i-stateful-operatsii">Stateless и stateful операции</a></li><li class="toc-item toc-h3"><a href="#stateless-bez-sostoyaniya">Stateless (без состояния)</a></li><li class="toc-item toc-h3"><a href="#stateful-s-sostoyaniem">Stateful (с состоянием)</a></li><li class="toc-item toc-h2"><a href="#okna-kak-pridat-vremeni-strukturu">Окна: как придать времени структуру</a></li><li class="toc-item toc-h2"><a href="#khranenie-sostoyaniya-rocksdb-changelog-i-vosstanovlenie">Хранение состояния: RocksDB, changelog и восстановление</a></li><li class="toc-item toc-h2"><a href="#exactly-once-semantika">Exactly-once семантика</a></li><li class="toc-item toc-h2"><a href="#interaktivnye-zaprosy">Интерактивные запросы</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-lokalnoe-sostoyanie-effektivnee-udalyonnogo">Mechanical Sympathy: почему локальное состояние эффективнее удалённого</a></li><li class="toc-item toc-h2"><a href="#go-i-potokovaya-obrabotka-alternativy-kafka-streams">Go и потоковая обработка: альтернативы Kafka Streams</a></li><li class="toc-item toc-h3"><a href="#1-goka-biblioteka-vdokhnovlyonnaya-kafka-streams">1. Goka — библиотека, вдохновлённая Kafka Streams</a></li><li class="toc-item toc-h3"><a href="#2-ruchnaya-realizatsiya-s-franz-go">2. Ручная реализация с franz-go</a></li><li class="toc-item toc-h3"><a href="#3-ispolzovanie-vneshnikh-freymvorkov">3. Использование внешних фреймворков</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</a></li>
+    <li class="toc-item toc-h2"><a href="#chto-takoe-kafka-streams">Что такое Kafka Streams</a></li><li class="toc-item toc-h2"><a href="#osnovnye-abstraktsii-graf-protsessorov">Основные абстракции: граф процессоров</a></li><li class="toc-item toc-h3"><a href="#dualizm-potokov-i-tablits-stream-table-duality">Дуализм потоков и таблиц (Stream-Table Duality)</a></li><li class="toc-item toc-h2"><a href="#stateless-i-stateful-operatsii">Stateless и stateful операции</a></li><li class="toc-item toc-h3"><a href="#stateless-bez-sokhraneniya-sostoyaniya">Stateless (без сохранения состояния)</a></li><li class="toc-item toc-h3"><a href="#stateful-s-sokhraneniem-sostoyaniya">Stateful (с сохранением состояния)</a></li><li class="toc-item toc-h2"><a href="#okna-kak-pridat-vremeni-strukturu">Окна: как придать времени структуру</a></li><li class="toc-item toc-h2"><a href="#khranenie-sostoyaniya-rocksdb-changelog-i-vosstanovlenie">Хранение состояния: RocksDB, changelog и восстановление</a></li><li class="toc-item toc-h2"><a href="#exactly-once-semantika">Exactly-once семантика</a></li><li class="toc-item toc-h2"><a href="#interaktivnye-zaprosy-interactive-queries">Интерактивные запросы (Interactive Queries)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-lokalnoe-sostoyanie-effektivnee-udalyonnogo">Mechanical Sympathy: почему локальное состояние эффективнее удалённого</a></li><li class="toc-item toc-h2"><a href="#go-i-potokovaya-obrabotka-alternativy-kafka-streams">Go и потоковая обработка: альтернативы Kafka Streams</a></li><li class="toc-item toc-h3"><a href="#1-goka-biblioteka-vdokhnovlyonnaya-kafka-streams">1. Goka — библиотека, вдохновлённая Kafka Streams</a></li><li class="toc-item toc-h3"><a href="#2-ruchnaya-realizatsiya-s-franz-go">2. Ручная реализация с franz-go</a></li><li class="toc-item toc-h3"><a href="#3-ispolzovanie-vneshnikh-freymvorkov">3. Использование внешних фреймворков</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</a></li>
   </ul>
 </aside>
 

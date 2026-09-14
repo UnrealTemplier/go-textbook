@@ -2168,14 +2168,18 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~53 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Producer и consumer</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Вот фундаментальная статья, разбирающая внутреннее устройство и идиоматику работы Producer и Consumer в Kafka с фокусом на Go и механическую симпатию.</p>
+            <h1>3. Producer и consumer: анатомия взаимодействия с распределенным логом</h1>
+<blockquote>
+<p><em>"To make a program fast, make it do less work. To make it do less work, batch its operations."</em><br />
+— Стивен Борн, создатель Bourne shell</p>
+</blockquote>
 <div class="callout callout-note">
   <div class="callout-header">
     <span class="callout-icon">📝</span>
@@ -2186,14 +2190,82 @@
   </div>
 </div>
 
+<hr />
 <h2 id="dve-storony-odnogo-loga">Две стороны одного лога</h2>
 
-<p>Kafka-клиент состоит из двух симметричных, но архитектурно разных сущностей: Producer и Consumer. Их объединяет общая цель — максимально эффективно передавать байты по сети, но достигается она противоположными механизмами. Продюсер агрегирует записи в пакеты, маскируя сетевые задержки; консьюмер, напротив, вытягивает готовые пакеты большими блоками, экономя CPU и пропускную способность памяти.</p>
+<p>Любая распределенная система обмена сообщениями рано или поздно упирается в физику: пропускную способность шины PCI Express, задержки сетевых интерфейсов (NIC) и накладные расходы операционной системы на переключение контекста. Apache Kafka проектировалась с глубоким уважением к этим физическим ограничениям — с тем, что Мартин Томпсон назвал <em>Mechanical Sympathy</em> (механическим сочувствием к аппаратуре).</p>
+<p>Kafka-клиент состоит из двух симметричных, но архитектурно противоположных сущностей: <strong>Producer</strong> (отправитель) и <strong>Consumer</strong> (получатель). Их объединяет фундаментальная цель — максимально эффективно перемещать байты между памятью пользовательских приложений и страничным кэшем ядра Linux, но достигается она противоположными механизмами:</p>
+<ul>
+<li><strong>Продюсер</strong> работает как логистический распределительный центр: он агрегирует отдельные прикладные записи в плотно упакованные батчи, маскируя сетевые задержки и амортизируя системные вызовы операционной системы.</li>
+<li><strong>Консьюмер</strong>, напротив, использует <strong>pull-модель</strong>: он самостоятельно вытягивает готовые батчи большими блоками, получая естественный контроль над темпом обработки (backpressure) и позволяя брокеру сбрасывать данные с диска прямо в сетевой сокет через механизм <code>Zero-Copy</code> без единого копирования в userspace.</li>
+</ul>
+<hr />
 <h2 id="producer-ot-vyzova-send-do-bitov-na-provode">Producer: от вызова `Send` до битов на проводе</h2>
 
-<p>Продюсер — это не просто тонкая обёртка над сокетом. Внутри каждого продюсера скрыт асинхронный конвейер, состоящий из сериализаторов, буфера записей (RecordAccumulator), батчера и сетевого клиента с неблокирующим вводом-выводом. Понимание этих слоёв принципиально для тюнинга производительности.</p>
+<p>Продюсер — это не просто тонкая обёртка над сетевым сокетом. Внутри каждого промышленного продюсера скрыт сложный асинхронный конвейер, состоящий из сериализаторов, интерцепторов, партиционера, буфера накопления записей (<code>RecordAccumulator</code>), фонового потока ввода-вывода (NetworkClient) и компрессора. </p>
+<p>Каждый вызов метода отправки — это не блокирующий сетевой запрос к серверу, а быстрая операция добавления байтов в локальный буфер в памяти.</p>
 <h3 id="vnutrenniy-konveyer">Внутренний конвейер</h3>
 
+<p>Рассмотрим путь сообщения от прикладного кода до сетевого сокета:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph ClientApp[&quot;Прикладной код&quot;]
+A[&quot;Вызов Send&lt;br&gt;с ключом и значением&quot;]
+end
+
+subgraph Pipeline[&quot;Конвейер Producer&quot;]
+B[&quot;Интерцепторы&lt;br&gt;на стороне продюсера&quot;]
+C[&quot;Serializer&lt;br&gt;Key/Value&quot;]
+D[&quot;Partitioner&lt;br&gt;выбор партиции&quot;]
+E[&quot;RecordAccumulator&lt;br&gt;буферизация по партициям&quot;]
+F[&quot;Батчер&lt;br&gt;накопление записей&quot;]
+G[&quot;Compression&lt;br&gt;сжатие батча&quot;]
+end
+
+subgraph NetLayer[&quot;Сетевой слой (I/O Thread)&quot;]
+H[&quot;NetworkClient&lt;br&gt;асинхронная отправка&quot;]
+end
+
+subgraph Cluster[&quot;Кластер Kafka&quot;]
+I[&quot;Брокер-лидер&lt;br&gt;партиции&quot;]
+end
+
+A --&gt; B
+B --&gt; C
+C --&gt; D
+D --&gt; E
+E --&gt; F
+F --&gt; G
+G --&gt; H
+H --&gt; I
+  </pre>
+</div>
+
+
+<p>Разберём каждый этап этого конвейера:</p>
+<ol>
+<li><strong>Интерцепторы (ProducerInterceptor)</strong> — выполняют сквозную модификацию метаданных, внедрение трейсинг-заголовков (OpenTelemetry W3C Trace Context) или аудит до попадания в сериализатор.</li>
+<li><strong>Сериализация (Serializer)</strong> — преобразует строго типизированные прикладные структуры данных (Go-структуры, Java POJO) в байтовые массивы. Для контроля за эволюцией схемы и обратной совместимостью используются Protobuf, Avro или JSON Schema совместно со Schema Registry (<a href="11-schema-registry-i-evolyutsiya-skhem.html" class="wikilink">11. Schema Registry и эволюция схем</a>).</li>
+<li><strong>Partitioner</strong> — определяет, в какую конкретно партицию топика отправится запись:<br />
+   - Если ключ задан: стандартный алгоритм хэширования <code>murmur2(key) % num_partitions</code> гарантирует, что все события по одной сущности (например, <code>order_id</code> или <code>user_id</code>) попадут в одну партицию и будут обработаны строго по порядку (<a href="5-ordering-i-partitioning.html" class="wikilink">5. Ordering и partitioning</a>).<br />
+   - Если ключ пуст (<code>nil</code>): современный Kafka-клиент использует <code>StickyKeyPartitioner</code> (или встроенный UniformStickyPartitioner). Вместо наивного Round-Robin для каждого сообщения продюсер «прилипает» к одной партиции до тех пор, пока текущий батч не заполнится (<code>batch.size</code>) или не истечет таймер (<code>linger.ms</code>). Это снижает фрагментацию сети и формирует полновесные пакеты.</li>
+<li><strong>RecordAccumulator</strong> — сердце производительности продюсера. Это специализированный буфер в оперативной памяти, разделенный на очереди батчей по каждой партиции (<code>TopicPartition</code>). Прикладные горутины складывают сообщения в <code>RecordAccumulator</code> почти мгновенно, не дожидаясь ответа брокера.</li>
+<li><strong>Батчер</strong> — накапливает записи в текущем открытом буфере памяти. Когда размер буфера достигает границы <code>batch.size</code> или истекает таймер задержки <code>linger.ms</code>, батч «запечатывается» и помечается готовым к отправке.</li>
+<li><strong>Compression</strong> — сжатие целого батча с использованием алгоритмов gzip, snappy, lz4 или zstd. Сжатие на стороне продюсера драматически снижает сетевой трафик и дисковую нагрузку: брокер сохраняет сжатый батч на диск как есть, без распаковки, и консьюмер считывает его в сжатом виде, распаковывая уже на своей стороне!</li>
+<li><strong>NetworkClient</strong> — отдельный сетевой фоновый поток/горутина, использующий мультиплексирование неблокирующего ввода-вывода (epoll в Linux, kqueue в macOS/BSD, Java NIO). Он собирает готовые батчи для одного и того же брокера (даже если они принадлежат разным топикам и партициям) в один составной TCP-запрос <code>ProduceRequest</code>.</li>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2208,60 +2280,167 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Вызов Send&lt;br&gt;с ключом и значением&quot;] --&gt; B[&quot;Интерцепторы&lt;br&gt;на стороне продюсера&quot;]
-B --&gt; C[&quot;Serializer&lt;br&gt;Key/Value&quot;]
-C --&gt; D[&quot;Partitioner&lt;br&gt;выбор партиции&quot;]
-D --&gt; E[&quot;RecordAccumulator&lt;br&gt;буферизация по партициям&quot;]
-E --&gt; F[&quot;Батчер&lt;br&gt;накопление записей&quot;]
-F --&gt; G[&quot;Compression&lt;br&gt;сжатие батча&quot;]
-G --&gt; H[&quot;NetworkClient&lt;br&gt;асинхронная отправка&quot;]
-H --&gt; I[&quot;Брокер-лидер&lt;br&gt;партиции&quot;]
+subgraph Accumulator[&quot;RecordAccumulator в оперативной памяти&quot;]
+direction TB
+subgraph P0[&quot;Partition 0 Queue&quot;]
+B1[&quot;Batch 1 (16 KB) [FULL]&quot;]
+B2[&quot;Batch 2 (8 KB) [OPEN]&quot;]
+end
+subgraph P1[&quot;Partition 1 Queue&quot;]
+B3[&quot;Batch 1 (16 KB) [FULL]&quot;]
+end
+end
+
+subgraph Sender[&quot;I/O Sender Loop&quot;]
+Mux[&quot;Объединение батчей&lt;br&gt;для одного брокера&quot;]
+end
+
+subgraph Broker1[&quot;Брокер 1 (Лидер P0 и P1)&quot;]
+Socket[&quot;TCP Socket (Single ProduceRequest)&quot;]
+end
+
+B1 --&gt; Mux
+B3 --&gt; Mux
+Mux --&gt; Socket
   </pre>
 </div>
 
 
-<ol>
-<li><strong>Сериализация (Serializer)</strong> — преобразует ключ и значение в байтовые массивы. Для контроля над схемой часто используют Schema Registry (<a href="11-schema-registry-i-evolyutsiya-skhem.html" class="wikilink">11. Schema Registry и эволюция схем</a>).</li>
-<li><strong>Partitioner</strong> — определяет целевую партицию. По умолчанию: murmur2(key) % num_partitions; если ключ пуст — round-robin с липкостью к случайно выбранной партиции на короткий промежуток.</li>
-<li><strong>RecordAccumulator</strong> — основной буфер в оперативной памяти, который группирует записи по топикам и партициям. Каждая партиция имеет свою очередь байтовых буферов фиксированного размера (<code>batch.size</code>).</li>
-<li><strong>Батчер</strong> — накапливает записи в текущем открытом буфере. Когда буфер заполняется или истекает <code>linger.ms</code>, он «запечатывается» и передаётся на сжатие и отправку.</li>
-<li><strong>Compression</strong> — сжатие целого батча (gzip, snappy, lz4, zstd). Сжатие на стороне продюсера снижает сетевой трафик и дисковую нагрузку на брокере; брокер хранит сжатый батч как есть, и консьюмер получает его без перепаковки.</li>
-<li><strong>NetworkClient</strong> — асинхронный сетевой слой, отправляющий готовые батчи брокеру-лидеру каждой партиции. Использует Java NIO (в librdkafka / franz-go — аналогичный неблокирующий цикл на epoll/kqueue).</li>
-</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Внутри RecordAccumulator работает пул буферов прямого доступа (DirectByteBuffer в Java, байтовые слайсы в Go), которые аллоцируются вне кучи GC, чтобы не создавать pressure на сборщик мусора. В Go-клиенте <code>franz-go</code> активно используется <code>sync.Pool</code> для переиспользования слайсов, что минимизирует аллокации и обеспечивает высокую пропускную способность.</p>
+    <p>Внутри <code>RecordAccumulator</code> работает пул буферов прямого доступа (<code>DirectByteBuffer</code> в Java, байтовые слайсы в Go), которые аллоцируются вне кучи GC, чтобы не создавать pressure на сборщик мусора. В Go-клиенте <code>franz-go</code> активно используется <code>sync.Pool</code> для переиспользования слайсов, что минимизирует аллокации и обеспечивает высокую пропускную способность. Память не запрашивается у ОС на каждое сообщение: буферы берутся из пула, заполняются и возвращаются обратно после получения подтверждения от брокера.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="mechanical-sympathy-zachem-nuzhen-linger-ms-i-batch-size">Mechanical Sympathy: зачем нужен `linger.ms` и `batch.size`</h3>
 
-<p>Системный вызов <code>send</code> (или <code>write</code>) на каждый одиночный байт — катастрофа. Мало того, что каждое сетевое сообщение несёт накладные расходы заголовков TCP/IP, так ещё и сам системный вызов стоит тысячи тактов из-за переключения контекста Ring 3 → Ring 0. Батчинг решает эту проблему в корне:</p>
+<p>Чтобы понять, почему архитектура продюсера устроена именно так, обратимся к физике процессора и операционной системы. </p>
+<p>Представьте курьера, которому поручено доставить письма из офиса в архив на другом конце города. Если курьер будет садиться на грузовик и ехать через весь город с одним конвертом в руке каждый раз, когда секретарь распечатывает документ — компания обанкротится на бензине и амортизации машины. Разумный секретарь складывает письма в лоток: если лоток заполнился до 100 писем — вызываем курьера; если лоток не полон, но прошло 10 минут — всё равно отправляем, чтобы адресат не ждал вечность.</p>
+<p>В компьютерных системах сетевой вызов <code>write(2)</code> или <code>send(2)</code> на каждый одиночный байт — точно такая же катастрофа. Каждое сетевое сообщение несёт с собой фиксированные накладные расходы:<br />
+1. <strong>Накладные расходы TCP/IP:</strong> Заголовки Ethernet (14B), IP (20B) и TCP (20–32B) плюс служебные протокольные заголовки Kafka. Передача 50 байт полезной нагрузки в отдельном пакете означает потерю более 60% пропускной способности канала на служебные заголовки.<br />
+2. <strong>Переключение контекста ядра (Context Switch):</strong> Переход процессора из пространства пользователя (Ring 3) в режим ядра (Ring 0) для выполнения системного вызова ввода-вывода сбрасывает часть регистров и конвейера инструкций CPU, отнимая от сотен до тысяч процессорных тактов.<br />
+3. <strong>Прерывания сетевой карты (NIC Interrupts):</strong> Обработка миллионов крошечных пакетов нагружает ядра CPU обработкой программных прерываний (softirq).</p>
+<p>Батчинг решает эту проблему в корне, находя идеальный баланс между пропускной способностью (throughput) и временем отклика (latency):</p>
 <ul>
-<li><strong><code>batch.size</code></strong> (по умолчанию 16 КБ) — максимальный размер одного батча в памяти. Увеличение этого параметра повышает пропускную способность за счёт уменьшения числа сетевых пакетов ценой небольшого потребления памяти.</li>
-<li><strong><code>linger.ms</code></strong> (по умолчанию 0) — искусственная задержка перед отправкой не полностью заполненного батча. Установка в 5–20 мс позволяет накопить больше записей в один пакет и кардинально повысить throughput при умеренном росте latency на процентилях.</li>
+<li><strong><code>batch.size</code></strong> (по умолчанию 16 КБ) — максимальный размер одного батча в памяти для конкретной партиции. Увеличение этого параметра (например, до 64 КБ, 256 КБ или 1 МБ в высоконагруженных системах) повышает пропускную способность за счёт уменьшения числа сетевых пакетов ценой небольшого потребления памяти.</li>
+<li><strong><code>linger.ms</code></strong> (по умолчанию 0) — искусственная задержка перед отправкой не полностью заполненного батча. Если продюсер работает с <code>linger.ms = 0</code>, он отдаст батч сетевому потоку немедленно, как только сокет освободится для записи. Если же установить <code>linger.ms=5</code> (или 5–20 мс), продюсер подождёт указанное количество миллисекунд, давая приложению шанс дописать в этот же батч новые сообщения. В высоконагруженных системах с потоковой записью <code>linger.ms=5</code> практически не добавляет задержки, но радикально улучшает эффективность использования сети.</li>
 </ul>
-<p>Эта пара параметров — классический компромисс: пропускная способность против задержки. В высоконагруженных системах с потоковой записью <code>linger.ms=5</code> практически не добавляет задержки, но радикально улучшает эффективность использования сети.</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Сценарий</th>
+<th style="text-align: center;"><code>batch.size</code></th>
+<th style="text-align: center;"><code>linger.ms</code></th>
+<th>Поведение системы</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Минимальная задержка (Low Latency / Trading)</strong></td>
+<td style="text-align: center;">16 KB</td>
+<td style="text-align: center;">0–1 ms</td>
+<td>Сообщения отправляются мгновенно; высокий RPS системных вызовов; сеть недоутилизирована</td>
+</tr>
+<tr>
+<td><strong>Высокая пропускная способность (High Throughput / Logs, Metrics)</strong></td>
+<td style="text-align: center;">256 KB – 1 MB</td>
+<td style="text-align: center;">10–50 ms</td>
+<td>Сообщения плотно пакуются; отличный коэффициент сжатия lz4/zstd; минимальный CPU overhead</td>
+</tr>
+<tr>
+<td><strong>Сбалансированный бэкенд (Баланс по умолчанию)</strong></td>
+<td style="text-align: center;">64 KB</td>
+<td style="text-align: center;">5–10 ms</td>
+<td>Оптимальное соотношение: задержка вырастает всего на единицы миллисекунд, а пропускная способность вырастает в 3–5 раз</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
 <h3 id="idempotentnyy-prodyuser-idempotent-producer">Идемпотентный продюсер (Idempotent Producer)</h3>
 
-<p>По умолчанию продюсер может доставить одно сообщение более одного раза при сбоях сети: продюсер отправляет батч, брокер записывает его, но подтверждение (ACK) теряется, и продюсер повторяет отправку. Чтобы избежать дублирования, начиная с Kafka 0.11 вводится <strong>идемпотентный продюсер</strong> (<code>enable.idempotence=true</code>).</p>
-<p>При включении этой опции продюсер получает уникальный идентификатор (Producer ID) от брокера, и каждому сообщению внутри партиции присваивается монотонно возрастающий sequence number. Брокер, видя повторный sequence number, игнорирует дубликат, не записывая его в лог. Это гарантирует <strong>exactly-once семантику на уровне одной сессии продюсера в рамках одной партиции</strong>.</p>
+<p>В распределенных сетях сбои — это норма, а не аномалия. Представим классический сценарий:<br />
+1. Продюсер отправляет батч сообщений брокеру.<br />
+2. Брокер успешно записывает батч на диск и реплицирует его в ISR.<br />
+3. В момент отправки сетевого подтверждения (ACK) сетевой кабель временно теряет связь или происходит сброс TCP-соединения.<br />
+4. Продюсер получает таймаут, не знает, сохранено ли сообщение, и добросовестно повторяет отправку (retry).<br />
+5. Результат: <strong>дубликат данных в логе!</strong></p>
+<p>Чтобы избежать дублирования без перекладывания сложной логики дедупликации на плечи разработчиков, начиная с Kafka 0.11 был представлен <strong>идемпотентный продюсер</strong> (<code>enable.idempotence=true</code>), который с версии Kafka 3.0 включен по умолчанию.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor App as Продюсер (PID 42)
+participant Broker as Брокер-лидер (Партиция 0)
+
+App-&gt;&gt;Broker: InitProducerIdRequest
+Broker--&gt;&gt;App: Assigned PID = 42, Epoch = 0
+
+rect rgb(19, 29, 51)
+Note over App,Broker: Первая отправка (успех)
+App-&gt;&gt;Broker: Produce(PID=42, SeqNum=0)
+Broker-&gt;&gt;Broker: Сохранение в лог (offset=100)
+Broker--&gt;&gt;App: ACK (offset=100)
+end
+
+rect rgb(33, 20, 30)
+Note over App,Broker: Потеря сетевого ACK
+App-&gt;&gt;Broker: Produce(PID=42, SeqNum=1)
+Broker-&gt;&gt;Broker: Сохранение в лог (offset=101)
+Broker--xApp: ACK потерян в сети (Network Drop)
+end
+
+rect rgb(20, 35, 30)
+Note over App,Broker: Автоматический Retry продюсера
+App-&gt;&gt;Broker: Produce(PID=42, SeqNum=1) [RETRY]
+Broker-&gt;&gt;Broker: Проверка: SeqNum 1 уже записан! Дубликат отброшен.
+Broker--&gt;&gt;App: ACK (offset=101) [Дубликат не записан]
+end
+  </pre>
+</div>
+
+
+<p>Принцип работы идемпотентного продюсера:<br />
+1. При старте продюсер отправляет брокеру запрос <code>InitProducerIdRequest</code> и получает глобально уникальный 64-битный идентификатор — <strong>Producer ID (PID)</strong> и номер эпохи (Epoch).<br />
+2. Для каждой целевой партиции продюсер поддерживает монотонно возрастающий порядковый номер последовательности — <strong>Sequence Number</strong> (начиная с 0).<br />
+3. Принимая батч, брокер проверяет: <code>IncomingSeqNum == LastStoredSeqNum + 1</code>.<br />
+   - Если совпадает — данные пишутся в лог, а <code>LastStoredSeqNum</code> обновляется.<br />
+   - Если <code>IncomingSeqNum &lt;= LastStoredSeqNum</code> — брокер понимает, что это дубликат из-за сетевого ретрая. Он <strong>не пишет запись в лог повторно</strong>, но возвращает продюсеру успешный <code>ACK</code>.<br />
+   - Если <code>IncomingSeqNum &gt; LastStoredSeqNum + 1</code> — значит, произошла потеря сообщений в пути; брокер возвращает ошибку <code>OutOfOrderSequenceException</code>.</p>
+<p>Это гарантирует <strong>exactly-once семантику на уровне одной сессии продюсера в рамках одной партиции</strong> без снижения производительности.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Идемпотентность продюсера спасает от дублирования, порождённого сетевыми ретраями, но она <strong>не переживает перезапуск продюсера с потерей Producer ID</strong>. Для сквозного exactly-once между топиками нужны транзакции (см. <a href="6-exactly-once-v-kafka.html" class="wikilink">6. Exactly once в Kafka</a>).</p>
+    <p>Идемпотентность продюсера спасает от дублирования, порождённого сетевыми ретраями, но она <strong>не переживает перезапуск продюсера с потерей Producer ID</strong>. При перезапуске процесс получит новый PID, и его последовательность <code>Sequence Number</code> начнётся заново. Для сквозного exactly-once между топиками и при перезапусках процессов используются Kafka Transactions (см. <a href="6-exactly-once-v-kafka.html" class="wikilink">6. Exactly once в Kafka</a>).</p>
   </div>
 </div>
 
+<hr />
 <h3 id="production-ready-prodyuser-na-go-franz-go">Production-ready продюсер на Go (franz-go)</h3>
 
+<p>В экосистеме Go исторически использовался клиент <code>Shopify/sarama</code>, однако в современном высоконагруженном бэкенде отраслевым стандартом de-facto стал чистый Go-клиент <code>franz-go</code> (<code>github.com/twmb/franz-go</code>). Он превосходит альтернативы за счет:<br />
+- 100% реализации на Go (без CGO-зависимостей от <code>librdkafka</code>);<br />
+- Экстремальной оптимизации аллокаций памяти (<code>sync.Pool</code>);<br />
+- Полной поддержки всех современных KIP (включая KRaft, KIP-500, гибкие протоколы версионирования).</p>
+<p>Ниже приведен эталонный пример отказоустойчивого асинхронного продюсера на Go:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2283,46 +2462,64 @@ import (
 )
 
 func main() {
+    // Создание клиента с production-настройками
     cl, err := kgo.NewClient(
         kgo.SeedBrokers(&quot;localhost:9092&quot;),
-        // Включаем идемпотентность — franz-go делает это автоматически при
-        // использовании транзакций или при явном указании idempotent mode.
+        // Включаем подтверждение от всех реплик в ISR (In-Sync Replicas)
         kgo.RequiredAcks(kgo.AllISRAcks()),
+        // Время на автоматические ретраи при сбоях сети или смене лидеров
         kgo.RetryTimeout(30*time.Second),
-        kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)), // липкий по ключу
-        kgo.BatchMaxBytes(1&lt;&lt;20), // 1 MB максимальный размер батча
+        // StickyKeyPartitioner оптимизирует батчинг при отсутствии ключа
+        kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
+        // Накопление батча до 1 МБ
+        kgo.BatchMaxBytes(1&lt;&lt;20),
+        // Устанавливаем задержку linger для эффективного накопления записей
+        kgo.Linger(5 * time.Millisecond),
+        // Сжатие батчей алгоритмом zstd (баланс скорости и сжатия)
+        kgo.ProducerBatchCompression(kgo.ZstdCompression()),
     )
     if err != nil {
-        log.Fatalf(&quot;failed to create client: %v&quot;, err)
+        log.Fatalf(&quot;failed to create kafka client: %v&quot;, err)
     }
     defer cl.Close()
 
-    ctx := context.Background()
-    // Асинхронная запись: продьюс-рекорд не блокирует горутину
-    cl.Produce(ctx, &amp;kgo.Record{
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    // Асинхронная запись: прикладная горутина не блокируется в ожидании сети
+    record := &amp;kgo.Record{
         Topic: &quot;orders&quot;,
         Key:   []byte(&quot;cust-12345&quot;),
         Value: []byte(`{&quot;order_id&quot;:&quot;xyz&quot;,&quot;amount&quot;:250}`),
-    }, func(r *kgo.Record, err error) {
+    }
+
+    cl.Produce(ctx, record, func(r *kgo.Record, err error) {
         if err != nil {
-            log.Printf(&quot;failed to deliver: %v&quot;, err)
+            // Обработка критической ошибки после исчерпания всех ретраев
+            log.Printf(&quot;failed to deliver record to topic %s: %v&quot;, r.Topic, err)
             return
         }
-        fmt.Printf(&quot;delivered to partition %d at offset %d\n&quot;, r.Partition, r.Offset)
+        fmt.Printf(&quot;Delivered to partition %d at offset %d (timestamp: %v)\n&quot;,
+            r.Partition, r.Offset, r.Timestamp)
     })
-    // Flush перед завершением программы
+
+    // Принудительный сброс всех накопленных буферов перед завершением сервиса
     if err := cl.Flush(ctx); err != nil {
         log.Fatalf(&quot;flush failed: %v&quot;, err)
     }
+    fmt.Println(&quot;All accumulated batches have been successfully flushed.&quot;)
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="consumer-pull-based-razgruzka-loga">Consumer: pull-based разгрузка лога</h2>
 
-<p>В отличие от брокеров, которые проталкивают сообщения (push) потребителям, Kafka использует <strong>pull-модель</strong>. Консьюмер периодически опрашивает брокера, запрашивая следующую порцию данных. Это даёт потребителю полный контроль над темпом обработки, исключает переполнение его буферов и позволяет эффективно применять backpressure (<a href="../01-fundament-asinkhronnosti/6-backpressure-i-kontrol-nagruzki.html" class="wikilink">6. Backpressure и контроль нагрузки</a>).</p>
+<p>В отличие от традиционных брокеров очередей (например, RabbitMQ), которые проталкивают сообщения (push) в TCP-сокеты потребителей, архитектура Kafka фундаментально построена на <strong>pull-модели</strong>. Консьюмер сам опрашивает брокера, отправляя сетевой запрос <code>FetchRequest</code> и запрашивая следующую порцию данных.</p>
+<p>Это даёт потребителю полный контроль над темпом обработки, исключает переполнение его локальных буферов и обеспечивает естественный backpressure (<a href="../01-fundament-asinkhronnosti/6-backpressure-i-kontrol-nagruzki.html" class="wikilink">6. Backpressure и контроль нагрузки</a>).</p>
 <h3 id="vnutrenniy-tsikl-konsyumera">Внутренний цикл консьюмера</h3>
 
+<p>Жизненный цикл консьюмера состоит из двух уровней: координации в группе и регулярного цикла опроса лога (<code>Poll loop</code>).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2352,12 +2549,13 @@ Auto --&gt; Poll
 </div>
 
 
+<p>Ключевые компоненты и протокольные механизмы консьюмера:</p>
 <ol>
-<li><strong>Координатор группы</strong> — один из брокеров, выбранный для управления Consumer Group. Он обрабатывает регистрацию, heartbeat-ы, ребалансировку.</li>
-<li><strong>Лидер группы</strong> — один из консьюмеров в группе, который вычисляет распределение партиций по стратегии (Range, Sticky и т.д.) и отправляет план координатору.</li>
-<li><strong>Fetcher</strong> — компонент, занимающийся предвыборкой (prefetch) батчей. Он может получать данные параллельно из нескольких брокеров, используя отдельные сетевые соединения.</li>
-<li><strong>Heartbeat</strong> — периодические сигналы (по умолчанию каждые 3 секунды), подтверждающие, что консьюмер жив. Если брокер не получает heartbeat дольше <code>session.timeout.ms</code> (по умолчанию 45 с), консьюмер считается мёртвым и запускается ребалансировка.</li>
-<li><strong>Max.poll.interval.ms</strong> — максимальное время между вызовами <code>Poll</code>. Если приложение зависло в обработке и не вызывает Poll дольше этого интервала, консьюмер покидает группу, вызывая ребалансировку. По умолчанию 5 минут.</li>
+<li><strong>Координатор группы (Group Coordinator)</strong> — один из брокеров кластера Kafka (ответственный за партицию внутреннего топика <code>__consumer_offsets</code>, в которую попадает хэш имени группы). Он управляет членством в группе, отслеживает heartbeat-сообщения и инициирует ребалансировку.</li>
+<li><strong>Лидер группы (Group Leader)</strong> — один из консьюмеров группы (обычно первый подключившийся). Координатор передает лидеру список всех живых участников, и лидер вычисляет распределение партиций по выбранной стратегии (Range, RoundRobin, Sticky, CooperativeSticky) и возвращает план координатору.</li>
+<li><strong>Fetcher</strong> — внутренний компонент, занимающийся асинхронной предвыборкой (<code>prefetch</code>) батчей с брокеров. Консьюмер не ждёт ответа брокера на каждый вызов <code>Poll</code>: Fetcher в фоновом режиме запрашивает новые батчи из брокеров-лидеров назначенных партиций, заполняя внутреннюю очередь.</li>
+<li><strong>Heartbeat</strong> — фоновые сигналы жизнедеятельности (по умолчанию отправляются каждые 3 секунды), подтверждающие координатору, что данный консьюмер жив. Если брокер не получает heartbeat дольше интервала <code>session.timeout.ms</code> (по умолчанию 45 с), консьюмер признаётся выпавшим из кластера, и координатор объявляет ребалансировку.</li>
+<li><strong><code>max.poll.interval.ms</code></strong> — максимальное допустимое время между последовательными вызовами метода <code>Poll</code> (по умолчанию 5 минут). Это защита от «зависших» или перегруженных воркеров. Если приложение заблокировалось при обработке батча (например, на тяжелом SQL-запросе) и не успело вызвать <code>Poll</code> до истечения таймаута, клиент самостоятельно покидает группу, чтобы не тормозить чтение партиции.</li>
 </ol>
 <div class="callout callout-warning">
   <div class="callout-header">
@@ -2365,19 +2563,27 @@ Auto --&gt; Poll
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>В Go-консьюмере нельзя блокировать горутину, вызывающую <code>Poll</code>, на длительное время (например, синхронной записью в БД). Это приведёт к превышению <code>max.poll.interval.ms</code> и бесконечным ребалансировкам. Сообщения всегда нужно обрабатывать в отдельных горутинах или пулах, оставляя Poll-цикл быстрым и асинхронным.</p>
+    <p>В Go-консьюмере нельзя блокировать горутину, вызывающую <code>Poll</code>, на длительное время (например, тяжелой синхронной записью в базу данных или обращением к внешнему HTTP API). Это приведет к превышению <code>max.poll.interval.ms</code> и возникновению <strong>шторма бесконечных ребалансировок</strong> (rebalance storm): группа перераспределяет партиции, брокер отзывает их у зависшего воркера, другой воркер берет тот же батч, тоже зависает, и весь консьюмерский кластер встает колом! Сообщения всегда нужно передавать пулу рабочих горутин, оставляя цикл <code>Poll</code> быстрым и непрерывным.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="upravlenie-smeshcheniyami-avtomaticheskiy-vs-ruchnoy-kommit">Управление смещениями: автоматический vs ручной коммит</h3>
 
+<p>Смещение (offset) — это закладка в книге лога. То, как именно консьюмер обновляет эту закладку во внутреннем топике <code>__consumer_offsets</code>, определяет гарантии надёжности обработки данных:</p>
 <ul>
-<li><strong>Автоматический коммит</strong> (<code>enable.auto.commit=true</code>) — консьюмер периодически фиксирует offset последнего возвращённого Poll-ом сообщения. Прост, но может привести к потере сообщений (если приложение упало после Poll, но до обработки) или к дубликатам (если обработка завершилась, но коммит не успел).</li>
-<li><strong>Ручной коммит</strong> — приложение само решает, когда фиксировать offset. Обычно коммитят после завершения всей бизнес-логики, включая запись в БД, обеспечивая семантику at-least-once с контролируемым окном дублирования.</li>
+<li><strong>Автоматический коммит</strong> (<code>enable.auto.commit=true</code>) — каждые <code>auto.commit.interval.ms</code> (по умолчанию 5 секунд) клиент автоматически фиксирует максимальный offset, полученный при предыдущих вызовах <code>Poll</code>. </li>
+<li><em>Плюсы:</em> Предельная простота прикладного кода.</li>
+<li><em>Риски:</em> Высокая вероятность <strong>потери данных</strong> (если воркер получил сообщения, закоммитил смещение по таймеру, но упал с panic до реальной записи в БД) либо <strong>дублирования сообщений</strong> (если падение произошло до истечения таймера коммита).</li>
+<li><strong>Ручной коммит</strong> (<code>enable.auto.commit=false</code>) — приложение явно вызывает методы <code>CommitOffsets</code> (синхронно или асинхронно) строго после того, как все побочные эффекты (запись в БД, вызов платежного шлюза) успешно зафиксированы.</li>
+<li><em>Плюсы:</em> Надежная семантика доставки <strong>at-least-once</strong> («как минимум один раз»).</li>
+<li><em>Стратегия:</em> При сбое узел перезапускается и перечитывает последние незакоммиченные сообщения с момента предыдущей фиксации.</li>
 </ul>
-<p>Для exactly-once в рамках Consumer Group часто комбинируют ручной коммит с идемпотентным обработчиком (<a href="../07-praktika/4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>), повторно проверяя, не был ли offset уже обработан.</p>
+<p>Для построения сквозного <code>exactly-once</code> на стороне консьюмера ручной коммит комбинируют с паттерном <strong>Идемпотентного потребителя</strong> (<a href="../07-praktika/4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>), сохраняя обработанный бизнес-идентификатор в уникальном индексе базы данных в рамках одной локальной транзакции.</p>
+<hr />
 <h3 id="proizvoditelnyy-konsyumer-na-go">Производительный консьюмер на Go</h3>
 
+<p>Ниже представлен production-ready консьюмер на <code>franz-go</code>, реализующий конкурентную обработку сообщений по партициям, корректную обработку сигналов завершения ОС (Graceful Shutdown) и безопасный ручной коммит смещений:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2396,11 +2602,13 @@ import (
     &quot;os/signal&quot;
     &quot;sync&quot;
     &quot;syscall&quot;
+    &quot;time&quot;
 
     &quot;github.com/twmb/franz-go/pkg/kgo&quot;
 )
 
 func main() {
+    // Перехват сигналов завершения для корректного выхода из группы (Graceful Shutdown)
     ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     defer stop()
 
@@ -2408,59 +2616,131 @@ func main() {
         kgo.SeedBrokers(&quot;localhost:9092&quot;),
         kgo.ConsumerGroup(&quot;order-processors&quot;),
         kgo.ConsumeTopics(&quot;orders&quot;),
+        // Отключаем автокоммит для предотвращения потери сообщений
         kgo.DisableAutoCommit(),
-        // Настройки heartbeats и таймаутов
+        // Настройки heartbeats и таймаутов обнаружения сбоев
         kgo.SessionTimeout(30*time.Second),
         kgo.HeartbeatInterval(3*time.Second),
+        // Cooperative Sticky стратегия позволяет ребалансироваться без Stop-the-World
+        kgo.Balancers(kgo.CooperativeStickyBalancer()),
     )
     if err != nil {
-        log.Fatalf(&quot;failed to create client: %v&quot;, err)
+        log.Fatalf(&quot;failed to create consumer client: %v&quot;, err)
     }
     defer cl.Close()
 
     var wg sync.WaitGroup
-    fmt.Println(&quot;Consumer started, processing messages...&quot;)
+    fmt.Println(&quot;Consumer started. Waiting for partition assignment...&quot;)
+
     for {
+        // Опрос брокера: возвращает батчи записей по всем назначенным партициям
         fetches := cl.PollFetches(ctx)
         if fetches.IsClientClosed() {
             break
         }
+        if ctx.Err() != nil {
+            // Получен сигнал SIGINT/SIGTERM, прекращаем опрос
+            break
+        }
         if errs := fetches.Errors(); len(errs) &gt; 0 {
-            log.Printf(&quot;fetch errors: %v&quot;, errs)
+            log.Printf(&quot;fetch warnings/errors: %v&quot;, errs)
             continue
         }
 
-        // Обработка каждой партиции параллельно
+        // Параллельная обработка каждой партиции в отдельной горутине.
+        // Внутри ОДНОЙ партиции порядок сообщений сохраняется строго последовательно!
         fetches.EachPartition(func(ftp kgo.FetchTopicPartition) {
             wg.Add(1)
-            go func(ftp kgo.FetchTopicPartition) {
+            go func(p kgo.FetchTopicPartition) {
                 defer wg.Done()
-                for _, record := range ftp.Records {
-                    // Бизнес-логика: запись в БД, вызов других сервисов
-                    fmt.Printf(&quot;processed offset=%d key=%s\n&quot;, record.Offset, record.Key)
+
+                for _, record := range p.Records {
+                    // Бизнес-логика: идемпотентная обработка заказа
+                    processOrder(record)
                 }
-                // Коммит только после успешной обработки всех записей партиции
-                cl.CommitUncommittedOffsets(ctx)
+
+                // Коммит смещений выполняется только после успешной обработки всех записей партиции!
+                // cl.CommitUncommittedOffsets фиксирует максимальный прочитанный offset
+                if err := cl.CommitUncommittedOffsets(context.Background()); err != nil {
+                    log.Printf(&quot;failed to commit offsets for partition %d: %v&quot;, p.Partition, err)
+                }
             }(ftp)
         })
     }
-    wg.Wait() // ожидание завершения всех обработчиков перед выходом
+
+    fmt.Println(&quot;Shutting down consumer, waiting for pending partition workers...&quot;)
+    wg.Wait()
+    fmt.Println(&quot;All partition workers finished. Exiting gracefully.&quot;)
+}
+
+func processOrder(r *kgo.Record) {
+    fmt.Printf(&quot;[Partition %d | Offset %d] Processed key=%s val_len=%d\n&quot;,
+        r.Partition, r.Offset, string(r.Key), len(r.Value))
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="pull-vs-push-pochemu-ne-push">Pull vs Push: почему не push?</h2>
 
-<p>Выбор pull-модели для Kafka — не случайность, а архитектурное решение, продиктованное механической симпатией к железу:</p>
+<p>Выбор pull-модели для Kafka — не случайность и не исторический курьёз, а фундаментальное архитектурное решение, продиктованное механической симпатией к дисковой и сетевой подсистеме современного оборудования:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph PushModel[&quot;Push-модель (RabbitMQ, ActiveMQ)&quot;]
+direction TB
+B1[&quot;Брокер&quot;] --&gt;|&quot;Проталкивает сообщения&lt;br&gt;на полной скорости&quot;| C1[&quot;Консьюмер&quot;]
+C1 -.-&gt;|&quot;Переполнение памяти!&lt;br&gt;Нужен сложный Flow Control&quot;| B1
+end
+
+subgraph PullModel[&quot;Pull-модель (Kafka)&quot;]
+direction TB
+C2[&quot;Консьюмер&quot;] --&gt;|&quot;Запрашивает ровно N байт&lt;br&gt;когда готов обработать&quot;| B2[&quot;Брокер&quot;]
+B2 --&gt;|&quot;Ответ через sendfile(2)&lt;br&gt;напрямую из Page Cache&quot;| C2
+end
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>Backpressure «из коробки».</strong> В push-системе брокеру нужен механизм обратной связи (flow control), чтобы не перегрузить медленного консьюмера. В pull консьюмер просто запрашивает столько, сколько готов обработать.</li>
-<li><strong>Эффективный сетевой ввод-вывод.</strong> Консьюмер может запрашивать большие блоки данных за один вызов <code>poll</code>, получая сразу целый батч. В push-модели брокер дробил бы данные на множество мелких пакетов, теряя в пропускной способности.</li>
-<li><strong>Zero-copy до последнего байта.</strong> Благодаря тому, что брокер просто отдаёт сегменты лога через <code>sendfile</code>, консьюмер может читать данные напрямую из страничного кеша брокера, вообще не затрагивая приложение брокера в пространстве пользователя.</li>
+<li><strong>Естественный Backpressure «из коробки»:</strong><br />
+   - В традиционных push-системах (RabbitMQ, классические RPC) брокер пытается протолкнуть данные получателю как можно быстрее. Если потребитель замедлился (например, база данных деградировала по задержке), брокер заваливает его сетевыми пакетами. Чтобы не упасть с <code>Out of Memory</code>, системе требуется сложный двусторонний протокол управления потоком (flow control, credit-based rate limiting, pause/resume).<br />
+   - В pull-модели консьюмер запрашивает новую порцию данных <strong>только тогда, когда закончил обработку предыдущей</strong>. Замедлился консьюмер — он просто реже вызывает <code>poll</code>. Брокер даже не замечает этого, сохраняя сообщения на диске. Backpressure возникает автоматически, как фундаментальный закон природы.</li>
+<li><strong>Агрессивный сетевой батчинг на чтении:</strong><br />
+   - Консьюмер запрашивает данные большими порциями (параметры <code>fetch.min.bytes</code>, <code>fetch.max.bytes</code>, например, до 50 МБ за один сетевой round-trip). В push-модели брокеру пришлось бы принимать решение: отправить ли одно сообщение сейчас или подождать? В pull-модели консьюмер говорит: «Дай мне все накопившиеся записи вплоть до 10 МБ», минимизируя накладные расходы протокола.</li>
+<li><strong>Zero-Copy до последнего байта:</strong><br />
+   - Поскольку консьюмер запрашивает непрерывный диапазон смещений из конкретной партиции, брокеру не нужно разбирать записи в пользовательской памяти! <br />
+   - Ядро Linux выполняет системный вызов <code>sendfile(2)</code> (или <code>splice(2)</code>), который переносит данные из страничного кэша (Page Cache) прямо в DMA-буфер сетевой карты, минуя пространство пользователя брокера. Никаких аллокаций в JVM/Go-рантайме брокера, никакой нагрузки на GC!</li>
 </ol>
+<hr />
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Вопрос с собеседования</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> «Что произойдет, если в Go-консьюмере обработка одного батча в вызове <code>Poll</code> займет 7 минут при <code>max.poll.interval.ms = 300000</code> (5 минут)? Поможет ли то, что фоновая горутина исправно шлет heartbeats брокеру?»<br />
+<strong>Ответ:</strong> Фоновые heartbeats (<code>session.timeout.ms</code>) подтверждают лишь то, что процесс консьюмера физически жив и сетевой сокет открыт. Однако брокер расценивает превышение <code>max.poll.interval.ms</code> как признак того, что консьюмер <strong>завис логически</strong> (deadlock, вечный цикл, зависший запрос к БД). Координатор принудительно исключит консьюмера из группы и запустит ребалансировку, отдав его партиции другому инстансу. Когда «зависший» консьюмер наконец очнется через 7 минут и попытается закоммитить свои offsets, брокер отклонит коммит с ошибкой <code>CommitFailedException</code> (партиции уже принадлежат другому узлу), что неизбежно приведет к повторной обработке и дубликатам. Для решения проблемы следует либо уменьшать размер вычитываемого батча (<code>max.poll.records</code>), либо выносить тяжелую работу в пул горутин.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="zaklyuchenie-i-sleduyushchie-shagi">Заключение и следующие шаги</h2>
 
-<p>Понимание внутреннего устройства Producer и Consumer — фундамент для построения надёжных и высокопроизводительных пайплайнов. Мы рассмотрели батчинг, сжатие, идемпотентность и pull-модель, которые напрямую опираются на возможности современных ОС: sendfile, страничный кеш и неблокирующий ввод-вывод.</p>
-<p>Теперь, когда одиночные клиенты освоены, пора переходить к координации множества потребителей в составе Consumer Group. В следующей статье <a href="4-consumer-groups.html" class="wikilink">4. Consumer groups</a> мы детально разберём ребалансировку, стратегии распределения партиций и управление жизненным циклом группы.</p>
+<p>Внутреннее устройство Producer и Consumer в Kafka подчинено одной доминирующей идее — максимальной эффективности утилизации железа. Батчинг на стороне продюсера через <code>RecordAccumulator</code>, аккуратная балансировка <code>linger.ms</code> и <code>batch.size</code>, аппаратное сжатие целых пакетов и pull-модель консьюмера с опорой на <code>sendfile(2)</code> и страничный кэш ядра превращают Kafka в высокопроизводительную конвейерную магистраль данных.</p>
+<p>Теперь, когда механика одиночных отправителей и получателей ясна, мы готовы перейти к масштабированию: как распределить чтение огромного топика из сотен партиций между десятками параллельно работающих сервисов? </p>
+<p>В следующей статье — <a href="4-consumer-groups.html" class="wikilink">4. Consumer groups</a> — мы детально разберем внутреннюю кухню координатора групп, протоколы Rebalance (Eager vs Incremental Cooperative) и то, как избежать деградации сервиса при выкатке новых релизов.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

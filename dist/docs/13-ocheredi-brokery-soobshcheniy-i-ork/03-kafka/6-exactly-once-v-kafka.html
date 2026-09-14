@@ -2168,14 +2168,19 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~38 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Exactly once в Kafka</h1>
           </header>
 
           <div class="article-markdown">
-            <div class="callout callout-note">
+            <h1>6. Exactly once в Kafka: идемпотентность, транзакции и границы возможного</h1>
+<blockquote>
+<p><em>"There are only two hard problems in distributed systems: 2. Exactly-once delivery 1. Guaranteed order 2. Exactly-once delivery."</em><br />
+— Инженерный фольклор</p>
+</blockquote>
+<div class="callout callout-note">
   <div class="callout-header">
     <span class="callout-icon">📝</span>
     <span class="callout-title">Заметка</span>
@@ -2185,46 +2190,21 @@
   </div>
 </div>
 
+<hr />
 <h2 id="tri-grani-garantiy-dostavki">Три грани гарантий доставки</h2>
 
-<p>Прежде чем погружаться в реализацию exactly-once в Kafka, зафиксируем три классические семантики, знакомые по распределённым системам:</p>
+<p>В теории распределенных систем существует доказанная теорема: в ненадежной асинхронной сети с возможными падениями узлов (модель сбоев crash-recovery) абсолютная доставка «ровно один раз» невозможна в общем виде из-за фундаментальной неразрешимости Задачи двух генералов (Two Generals' Problem). Сетевой пакет может потеряться, подтверждение (ACK) может задержаться, а узел-отправитель принципиально не способен отличить упавший сервер от медленной сети.</p>
+<p>Тем не менее в индустрии мы ежедневно слышим термин <strong>EOS (Exactly-Once Semantics)</strong> в Apache Kafka. Что же это такое на самом деле? Маркетинговый трюк или гениальная инженерия?</p>
+<p>Разложим классическую триаду гарантий:</p>
 <ul>
-<li><strong>At most once</strong> — сообщение либо доставлено один раз, либо потеряно. Самая быстрая, но ненадёжная модель: продюсер не ждёт подтверждений (<code>acks=0</code>), консьюмер коммитит offset до обработки.</li>
-<li><strong>At least once</strong> — сообщение гарантированно доставлено, но может дублироваться. Продюсер ретраит до успеха, консьюмер коммитит offset после обработки. Это стандартный режим Kafka по умолчанию.</li>
-<li><strong>Exactly once</strong> — сообщение обработано ровно один раз, даже при сбоях и повторах. Самая сложная семантика, требующая кооперации продюсера, брокера и консьюмера, а также идемпотентности обработчика.</li>
+<li><strong>At most once («не более одного раза»):</strong> Сообщение либо доставляется один раз, либо теряется навсегда. Продюсер отправляет данные в сокет с <code>acks=0</code> (fire-and-forget), не ожидая подтверждения от брокера. Консьюмер коммитит offset в момент извлечения из буфера до начала реальной обработки. Если процесс падает — данные безвозвратно утеряны.</li>
+<li><strong>At least once («как минимум один раз»):</strong> Сообщение гарантированно доставляется, но при сетевых сбоях и ретраях может быть продублировано. Продюсер требует подтверждения (<code>acks=all</code>) и повторяет отправку при малейшем таймауте. Консьюмер коммитит offset строго после успешного завершения обработки. Это режим по умолчанию в абсолютном большинстве промышленных систем.</li>
+<li><strong>Exactly once («ровно один раз»):</strong> Семантика, при которой логический эффект от обработки каждого сообщения наступает ровно один раз, даже при аппаратных сбоях серверов, разрывах сети и повторных попытках отправки.</li>
 </ul>
-<p>В Kafka exactly-once реализуется на нескольких уровнях: <strong>идемпотентный продюсер</strong> гарантирует ровно одну запись в партицию; <strong>транзакции</strong> позволяют атомарно записать в несколько партиций и топиков, а <strong>изолированное чтение</strong> консьюмера отфильтровывает незавершённые транзакции.</p>
-<h2 id="idempotentnyy-prodyuser-osnova-exactly-once-vnutri-partitsii">Идемпотентный продюсер: основа exactly-once внутри партиции</h2>
-
-<p>Идемпотентный продюсер (enable.idempotence=true) решает проблему дубликатов, вызванных сетевыми ретраями. Когда продюсер отправляет батч, брокер записывает его, но ACK теряется по пути — продюсер повторяет отправку, создавая дубликат. Идемпотентность предотвращает это на уровне протокола.</p>
-<h3 id="kak-eto-rabotaet-pod-kapotom">Как это работает под капотом</h3>
-
-<p>При включении идемпотентности продюсер при инициализации получает от брокера уникальный <strong>Producer ID (PID)</strong> — 64-битное целое, назначаемое координатором транзакций (Transaction Coordinator). Для каждого сообщения в каждой партиции продюсер поддерживает монотонно возрастающий <strong>sequence number</strong>, начинающийся с 0.</p>
-<p>Брокер, обслуживающий партицию, хранит в оперативной памяти последний принятый sequence number для каждого PID. Когда приходит батч, брокер проверяет:<br />
-- Если sequence number равен ожидаемому (последний + 1) или 0 — записать.<br />
-- Если меньше или равен последнему принятому — это дубликат, отбросить, но подтвердить успех.<br />
-- Если больше ожидаемого более чем на 1 — ошибка <code>OutOfOrderSequenceException</code>, свидетельствующая о потере промежуточных сообщений.</p>
-<p>Таким образом, даже если продюсер повторит отправку батча несколько раз, брокер запишет его ровно один раз — в пределах одной сессии Producer ID. Эта гарантия действует <strong>на одну партицию</strong> и <strong>на время жизни продюсера</strong> (PID живёт до перезапуска продюсера или истечения срока неактивности <code>transactional.id.timeout.ms</code>).</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Продюсер хранит sequence numbers в памяти, а не в логе. При перезапуске продюсера PID теряется и назначается новый, поэтому идемпотентность без транзакций не переживает крах продюсера. Для сквозной exactly-once между топиками или перезапусками нужны транзакции.</p>
-  </div>
-</div>
-
-<h2 id="tranzaktsii-atomarnaya-zapis-v-neskolko-partitsiy">Транзакции: атомарная запись в несколько партиций</h2>
-
-<p>Транзакции в Kafka расширяют идемпотентность до атомарных операций, охватывающих несколько партиций и топиков. Они позволяют гарантировать, что либо все сообщения, записанные в рамках одной транзакции, станут видимы консьюмерам, либо ни одно не станет.</p>
-<p>Транзакционный API вводит понятие <strong>transactional producer</strong> и <strong>transactional consumer</strong>. Продюсер вызывает <code>beginTransaction()</code>, затем отправляет сообщения в один или несколько топиков, после чего вызывает <code>commitTransaction()</code> или <code>abortTransaction()</code>. Консьюмер с режимом изоляции <code>read_committed</code> увидит только сообщения из завершённых транзакций.</p>
-<h3 id="transaction-coordinator-i-transaction-log">Transaction Coordinator и Transaction Log</h3>
-
-<p>Центральную роль в транзакционной инфраструктуре играет <strong>Transaction Coordinator</strong> — специальный брокер, назначаемый для каждого transactional producer'а. Координатор отвечает за:<br />
-- Назначение Producer ID.<br />
-- Управление транзакционным логом (служебный топик <code>__transaction_state</code>), в котором хранятся состояния транзакций (Ongoing, PrepareCommit, PrepareAbort, CompleteCommit, CompleteAbort).<br />
-- Выдачу маркеров завершения транзакций (commit/abort markers) в пользовательские топики.</p>
+<p>В Apache Kafka гарантия <strong>Exactly-Once</strong> — это не магия, нарушающая законы физики, а математически выверенная композиция трёх строгих компонентов:<br />
+1. <strong>Идемпотентный продюсер</strong> (<code>enable.idempotence=true</code>) — гарантирует ровно одну запись без дубликатов в рамках одной партиции и одной сессии;<br />
+2. <strong>Транзакционный координатор и 2PC (Two-Phase Commit)</strong> — обеспечивает атомарную запись пакета сообщений в произвольное число топиков и партиций;<br />
+3. <strong>Изолированное чтение консьюмера</strong> (<code>read_committed</code>) — скрывает от потребителей данные прерванных (aborted) и незавершённых транзакций.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2239,28 +2219,192 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-TP[&quot;Транзакционный продюсер&lt;br&gt;начинает транзакцию&quot;] --&gt;|&quot;1 - InitTransactions&quot;| TC[&quot;Transaction Coordinator&lt;br&gt;назначает PID и epoch&quot;]
-TP --&gt;|&quot;2 - Запись сообщений&lt;br&gt;в партиции&quot;| P0[&quot;Партиция 0 топика A&quot;]
-TP --&gt;|&quot;2 - Запись сообщений&lt;br&gt;в партиции&quot;| P1[&quot;Партиция 1 топика B&quot;]
-TP --&gt;|&quot;3 - commitTransaction&quot;| TC
-TC --&gt;|&quot;4 - Запись PrepareCommit&lt;br&gt;в __transaction_state&quot;| TL[&quot;Transaction Log&quot;]
-TC --&gt;|&quot;5 - Запись commit marker&lt;br&gt;в пользовательские топики&quot;| P0
-TC --&gt;|&quot;5 - Запись commit marker&lt;br&gt;в пользовательские топики&quot;| P1
-TC --&gt;|&quot;6 - Запись CompleteCommit&lt;br&gt;в __transaction_state&quot;| TL
+subgraph EOS[&quot;Фундамент Exactly-Once в Kafka&quot;]
+direction TB
+A[&quot;1. Идемпотентный Producer&lt;br&gt;(PID + Sequence Numbers)&quot;]
+B[&quot;2. Транзакции Kafka&lt;br&gt;(2-Phase Commit + Transaction Coordinator)&quot;]
+C[&quot;3. Изолированный Consumer&lt;br&gt;(read_committed + Last Stable Offset)&quot;]
+end
+
+A --&gt; B
+B --&gt; C
   </pre>
 </div>
 
 
-<p>Когда транзакция коммитится, координатор сначала записывает состояние <code>PrepareCommit</code> в транзакционный лог, затем асинхронно записывает <strong>commit marker</strong> в каждую задействованную партицию. Эти маркеры — специальные записи без значения, указывающие, что предыдущие сообщения с данным PID закоммичены. Только после записи маркера сообщения становятся видимы для консьюмеров с <code>read_committed</code>.</p>
-<p>Если продюсер падает до коммита, координатор по истечении <code>transaction.timeout.ms</code> прерывает транзакцию, записывая abort marker и делая сообщения невидимыми.</p>
+<hr />
+<h2 id="idempotentnyy-prodyuser-osnova-exactly-once-vnutri-partitsii">Идемпотентный продюсер: основа exactly-once внутри партиции</h2>
+
+<p>В распределенных системах большинство дубликатов рождается не из-за ошибок в коде, а из-за аномалий сети: продюсер отправляет батч, брокер-лидер успешно записывает его на диск и реплицирует в ISR, но сетевой пакет подтверждения (ACK) теряется в коммутаторе. Продюсер, не получив ответа по таймауту, инициирует повторную отправку (retry). Без специальной защиты в логе появится второй идентичный экземпляр записи.</p>
+<p>Идемпотентный продюсер (<code>enable.idempotence=true</code>) решает эту проблему на уровне бинарного протокола брокера.</p>
+<h3 id="kak-eto-rabotaet-pod-kapotom">Как это работает под капотом</h3>
+
+<p>При инициализации продюсера происходит следующий протокольный обмен:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor P as Продюсер
+participant TC as Transaction Coordinator (Брокер)
+participant L as Лидер партиции 0
+
+P-&gt;&gt;TC: InitProducerIdRequest
+TC--&gt;&gt;P: Assigned Producer ID (PID = 100500), Epoch = 0
+
+Note over P,L: Отправка батча с монотонным Sequence Number
+P-&gt;&gt;L: ProduceRequest(PID=100500, Epoch=0, SeqNum=0..4)
+L-&gt;&gt;L: Проверка: SeqNum == 0 (Ожидаемый). Запись в сегмент!
+L--&gt;&gt;P: ProduceResponse(ACK, BaseOffset=40)
+
+Note over P,L: Сетевой сбой: ACK потерян!
+P-&gt;&gt;L: ProduceRequest(PID=100500, Epoch=0, SeqNum=5..9)
+L--xP: TCP RST / Timeout (ACK утерян в коммутаторе)
+
+Note over P,L: Продюсер выполняет Retry того же батча
+P-&gt;&gt;L: ProduceRequest(PID=100500, Epoch=0, SeqNum=5..9) [RETRY]
+L-&gt;&gt;L: Проверка: SeqNum 5..9 уже записаны в память брокера!&lt;br&gt;Дубликат отброшен!
+L--&gt;&gt;P: ProduceResponse(ACK, BaseOffset=45) [Успех без дубликата]
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>Producer ID (PID):</strong> Продюсер отправляет запрос <code>InitProducerIdRequest</code> и получает глобальный 64-битный идентификатор PID.</li>
+<li><strong>Sequence Number:</strong> Для каждой целевой партиции клиент заводит локальный счетчик, монотонно возрастающий на 1 с каждым новым сообщением (начиная с 0).</li>
+<li><strong>Кэш состояний на брокере:</strong> Каждый брокер хранит в оперативной памяти кольцевой буфер последних 5 принятых sequence numbers для каждого активного PID в каждой партиции.</li>
+<li><strong>Валидация входящего батча:</strong><br />
+   - Если пришедший <code>Sequence Number</code> равен в точности <code>LastSequenceNumber + 1</code> — батч записывается в файл сегмента, а счетчик обновляется.<br />
+   - Если пришедший <code>Sequence Number &lt;= LastSequenceNumber</code> — брокер мгновенно распознает сетевой дубликат. Запись <strong>не производится</strong>, но клиенту возвращается подтверждение успешной доставки (ACK).<br />
+   - Если пришедший <code>Sequence Number &gt; LastSequenceNumber + 1</code> — брокер обнаруживает пропуск сообщений и возвращает фатальную ошибку <code>OutOfOrderSequenceException</code>.</li>
+</ol>
+<p>Таким образом, даже если продюсер повторит отправку батча несколько раз, брокер запишет его ровно один раз — в пределах одной сессии Producer ID. Эта гарантия действует <strong>на одну партицию</strong> и <strong>на время жизни продюсера</strong> (PID живёт до перезапуска продюсера или истечения срока неактивности <code>transactional.id.timeout.ms</code>).</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом</span>
+  </div>
+  <div class="callout-body">
+    <p>Продюсер хранит sequence numbers в оперативной памяти, а не в распределенном логе. При падении или перезапуске процесса продюсера PID теряется и назначается новый, поэтому идемпотентность без транзакций не переживает крах продюсера. Для сквозной exactly-once между топиками или перезапусками нужны транзакции.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="tranzaktsii-atomarnaya-zapis-v-neskolko-partitsiy">Транзакции: атомарная запись в несколько партиций</h2>
+
+<p>Что делать, если бизнес-операция требует атомарной записи сразу в несколько разных топиков (например, создание записи в <code>orders</code> и одновременное списание баланса в <code>payments</code>)? Или если мы реализуем классический потоковый конвейер: вычитываем сообщение из входного топика <code>raw_events</code>, трансформируем его и пишем в <code>aggregated_events</code>?</p>
+<p>Если сервис упадет посреди этой операции, часть сообщений окажется записана, а часть нет. На помощь приходят <strong>Транзакции Kafka</strong>, введенные в KIP-98.</p>
+<p>Транзакции расширяют гарантию идемпотентности: они гарантируют, что набор сообщений, адресованный в произвольное количество топиков и партиций, будет либо <strong>закоммичен целиком</strong>, либо <strong>полностью отброшен</strong> (All-or-Nothing).</p>
+<p>Транзакционный API вводит понятие <strong>transactional producer</strong> и <strong>transactional consumer</strong>. Продюсер вызывает <code>beginTransaction()</code>, затем отправляет сообщения в один или несколько топиков, после чего вызывает <code>commitTransaction()</code> или <code>abortTransaction()</code>. Консьюмер с режимом изоляции <code>read_committed</code> увидит только сообщения из завершённых транзакций.</p>
+<h3 id="transaction-coordinator-i-transaction-log">Transaction Coordinator и Transaction Log</h3>
+
+<p>Центральную роль в транзакционной инфраструктуре играет <strong>Transaction Coordinator</strong> — выделенный брокер кластера (лидер соответствующей партиции системного топика <code>__transaction_state</code>).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+TP[&quot;Транзакционный продюсер&lt;br&gt;(transactional.id=&#x27;order-worker-1&#x27;)&quot;] --&gt;|&quot;1. InitProducerId&quot;| TC[&quot;Transaction Coordinator&lt;br&gt;(Брокер кластера)&quot;]
+TC --&gt;|&quot;2. Регистрация состояния&lt;br&gt;(Ongoing)&quot;| TL[&quot;Transaction Log&lt;br&gt;(__transaction_state)&quot;]
+TP --&gt;|&quot;3. beginTransaction&quot;| TP
+TP --&gt;|&quot;4. Запись батчей&quot;| P0[&quot;Топик A: Партиция 0&quot;]
+TP --&gt;|&quot;4. Запись батчей&quot;| P1[&quot;Топик B: Партиция 1&quot;]
+TP --&gt;|&quot;5. commitTransaction&quot;| TC
+TC --&gt;|&quot;6. Запись PrepareCommit&quot;| TL
+TC --&gt;|&quot;7. Запись commit markers&quot;| P0
+TC --&gt;|&quot;7. Запись commit markers&quot;| P1
+TC --&gt;|&quot;8. Запись CompleteCommit&quot;| TL
+  </pre>
+</div>
+
+
+<p>Рассмотрим детальный двухфазный протокол коммита:</p>
+<ol>
+<li><strong>Регистрация транзакционного ID:</strong> Продюсер конфигурируется постоянным строковым идентификатором <code>transactional.id</code> (например, <code>order-service-node-42</code>). Координатор находит его в топике <code>__transaction_state</code>, проверяет эпоху и назначает неизменный PID.</li>
+<li><strong>Добавление партиций в транзакцию:</strong> Перед записью в целевые партиции продюсер отправляет координатору запрос <code>AddPartitionsToTxnRequest</code>. Координатор фиксирует в <code>__transaction_state</code>, что партиции $A:0$ и $B:1$ участвуют в текущей транзакции.</li>
+<li><strong>Запись данных:</strong> Продюсер отправляет батчи в партиции. Брокеры записывают их в обычные сегменты, но помечают как принадлежащие незавершенной транзакции (uncommitted).</li>
+<li><strong>Двухфазный коммит (Two-Phase Commit):</strong><br />
+   - <strong>Фаза 1 (Prepare):</strong> Продюсер вызывает <code>commitTransaction()</code>. Координатор пишет в свой внутренний лог запись <code>PrepareCommit</code>. С этого момента транзакция считается гарантированно зафиксированной. Даже если координатор упадет прямо сейчас, после перезапуска он завершит процесс.<br />
+   - <strong>Фаза 2 (Commit Markers):</strong> Координатор асинхронно отправляет специальный RPC-запрос <code>WriteTxnMarkersRequest</code> лидерам всех партиций, участвовавших в транзакции. Лидеры дописывают в конец партиций особый служебный маркер — <strong>Commit Marker</strong>.<br />
+   - <strong>Финализация:</strong> Координатор записывает статус <code>CompleteCommit</code> в <code>__transaction_state</code>.</li>
+</ol>
+<p>Если продюсер падает до вызова коммита или завершается с ошибкой, координатор по истечении <code>transaction.timeout.ms</code> (или при явном <code>abortTransaction()</code>) рассылает в партиции <strong>Abort Marker</strong>.</p>
 <h3 id="producer-epoch-i-zashchita-ot-zombi">Producer epoch и защита от зомби</h3>
 
-<p>Чтобы избежать ситуации «зомби-продюсера» (когда перезапущенный продюсер с тем же <code>transactional.id</code> пытается продолжить старую транзакцию), Kafka использует <strong>producer epoch</strong>. Это монотонно возрастающее число, которое координатор увеличивает при каждой инициализации транзакционного продюсера. Все сообщения и маркеры несут текущий epoch. Брокеры игнорируют записи с устаревшим epoch'ом, предотвращая вмешательство зомби.</p>
+<p>В распределенных системах чрезвычайно опасен сценарий <strong>«Зомби-продюсера» (Zombie / Split-Brain)</strong>:<br />
+1. Инстанс сервиса завис из-за долгой паузы GC (Stop-the-World) или сетевой изоляции.<br />
+2. Координатор счел его мертвым по таймауту <code>transaction.timeout.ms</code> и прервал его транзакцию.<br />
+3. Оркестратор запустил новый инстанс с тем же <code>transactional.id</code>. Новый инстанс начал новую транзакцию.<br />
+4. Старый «зомби»-инстанс внезапно отвисает и пытается дописать свои устаревшие батчи в партиции!</p>
+<p>Для защиты от зомби Kafka использует механизм <strong>Producer Epoch</strong> (поколение продюсера):<br />
+- При каждом вызове инициализации <code>InitProducerId</code> для существующего <code>transactional.id</code> координатор увеличивает счетчик <code>epoch</code> на 1 (например, с 0 на 1).<br />
+- Старый PID с устаревшей эпохой (<code>epoch = 0</code>) мгновенно отсекается (fenced).<br />
+- При любой попытке старого продюсера записать данные брокер возвращает ошибку <code>ProducerFencedException</code>. «Зомби» немедленно завершает свою работу, не повредив данные.</p>
+<hr />
 <h3 id="tranzaktsionnyy-konsyumer-i-rezhimy-izolyatsii">Транзакционный консьюмер и режимы изоляции</h3>
 
-<p>Консьюмеры могут читать топики в одном из двух режимов изоляции:<br />
-- <strong>read_uncommitted</strong> (по умолчанию) — видят все сообщения сразу, включая незакоммиченные и отменённые транзакции. Для exactly-once неприменим.<br />
-- <strong>read_committed</strong> — видят только сообщения, за которыми в логе партиции записан commit marker. Abort-маркеры заставляют консьюмера пропустить соответствующие сообщения. Это требует буферизации на стороне консьюмера: он накапливает сообщения, пока не встретит маркер.</p>
+<p>То, как потребители видят транзакционные записи, регулируется параметром <code>isolation.level</code>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Log[&quot;Сегмент лога партиции&quot;]
+direction LR
+M1[&quot;Msg 1 (Committed)&quot;] --&gt; M2[&quot;Msg 2 (Txn A)&quot;]
+M2 --&gt; M3[&quot;Msg 3 (Txn B)&quot;]
+M3 --&gt; CMark[&quot;Commit Marker (Txn A)&quot;]
+CMark --&gt; AMark[&quot;Abort Marker (Txn B)&quot;]
+AMark --&gt; M4[&quot;Msg 4 (Committed)&quot;]
+end
+
+subgraph Consumers[&quot;Поведение консьюмеров&quot;]
+direction TB
+RU[&quot;read_uncommitted:&lt;br&gt;Читает ВСЁ подряд: Msg 1, 2, 3, 4&lt;br&gt;(видит мусор из aborted Txn B!)&quot;]
+RC[&quot;read_committed:&lt;br&gt;Читает строго Msg 1 и Msg 4.&lt;br&gt;Msg 2 отдает после Commit Marker.&lt;br&gt;Msg 3 отбрасывает!&quot;]
+end
+
+Log -.-&gt; RU
+Log -.-&gt; RC
+  </pre>
+</div>
+
+
+<ul>
+<li><strong><code>read_uncommitted</code></strong> (по умолчанию) — консьюмер читает все сообщения подряд вплоть до <code>High Watermark</code>. Он видит промежуточные сообщения незавершенных транзакций и даже те сообщения, которые позже были отменены (aborted). В этом режиме семантика exactly-once невозможна.</li>
+<li><strong><code>read_committed</code></strong> — консьюмер читает данные только до специальной отметки <strong>LSO (Last Stable Offset)</strong> — смещения первой незавершенной транзакции. Консьюмер буферизирует сообщения в памяти:</li>
+<li>Если транзакция закоммичена (<code>Commit Marker</code>) — сообщения отдаются приложению.</li>
+<li>Если транзакция отменена (<code>Abort Marker</code>) — сообщения прозрачно отфильтровываются и удаляются из буфера, никогда не попадая в прикладной код.</li>
+</ul>
+<p>Пример настройки консьюмера на Go с библиотекой <code>franz-go</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2281,33 +2425,89 @@ cl, err := kgo.NewClient(
 </code></pre>
 </div>
 
+<hr />
 <h2 id="skvoznoy-exactly-once-pattern-consume-transform-produce">Сквозной exactly-once: паттерн consume-transform-produce</h2>
 
 <p>Наиболее распространённый сценарий exactly-once в Kafka — потоковая обработка, где консьюмер читает из одного топика, трансформирует данные и записывает в другой. Сочетание транзакционного продюсера и режима <code>read_committed</code> позволяет обеспечить exactly-once даже при ретраях и перезапусках.</p>
-<p>Шаги:</p>
+<p>В чем здесь главная сложность? Мы должны <strong>атомарно</strong> сделать две вещи:<br />
+1. Записать обработанные сообщения в выходной топик <code>processed_orders</code>;<br />
+2. Закоммитить смещение прочитанных сообщений входного топика <code>raw_orders</code> во внутренний топик <code>__consumer_offsets</code>.</p>
+<p>Если эти две операции не атомарны:<br />
+- Записали в выходной топик, но упали до коммита смещений $\to$ после рестарта вычитаем те же сообщения повторно $\to$ <strong>дубликат на выходе!</strong><br />
+- Закоммитили смещение, но упали до записи в выходной топик $\to$ <strong>потеря данных!</strong></p>
+<p>Решение Kafka гениально: смещение консьюмера записывается <strong>внутрь транзакции продюсера</strong> через специальный вызов <code>sendOffsetsToTransaction</code>!</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor App as Stream Processor (Consumer + Producer)
+participant InTopic as Входной топик (raw_orders)
+participant OutTopic as Выходной топик (processed_orders)
+participant TC as Transaction Coordinator
+participant Offsets as Топик __consumer_offsets
+
+App-&gt;&gt;InTopic: 1. PollFetches (чтение batch: offset 10..15)
+App-&gt;&gt;TC: 2. beginTransaction()
+App-&gt;&gt;App: 3. Бизнес-логика / Трансформация данных
+App-&gt;&gt;OutTopic: 4. Produce(результат обработки)
+App-&gt;&gt;TC: 5. sendOffsetsToTransaction(offset=16, groupId=&quot;stream-group&quot;)
+Note over TC,Offsets: Координатор регистрирует коммит смещения&lt;br&gt;как часть текущей транзакции!
+App-&gt;&gt;TC: 6. commitTransaction()
+Note over TC: Атомарный 2PC коммит:&lt;br&gt;И сообщения в OutTopic, и смещения в __consumer_offsets&lt;br&gt;становятся видимы одновременно!
+  </pre>
+</div>
+
+
+<p>Шаги паттерна Consume-Transform-Produce:</p>
 <ol>
 <li>Консьюмер читает батч из входного топика.</li>
-<li>Начинается транзакция.</li>
-<li>Выполняется бизнес-логика (возможно, с обращением к внешним системам, которые должны поддерживать идемпотентность или транзакционную координацию — <a href="../05-patterny-i-arkhitektura/6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>).</li>
+<li>Начинается транзакция продюсера (<code>beginTransaction()</code>).</li>
+<li>Выполняется бизнес-логика (чистая трансформация данных).</li>
 <li>Результат записывается в выходной топик.</li>
 <li>Offset входного топика коммитится <strong>внутри той же транзакции</strong> (через специальный API <code>sendOffsetsToTransaction</code>).</li>
-<li>Транзакция коммитится. Теперь и результат, и факт обработки становятся видимы атомарно.</li>
+<li>Транзакция коммитится (<code>commitTransaction()</code>). Теперь и результат, и факт обработки становятся видимы атомарно.</li>
 </ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Границы применимости</span>
   </div>
   <div class="callout-body">
     <p>Exactly-once <strong>не распространяется на внешние сайд-эффекты</strong>. Если внутри транзакции происходит запись в PostgreSQL или вызов HTTP API, Kafka не откатит эти операции при аборте. Для этого потребуется распределённая транзакция с использованием паттернов <a href="../05-patterny-i-arkhitektura/8-saga-cherez-brokery.html" class="wikilink">8. Saga через брокеры</a> или координация через <a href="../06-orkestratsiya-protsessov/2-temporal-arkhitektura-i-kontseptsii.html" class="wikilink">2. Temporal. Архитектура и концепции</a>. Не путайте exactly-once внутри Kafka с глобальной exactly-once всей системы.</p>
   </div>
 </div>
 
+<p>Если ваш консьюмер пишет в PostgreSQL или MongoDB, транзакции Kafka не спасут внешнюю базу от дубликатов при сбоях. Для внешних баз данных правильное решение — комбинация <strong>Идемпотентного потребителя</strong> (<a href="../07-praktika/4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>), паттерна <strong>Transactional Outbox</strong> (<a href="../05-patterny-i-arkhitektura/6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>) и уникальных констрейнтов в БД.</p>
+<hr />
 <h2 id="proizvoditelnost-mekhanicheskaya-simpatiya-i-podvodnye-kamni">Производительность, механическая симпатия и подводные камни</h2>
 
 <p>Транзакции не бесплатны. Каждая транзакция добавляет дополнительные записи в <code>__transaction_state</code> и commit-маркеры в пользовательские топики, увеличивая трафик и нагрузку на диски. Координатор транзакций становится узким местом при большом количестве продюсеров.</p>
+<h3 id="head-of-line-blocking-na-storone-konsyumera">Head-of-Line Blocking на стороне консьюмера</h3>
+
+<p>Самый коварный подводный камень транзакционного чтения — блокировка очереди (Head-of-Line Blocking) из-за зависшей транзакции:</p>
+<p>Представим:<br />
+1. Продюсер А начал долгую транзакцию в партиции 0 под смещением 100.<br />
+2. Продюсер Б отправляет обычные или короткие транзакции со смещениями 101, 102, 103...<br />
+3. Консьюмер в режиме <code>read_committed</code> доходит до смещения 100.<br />
+4. Поскольку транзакция продюсера А всё ещё активна, смещение <strong>LSO (Last Stable Offset)</strong> фиксируется на отметке 100!<br />
+5. <strong>Консьюмер полностью останавливает чтение всей партиции!</strong> Он не может отдать сообщения 101, 102, пока транзакция 100 не будет завершена (коммитом или абортом).</p>
+<p>Если разработчик установил <code>transaction.timeout.ms = 15 минут</code>, и продюсер завис — все консьюмеры этой партиции замрут на 15 минут!</p>
 <p>На стороне консьюмера режим <code>read_committed</code> требует буферизации входящих сообщений до появления маркеров, что увеличивает потребление памяти и может добавить задержку (особенно при долгих транзакциях). В Go-приложениях с ручным управлением памятью следует мониторить размер буферов и избегать утечек при долго висящих незакоммиченных транзакциях.</p>
-<p>С точки зрения операционной системы: commit-маркеры — это дополнительные записи в лог, нарушающие идеальную линейность последовательного ввода-вывода. Однако, так как Kafka пишет всё равно последовательно в активный сегмент, эти маркеры просто вклиниваются в поток, не вызывая случайных перемещений головок.</p>
+<p>С точки зрения операционной системы: commit-маркеры — это дополнительные записи в лог, нарушающие идеальную линейность последовательного ввода-вывода. Однако, так как Kafka пишет всё равно последовательно в активный сегмент, эти маркеры просто вклиниваются в поток, не вызывая случайных перемещений головок диска.</p>
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2330,6 +2530,7 @@ cl, err := kgo.NewClient(
   </div>
 </div>
 
+<hr />
 <h2 id="zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</h2>
 
 <p>Exactly-once в Kafka — это инженерный шедевр, построенный на трёх столпах: идемпотентном продюсере, транзакционном протоколе с координатором и изолированном чтении консьюмерами. Правильное применение этих инструментов позволяет строить конвейеры данных с гарантией отсутствия дубликатов и потерь, но требует чёткого понимания границ: exactly-once внутри кластера Kafka не равняется глобальной exactly-once всей системы.</p>
@@ -2361,7 +2562,7 @@ cl, err := kgo.NewClient(
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#tri-grani-garantiy-dostavki">Три грани гарантий доставки</a></li><li class="toc-item toc-h2"><a href="#idempotentnyy-prodyuser-osnova-exactly-once-vnutri-partitsii">Идемпотентный продюсер: основа exactly-once внутри партиции</a></li><li class="toc-item toc-h3"><a href="#kak-eto-rabotaet-pod-kapotom">Как это работает под капотом</a></li><li class="toc-item toc-h2"><a href="#tranzaktsii-atomarnaya-zapis-v-neskolko-partitsiy">Транзакции: атомарная запись в несколько партиций</a></li><li class="toc-item toc-h3"><a href="#transaction-coordinator-i-transaction-log">Transaction Coordinator и Transaction Log</a></li><li class="toc-item toc-h3"><a href="#producer-epoch-i-zashchita-ot-zombi">Producer epoch и защита от зомби</a></li><li class="toc-item toc-h3"><a href="#tranzaktsionnyy-konsyumer-i-rezhimy-izolyatsii">Транзакционный консьюмер и режимы изоляции</a></li><li class="toc-item toc-h2"><a href="#skvoznoy-exactly-once-pattern-consume-transform-produce">Сквозной exactly-once: паттерн consume-transform-produce</a></li><li class="toc-item toc-h2"><a href="#proizvoditelnost-mekhanicheskaya-simpatiya-i-podvodnye-kamni">Производительность, механическая симпатия и подводные камни</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</a></li>
+    <li class="toc-item toc-h2"><a href="#tri-grani-garantiy-dostavki">Три грани гарантий доставки</a></li><li class="toc-item toc-h2"><a href="#idempotentnyy-prodyuser-osnova-exactly-once-vnutri-partitsii">Идемпотентный продюсер: основа exactly-once внутри партиции</a></li><li class="toc-item toc-h3"><a href="#kak-eto-rabotaet-pod-kapotom">Как это работает под капотом</a></li><li class="toc-item toc-h2"><a href="#tranzaktsii-atomarnaya-zapis-v-neskolko-partitsiy">Транзакции: атомарная запись в несколько партиций</a></li><li class="toc-item toc-h3"><a href="#transaction-coordinator-i-transaction-log">Transaction Coordinator и Transaction Log</a></li><li class="toc-item toc-h3"><a href="#producer-epoch-i-zashchita-ot-zombi">Producer epoch и защита от зомби</a></li><li class="toc-item toc-h3"><a href="#tranzaktsionnyy-konsyumer-i-rezhimy-izolyatsii">Транзакционный консьюмер и режимы изоляции</a></li><li class="toc-item toc-h2"><a href="#skvoznoy-exactly-once-pattern-consume-transform-produce">Сквозной exactly-once: паттерн consume-transform-produce</a></li><li class="toc-item toc-h2"><a href="#proizvoditelnost-mekhanicheskaya-simpatiya-i-podvodnye-kamni">Производительность, механическая симпатия и подводные камни</a></li><li class="toc-item toc-h3"><a href="#head-of-line-blocking-na-storone-konsyumera">Head-of-Line Blocking на стороне консьюмера</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</a></li>
   </ul>
 </aside>
 

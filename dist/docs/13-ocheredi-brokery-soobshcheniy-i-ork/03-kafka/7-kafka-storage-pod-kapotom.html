@@ -2168,14 +2168,19 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~39 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Kafka storage под капотом</h1>
           </header>
 
           <div class="article-markdown">
-            <div class="callout callout-note">
+            <h1>7. Kafka storage под капотом: анатомия сегментов, разреженные индексы и Zero-Copy</h1>
+<blockquote>
+<p><em>"The Unix philosophy is to design systems that do one thing and do it well, relying on the operating system for what it does best."</em><br />
+— Дуг Макилрой, один из отцов Unix</p>
+</blockquote>
+<div class="callout callout-note">
   <div class="callout-header">
     <span class="callout-icon">📝</span>
     <span class="callout-title">Заметка</span>
@@ -2185,18 +2190,20 @@
   </div>
 </div>
 
+<hr />
 <h2 id="pochemu-ponimanie-khranilishcha-kritichno">Почему понимание хранилища критично</h2>
 
-<p>Производительность Kafka часто описывают как «миллионы сообщений в секунду». Но это не магия, а результат глубокой механической симпатии к операционной системе и железу. Центральный элемент этой эффективности — слой хранения, спроектированный как простой, неизменяемый, последовательный лог на диске. Без пулов потоков, сложных структур данных в памяти или самодельных кэшей. Kafka буквально полагается на то, что Linux и современные накопители делают лучше всего: линейную запись и чтение крупными блоками.</p>
+<p>Производительность Apache Kafka часто описывают в рекламных проспектах фразами вроде «миллионы сообщений в секунду на одном сервере». Но за этими цифрами нет ни «магии», ни сверхсложных самодельных алгоритмов в кодовой базе брокера. Напротив: архитектурное ядро хранилища Kafka поражает своей предельной, почти спартанской простотой.</p>
+<p>Создатели Kafka осознали фундаментальную истину вычислительной техники: <strong>не нужно соревноваться с ядром операционной системы в управлении памятью и дисками</strong>. Вместо того чтобы городить в адресном пространстве процесса сложные B-деревья, пользовательские буферные пулы (Buffer Pools) и самодельные LRU-кэши (как это делают традиционные реляционные СУБД), Kafka была спроектирована как тонкий сетевой диспетчер над <strong>неизменяемым последовательным файловым логом</strong>.</p>
+<p>Kafka буквально эксплуатирует то, что современная аппаратура и ядро Linux делают быстрее всего:<br />
+1. Последовательную (sequential) запись в конец файла;<br />
+2. Агрессивное кэширование страниц операционной системой (<strong>Linux Page Cache</strong>);<br />
+3. Аппаратную прямую передачу байтов из оперативной памяти в сетевую карту (<strong>Zero-Copy через <code>sendfile(2)</code></strong>).</p>
+<hr />
 <h2 id="fizicheskaya-organizatsiya-partitsii">Физическая организация партиции</h2>
 
-<p>Логическая партиция физически представляет собой директорию на файловой системе брокера (обычно <code>/var/lib/kafka/data/</code>), внутри которой лежит набор файлов-сегментов. Каждый сегмент — это тройка файлов:</p>
-<ul>
-<li><strong><code>.log</code></strong> — файл с самими сообщениями, записанными последовательно.</li>
-<li><strong><code>.index</code></strong> — разреженный индекс, отображающий смещение (offset) в физическую позицию внутри <code>.log</code>.</li>
-<li><strong><code>.timeindex</code></strong> — разреженный индекс, отображающий временную метку в offset.</li>
-</ul>
-<p>Имена файлов — это offset первого сообщения в сегменте, дополненный до 20 цифр. Например:</p>
+<p>Если зайти по SSH на сервер брокера Kafka и открыть рабочий каталог с данными (обычно <code>/var/lib/kafka/data/</code>), вы не обнаружите никакой сложной проприетарной базы данных. Логическая партиция — это просто <strong>обычная директория на файловой системе</strong> (например, <code>ext4</code> или <code>xfs</code>), названная по шаблону <code>&lt;topic_name&gt;-&lt;partition_id&gt;</code>.</p>
+<p>Внутри этой директории партиция нарезана на цепочку неизменяемых файлов-сегментов (Segments). Каждый логический сегмент физически представлен тройкой (или четверкой) файлов:</p>
 <pre><code>/var/lib/kafka/data/orders-0/
 ├── 00000000000000000000.log
 ├── 00000000000000000000.index
@@ -2204,9 +2211,15 @@
 ├── 00000000000000000250.log
 ├── 00000000000000000250.index
 ├── 00000000000000000250.timeindex
-...
+├── leader-epoch-checkpoint
 </code></pre>
-<p>При достижении активным сегментом лимита размера (<code>log.segment.bytes</code>, по умолчанию 1 ГБ) или времени (<code>log.roll.ms</code>, по умолчанию 7 дней) он закрывается, становится неизменяемым, и создаётся новый активный сегмент. Это простое разбиение на файлы критически важно: оно позволяет удалять старые данные целыми сегментами без фрагментации и без сканирования, что ложится в основу retention-политик (<a href="8-retention-i-compaction.html" class="wikilink">8. Retention и compaction</a>).</p>
+<p>Назначение файлов в сегменте:<br />
+- <strong><code>.log</code></strong> — основной файл данных, в который последовательно дописываются бинарные батчи сообщений (<code>RecordBatch</code>).<br />
+- <strong><code>.index</code></strong> — бинарный разреженный индекс (Offset Index), сопоставляющий логическое смещение (<code>offset</code>) с физическим байтовым смещением внутри файла <code>.log</code>.<br />
+- <strong><code>.timeindex</code></strong> — бинарный разреженный индекс (Time Index), сопоставляющий временную метку (Unix timestamp) со смещением <code>offset</code>.<br />
+- <strong><code>leader-epoch-checkpoint</code></strong> — служебный файл, отслеживающий смены лидеров партиции для безопасного восстановления при сбоях (KIP-101).</p>
+<p>Имя каждого файла в сегменте формируется из <strong>базового смещения (Base Offset)</strong> — смещения самой первой записи, сохраненной в данном сегменте, дополненного ведущими нулями до ровно 20 цифр (64-битное беззнаковое число). </p>
+<p>Файл <code>00000000000000000250.log</code> означает, что первое сообщение в этом файле имеет offset 250.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2221,90 +2234,176 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-subgraph Партиция
+subgraph PartitionDir[&quot;Директория: /orders-0/&quot;]
 direction LR
-S1[&quot;Сегмент 0&lt;br&gt;0000.log + .index + .timeindex&quot;] --&gt; S2[&quot;Сегмент 250&lt;br&gt;0250.log + ...&quot;] --&gt; S3[&quot;Активный сегмент&lt;br&gt;0500.log&quot;]
+S1[&quot;Сегмент 0&lt;br&gt;00000000000000000000.log&lt;br&gt;00000000000000000000.index&lt;br&gt;00000000000000000000.timeindex&quot;]
+S2[&quot;Сегмент 250&lt;br&gt;00000000000000000250.log&lt;br&gt;00000000000000000250.index&lt;br&gt;00000000000000000250.timeindex&quot;]
+S3[&quot;Активный сегмент (Active)&lt;br&gt;00000000000000000500.log&lt;br&gt;(Идет запись!)&quot;]
 end
-S3 --&gt;|&quot;append&quot;| Writer[&quot;Продюсер&quot;]
-S1 --&gt;|&quot;read&quot;| Consumer[&quot;Консьюмер&lt;br&gt;старые данные&quot;]
-S3 --&gt;|&quot;read&quot;| Consumer2[&quot;Консьюмер&lt;br&gt;свежие данные из Page Cache&quot;]
+
+S1 --&gt; S2 --&gt; S3
   </pre>
 </div>
 
 
-<h2 id="format-dannykh-na-diske">Формат данных на диске</h2>
+<h3 id="zhiznennyy-tsikl-segmenta-segment-rolling">Жизненный цикл сегмента (Segment Rolling)</h3>
 
-<p>Начиная с Kafka 0.11, сообщения хранятся в <strong>RecordBatch</strong> формате версии v2, который заменил старый формат записей "message set". RecordBatch — это контейнер, содержащий:</p>
-<ul>
-<li><strong>baseOffset</strong> — offset первого сообщения в батче.</li>
-<li><strong>baseTimestamp</strong> — временная метка создания батча.</li>
-<li><strong>attributes</strong> — флаги сжатия (gzip, snappy, lz4, zstd), признак транзакционности, флаги управления (control batch, commit/abort marker).</li>
-<li><strong>crc</strong> — контрольная сумма для целостности.</li>
-<li><strong>record count</strong> — количество записей.</li>
-<li><strong>records</strong> — массив отдельных записей Record.</li>
-</ul>
-<p>Каждый Record содержит:<br />
-- <strong>length</strong> — длина сообщения.<br />
-- <strong>attributes</strong> — timestamp delta от базовой метки батча.<br />
-- <strong>offset delta</strong> — смещение относительно baseOffset.<br />
-- <strong>key</strong> — байтовый массив ключа.<br />
-- <strong>value</strong> — байтовый массив значения.<br />
-- <strong>headers</strong> — массив пар ключ-значение заголовков.</p>
-<p>Брокер хранит батч как одну неделимую единицу: он не распаковывает и не модифицирует сжатые батчи, а просто дописывает их в <code>.log</code> и отдаёт консьюмерам как есть. Это означает, что сжатие на продюсере напрямую экономит не только сеть, но и дисковое пространство, и пропускную способность канала между брокером и консьюмером.</p>
+<p>В каждый момент времени для партиции существует строго <strong>один активный сегмент</strong> (Active Segment). Только в него продюсер дописывает новые байты. Все остальные предшествующие сегменты навсегда закрыты для записи и доступны исключительно на чтение!</p>
+<p>Сегмент «запечатывается» (rolls over), и создается новый активный сегмент при наступлении любого из двух событий:<br />
+1. <strong>Превышение размера:</strong> Размер файла <code>.log</code> достигает порога <code>log.segment.bytes</code> (по умолчанию 1 ГБ).<br />
+2. <strong>Превышение времени:</strong> С момента первой записи в активный сегмент прошло больше времени, чем задано в <code>log.roll.ms</code> или <code>log.roll.hours</code> (по умолчанию 7 дней).</p>
+<p>Зачем сегментировать лог на диске? Почему нельзя писать в один огромный 10-терабайтный файл?<br />
+Потому что удаление устаревших данных (<strong>Retention</strong>) в сегментированном логе сводится к тривиальному системному вызову ядра <code>unlink(2)</code> целого файла! Никакой сборки мусора на диске, никакой фрагментации файловой системы и никакого дефрагментирующего перемещения блоков данных.</p>
+<hr />
+<h2 id="format-dannykh-na-diske-recordbatch-v2">Формат данных на диске: RecordBatch v2</h2>
+
+<p>Начиная с Kafka 0.11, на диске используется высокоэффективный формат <strong>RecordBatch v2</strong> (введенный в KIP-98). Главная особенность этого формата — <strong>структурный батчинг</strong>: служебные метаданные (заголовки, контрольные суммы, флаги продюсера) вынесены на уровень батча, а индивидуальные записи внутри батча кодируются компактными дельтами:</p>
+<pre><code>+-------------------------------------------------------------------------------+
+|                             RecordBatch Header                                |
+| BaseOffset (8B) | Length (4B) | PartitionLeaderEpoch (4B) | MagicByte (1B)    |
+| CRC32C (4B)     | Attributes (2B) | LastOffsetDelta (4B)                      |
+| BaseTimestamp (8B) | MaxTimestamp (8B) | ProducerId (8B) | ProducerEpoch (2B) |
+| BaseSequence (4B)  | RecordsCount (4B)                                        |
++-------------------------------------------------------------------------------+
+|                               Records Payload                                 |
+| Record 1: Length (Varint) | Attributes (1B) | TimestampDelta (Varint)         |
+|           OffsetDelta (Varint) | KeyLength | Key | ValueLength | Value        |
+| Record 2: ...                                                                 |
+| Record N: ...                                                                 |
++-------------------------------------------------------------------------------+
+</code></pre>
+<p>Разбор полей RecordBatch:<br />
+- <strong><code>baseOffset</code> (8 байт)</strong> — логическое смещение первой записи в пакете.<br />
+- <strong><code>baseTimestamp</code> (8 байт)</strong> — временная метка создания пакета.<br />
+- <strong><code>attributes</code> (2 байта)</strong> — битовые флаги: алгоритм сжатия (None, GZIP, Snappy, LZ4, ZSTD), признак транзакционности, признак управляющего пакета (Control Batch для commit/abort маркеров).<br />
+- <strong><code>crc</code> (4 байта)</strong> — контрольная сумма CRC32C заголовка и записей для проверки целостности.<br />
+- <strong><code>ProducerId</code> (8 байт) и <code>ProducerEpoch</code> (2 байта)</strong> — параметры для поддержки идемпотентности и транзакций.<br />
+- <strong><code>records</code></strong> — поток отдельных сообщений. Каждое сообщение сохраняет свой offset как компактную дельту <code>offset delta = record.offset - baseOffset</code> (в виде Protobuf-подобного <code>varint</code>), что экономит до 7 байт на каждое сообщение!</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Для проверки контрольных сумм и доступа к метаданным брокер использует <code>FileChannel</code> и <code>MappedByteBuffer</code> (в Java). При чтении консьюмера зачастую не требуется даже копирование в userspace: системный вызов <code>sendfile</code> передаёт байты из страничного кеша напрямую в сокет.</p>
+    <p>Брокер Kafka хранит сжатый батч на диске в абсолютно неизменном виде: он <strong>не распаковывает</strong> данные при записи и не упаковывает их заново при чтении консьюмером! Продюсер сжал батч в lz4/zstd $\to$ брокер сохранил его в <code>.log</code> $\to$ передал по сети в сетевую карту через <code>sendfile</code> $\to$ консьюмер распаковал. Брокер тратит 0 процессорных тактов на декомпрессию, выступая идеальной конвейерной трубой.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="razrezhennye-indeksy">Разреженные индексы</h2>
 
-<p>Поскольку лог может достигать гигабайт, полный индекс всех offset'ов занял бы слишком много памяти. Kafka использует <strong>разреженный (sparse) индекс</strong>: запись добавляется не для каждого сообщения, а с интервалом, определяемым <code>log.index.interval.bytes</code> (по умолчанию 4096 байт).</p>
-<h3 id="offset-index">Offset Index</h3>
+<p>Если бы Kafka сохраняла смещение каждого отдельного сообщения в B-дереве или хэш-таблице (как классические базы данных), то для лога из 10 миллиардов сообщений сам индекс весил бы сотни гигабайт и требовал огромного объема дорогой оперативной памяти.</p>
+<p>Вместо этого Kafka использует <strong>разреженные индексы (Sparse Indexes)</strong>.</p>
+<p>Индексные файлы <code>.index</code> и <code>.timeindex</code> проецируются напрямую в адресное пространство процесса с помощью системного вызова <code>mmap(2)</code> (в Java — <code>MappedByteBuffer</code>).</p>
+<p>Индексная запись добавляется <strong>не на каждое сообщение</strong>, а только тогда, когда объем записанных в лог данных превышает интервал <code>log.index.interval.bytes</code> (по умолчанию 4096 байт — размер одной страницы памяти Linux!).</p>
 
-<p>Файл <code>.index</code> содержит записи фиксированного размера (8 байт offset + 4 байта позиция). Для поиска offset'а X алгоритм:<br />
-1. Определяется сегмент, которому принадлежит X (по имени файла).<br />
-2. В <code>.index</code> бинарным поиском находится ближайшая запись с offset ≤ X.<br />
-3. От полученной физической позиции в <code>.log</code> начинается последовательное сканирование до целевого offset.</p>
-<p>Таким образом, на поиск любой позиции требуется O(log N) по индексу и небольшое линейное сканирование внутри блока размером до <code>index.interval.bytes</code>.</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph SparseIndex[&quot;Файл 0000.index (mmap)&quot;]
+direction TB
+I1[&quot;Offset: 0   -&gt; Position: 0&quot;]
+I2[&quot;Offset: 25  -&gt; Position: 4096&quot;]
+I3[&quot;Offset: 52  -&gt; Position: 8192&quot;]
+I4[&quot;Offset: 80  -&gt; Position: 12288&quot;]
+end
+
+subgraph LogFile[&quot;Файл 0000.log на диске&quot;]
+direction TB
+L1[&quot;Байты 0..4095: Записи с offset 0 по 24&quot;]
+L2[&quot;Байты 4096..8191: Записи с offset 25 по 51&quot;]
+L3[&quot;Байты 8192..12287: Записи с offset 52 по 79&quot;]
+L4[&quot;Байты 12288..: Записи с offset 80+&quot;]
+end
+
+I1 -.-&gt; L1
+I2 -.-&gt; L2
+I3 -.-&gt; L3
+I4 -.-&gt; L4
+  </pre>
+</div>
+
+
+<h3 id="offset-index-poisk-smeshcheniya-za-olog-n">Offset Index: поиск смещения за O(log N)</h3>
+
+<p>Каждая запись в файле <code>.index</code> имеет фиксированный размер ровно <strong>12 байт</strong>:<br />
+- <strong>Относительное смещение (Relative Offset, 4 байта):</strong> Смещение сообщения относительно базового смещения сегмента (<code>offset - baseOffset</code>). Использование 4 байт вместо 8 байт позволяет экономить 50% размера индекса.<br />
+- <strong>Физическая позиция (Physical Position, 4 байта):</strong> Точный байтовый офсет внутри файла <code>.log</code>.</p>
+<p><strong>Алгоритм поиска смещения $X$:</strong><br />
+1. <strong>Бинарный поиск по сегментам:</strong> По имени файлов сегментов в памяти находится нужный сегмент, где <code>BaseOffset &lt;= X &lt; NextSegmentBaseOffset</code>.<br />
+2. <strong>Бинарный поиск по <code>.index</code>:</strong> Векторизованный бинарный поиск по проецированному в память <code>mmap</code>-индексу находит наибольшее проиндексированное смещение, меньшее или равное $X$ (например, смещение 52 с физической позицией 8192).<br />
+3. <strong>Линейное дочитывание:</strong> Брокер прыгает на позицию 8192 в файле <code>.log</code> и последовательно читает максимум 4 КБ данных, пока не встретит точный offset $X$.</p>
+<p>Поскольку размер индексного блока составляет всего 4 КБ, линейное сканирование занимает доли микросекунды и полностью умещается в кэше процессора L1/L2!</p>
 <h3 id="time-index">Time Index</h3>
 
-<p>Файл <code>.timeindex</code> устроен аналогично, но сопоставляет временные метки (timestamp) с offset'ами. Позволяет искать сообщения по времени, например, при смещении <code>offsetsForTimes(timestamp)</code>. Разреженность определяется <code>log.index.interval.bytes</code> тоже.</p>
+<p>Файл <code>.timeindex</code> устроен полностью аналогично, но оперирует записями по <strong>12 байт</strong>: 8 байт Unix Timestamp + 4 байта Relative Offset. </p>
+<p>Он используется, когда приложению необходимо перемотать консьюмер на определенный момент времени — например, через API <code>offsetsForTimes(timestamp)</code>. Kafka находит по времени целевой <code>offset</code>, а затем по <code>.index</code> — физическую позицию на диске.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Деградация поиска по времени</span>
   </div>
   <div class="callout-body">
-    <p>Если консьюмер запрашивает offset по временной метке, которая приходится на середину большого несжатого батча старых версий, брокеру может потребоваться распаковать весь батч для поиска точного offset'а. В современных RecordBatch v2 с дельтами offset и timestamp это делается эффективнее, но всё ещё требует чтения с диска. Чрезмерное использование временных запросов без «горячего» кеша может нагрузить ввод-вывод.</p>
+    <p>Если в топик пишутся сообщения с некорректными (немонотонными) временными метками (например, продюсер генерирует timestamp на стороне распределенных клиентов с рассинхронизированными часами), <code>.timeindex</code> теряет строгую монотонность. В этом случае вызов <code>offsetsForTimes(timestamp)</code> может вернуть не самое ранее смещение, а брокер будет вынужден выполнять более глубокое сканирование лога. В современных системах рекомендуется использовать <code>CreateTime</code> на стороне продюсера с NTP-синхронизацией либо переключать топик на <code>LogAppendTime</code> на брокере.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="put-soobshcheniya-ot-prodyusera-do-diska">Путь сообщения от продюсера до диска</h2>
 
-<p>Когда продюсер отправляет батч, брокер-лидер выполняет следующие шаги:</p>
+<p>Когда сетевой поток брокера получает TCP-пакет <code>ProduceRequest</code>, происходит строго детерминированный цикл операций:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+A[&quot;Сетевой пакет ProduceRequest&quot;] --&gt; B[&quot;Валидация заголовков и CRC32C&quot;]
+B --&gt; C[&quot;Проверка прав ACL и квот (Quotas)&quot;]
+C --&gt; D[&quot;FileChannel.write() в активный .log&quot;]
+D --&gt; E[&quot;Запись в .index (если прошло &gt; 4 KB)&quot;]
+E --&gt; F[&quot;Данные в Linux Page Cache!&quot;]
+F --&gt; G[&quot;Репликация в ISR фолловерам&quot;]
+G --&gt; H[&quot;Смещение High Watermark обновлено&quot;]
+H --&gt; I[&quot;Отправка ACK продюсеру&quot;]
+  </pre>
+</div>
+
+
 <ol>
-<li>Принять байты по сети, десериализовать заголовки запроса.</li>
-<li>Проверить контрольную сумму батча.</li>
-<li>Добавить батч в конец активного сегмента <code>.log</code> через <code>FileChannel.write</code> (последовательная запись).</li>
-<li>Обновить позиционный и временной индексы (тоже последовательная запись).</li>
-<li>Отправить ACK продюсеру (согласно <code>acks</code>, см. <a href="1-kafka-arkhitektura-i-model-log-based-sistemy.html" class="wikilink">1. Kafka. Архитектура и модель log based системы</a>).</li>
-<li>Периодически вызвать <code>fsync</code> для обеспечения долговечности (<a href="../01-fundament-asinkhronnosti/7-message-durability-i-persistence.html" class="wikilink">7. Message durability и persistence</a>).</li>
+<li><strong>Валидация:</strong> Проверка контрольной суммы CRC32C и прав доступа.</li>
+<li><strong>Последовательный append:</strong> Вызов <code>FileChannel.write</code> добавляет байты в конец активного сегмента <code>.log</code>. Это системный вызов <code>write(2)</code>.</li>
+<li><strong>Обновление индекса:</strong> Если накопилось более 4096 байт с прошлой отметки, в <code>.index</code> и <code>.timeindex</code> добавляется новая точка.</li>
+<li><strong>Попадание в Page Cache:</strong> Данные оказываются в оперативной памяти ОС (страничный кэш).</li>
+<li><strong>Репликация:</strong> Фолловеры вычитывают новый батч; когда кворум ISR подтверждает запись, <code>High Watermark</code> сдвигается вперед, и продюсер получает сетевой ACK.</li>
 </ol>
-<p>Запись в <code>.log</code> — это чистое дописывание. Нет чтения, поиска или модификации существующих данных. Именно это делает запись в Kafka невероятно быстрой: диски прекрасно справляются с последовательной нагрузкой, а современные NVMe-накопители выдают несколько гигабайт в секунду без значительных задержек.</p>
+<p>Заметьте: брокер <strong>не вызывает <code>fsync</code></strong> перед отправкой ответа продюсеру! Почему? Об этом ниже.</p>
+<hr />
 <h2 id="put-ot-diska-do-konsyumera-zero-copy-i-sendfile">Путь от диска до консьюмера: Zero-Copy и sendfile</h2>
 
-<p>При запросе консьюмера (<code>Fetch</code> request) брокер:</p>
-<ol>
-<li>Определяет offset, с которого нужно читать.</li>
-<li>Находит сегмент и физическую позицию через индекс.</li>
-<li>Использует <strong><code>FileChannel.transferTo</code></strong> (в Java), который на Linux вызывает системный вызов <code>sendfile</code>. Эта функция копирует данные из страничного кеша (или с диска, если данных нет в кеше) напрямую в сокетный буфер, минуя промежуточный буфер в userspace.</li>
-</ol>
-<p>Традиционный подход «прочитать в буфер брокера, затем записать в сокет» требовал бы двух копий (диск → буфер в userspace → сокет) и двух переключений контекста (пространство пользователя ↔ ядро). С <code>sendfile</code> данные копируются только один раз внутри ядра, а пользовательский процесс лишь инициирует передачу. Это радикально экономит CPU и пропускную способность памяти.</p>
+<p>При запросе консьюмера (<code>Fetch</code> request) брокер выполняет следующие действия:<br />
+1. Определяет offset, с которого нужно читать.<br />
+2. Находит нужный сегмент и физическую позицию внутри <code>.log</code> через бинарный поиск по индексу.<br />
+3. Использует <strong><code>FileChannel.transferTo</code></strong> (в Java), который в среде Linux компилируется непосредственно в системный вызов <code>sendfile</code>. Эта функция копирует данные из страничного кеша (или с диска, если данных нет в кеше) напрямую в сокетный буфер, минуя промежуточный буфер в userspace.</p>
+<p>В классических серверах (например, традиционных веб-серверах старого поколения или брокерах на чистом userspace) передача файла с диска в сетевой сокет выглядит как чудовищно неэффективная растрата аппаратных ресурсов:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2319,49 +2418,122 @@ S3 --&gt;|&quot;read&quot;| Consumer2[&quot;Консьюмер&lt;br&gt;свеж
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant Disk as Диск / Page Cache
-participant Kernel as Ядро Linux
-participant Broker as Брокер Kafka (User Space)
-participant NIC as Сетевая карта
+autonumber
+participant Disk as Диск / Page Cache ядра
+participant KernelBuf as Буфер ядра Linux (Kernel Space)
+participant UserBuf as Память приложения (User Space)
+participant SocketBuf as Сокетный буфер (Socket Buffer)
+participant NIC as Сетевая карта (NIC DMA)
 
-Note over Broker,NIC: Традиционный подход: 2 копии
-Disk-&gt;&gt;Kernel: read() → буфер ядра
-Kernel-&gt;&gt;Broker: copy → буфер брокера
-Broker-&gt;&gt;Kernel: write() → сокетный буфер
-Kernel-&gt;&gt;NIC: отправка пакета
-
-Note over Broker,NIC: Подход Kafka: sendfile — 0 копий в userspace
-Disk-&gt;&gt;Kernel: данные в Page Cache
-Kernel-&gt;&gt;NIC: sendfile() — прямое копирование в сокетный буфер
+Note over Disk,NIC: Классический подход (read + write): 4 переключения контекста, 4 копирования!
+Disk-&gt;&gt;KernelBuf: 1. DMA Copy с диска в память ядра
+KernelBuf-&gt;&gt;UserBuf: 2. CPU Copy из ядра в буфер приложения (read)
+UserBuf-&gt;&gt;SocketBuf: 3. CPU Copy из приложения в сокетный буфер (write)
+SocketBuf-&gt;&gt;NIC: 4. DMA Copy из памяти ядра в сетевую карту
   </pre>
 </div>
 
 
-<div class="callout callout-info">
+<p>При традиционном <code>read() + write()</code>:<br />
+- Процессор выполняет <strong>4 переключения контекста</strong> (User Mode $\leftrightarrow$ Kernel Mode);<br />
+- Данные <strong>дважды копируются процессором</strong> через шину памяти RAM (из ядра в userspace, затем из userspace в ядро), сжигая драгоценную пропускную способность шины памяти и загрязняя кэши L1/L2/L3 CPU.</p>
+<h3 id="magiya-sistemnogo-vyzova-sendfile-zero-copy">Магия системного вызова `sendfile` (Zero-Copy)</h3>
+
+<p>В Apache Kafka чтение консьюмера реализовано через Java-метод <code>FileChannel.transferTo</code>, который в среде Linux компилируется непосредственно в системный вызов <strong><code>sendfile(2)</code></strong> (или <code>splice(2)</code>):</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant PageCache as Linux Page Cache (DRAM)
+participant Kernel as Ядро Linux
+participant Broker as Брокер (User Space)
+participant NIC as Сетевая карта (NIC DMA)
+
+Broker-&gt;&gt;Kernel: sendfile(out_fd, in_fd, offset, count)
+Note over Kernel: 2 переключения контекста вместо 4!&lt;br&gt;0 копирований через CPU!
+PageCache-&gt;&gt;NIC: Прямой DMA-трансфер из Page Cache в сетевой буфер карты!
+Kernel--&gt;&gt;Broker: Успех (число переданных байт)
+  </pre>
+</div>
+
+
+<p>Как работает Zero-Copy:<br />
+1. Брокер вызывает <code>sendfile(socket_fd, file_fd, offset, length)</code>.<br />
+2. Процессор переключается в режим ядра всего один раз.<br />
+3. Данные берутся напрямую из <strong>Page Cache</strong> ядра Linux и с помощью контроллера прямого доступа к памяти (<strong>Scatter-Gather DMA</strong>) отправляются непосредственно в кольцевой буфер сетевого адаптера!<br />
+4. В пространство пользователя брокера <strong>не копируется ни единого байта</strong>! Процессор вообще не участвует в перемещении данных.</p>
+<p>Это означает, что скорость отдачи сообщений консьюмерам в Kafka ограничена исключительно <strong>физической пропускной способностью сетевой карты</strong> (например, 25 Gbps или 100 Gbps), а не мощностью процессора сервера!</p>
+<hr />
+<h2 id="dolgovechnost-i-strategii-fsync">Долговечность и стратегии fsync</h2>
+
+<p>Существует распространенное заблуждение: «Если Kafka не делает <code>fsync</code> на каждую запись, значит, она может потерять данные при отключении питания серверов!»</p>
+<p>Системный вызов <code>fsync(2)</code> принудительно сбрасывает грязные страницы из кэша памяти на физические пластины или ячейки флэш-памяти. Однако вызов <code>fsync</code> на каждое сообщение превратил бы производительность современного накопителя из сотен тысяч записей в секунду в жалкие 500–2000 IOPS из-за задержек контроллера.</p>
+<p>Kafka предлагает выбор через параметры конфигурации брокера:<br />
+- <code>log.flush.interval.messages</code> — принудительный сброс на диск каждые N сообщений;<br />
+- <code>log.flush.interval.ms</code> — принудительный сброс на диск каждые N миллисекунд.</p>
+<div class="callout callout-important">
   <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Официальная рекомендация архитекторов Kafka</span>
   </div>
   <div class="callout-body">
-    <p>В Go-клиентах (например, <code>franz-go</code>) аналогичная эффективность достигается на стороне приёма сообщений: клиент использует <code>syscall.Read</code> в горутине, читающей из TCP-соединения, и получает готовые батчи в заранее аллоцированные буферы (часто из <code>sync.Pool</code>), избегая дополнительных аллокаций.</p>
+    <p><strong>Оставьте параметры <code>log.flush.interval.messages</code> и <code>log.flush.interval.ms</code> отключенными (по умолчанию <code>Long.MAX_VALUE</code>)!</strong><br />
+Доверьте фоновый сброс грязных страниц демонам ядра Linux (<code>kswapd</code>, <code>pdflush</code>). Надёжность и долговечность данных в Kafka гарантируются не локальным диском одного узла, а <strong>распределенной репликацией в оперативной памяти нескольких независимых серверов (ISR с <code>acks=all</code>)</strong>! Вероятность одновременного внезапного обесточивания сразу трех серверов в разных стойках или зонах доступности несоизмеримо ниже, чем вероятность деградации производительности из-за синхронного <code>fsync</code>.</p>
   </div>
 </div>
 
-<h2 id="dolgovechnost-i-strategii-fsync">Долговечность и стратегии fsync</h2>
-
-<p>По умолчанию Kafka не вызывает <code>fsync</code> на каждое сообщение; она полагается на фоновую запись грязных страниц из Page Cache на диск ядром Linux. Параметры <code>log.flush.interval.messages</code> и <code>log.flush.interval.ms</code> управляют явным сбросом, но их тюнинг требует осторожности.</p>
-<ul>
-<li><strong>Высокая пропускная способность</strong> — fsync редко (или полностью отключён), риск потери нескольких сообщений при крахе ОС.</li>
-<li><strong>Максимальная надёжность</strong> — fsync на каждое сообщение, но это резко снижает throughput из-за затрат на синхронный ввод-вывод.</li>
-</ul>
-<p>Репликация в ISR (In-Sync Replicas) служит дополнительным уровнем защиты: даже если одна машина потеряет данные, синхронные реплики на других брокерах их сохранят. Поэтому типичные настройки оставляют fsync на усмотрение ядра, а надёжность обеспечивают через <code>acks=all</code> и достаточное количество реплик.</p>
+<hr />
 <h2 id="mechanical-sympathy-pochemu-eto-rabotaet">Mechanical Sympathy: почему это работает</h2>
 
-<p>Современные накопители (NVMe SSD) имеют пропускную способность в несколько ГБ/с при последовательном доступе и на порядок хуже при случайном. Kafka эксплуатирует только последовательный доступ. Каждый сегмент пишется линейно; даже при чтении с лагом консьюмер читает сегмент последовательно, позволяя диску эффективно выполнять предвыборку.</p>
-<p>Кроме того, Kafka минимизирует накладные расходы на управление памятью. Нет сложных структур на хипе, нет сборщика мусора, удерживающего сотни гигабайт данных. Всё уходит в страничный кеш ядра, который автоматически вытесняет старые холодные страницы при нехватке памяти. Брокер остаётся лёгким, что особенно ценится при эксплуатации в Kubernetes с лимитами памяти.</p>
+<p>Подведем итог mechanical sympathy подсистемы хранения Kafka:</p>
+<ol>
+<li><strong>Последовательный доступ вместо случайного:</strong> Скорость последовательной записи на современные NVMe SSD достигает 3–7 ГБ/с, в то время как случайная запись мелкими блоками быстро упирается в лимиты контроллера и вызывает дорогостоящий Write Amplification.</li>
+<li><strong>Отсутствие нагрузки на GC брокера:</strong> Поскольку брокер не держит кэш сообщений в памяти виртуальной машины, куча JVM остается компактной (4–8 ГБ даже на серверах с 256 ГБ RAM). Нет многосекундных пауз Stop-the-World сборщика мусора!</li>
+<li><strong>Бесплатный кэш ОС:</strong> Весь неиспользуемый объем RAM автоматически отдается операционной системой под Page Cache. Если брокер перезапустить, его кэш не сбрасывается — он сохраняется в ядре Linux!</li>
+</ol>
+<hr />
 <h2 id="vliyanie-go-klientov">Влияние Go-клиентов</h2>
 
-<p>Go-консьюмеры, например <code>franz-go</code>, используют асинхронный сетевой ввод-вывод с epoll/kqueue и пул горутин для приёма сообщений из нескольких брокеров. Когда брокер отправляет большой батч через <code>sendfile</code>, данные поступают в сокетный буфер ядра, и горутина Go читает их одним системным вызовом <code>Read</code>, не вовлекая лишние промежуточные буферы. Сочетание эффективного клиента и серверной zero-copy даёт впечатляющую пропускную способность на современных серверах.</p>
+<p>Со стороны клиентов на Go (таких как <code>franz-go</code>) архитектура хранения Kafka находит идеальное отражение.</p>
+<p>Когда брокер сбрасывает данные через <code>sendfile</code>, консьюмер на Go получает гигантские непрерывные TCP-пакеты. Клиент <code>franz-go</code> использует мультиплексирование ввода-вывода и системный вызов <code>syscall.Read</code> непосредственно в горутине, читающей сокет, помещая данные в пулы переиспользуемых байтовых срезов из <code>sync.Pool</code>. </p>
+<p>Это сводит выделение памяти на стороне Go-приложения к абсолютному минимуму и предотвращает деградацию GC Go-рантайма даже при обработке гигабайтных потоков данных.</p>
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Почему в Kafka файлы сегментов имеют имена из 20 цифр, например <code>00000000000000000250.log</code>?<br />
+<strong>Ответ:</strong> Имя файла кодирует базовое логическое смещение (<code>Base Offset</code>) — смещение первой записи, с которой начинается данный сегмент. Это позволяет брокеру находить нужный файл сегмента для любого запрашиваемого смещения $X$ с помощью быстрого алгоритма бинарного поиска по массиву имен файлов в памяти за время $O(\log N)$ без открытия самих файлов.</p>
+  </div>
+</div>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> В чем разница между плотным (dense) и разреженным (sparse) индексом, и почему Kafka выбрала разреженный?<br />
+<strong>Ответ:</strong> Плотный индекс содержит указатель на абсолютно каждую запись в логе; его размер растет линейно с числом записей, требуя гигабайты оперативной памяти. Разреженный индекс Kafka сохраняет позицию только раз на каждые 4096 байт данных (<code>log.index.interval.bytes</code>). Это делает файлы индексов предельно компактными (несколько мегабайт), позволяя держать все индексы в памяти через <code>mmap</code> и находить точную запись за бинарный поиск по индексу плюс минимальное последовательное дочитывание блока до 4 КБ.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="zaklyuchenie">Заключение</h2>
 
 <p>Хранилище Kafka — это триумф простоты: неизменяемый лог, сегменты на файловой системе, разреженные индексы и полное доверие страничному кешу ОС. Никаких самодельных буферных менеджеров, никаких сложных структур в памяти — только линейная запись, линейное чтение и <code>sendfile</code>. Именно эта архитектура позволяет одному брокеру обслуживать миллионы сообщений в секунду, не превращаясь в бутылочное горлышко.</p>
@@ -2393,7 +2565,7 @@ Kernel-&gt;&gt;NIC: sendfile() — прямое копирование в сок
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pochemu-ponimanie-khranilishcha-kritichno">Почему понимание хранилища критично</a></li><li class="toc-item toc-h2"><a href="#fizicheskaya-organizatsiya-partitsii">Физическая организация партиции</a></li><li class="toc-item toc-h2"><a href="#format-dannykh-na-diske">Формат данных на диске</a></li><li class="toc-item toc-h2"><a href="#razrezhennye-indeksy">Разреженные индексы</a></li><li class="toc-item toc-h3"><a href="#offset-index">Offset Index</a></li><li class="toc-item toc-h3"><a href="#time-index">Time Index</a></li><li class="toc-item toc-h2"><a href="#put-soobshcheniya-ot-prodyusera-do-diska">Путь сообщения от продюсера до диска</a></li><li class="toc-item toc-h2"><a href="#put-ot-diska-do-konsyumera-zero-copy-i-sendfile">Путь от диска до консьюмера: Zero-Copy и sendfile</a></li><li class="toc-item toc-h2"><a href="#dolgovechnost-i-strategii-fsync">Долговечность и стратегии fsync</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-eto-rabotaet">Mechanical Sympathy: почему это работает</a></li><li class="toc-item toc-h2"><a href="#vliyanie-go-klientov">Влияние Go-клиентов</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie">Заключение</a></li>
+    <li class="toc-item toc-h2"><a href="#pochemu-ponimanie-khranilishcha-kritichno">Почему понимание хранилища критично</a></li><li class="toc-item toc-h2"><a href="#fizicheskaya-organizatsiya-partitsii">Физическая организация партиции</a></li><li class="toc-item toc-h3"><a href="#zhiznennyy-tsikl-segmenta-segment-rolling">Жизненный цикл сегмента (Segment Rolling)</a></li><li class="toc-item toc-h2"><a href="#format-dannykh-na-diske-recordbatch-v2">Формат данных на диске: RecordBatch v2</a></li><li class="toc-item toc-h2"><a href="#razrezhennye-indeksy">Разреженные индексы</a></li><li class="toc-item toc-h3"><a href="#offset-index-poisk-smeshcheniya-za-olog-n">Offset Index: поиск смещения за O(log N)</a></li><li class="toc-item toc-h3"><a href="#time-index">Time Index</a></li><li class="toc-item toc-h2"><a href="#put-soobshcheniya-ot-prodyusera-do-diska">Путь сообщения от продюсера до диска</a></li><li class="toc-item toc-h2"><a href="#put-ot-diska-do-konsyumera-zero-copy-i-sendfile">Путь от диска до консьюмера: Zero-Copy и sendfile</a></li><li class="toc-item toc-h3"><a href="#magiya-sistemnogo-vyzova-sendfile-zero-copy">Магия системного вызова sendfile (Zero-Copy)</a></li><li class="toc-item toc-h2"><a href="#dolgovechnost-i-strategii-fsync">Долговечность и стратегии fsync</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-eto-rabotaet">Mechanical Sympathy: почему это работает</a></li><li class="toc-item toc-h2"><a href="#vliyanie-go-klientov">Влияние Go-клиентов</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie">Заключение</a></li>
   </ul>
 </aside>
 

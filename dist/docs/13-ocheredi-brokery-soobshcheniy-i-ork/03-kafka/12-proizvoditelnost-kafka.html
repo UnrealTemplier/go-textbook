@@ -2168,14 +2168,19 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">12. Производительность Kafka</h1>
           </header>
 
           <div class="article-markdown">
-            <div class="callout callout-note">
+            <h1>12. Производительность Kafka: Mechanical Sympathy, тюнинг от железа до Go и бенчмарки</h1>
+<blockquote>
+<p><em>"Bottlenecks occur in surprising places, so don't try to second-guess and put in a speed hack until you have actually measured that you need it."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
   <div class="callout-header">
     <span class="callout-icon">📝</span>
     <span class="callout-title">Заметка</span>
@@ -2185,22 +2190,53 @@
   </div>
 </div>
 
+<hr />
 <h2 id="proizvoditelnost-kak-arkhitekturnoe-svoystvo">Производительность как архитектурное свойство</h2>
 
-<p>Производительность Apache Kafka — не результат одного гениального алгоритма, а сумма десятков инженерных решений, каждое из которых выражает глубокую механическую симпатию к операционной системе и железу. Последовательная запись в сегменты, zero-copy через <code>sendfile</code>, страничный кеш вместо собственных буферов, группировка записей в батчи, асинхронный сетевой ввод-вывод — всё это работает как слаженный оркестр. Но чтобы оркестр не сфальшивил при росте нагрузки, нужно понимать, как настраивать каждый инструмент.</p>
-<p>Производительность Kafka принято измерять по двум осям:<br />
-- <strong>Throughput (пропускная способность):</strong> Мбайт/с или сообщений/с, которые система способна обработать.<br />
-- <strong>Latency (задержка):</strong> время от отправки сообщения продюсером до его получения консьюмером (end-to-end latency), обычно измеряемое на процентилях p95, p99.</p>
-<p>Эти оси находятся в классическом компромиссе: чем больше мы накапливаем сообщений в батчи перед отправкой, тем выше пропускная способность, но тем выше и задержка. Задача инженера — найти точку равновесия под конкретный бизнес-сценарий.</p>
+<p>Производительность Apache Kafka — это не случайная удача и не результат одного изолированного алгоритмического трюка. Это следствие системной реализации концепции <strong>Mechanical Sympathy</strong> (механического сочувствия к оборудованию) на всех уровнях стека: от кремния процессора и шины памяти до системных вызовов ядра Linux и сетевого протокола.</p>
+<p>Вместо того чтобы бороться с ограничениями физического мира, архитекторы Kafka поставили их себе на службу:<br />
+- <strong>Последовательный доступ к диску</strong> вместо случайного (скорость чтения/записи NVMe SSD достигает 3–7 ГБ/с);<br />
+- <strong>Нулевое копирование (Zero-Copy)</strong> через системный вызов <code>sendfile</code>, исключающий копирование данных процессором в пользовательское пространство;<br />
+- <strong>Использование страничного кэша ядра Linux (Page Cache)</strong> вместо раздутой JVM-кучи, что устраняет многосекундные паузы сборщика мусора (Stop-the-World GC);<br />
+- <strong>Батчинг на всех этапах</strong>, амортизирующий накладные расходы заголовков TCP/IP и переключений контекста CPU;<br />
+- <strong>Сжатие целых пакетов сообщений</strong> на стороне клиента (Snappy, LZ4, ZSTD), разгружающее сетевой канал и дисковую подсистему брокеров.</p>
+<p>Производительность любой распределенной системы обмена сообщениями оценивается по двум ключевым координатам:<br />
+- <strong>Throughput (пропускная способность):</strong> Объем данных (Мбайт/с) или количество сообщений в секунду (RPS), которые система способна гарантированно пропустить через себя.<br />
+- <strong>Latency (задержка):</strong> Время от момента вызова <code>Produce</code> на клиенте-отправителе до момента получения сообщения консьюмером (end-to-end latency), измеряемое на строгих перцентилях (p95, p99, p99.9).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Tradeoff[&quot;Фундаментальный компромисс: Throughput vs Latency&quot;]
+direction TB
+T[&quot;Высокий Throughput&lt;br&gt;(batch.size=1MB, linger.ms=20ms)&lt;br&gt;Плотные пакеты, сжатие ZSTD, редкие прерывания&quot;]
+L[&quot;Низкая Latency&lt;br&gt;(batch.size=16KB, linger.ms=0ms)&lt;br&gt;Мгновенная отправка, частые сетевые пакеты&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Эти две оси находятся в строгом физическом компромиссе. Нельзя получить минимальную задержку в 500 микросекунд и одновременно рекордный throughput в гигабайты в секунду на одном канале. Задача инженера — осознанно настроить систему под конкретные бизнес-требования.</p>
+<hr />
 <h2 id="tri-urovnya-tyuninga">Три уровня тюнинга</h2>
 
-<p>Любую проблему производительности Kafka можно локализовать на одном из трёх уровней (или на их стыках):</p>
+<p>Любое узкое место производительности локализуется на одном из трёх уровней конвейера или на их стыках:</p>
 <ol>
-<li><strong>Продюсер</strong> — решает, как часто и какими порциями отправлять данные.</li>
-<li><strong>Брокер</strong> — обрабатывает запись, репликацию, хранение и выдачу данных.</li>
-<li><strong>Консьюмер</strong> — определяет, как быстро забирать и обрабатывать сообщения.</li>
+<li><strong>Продюсер:</strong> Формирует батчи, сжимает данные и управляет сетевыми очередями отправки.</li>
+<li><strong>Брокер:</strong> Принимает TCP-пакеты, сохраняет данные в Page Cache, управляет репликацией в ISR и отдает сегменты через <code>sendfile</code>.</li>
+<li><strong>Консьюмер:</strong> Вытягивает батчи через <code>FetchRequest</code>, параллелит вычисления и коммитит смещения.</li>
 </ol>
-<p>К ним добавляется четвёртый слой — <strong>операционная система и железо</strong>, на котором всё работает. Каждый уровень имеет свои параметры, и ошибка на одном может свести на нет все усилия на других.</p>
+<p>Фундаментом для всех трех уровней служит <strong>четвертый уровень — операционная система и физическое оборудование</strong> (процессорные ядра, сетевые карты NIC, контроллеры NVMe, планировщики ввода-вывода ядра Linux).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2244,6 +2280,7 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 </div>
 
 
+<hr />
 <h2 id="prodyuser-kak-otpravit-million-soobshcheniy-i-ne-zakhlebnutsya">Продюсер: как отправить миллион сообщений и не захлебнуться</h2>
 
 <p>Производительность продюсера определяется настройками батчинга и сжатия. Одиночная отправка (<code>Send</code> на каждое сообщение) — гарантированный путь к посредственной производительности.</p>
@@ -2251,8 +2288,8 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 
 <p>Продюсер накапливает сообщения в буферах RecordAccumulator для каждой партиции. Когда буфер для партиции достигает <code>batch.size</code> (по умолчанию 16 КБ) или истекает <code>linger.ms</code> (по умолчанию 0), батч отправляется брокеру.</p>
 <ul>
-<li><strong><code>batch.size</code></strong> — увеличивайте до 64–512 КБ для высоконагруженных систем, особенно при включённом сжатии. Более крупные батчи лучше сжимаются, а брокер выполняет меньше операций записи на единицу данных.</li>
-<li><strong><code>linger.ms</code></strong> — установите 5–20 мс, чтобы небольшая задержка наполняла батчи, не увеличивая заметно end-to-end latency. При значении 0 многие батчи будут отправляться полупустыми, снижая эффективность.</li>
+<li><strong><code>batch.size</code></strong> — увеличивайте до 64–512 КБ (а в высокопоточных аналитических пайплайнах до 1 МБ). Более крупные батчи лучше сжимаются, а брокер выполняет меньше операций записи на единицу данных.</li>
+<li><strong><code>linger.ms</code></strong> — установите 5–20 мс, чтобы небольшая задержка наполняла батчи, не увеличивая заметно end-to-end latency. При значении 0 многие батчи будут отправляться полупустыми, снижая эффективность. В высоконагруженных системах <code>linger.ms=5</code> практически не добавляет задержки, но утраивает пропускную способность.</li>
 </ul>
 <h3 id="szhatie">Сжатие</h3>
 
@@ -2261,29 +2298,40 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 <thead>
 <tr>
 <th>Кодек</th>
-<th>Степень сжатия</th>
-<th>CPU (сжатие)</th>
-<th>Скорость</th>
+<th style="text-align: center;">Степень сжатия</th>
+<th style="text-align: center;">Нагрузка на CPU</th>
+<th style="text-align: center;">Скорость декомпрессии</th>
+<th>Рекомендация</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>snappy</td>
-<td>Среднее</td>
-<td>Низкое</td>
-<td>Быстро</td>
+<td><strong>lz4</strong></td>
+<td style="text-align: center;">Средняя</td>
+<td style="text-align: center;">Минимальная</td>
+<td style="text-align: center;">Сверхбыстро</td>
+<td><strong>Идеальный баланс по умолчанию</strong> для микросервисов</td>
 </tr>
 <tr>
-<td>lz4</td>
-<td>Среднее</td>
-<td>Низкое</td>
-<td>Очень быстро</td>
+<td><strong>snappy</strong></td>
+<td style="text-align: center;">Средняя</td>
+<td style="text-align: center;">Низкая</td>
+<td style="text-align: center;">Очень быстро</td>
+<td>Отличная альтернатива для CPU-bound систем</td>
 </tr>
 <tr>
-<td>zstd</td>
-<td>Высокое</td>
-<td>Среднее/Высокое</td>
-<td>Зависит от уровня</td>
+<td><strong>zstd</strong></td>
+<td style="text-align: center;">Экстремально высокая</td>
+<td style="text-align: center;">Средняя/Высокая</td>
+<td style="text-align: center;">Быстро</td>
+<td><strong>Максимум сжатия</strong> для Big Data и экономии диска</td>
+</tr>
+<tr>
+<td><strong>gzip</strong></td>
+<td style="text-align: center;">Высокая</td>
+<td style="text-align: center;">Высокая</td>
+<td style="text-align: center;">Медленно</td>
+<td>Устаревший выбор, не рекомендуется для высоких RPS</td>
 </tr>
 </tbody>
 </table></div>
@@ -2300,14 +2348,16 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 <h3 id="acks-i-dolgovechnost">acks и долговечность</h3>
 
 <p>Параметр <code>acks</code> прямо влияет на задержку отправки:<br />
-- <code>acks=0</code> — не ждать ответа, наименьшая задержка, возможна потеря данных.<br />
-- <code>acks=1</code> — ждать подтверждения от лидера партиции. Баланс между скоростью и надёжностью.<br />
-- <code>acks=all</code> — ждать подтверждения от всех синхронизированных реплик (ISR). Максимальная долговечность ценой увеличения задержки на время репликации.</p>
+- <strong><code>acks=0</code></strong> — продюсер не ждет ответа от сети. Минимальная задержка (sub-millisecond), но риск безвозвратной потери сообщений при малейшем сетевом сбое.<br />
+- <strong><code>acks=1</code></strong> — брокер-лидер подтверждает запись после сброса в локальный Page Cache. Баланс скорости и надёжности, но смена лидера до репликации может привести к потере данных.<br />
+- <strong><code>acks=all</code></strong> — брокер ждет подтверждения от всех синхронных реплик в ISR (<code>min.insync.replicas</code>). Максимальная надежность ценой задержки на сетевой round-trip между брокерами.</p>
 <p>Для высокопроизводительных систем с требованиями надёжности обычно выбирают <code>acks=all</code> в сочетании с <code>min.insync.replicas=2</code> и настройкой <code>enable.idempotence=true</code> для предотвращения дубликатов.</p>
 <h3 id="parallelizm-i-bufery">Параллелизм и буферы</h3>
 
-<p>Множество горутин, вызывающих <code>Produce</code>, могут конкурировать за RecordAccumulator. Увеличение <code>max.in.flight.requests.per.connection</code> (по умолчанию 5) позволяет отправлять несколько батчей параллельно на один брокер, не дожидаясь подтверждения предыдущего, что повышает throughput при высоких задержках сети.</p>
-<p><code>buffer.memory</code> (по умолчанию 32 МБ) — общий лимит памяти для буферов продюсера. Если буфер переполняется, <code>Send</code> блокируется, снижая производительность. Увеличьте до 64–256 МБ в зависимости от числа партиций и размера батчей.</p>
+<p>Множество горутин, вызывающих <code>Produce</code>, могут конкурировать за RecordAccumulator. <br />
+- <strong><code>max.in.flight.requests.per.connection</code></strong> (по умолчанию 5): Позволяет отправлять до 5 сетевых TCP-пакетов параллельно в один брокер без ожидания подтверждения предыдущего, полностью насыщая сетевой канал (Bandwidth-Delay Product). При включенной идемпотентности (<code>enable.idempotence=true</code>) брокер отслеживает <code>Sequence Number</code> и гарантирует идеальный порядок даже при параллельной отправке!<br />
+- <strong><code>buffer.memory</code></strong> (по умолчанию 32 МБ): Общий пул оперативной памяти продюсера под накопление батчей. Если сеть временно деградировала, буфер заполняется, и вызовы <code>Produce</code> начинают блокироваться по истечении <code>max.block.ms</code>. Для высоконагруженных продюсеров этот параметр увеличивают до 64–256 МБ.</p>
+<hr />
 <h2 id="broker-zapis-replikatsiya-khranenie">Брокер: запись, репликация, хранение</h2>
 
 <p>Брокер — центральное звено, и его производительность ограничена двумя физическими ресурсами: дисковой подсистемой и сетью.</p>
@@ -2315,13 +2365,16 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 
 <p>Kafka предельно зависима от последовательного ввода-вывода. Использование <strong>NVMe SSD</strong> (например, AWS i3/i4i инстансы с локальными NVMe) — обязательное условие для высоких нагрузок. На HDD throughput падает в десятки раз.</p>
 <p>Рекомендации по файловой системе:<br />
-- Предпочтительнее <strong>XFS</strong> — показывает лучшую производительность на больших файлах и операциях sequential write, чем ext4.<br />
+- Предпочтительнее <strong>XFS</strong> — показывает лучшую производительность на больших файлах и операциях sequential write, чем ext4, благодаря более эффективной работе с непрерывными экстентами (extents).<br />
 - Монтирование с опцией <strong><code>noatime</code></strong> отключает обновление времени последнего доступа к файлам, экономя метаданные операции при каждом чтении.<br />
 - Блочное выравнивание разделов по границам erase block SSD (обычно 1 МБ) предотвращает write amplification на уровне контроллера.</p>
 <h3 id="stranichnyy-kesh-i-upravlenie-pamyatyu">Страничный кеш и управление памятью</h3>
 
 <p>Брокер активно использует Page Cache ядра Linux. Для производства крайне важно, чтобы операционная система не вытесняла горячие страницы Kafka из кеша. Настройте <strong><code>vm.swappiness=1</code></strong> (не 0, чтобы избежать OOM Killer при нехватке памяти), чтобы ядро агрессивно держало страничный кеш.</p>
-<p>Внутри JVM брокера не следует выделять более 6–8 ГБ heap (для брокеров с ~30 ГБ RAM). Остальная память остаётся под Page Cache. Флаг JVM <code>-XX:+UseG1GC</code> обеспечивает предсказуемые паузы GC, особенно при большом количестве партиций.</p>
+<p>Дополнительные параметры ядра для дискового кэша:<br />
+- <code>vm.dirty_background_ratio = 5</code> — ядро начинает сбрасывать грязные страницы на диск в фоне, когда они занимают 5% доступной RAM, предотвращая внезапные лавины I/O;<br />
+- <code>vm.dirty_ratio = 10</code> — жесткий порог, при котором процессы начинают блокироваться до сброса страниц.</p>
+<p>Внутри JVM брокера не следует выделять более 6–8 ГБ heap (для брокеров с ~30–64 ГБ RAM). Остальная память остаётся под Page Cache. Флаг JVM <code>-XX:+UseG1GC</code> обеспечивает предсказуемые паузы GC, особенно при большом количестве партиций.</p>
 <h3 id="kolichestvo-partitsiy-i-topikov">Количество партиций и топиков</h3>
 
 <p>Избыточное количество партиций — частая причина скрытой деградации:<br />
@@ -2331,6 +2384,7 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 <h3 id="replikatsiya-i-min-insync-replicas">Репликация и min.insync.replicas</h3>
 
 <p>При <code>acks=all</code> запись считается успешной, когда её подтвердили все реплики в ISR. Параметр <code>min.insync.replicas</code> определяет, сколько реплик должно подтвердить запись. Значение <code>min.insync.replicas=2</code> (при факторе репликации 3) означает, что лидер + одна синхронная реплика обязаны подтвердить. Это повышает надёжность без значительного ухудшения задержки. Установка значения, равного фактору репликации, максимизирует долговечность, но при выходе из строя любого брокера топик становится недоступным для записи.</p>
+<hr />
 <h2 id="konsyumer-bystraya-vychitka-bez-poter">Консьюмер: быстрая вычитка без потерь</h2>
 
 <p>Производительность консьюмера определяется тем, насколько быстро он может забирать данные и обрабатывать их.</p>
@@ -2372,17 +2426,36 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 <h3 id="kolichestvo-konsyumerov-vs-partitsiy">Количество консьюмеров vs партиций</h3>
 
 <p>Максимальный параллелизм Consumer Group ограничен числом партиций топика. Добавление консьюмеров сверх числа партиций не повышает throughput — лишние экземпляры бездействуют. Проектируйте топики с достаточным числом партиций под ожидаемый уровень параллелизма, учитывая накладные расходы, описанные выше.</p>
+<hr />
 <h2 id="operatsionnaya-sistema-nevidimyy-fundament">Операционная система: невидимый фундамент</h2>
 
 <h3 id="set">Сеть</h3>
 
-<p>Брокер обслуживает множество TCP-соединений от продюсеров, консьюмеров и других брокеров (репликация). Пропускная способность сетевого интерфейса — ещё один физический лимит. На платформах вроде AWS выбирайте инстансы с гарантированной пропускной способностью (Enhanced Networking, ENA). Увеличение размеров TCP-буферов ядра через <code>sysctl</code> (<code>net.core.rmem_max</code>, <code>net.core.wmem_max</code>) может улучшить пропускную способность на высоких задержках.</p>
+<p>Брокер обслуживает множество TCP-соединений от продюсеров, консьюмеров и других брокеров (репликация). Пропускная способность сетевого интерфейса — ещё один физический лимит. На платформах вроде AWS выбирайте инстансы с гарантированной пропускной способностью (Enhanced Networking, ENA). </p>
+<p>Увеличение размеров TCP-буферов ядра через <code>sysctl</code> (<code>net.core.rmem_max</code>, <code>net.core.wmem_max</code>) может улучшить пропускную способность на высоких задержках:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+sysctl -w net.ipv4.tcp_rmem=&quot;4096 87380 16777216&quot;
+sysctl -w net.ipv4.tcp_wmem=&quot;4096 65536 16777216&quot;
+</code></pre>
+</div>
+
 <h3 id="io-planirovshchik">IO-планировщик</h3>
 
-<p>Для SSD/NVMe используйте <code>none</code> (или <code>noop</code> в старых ядрах) — планировщик без переупорядочивания, отдающий запросы напрямую в очередь устройства. Это минимизирует накладные расходы ядра на сортировку запросов, которая для NVMe бессмысленна.</p>
+<p>Для современных SSD/NVMe используйте планировщик <code>none</code> (или <code>noop</code> в старых ядрах Linux) — он отключает лишнюю сортировку запросов в ядре и передает команды контроллеру NVMe напрямую, экономя такты CPU.</p>
 <h3 id="max-open-files">Max open files</h3>
 
-<p>Каждый сегмент партиции потребляет файловые дескрипторы. При большом количестве партиций стандартного лимита (1024) недостаточно. Установите <code>ulimit -n 100000</code> или выше.</p>
+<p>Каждый сегмент партиции потребляет файловые дескрипторы. При большом количестве партиций стандартного лимита (1024) недостаточно. Установите <code>ulimit -n 100000</code> или выше (например, <code>1000000</code> в <code>/etc/security/limits.conf</code>).</p>
+<hr />
 <h2 id="tipichnye-tsifry">Типичные цифры</h2>
 
 <p>При правильной настройке на современном оборудовании (NVMe, 10+ GbE) можно ожидать:</p>
@@ -2390,28 +2463,29 @@ OS_IO &amp; OS_Net &amp; OS_FS --&gt; B_Disk &amp; B_PC &amp; B_Repl &amp; C_Fet
 <thead>
 <tr>
 <th>Сценарий</th>
-<th>Throughput</th>
-<th>End-to-end latency p99</th>
+<th style="text-align: center;">Throughput</th>
+<th style="text-align: center;">End-to-end latency p99</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>1 продюсер, 1 консьюмер, 1 партиция</td>
-<td>100+ Мбайт/с</td>
-<td>&lt; 5 мс</td>
+<td><strong>1 продюсер, 1 консьюмер, 1 партиция</strong></td>
+<td style="text-align: center;">100+ Мбайт/с</td>
+<td style="text-align: center;">&lt; 5 мс</td>
 </tr>
 <tr>
-<td>8 продюсеров, 8 консьюмеров, 32 партиции</td>
-<td>800+ Мбайт/с</td>
-<td>&lt; 10 мс</td>
+<td><strong>8 продюсеров, 8 консьюмеров, 32 партиции</strong></td>
+<td style="text-align: center;">800+ Мбайт/с</td>
+<td style="text-align: center;">&lt; 10 мс</td>
 </tr>
 <tr>
-<td>Транзакционная запись exactly-once</td>
-<td>~70% от базового</td>
-<td>+2–5 мс</td>
+<td><strong>Транзакционная запись exactly-once</strong></td>
+<td style="text-align: center;">~70% от базового</td>
+<td style="text-align: center;">+2–5 мс</td>
 </tr>
 </tbody>
 </table></div>
+<hr />
 <h2 id="instrumenty-izmereniya">Инструменты измерения</h2>
 
 <p>Не тюньте вслепую. Используйте встроенные инструменты бенчмаркинга:</p>
@@ -2441,7 +2515,14 @@ kafka-consumer-perf-test \
 </code></pre>
 </div>
 
-<p>Для production-мониторинга подключайте JMX-метрики брокеров через Prometheus exporter и отслеживайте ключевые показатели: <code>request-handler-idle-ratio</code>, <code>network-processor-idle-ratio</code>, <code>disk-write-rate</code>, <code>replication-under-replicated-partitions</code>.</p>
+<p>Для production-мониторинга подключайте JMX-метрики брокеров через Prometheus exporter и отслеживайте ключевые показатели:<br />
+- <strong><code>request-handler-idle-ratio</code></strong> — доля времени, когда потоки обработки запросов простаивают (если &lt; 0.2 — нехватка CPU или потоков);<br />
+- <strong><code>network-processor-idle-ratio</code></strong> — простой сетевых потоков;<br />
+- <strong><code>disk-write-rate</code></strong> — интенсивность дисковой записи;<br />
+- <strong><code>replication-under-replicated-partitions</code></strong> — количество недореплицированных партиций (должно быть строго 0).</p>
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2453,10 +2534,22 @@ kafka-consumer-perf-test \
   </div>
 </div>
 
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Почему для брокера Kafka рекомендуется устанавливать <code>vm.swappiness=1</code>, а не <code>0</code>?<br />
+<strong>Ответ:</strong> Значение <code>vm.swappiness=1</code> заставляет ядро Linux максимально агрессивно удерживать страничный кэш в оперативной памяти и избегать выгрузки страниц на диск в swap. Однако установка в <code>0</code> в некоторых ядрах полностью запрещает подкачку страниц, что при внезапном скачке аллокаций памяти может немедленно активировать аварийный <code>OOM Killer</code> и убить процесс брокера. Значение <code>1</code> оставляет ядру Linux узкую форточку безопасности.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="zaklyuchenie">Заключение</h2>
 
 <p>Высокая производительность Kafka — это инженерная дисциплина, а не разовый акт. Она достигается пониманием того, как батчинг и сжатие продюсера, неизменяемый лог брокера, страничный кеш и zero-copy, а также асинхронная обработка консьюмера складываются в единый конвейер. Каждый параметр — рычаг, влияющий на компромисс между пропускной способностью и задержкой.</p>
-<p>Мы завершили подраздел Kafka, прошед путь от архитектуры лога и партиций до потоковых процессоров, схем и тюнинга производительности. Теперь мы можем перейти к другому, не менее важному брокеру экосистемы — лёгкому и высокоскоростному NATS. Следующая статья откроет подраздел <a href="../04-nats/1-nats-legkovesnyy-broker.html" class="wikilink">1. NATS. Легковесный брокер</a>.</p>
+<p>Мы завершили подраздел Kafka, пройдя путь от архитектуры лога и партиций до потоковых процессоров, схем и тюнинга производительности. Теперь мы можем перейти к другому, не менее важному брокеру экосистемы — лёгкому и высокоскоростному NATS. Следующая статья откроет подраздел <a href="../04-nats/1-nats-legkovesnyy-broker.html" class="wikilink">1. NATS. Легковесный брокер</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2484,7 +2577,7 @@ kafka-consumer-perf-test \
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#proizvoditelnost-kak-arkhitekturnoe-svoystvo">Производительность как архитектурное свойство</a></li><li class="toc-item toc-h2"><a href="#tri-urovnya-tyuninga">Три уровня тюнинга</a></li><li class="toc-item toc-h2"><a href="#prodyuser-kak-otpravit-million-soobshcheniy-i-ne-zakhlebnutsya">Продюсер: как отправить миллион сообщений и не захлебнуться</a></li><li class="toc-item toc-h3"><a href="#batch-size-i-linger-ms">batch.size и linger.ms</a></li><li class="toc-item toc-h3"><a href="#szhatie">Сжатие</a></li><li class="toc-item toc-h3"><a href="#acks-i-dolgovechnost">acks и долговечность</a></li><li class="toc-item toc-h3"><a href="#parallelizm-i-bufery">Параллелизм и буферы</a></li><li class="toc-item toc-h2"><a href="#broker-zapis-replikatsiya-khranenie">Брокер: запись, репликация, хранение</a></li><li class="toc-item toc-h3"><a href="#diski-i-faylovaya-sistema">Диски и файловая система</a></li><li class="toc-item toc-h3"><a href="#stranichnyy-kesh-i-upravlenie-pamyatyu">Страничный кеш и управление памятью</a></li><li class="toc-item toc-h3"><a href="#kolichestvo-partitsiy-i-topikov">Количество партиций и топиков</a></li><li class="toc-item toc-h3"><a href="#replikatsiya-i-min-insync-replicas">Репликация и min.insync.replicas</a></li><li class="toc-item toc-h2"><a href="#konsyumer-bystraya-vychitka-bez-poter">Консьюмер: быстрая вычитка без потерь</a></li><li class="toc-item toc-h3"><a href="#fetch-min-bytes-i-fetch-max-wait-ms">fetch.min.bytes и fetch.max.wait.ms</a></li><li class="toc-item toc-h3"><a href="#max-poll-records-i-tsikl-obrabotki">max.poll.records и цикл обработки</a></li><li class="toc-item toc-h3"><a href="#kolichestvo-konsyumerov-vs-partitsiy">Количество консьюмеров vs партиций</a></li><li class="toc-item toc-h2"><a href="#operatsionnaya-sistema-nevidimyy-fundament">Операционная система: невидимый фундамент</a></li><li class="toc-item toc-h3"><a href="#set">Сеть</a></li><li class="toc-item toc-h3"><a href="#io-planirovshchik">IO-планировщик</a></li><li class="toc-item toc-h3"><a href="#max-open-files">Max open files</a></li><li class="toc-item toc-h2"><a href="#tipichnye-tsifry">Типичные цифры</a></li><li class="toc-item toc-h2"><a href="#instrumenty-izmereniya">Инструменты измерения</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie">Заключение</a></li>
+    <li class="toc-item toc-h2"><a href="#proizvoditelnost-kak-arkhitekturnoe-svoystvo">Производительность как архитектурное свойство</a></li><li class="toc-item toc-h2"><a href="#tri-urovnya-tyuninga">Три уровня тюнинга</a></li><li class="toc-item toc-h2"><a href="#prodyuser-kak-otpravit-million-soobshcheniy-i-ne-zakhlebnutsya">Продюсер: как отправить миллион сообщений и не захлебнуться</a></li><li class="toc-item toc-h3"><a href="#batch-size-i-linger-ms">batch.size и linger.ms</a></li><li class="toc-item toc-h3"><a href="#szhatie">Сжатие</a></li><li class="toc-item toc-h3"><a href="#acks-i-dolgovechnost">acks и долговечность</a></li><li class="toc-item toc-h3"><a href="#parallelizm-i-bufery">Параллелизм и буферы</a></li><li class="toc-item toc-h2"><a href="#broker-zapis-replikatsiya-khranenie">Брокер: запись, репликация, хранение</a></li><li class="toc-item toc-h3"><a href="#diski-i-faylovaya-sistema">Диски и файловая система</a></li><li class="toc-item toc-h3"><a href="#stranichnyy-kesh-i-upravlenie-pamyatyu">Страничный кеш и управление памятью</a></li><li class="toc-item toc-h3"><a href="#kolichestvo-partitsiy-i-topikov">Количество партиций и топиков</a></li><li class="toc-item toc-h3"><a href="#replikatsiya-i-min-insync-replicas">Репликация и min.insync.replicas</a></li><li class="toc-item toc-h2"><a href="#konsyumer-bystraya-vychitka-bez-poter">Консьюмер: быстрая вычитка без потерь</a></li><li class="toc-item toc-h3"><a href="#fetch-min-bytes-i-fetch-max-wait-ms">fetch.min.bytes и fetch.max.wait.ms</a></li><li class="toc-item toc-h3"><a href="#max-poll-records-i-tsikl-obrabotki">max.poll.records и цикл обработки</a></li><li class="toc-item toc-h3"><a href="#kolichestvo-konsyumerov-vs-partitsiy">Количество консьюмеров vs партиций</a></li><li class="toc-item toc-h2"><a href="#operatsionnaya-sistema-nevidimyy-fundament">Операционная система: невидимый фундамент</a></li><li class="toc-item toc-h3"><a href="#set">Сеть</a></li><li class="toc-item toc-h3"><a href="#io-planirovshchik">IO-планировщик</a></li><li class="toc-item toc-h3"><a href="#max-open-files">Max open files</a></li><li class="toc-item toc-h2"><a href="#tipichnye-tsifry">Типичные цифры</a></li><li class="toc-item toc-h2"><a href="#instrumenty-izmereniya">Инструменты измерения</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie">Заключение</a></li>
   </ul>
 </aside>
 

@@ -2168,14 +2168,19 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~36 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Retention и compaction</h1>
           </header>
 
           <div class="article-markdown">
-            <div class="callout callout-note">
+            <h1>8. Retention и compaction: управление жизненным циклом и уплотнение лога</h1>
+<blockquote>
+<p><em>"Data structures and algorithms are tools to manage complexity, but managing the lifetime of data is what keeps systems alive."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
   <div class="callout-header">
     <span class="callout-icon">📝</span>
     <span class="callout-title">Заметка</span>
@@ -2185,70 +2190,169 @@
   </div>
 </div>
 
+<hr />
 <h2 id="dva-vzglyada-na-zhiznennyy-tsikl-dannykh">Два взгляда на жизненный цикл данных</h2>
 
-<p>Apache Kafka хранит сообщения на диске, но дисковое пространство конечно. Управление жизненным циклом данных критически важно: бесконтрольно растущий лог рано или поздно исчерпает все ресурсы и остановит кластер. При этом просто удалять всё подряд нельзя — разные сценарии предъявляют противоположные требования к хранению:</p>
-<ul>
-<li><strong>Поток событий, журнал пользовательских действий:</strong> нужна возможность воспроизвести поток за последние N часов/дней, а всё, что старше, можно удалить.</li>
-<li><strong>Хранилище текущего состояния (CDC, таблицы соответствий, последний снапшот):</strong> нужно всегда иметь последнее значение для каждого ключа, а историю изменений можно отбросить.</li>
-</ul>
-<p>Kafka предлагает два режима очистки — <strong>delete</strong> (retention) и <strong>compact</strong> (compaction), — и позволяет гибко комбинировать их для разных топиков через <code>cleanup.policy</code>.</p>
+<p>Дисковое пространство любого промышленного сервера конечно. В высоконагруженных системах, генерирующих сотни гигабайт или терабайты событий в сутки, бесконтрольно растущий лог — это верный рецепт аварийной остановки кластера с ошибкой <code>No space left on device</code> (ENOSPC).</p>
+<p>При этом характер хранимых данных в бэкенд-архитектурах принципиально различен:</p>
+<ol>
+<li><strong>Непрерывный поток неизменяемых событий (Event Stream):</strong> Клики пользователей, телеметрия IoT-датчиков, финансовые транзакции, трейсы и логи приложений. В таких сценариях важна возможность воспроизвести поток за последние $N$ часов или дней (например, для расследования инцидентов или повторного обучения моделей машинного обучения), а всё, что старше этого окна, можно безболезненно уничтожить.</li>
+<li><strong>Поток изменений состояния сущностей (State Updates / CDC):</strong> Балансы пользователей, каталог цен товаров, текущий статус доставки заказа, служебный реестр смещений консьюмеров. Здесь бизнес-логике не интересна вся цепочка из 50 промежуточных изменений цены за полгода — приложению критически важно иметь <strong>самое последнее актуальное состояние для каждого первичного ключа</strong>!</li>
+</ol>
+<p>Apache Kafka предлагает два взаимодополняющих режима очистки лога — <strong>delete</strong> (Retention) и <strong>compact</strong> (Log Compaction), — и позволяет гибко настраивать их на уровне каждого отдельного топика через параметр <code>cleanup.policy</code>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph RawLog[&quot;Исходный топик (события по ключам A, B, C)&quot;]
+direction LR
+M1[&quot;k:A, v:1&quot;] --&gt; M2[&quot;k:B, v:2&quot;] --&gt; M3[&quot;k:A, v:3&quot;] --&gt; M4[&quot;k:C, v:4&quot;] --&gt; M5[&quot;k:A, v:5&quot;]
+end
+
+subgraph DeletePolicy[&quot;Политика: delete (Retention)&quot;]
+D1[&quot;Удаление СТАРЫХ СЕГМЕНТОВ&lt;br&gt;по времени (retention.ms) или объему (retention.bytes)&quot;]
+end
+
+subgraph CompactPolicy[&quot;Политика: compact (Log Compaction)&quot;]
+C1[&quot;Уплотнение по ключам:&lt;br&gt;k:B -&gt; 2&lt;br&gt;k:C -&gt; 4&lt;br&gt;&lt;b&gt;k:A -&gt; 5&lt;/b&gt; (дубликаты 1 и 3 удалены)&quot;]
+end
+
+RawLog --&gt;|&quot;cleanup.policy=delete&quot;| DeletePolicy
+RawLog --&gt;|&quot;cleanup.policy=compact&quot;| CompactPolicy
+  </pre>
+</div>
+
+
+<hr />
 <h2 id="retention-klassicheskoe-udalenie-po-vremeni-i-razmeru">Retention: классическое удаление по времени и размеру</h2>
 
-<p>Это самый интуитивный и распространённый механизм. Топик с политикой <code>delete</code> хранит сообщения определённое время и/или до превышения заданного суммарного объёма, после чего старые данные безвозвратно удаляются.</p>
+<p>Политика <code>delete</code> — это классический и наиболее распространенный способ управления размером топиков в Kafka. Топик хранит сообщения в течение заданного окна времени либо до достижения заданного суммарного объема на диске.</p>
 <h3 id="parametry-upravlyayushchie-retention">Параметры, управляющие retention</h3>
 
+<p>Поведение политики удаления регулируется на уровне брокера (глобально) и может быть переопределено для каждого отдельного топика:</p>
 <ul>
-<li><strong><code>retention.ms</code></strong> — максимальное время хранения сообщения в топике (по умолчанию 7 дней на уровне брокера, может переопределяться на уровне топика). Сообщения, чей timestamp старше <code>now - retention.ms</code>, становятся кандидатами на удаление.</li>
-<li><strong><code>retention.bytes</code></strong> — максимальный суммарный размер всех сегментов партиции (по умолчанию <code>-1</code>, т.е. без ограничения). При превышении этого порога самые старые сегменты удаляются, даже если их возраст меньше <code>retention.ms</code>.</li>
-<li><strong><code>log.retention.check.interval.ms</code></strong> — периодичность, с которой планировщик Log Manager проверяет сегменты на соответствие условиям удаления (по умолчанию 5 минут).</li>
+<li><strong><code>retention.ms</code></strong> — максимальное время хранения сообщения в топике (по умолчанию 7 дней: <code>604800000 мс</code>). Сообщения, чей timestamp старше <code>now - retention.ms</code>, становятся кандидатами на удаление.</li>
+<li><strong><code>retention.bytes</code></strong> — максимальный суммарный размер всех сегментов партиции на диске (по умолчанию <code>-1</code>, то есть без ограничения). При превышении этого порога самые старые сегменты удаляются, даже если их возраст меньше <code>retention.ms</code>.</li>
+<li><strong><code>log.retention.check.interval.ms</code></strong> — периодичность, с которой фоновый планировщик Log Manager сканирует директории брокера на соответствие условиям очистки (по умолчанию 5 минут).</li>
 </ul>
-<h3 id="kak-rabotaet-udalenie">Как работает удаление</h3>
+<h3 id="kak-rabotaet-udalenie-pod-kapotom">Как работает удаление под капотом</h3>
 
-<p>Физически удаление оперирует целыми <strong>сегментами</strong> — файлами на диске. Активный сегмент, в который идёт запись, никогда не удаляется. Log Manager периодически проверяет закрытые сегменты:</p>
-<ol>
-<li>Если максимальный timestamp записей в сегменте меньше <code>now - retention.ms</code>, весь сегмент помечается на удаление.</li>
-<li>Если суммарный размер закрытых сегментов превысил <code>retention.bytes</code>, удаляются самые старые сегменты, пока суммарный размер не вернётся в лимит.</li>
-</ol>
-<p>Удаление реализовано простым системным вызовом <code>unlink</code> (или <code>delete</code> в Java), который освобождает дисковое пространство. Это чрезвычайно дешёвая операция по сравнению с переписыванием данных.</p>
+<p>Физически операция удаления в Kafka оперирует исключительно <strong>целыми файлами-сегментами</strong>! </p>
+<p>Брокер никогда не пытается «вырезать» отдельные сообщения из середины файла <code>.log</code> — это вызвало бы чудовищный оверхед на дефрагментацию и переписывание сотен гигабайт данных.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph ClosedSegments[&quot;Закрытые сегменты (Read-Only)&quot;]
+direction LR
+S1[&quot;Сегмент 0&lt;br&gt;(Age: 9 days)&quot;] --&gt; S2[&quot;Сегмент 250&lt;br&gt;(Age: 3 days)&quot;]
+end
+
+subgraph ActiveSegment[&quot;Активный сегмент&quot;]
+S3[&quot;Сегмент 500&lt;br&gt;(Идет запись!)&quot;]
+end
+
+ClosedSegments --&gt; ActiveSegment
+
+Del[&quot;Log Manager: retenton.ms = 7 days&quot;] -.-&gt;|&quot;unlink(2)&quot;| S1
+S1 -.-&gt;|&quot;Удален с диска!&quot;| Trash[(&quot;Свободное место&quot;)]
+  </pre>
+</div>
+
+
+<p>Правила работы Log Manager:<br />
+1. <strong>Неприкосновенность активного сегмента:</strong> Активный сегмент, в который в текущий момент поступают записи от продюсеров, <strong>никогда не удаляется</strong>, даже если его размер превышает <code>retention.bytes</code> или сообщения внутри него устарели по времени!<br />
+2. <strong>Проверка временных меток:</strong> Log Manager находит максимальный timestamp среди всех записей сегмента (хранящийся в заголовке <code>.timeindex</code>). Если <code>now - max_segment_timestamp &gt; retention.ms</code>, весь сегмент помечается кандидатом на удаление.<br />
+3. <strong>Системный вызов <code>unlink(2)</code>:</strong> Удаление закрытого сегмента — это тривиальный системный вызов ядра операционной системы <code>unlink(2)</code> (в Java — <code>File.delete()</code>), удаляющий тройку файлов: <code>.log</code>, <code>.index</code> и <code>.timeindex</code>. </p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Удаление сегментов не приводит к дефрагментации файловой системы и не требует сканирования контента. Всё, что делает брокер, — удаляет файлы <code>.log</code>, <code>.index</code> и <code>.timeindex</code> целиком. Именно поэтому retention — лёгкая операция, практически не нагружающая ввод-вывод, если не считать кратковременного обновления метаданных файловой системы.</p>
+    <p>Удаление сегментов не приводит к дефрагментации файловой системы и не требует сканирования контента. Всё, что делает брокер, — удаляет файлы <code>.log</code>, <code>.index</code> и <code>.timeindex</code> целиком. Именно поэтому retention — лёгкая операция, практически не нагружающая ввод-вывод, если не считать кратковременного обновления метаданных файловой системы (inode в <code>ext4</code>/<code>xfs</code>).</p>
   </div>
 </div>
 
+<hr />
 <h2 id="compaction-uplotnenie-po-klyuchu">Compaction: уплотнение по ключу</h2>
 
-<p>Если retention отвечает на вопрос «как долго хранить сообщения?», то compaction — на вопрос «какое значение ключа является актуальным?». В компактифицированном топике для каждого уникального ключа сохраняется <strong>только запись с максимальным offset-ом</strong> (последняя по порядку записи). Все старые дубликаты ключа удаляются. Гарантируется, что в конце концов в логе останется не более одного значения на ключ, и консьюмер, читая лог с начала, увидит последнее известное состояние каждого ключа.</p>
+<p>Если политика retention отвечает на вопрос: <em>«Как долго хранить временную историю сообщений?»</em>, то Log Compaction отвечает на совершенно другой инженерный вопрос: <em>«Какое значение каждого уникального ключа является актуальным на данный момент?»</em>.</p>
+<p>В компактифицированном топике для каждого уникального ключа гарантированно сохраняется <strong>только запись с максимальным offset-ом</strong> (последняя по времени записи). Все предшествующие исторические записи с тем же самым ключом признаются устаревшими и безвозвратно удаляются из лога.</p>
+<p>Консьюмер, начавший чтение компактифицированного топика с самого начала (<code>offset = 0</code>), гарантированно восстановит полное актуальное состояние системы, прочитав минимально необходимый объем данных.</p>
 <h3 id="zachem-nuzhen-compaction">Зачем нужен compaction</h3>
 
-<p>Основные сценарии:</p>
-<ul>
-<li><strong>Change Data Capture (CDC)</strong> — захват изменений строк из БД. Каждое изменение строки (INSERT, UPDATE, DELETE) приходит в топик с ключом = первичный ключ. Compaction гарантирует, что новый консьюмер сможет восстановить полное текущее состояние, прочитав компактифицированный топик с начала, вместо того чтобы проходить всю историю изменений.</li>
-<li><strong>Хранение эталонных данных (reference data)</strong> — например, справочники, курсы валют.</li>
-<li><strong>Служебные топики Kafka</strong> — <code>__consumer_offsets</code> использует compaction для хранения последнего коммиченного offset'а для каждой Consumer Group и партиции.</li>
-</ul>
+<p>Основные сценарии применения уплотнения лога:</p>
+<ol>
+<li><strong>Change Data Capture (CDC):</strong> Интеграция с реляционными базами данных через Debezium. Каждое изменение строки (INSERT, UPDATE, DELETE) в PostgreSQL или MySQL публикуется в топик Kafka, где ключом является первичный ключ таблицы (<code>id</code>). Уплотнение лога превращает топик в распределенный материализованный снапшот базы данных!</li>
+<li><strong>Хранение эталонных справочников (Reference Data):</strong> Таблицы курсов валют, конфигурации фиче-флагов, каталоги категорий товаров.</li>
+<li><strong>Системные внутренние топики Kafka:</strong> Самый известный пример — топик <code>__consumer_offsets</code>. Каждое сообщение в нем хранит ключ <code>[group_id, topic, partition]</code>, а значением является последний зафиксированный <code>offset</code>. Благодаря compaction топик смещений не разрастается до терабайтов, удерживая только последние смещения консьюмеров.</li>
+</ol>
+<hr />
 <h3 id="kak-rabotaet-log-cleaner-pod-kapotom">Как работает Log Cleaner под капотом</h3>
 
-<p>За compaction отвечает пул фоновых потоков — <strong>Log Cleaner</strong>. Его задача: переписывать старые сегменты, удаляя дублирующиеся записи и tombstone-ы.</p>
-<p>Алгоритм:</p>
+<p>За процесс компактификации отвечает выделенный пул фоновых потоков брокера — <strong>Log Cleaner</strong>. </p>
+<p>Физическая партиция делится на две логические зоны:<br />
+- <strong>Чистая часть (Clean/Tail):</strong> Сегменты, которые уже прошли уплотнение. Здесь каждый ключ встречается ровно один раз.<br />
+- <strong>Грязная часть (Dirty/Head):</strong> Сегменты, в которые дописывались новые данные, и где присутствуют повторные записи одних и тех же ключей.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph CleanTail[&quot;Чистая часть (Clean / Compacted)&quot;]
+direction LR
+C1[&quot;Сегмент 0&lt;br&gt;(Уникальные ключи)&quot;]
+end
+
+subgraph DirtyHead[&quot;Грязная часть (Dirty)&quot;]
+direction LR
+D1[&quot;Сегмент 100&lt;br&gt;(Дубликаты)&quot;]
+D2[&quot;Активный сегмент 200&lt;br&gt;(Запись продюсера)&quot;]
+end
+
+CleanTail --&gt; DirtyHead
+  </pre>
+</div>
+
+
+<p>Алгоритм работы Log Cleaner:</p>
 <ol>
-<li>
-<p>Log Cleaner выбирает сегмент для очистки. Предпочтение отдаётся сегментам с наибольшим соотношением «грязных» записей (дубликатов) к общему размеру сегмента. Это контролируется параметром <strong><code>min.cleanable.dirty.ratio</code></strong> (по умолчанию 0.5). Если доля грязных записей ниже порога, очистка откладывается до накопления большего количества дубликатов, чтобы не тратить ресурсы на почти чистый лог.</p>
-</li>
-<li>
-<p>Для выбранного сегмента Log Cleaner строит в оперативной памяти <strong>Offset Map</strong> — хеш-таблицу (или компактное дерево), отображающую ключ сообщения в его последний offset <strong>в пределах этого сегмента и всех более свежих сегментов</strong>. Таким образом, если ключ встречается несколько раз, в карте останется только наибольший offset.</p>
-</li>
-<li>
-<p>Затем начинается «копирующая» фаза: Log Cleaner читает выбранный сегмент последовательно, и для каждой записи проверяет, присутствует ли её ключ в Offset Map и совпадает ли её offset с хранящимся максимальным. Если да — запись копируется в новый, чистый сегмент. Если нет — она пропускается (удаляется).</p>
-</li>
-<li>
-<p>После завершения копирования старый сегмент заменяется новым, чистым сегментом, а старый файл удаляется. Активный сегмент (в который идёт запись) никогда не подвергается компактификации.</p>
-</li>
+<li><strong>Выбор кандидата:</strong> Log Cleaner вычисляет соотношение «грязных» данных к общему размеру закрытых сегментов партиции:<br />
+   $$\text{Dirty Ratio} = \frac{\text{Bytes in Dirty Segments}}{\text{Bytes in Clean Segments} + \text{Bytes in Dirty Segments}}$$<br />
+   Очистка запускается только тогда, когда $\text{Dirty Ratio} \ge \textbf{min.cleanable.dirty.ratio}$ (по умолчанию 0.5, то есть 50% грязных данных). Если грязных данных мало, брокер откладывает работу, чтобы не расходовать драгоценные циклы дискового ввода-вывода на переписывание почти чистого лога.</li>
+<li><strong>Построение Offset Map (SkimpyOffsetMap):</strong> Log Cleaner строит в оперативной памяти компактную хэш-таблицу (используя 128-битный хэш ключа Murmur3 и 64-битный offset). Карта сохраняет отображение: $\text{Key Hash} \to \text{Highest Offset}$.</li>
+<li><strong>Линейное слияние (Deduplication Merge):</strong> Поток Log Cleaner последовательно читает записи из грязных сегментов. Если offset записи совпадает со значением в <code>Offset Map</code> — запись копируется в новый чистый сегмент. Если offset меньше — запись признается устаревшим дубликатом и <strong>пропускается</strong> (не попадает в новый файл).</li>
+<li><strong>Атомарная подмена сегмента:</strong> Новый компактный сегмент завершается, индексы пересчитываются, старые сегменты удаляются через <code>unlink(2)</code>, а ссылка на чистый сегмент атомарно обновляется.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2285,34 +2389,68 @@ M --&gt;|&quot;оставляет только последние&quot;| C1 &amp
 </div>
 
 
+<hr />
 <h3 id="tombstone-zapisi-i-delete-retention-ms">Tombstone-записи и `delete.retention.ms`</h3>
 
-<p>Когда нужно сообщить, что ключ удалён, в Kafka публикуется <strong>tombstone</strong> — запись с ключом и <code>null</code>-значением. Это маркер «удалён». Однако tombstone не может быть удалён немедленно после компактификации: иначе консьюмер, читающий с начала, увидит старые значения и не узнает, что ключ был удалён.</p>
+<p>А как удалить ключ в системе, где лог только дописывается? Для этого продюсер публикует специальную запись — <strong>Tombstone</strong> («надгробная плита»): сообщение с непустым бизнес-ключом и пустым телом: <code>Value == nil</code> (<code>null</code>).</p>
+<p>Однако Tombstone нельзя стереть немедленно в процессе первого же раунда компактификации! Представьте, что консьюмер был временно отключен на 2 часа: если брокер мгновенно удалит и старое значение, и сам Tombstone, проснувшийся консьюмер вообще не узнает, что объект был удален из базы данных!</p>
 <p>Параметр <strong><code>delete.retention.ms</code></strong> (по умолчанию 24 часа) определяет, как долго tombstone хранится в логе после того, как он был обработан Log Cleaner и признан последней записью для своего ключа. По истечении этого срока при следующей очистке tombstone будет окончательно удалён, и ключ исчезнет из лога.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor App as Продюсер (CDC)
+participant Log as Партиция Kafka
+participant Cleaner as Log Cleaner
+actor Consumer as Отстающий консьюмер
+
+App-&gt;&gt;Log: Запись Tombstone: Key=&quot;user-42&quot;, Value=nil (offset=100)
+Note over Log,Cleaner: Первый проход Cleaner: старые записи user-42 стёрты,&lt;br&gt;но Tombstone ОСТАЕТСЯ в логе!
+Consumer-&gt;&gt;Log: Чтение лога (offset 100): получил Tombstone!&lt;br&gt;Удаляет запись из локальной БД!
+Note over Log,Cleaner: Прошло delete.retention.ms (24 часа)
+Note over Cleaner: Второй проход Cleaner: Tombstone удален с диска без следа!
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Воскрешение удаленных сущностей (Zombie Resurrect)</span>
   </div>
   <div class="callout-body">
     <p>Если консьюмер отстаёт больше, чем на <code>delete.retention.ms</code>, и tombstone уже удалён, при перемотке он увидит старые значения ключа, не узнав, что ключ был удалён. Это приводит к «воскрешению» удалённых записей в состоянии консьюмера. Чтобы избежать этого, необходимо либо гарантировать, что консьюмер не отстаёт на такие длительные периоды, либо использовать компактифицированные топики в сочетании с дополнительным механизмом синхронизации (например, снапшоты в Kafka Streams).</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-vliyanie-na-vvod-vyvod-i-stranichnyy-kesh">Mechanical Sympathy: влияние на ввод-вывод и страничный кеш</h2>
 
+<p>Понимание аппаратной цены каждого механизма очистки критично при проектировании архитектуры:</p>
 <h3 id="retention-pochti-besplatno">Retention: почти бесплатно</h3>
 
-<p>Удаление сегментов — это метаданные операции. Файловая система просто освобождает блоки, никакого чтения или записи данных не происходит. Страничный кеш самоочищается по мере вытеснения ненужных страниц. Нагрузка на диски минимальна.</p>
+<p>Удаление сегментов — это чистая метаданная операция операционной системы. Файловая система освобождает экстенты и блоки, не требуя ни единого чтения или записи данных с физического носителя. Страничный кэш ядра Linux автоматически очищается по мере вытеснения ненужных страниц демоном <code>kswapd</code>. Дисковая нагрузка равна нулю.</p>
 <h3 id="compaction-tyazhelovesnaya-operatsiya">Compaction: тяжеловесная операция</h3>
 
 <p>Log Cleaner — это интенсивная фоновая работа, которая читает старые сегменты и записывает новые. Это конкурирует со штатной нагрузкой брокера (продюсеры, консьюмеры). Ключевые аспекты:</p>
 <ul>
-<li><strong>Чтение:</strong> холодные сегменты, возможно, вытеснены из Page Cache в момент очистки, что приводит к физическому чтению с диска.</li>
-<li><strong>Запись:</strong> создание новых сегментов порождает последовательную запись, что эффективно, но добавляет общий объём ввода-вывода.</li>
-<li><strong>Память:</strong> Offset Map для каждой партиции может быть значительной (десятки мегабайт), потребляя оперативную память брокера.</li>
+<li><strong>Чтение:</strong> холодные сегменты, возможно, вытеснены из <code>Page Cache</code> в момент очистки, что приводит к физическому чтению с диска.</li>
+<li><strong>Запись:</strong> создание новых сегментов порождает последовательную запись, что эффективно, но добавляет общий объём ввода-вывода (Write Amplification).</li>
+<li><strong>Память:</strong> <code>Offset Map</code> для каждой партиции может быть значительной (десятки мегабайт), потребляя оперативную память брокера.</li>
 </ul>
-<p>Тюнинг <code>log.cleaner.threads</code> и <code>min.cleanable.dirty.ratio</code> позволяет балансировать между свежестью компактификации и нагрузкой на железо.</p>
+<p>Тюнинг <code>log.cleaner.threads</code> (число потоков очистки) и <code>min.cleanable.dirty.ratio</code> позволяет балансировать между свежестью компактификации и нагрузкой на железо.</p>
+<hr />
 <h2 id="sravnenie-retention-i-compaction">Сравнение Retention и Compaction</h2>
 
 <div class="table-container"><table>
@@ -2325,41 +2463,42 @@ M --&gt;|&quot;оставляет только последние&quot;| C1 &amp
 </thead>
 <tbody>
 <tr>
-<td>Критерий очистки</td>
-<td>Время / размер топика</td>
-<td>Последнее значение ключа</td>
+<td><strong>Критерий очистки</strong></td>
+<td>Время (<code>retention.ms</code>) / размер топика (<code>retention.bytes</code>)</td>
+<td>Последнее значение ключа (<code>Offset Map</code>)</td>
 </tr>
 <tr>
-<td>Операция</td>
+<td><strong>Физическая операция</strong></td>
 <td>Удаление целых сегментов (<code>unlink</code>)</td>
 <td>Переписывание сегментов с удалением дубликатов</td>
 </tr>
 <tr>
-<td>Порядок сообщений</td>
-<td>Сохраняется</td>
+<td><strong>Порядок сообщений</strong></td>
+<td>Сохраняется строго</td>
 <td>Сохраняется, но часть сообщений исчезает</td>
 </tr>
 <tr>
-<td>Возможность воспроизвести историю</td>
-<td>Да, за период retention</td>
+<td><strong>Воспроизведение истории</strong></td>
+<td>Да, за весь период retention</td>
 <td>Нет, только последнее состояние каждого ключа</td>
 </tr>
 <tr>
-<td>Накладные расходы</td>
-<td>Почти нулевые</td>
-<td>Значительные (I/O, CPU, память)</td>
+<td><strong>Накладные расходы CPU/IO</strong></td>
+<td>Почти нулевые (только метаданные ФС)</td>
+<td>Значительные (I/O чтение/запись, RAM на Offset Map)</td>
 </tr>
 <tr>
-<td>Типовые сценарии</td>
-<td>Логирование, поток событий, аналитика</td>
+<td><strong>Типовые сценарии</strong></td>
+<td>Логирование, поток событий, метрики, аналитика</td>
 <td>CDC, таблицы состояний, <code>__consumer_offsets</code></td>
 </tr>
 </tbody>
 </table></div>
 <p>Допустимо комбинировать политики: <code>cleanup.policy=compact,delete</code> — топик будет одновременно удалять сообщения по времени/размеру и компактифицировать старые сегменты. Это позволяет ограничить абсолютный объём хранилища, сохраняя преимущества compaction.</p>
+<hr />
 <h2 id="prakticheskoe-ispolzovanie-v-go-vosstanovlenie-sostoyaniya-iz-kompaktifitsirovan">Практическое использование в Go: восстановление состояния из компактифицированного топика</h2>
 
-<p>Типичный паттерн для stateful-сервиса на Go: при старте консьюмер читает компактифицированный топик с <code>auto.offset.reset=earliest</code> и строит в памяти хеш-таблицу текущего состояния.</p>
+<p>Типичный паттерн для stateful-микросервиса на Go: при холодном старте консьюмер читает компактифицированный топик с настройкой <code>auto.offset.reset=earliest</code> и строит в оперативной памяти быструю проекцию состояния (In-Memory K-V Cache):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2369,7 +2508,29 @@ M --&gt;|&quot;оставляет только последние&quot;| C1 &amp
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Пример: загрузка справочника курсов валют из компактифицированного топика
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;log&quot;
+    &quot;strconv&quot;
+    &quot;sync&quot;
+
+    &quot;github.com/twmb/franz-go/pkg/kgo&quot;
+)
+
+// CurrencyCache представляет потокобезопасный локальный кэш курсов валют
+type CurrencyCache struct {
+    mu    sync.RWMutex
+    rates map[string]float64
+}
+
+func NewCurrencyCache() *CurrencyCache {
+    return &amp;CurrencyCache{rates: make(map[string]float64)}
+}
+
+// Пример: загрузка справочника курсов валют из компактифицированного топика
 func loadCurrencyRates(ctx context.Context, client *kgo.Client) (map[string]float64, error) {
     rates := make(map[string]float64)
     for {
@@ -2377,16 +2538,25 @@ func loadCurrencyRates(ctx context.Context, client *kgo.Client) (map[string]floa
         if fetches.IsClientClosed() {
             break
         }
+        if ctx.Err() != nil {
+            break
+        }
+
         fetches.EachRecord(func(record *kgo.Record) {
             key := string(record.Key)
-            // tombstone: ключ удалён
+            // tombstone: ключ удалён из системы
             if record.Value == nil {
                 delete(rates, key)
                 return
             }
-            rate, _ := strconv.ParseFloat(string(record.Value), 64)
+            rate, err := strconv.ParseFloat(string(record.Value), 64)
+            if err != nil {
+                log.Printf(&quot;invalid currency rate format for key %s: %v&quot;, key, err)
+                return
+            }
             rates[key] = rate
         })
+
         // Коммитить offset имеет смысл только после построения полного состояния,
         // чтобы при перезапуске не перечитывать всё заново.
         client.CommitUncommittedOffsets(ctx)
@@ -2395,6 +2565,9 @@ func loadCurrencyRates(ctx context.Context, client *kgo.Client) (map[string]floa
 }
 </code></pre>
 </div>
+
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
 
 <div class="callout callout-interview">
   <div class="callout-header">
@@ -2407,6 +2580,18 @@ func loadCurrencyRates(ctx context.Context, client *kgo.Client) (map[string]floa
   </div>
 </div>
 
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Что произойдет, если в компактифицированный топик отправлять сообщения без ключа (<code>key == nil</code>)?<br />
+<strong>Ответ:</strong> Сообщения без ключа не могут быть уплотнены, так как у них нет идентификатора сущности. В старых версиях Kafka такие сообщения удалялись при первой же очистке. В современных версиях брокер не может сопоставить им <code>Offset Map</code>, и они приводят либо к деградации эффективности Log Cleaner, либо сохраняются бесконечно. В компактифицированных топиках ключ сообщения <strong>обязателен</strong> для каждой записи.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="kogda-retention-a-kogda-compaction-pravilo-vybora">Когда Retention, а когда Compaction: правило выбора</h2>
 
 <ul>
@@ -2414,6 +2599,7 @@ func loadCurrencyRates(ctx context.Context, client *kgo.Client) (map[string]floa
 <li>Если данные — это <strong>изменения сущностей</strong> (пользователи, заказы), и вам важно текущее состояние, а не история — используйте <strong>compaction</strong>.</li>
 <li>Если вам нужно и то, и другое (история изменений за период и быстрое восстановление состояния) — комбинируйте: используйте отдельный топик с retention для событий и компактифицированный топик для CDC-снапшотов. Или <code>compact,delete</code>.</li>
 </ul>
+<hr />
 <h2 id="zaklyuchenie-i-sleduyushchie-shagi">Заключение и следующие шаги</h2>
 
 <p>Retention и Compaction — два фундаментальных механизма, превращающих Kafka из просто «распределённого лога» в долговременное хранилище, способное обслуживать как операционную аналитику, так и постоянно актуальные таблицы состояний. Понимание их физического устройства — ключ к корректной настройке кластера и предотвращению катастрофических отставаний или потерь данных.</p>
@@ -2445,7 +2631,7 @@ func loadCurrencyRates(ctx context.Context, client *kgo.Client) (map[string]floa
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#dva-vzglyada-na-zhiznennyy-tsikl-dannykh">Два взгляда на жизненный цикл данных</a></li><li class="toc-item toc-h2"><a href="#retention-klassicheskoe-udalenie-po-vremeni-i-razmeru">Retention: классическое удаление по времени и размеру</a></li><li class="toc-item toc-h3"><a href="#parametry-upravlyayushchie-retention">Параметры, управляющие retention</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-udalenie">Как работает удаление</a></li><li class="toc-item toc-h2"><a href="#compaction-uplotnenie-po-klyuchu">Compaction: уплотнение по ключу</a></li><li class="toc-item toc-h3"><a href="#zachem-nuzhen-compaction">Зачем нужен compaction</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-log-cleaner-pod-kapotom">Как работает Log Cleaner под капотом</a></li><li class="toc-item toc-h3"><a href="#tombstone-zapisi-i-delete-retention-ms">Tombstone-записи и delete.retention.ms</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-vliyanie-na-vvod-vyvod-i-stranichnyy-kesh">Mechanical Sympathy: влияние на ввод-вывод и страничный кеш</a></li><li class="toc-item toc-h3"><a href="#retention-pochti-besplatno">Retention: почти бесплатно</a></li><li class="toc-item toc-h3"><a href="#compaction-tyazhelovesnaya-operatsiya">Compaction: тяжеловесная операция</a></li><li class="toc-item toc-h2"><a href="#sravnenie-retention-i-compaction">Сравнение Retention и Compaction</a></li><li class="toc-item toc-h2"><a href="#prakticheskoe-ispolzovanie-v-go-vosstanovlenie-sostoyaniya-iz-kompaktifitsirovan">Практическое использование в Go: восстановление состояния из компактифицированного топика</a></li><li class="toc-item toc-h2"><a href="#kogda-retention-a-kogda-compaction-pravilo-vybora">Когда Retention, а когда Compaction: правило выбора</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-sleduyushchie-shagi">Заключение и следующие шаги</a></li>
+    <li class="toc-item toc-h2"><a href="#dva-vzglyada-na-zhiznennyy-tsikl-dannykh">Два взгляда на жизненный цикл данных</a></li><li class="toc-item toc-h2"><a href="#retention-klassicheskoe-udalenie-po-vremeni-i-razmeru">Retention: классическое удаление по времени и размеру</a></li><li class="toc-item toc-h3"><a href="#parametry-upravlyayushchie-retention">Параметры, управляющие retention</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-udalenie-pod-kapotom">Как работает удаление под капотом</a></li><li class="toc-item toc-h2"><a href="#compaction-uplotnenie-po-klyuchu">Compaction: уплотнение по ключу</a></li><li class="toc-item toc-h3"><a href="#zachem-nuzhen-compaction">Зачем нужен compaction</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-log-cleaner-pod-kapotom">Как работает Log Cleaner под капотом</a></li><li class="toc-item toc-h3"><a href="#tombstone-zapisi-i-delete-retention-ms">Tombstone-записи и delete.retention.ms</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-vliyanie-na-vvod-vyvod-i-stranichnyy-kesh">Mechanical Sympathy: влияние на ввод-вывод и страничный кеш</a></li><li class="toc-item toc-h3"><a href="#retention-pochti-besplatno">Retention: почти бесплатно</a></li><li class="toc-item toc-h3"><a href="#compaction-tyazhelovesnaya-operatsiya">Compaction: тяжеловесная операция</a></li><li class="toc-item toc-h2"><a href="#sravnenie-retention-i-compaction">Сравнение Retention и Compaction</a></li><li class="toc-item toc-h2"><a href="#prakticheskoe-ispolzovanie-v-go-vosstanovlenie-sostoyaniya-iz-kompaktifitsirovan">Практическое использование в Go: восстановление состояния из компактифицированного топика</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#kogda-retention-a-kogda-compaction-pravilo-vybora">Когда Retention, а когда Compaction: правило выбора</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-sleduyushchie-shagi">Заключение и следующие шаги</a></li>
   </ul>
 </aside>
 

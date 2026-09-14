@@ -2168,14 +2168,19 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~36 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">11. Schema Registry и эволюция схем</h1>
           </header>
 
           <div class="article-markdown">
-            <div class="callout callout-note">
+            <h1>11. Schema Registry и эволюция схем: строгие контракты и совместимость в распределенном логе</h1>
+<blockquote>
+<p><em>"Control the interfaces, and you control the system. Let the interfaces slip, and chaos takes over."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
   <div class="callout-header">
     <span class="callout-icon">📝</span>
     <span class="callout-title">Заметка</span>
@@ -2185,83 +2190,149 @@
   </div>
 </div>
 
+<hr />
 <h2 id="problema-nevidimykh-kontraktov">Проблема невидимых контрактов</h2>
 
-<p>В синхронном RESTful мире изменение формата данных приводит к немедленной ошибке десериализации: контракт между клиентом и сервером проверяется в рантайме при первом же вызове. В асинхронной Kafka-экосистеме всё иначе: продюсер публикует сообщения в одном сервисе, консьюмер читает их в другом — между ними могут быть часы, дни или даже годы разницы в обновлении кода. Если продюсер начнёт записывать поле <code>amount</code> как строку вместо числа, консьюмер упадёт при попытке разбора, но узнает он об этом далеко не сразу.</p>
-<p>Без формального управления схемами команды быстро скатываются к «гаданию по JSON»: неясно, какие поля обязательные, какие опциональные, какие типы допустимы, что означает отсутствие поля, можно ли его добавить, не ломая потребителей. Ответом на этот хаос стал <strong>Schema Registry</strong> — централизованный реестр схем, обеспечивающий строгую типизацию и контролируемую эволюцию контрактов в event-driven системах.</p>
+<p>В классическом синхронном мире (REST, gRPC) несовместимое изменение формата данных обнаруживается практически мгновенно: клиент получает HTTP 400 Bad Request или ошибку десериализации прямо во время запроса. Инженеры сразу видят проблему на дашбордах мониторинга и откатывают несовместимый релиз.</p>
+<p>В асинхронных событийно-ориентированных системах на базе Apache Kafka всё устроено принципиально иначе:<br />
+- Продюсер и консьюмер разделены не только физической сетью, но и <strong>временем</strong>.<br />
+- Продюсер может записать сообщение сегодня, а консьюмер (например, сервис аналитики или пересчета финансового баланса) прочитает его через неделю, месяц или даже год при перечитывании истории из лога!</p>
+<p>Если разработчик продюсера изменит тип поля <code>amount</code> с числа <code>float64</code> на строку <code>"100.50"</code>, брокер Kafka даже не поморщится — для брокера сообщение является просто аморфным набором сырых байтов <code>[]byte</code>. </p>
+<p>Но когда через несколько дней или месяцев консьюмер натолкнется на эту запись в партиции, он упадет в аварийную панику (panic). Что еще хуже — возникнет <strong>Poison Pill</strong> («отравленная пилюля»): консьюмер не сможет сдвинуть свой <code>offset</code>, зависнет на этой записи, начнет бесконечно падать и перезапускаться, полностью парализуя работу критического бизнес-процесса!</p>
+<p>Без централизованного формального управления схемами распределенная разработка быстро превращается в «гадание по нетипизированному JSON»:<br />
+- Какие поля обязательные, а какие опциональные?<br />
+- Что означает отсутствие ключа в JSON: <code>null</code> или дефолтное значение?<br />
+- Можно ли безопасно переименовать поле <code>userId</code> в <code>user_id</code>?<br />
+- Как обновить схему продюсера так, чтобы не сломать 15 независимых сервисов-потребителей, написанных на разных языках разными командами?</p>
+<p>Ответом на этот архитектурный хаос стал <strong>Schema Registry</strong> — централизованный реестр контрактов и валидатор совместимости для событийно-ориентированных систем.</p>
+<hr />
 <h2 id="chto-takoe-schema-registry">Что такое Schema Registry</h2>
 
-<p>Schema Registry — это отдельный сервер, который служит единым источником истины для всех схем данных, циркулирующих в Kafka. Он живёт вне брокеров, но взаимодействует с ними через REST API и хранит своё состояние в специальном компактифицированном топике <code>_schemas</code> внутри самого же кластера Kafka. Наиболее известная реализация — <strong>Confluent Schema Registry</strong>, де-факто стандарт в индустрии.</p>
-<p>Ключевые обязанности реестра:</p>
-<ul>
-<li>Хранить зарегистрированные схемы, присваивая каждой уникальный глобальный идентификатор.</li>
-<li>Проверять совместимость новых версий схем с предыдущими согласно заданной стратегии (эволюция без поломок).</li>
-<li>Обслуживать запросы продюсеров и консьюмеров на получение схемы по её идентификатору.</li>
-<li>Кешировать схемы для минимизации задержки.</li>
-</ul>
-<p>Продюсер, отправляя сообщение, не включает в него полную схему — достаточно компактного schema ID (4 байта) в префиксе. Консьюмер извлекает этот ID и запрашивает схему из реестра, что экономит пропускную способность и дисковое пространство в логах Kafka.</p>
+<p><strong>Schema Registry</strong> — это выделенный распределенный сервис, служащий единым источником правды (Single Source of Truth) для всех схем данных, циркулирующих внутри кластеров Kafka. </p>
+<p>Schema Registry живет вне брокеров Kafka, предоставляя легковесный REST API для регистрации, извлечения и валидации схем. Историческим стандартом индустрии de-facto является <strong>Confluent Schema Registry</strong> (а также его открытые альтернативы, такие как Aiven Karapace или Redpanda Schema Registry).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Producers[&quot;Сервисы-продюсеры&quot;]
+P1[&quot;Order Service (Go)&quot;]
+end
+
+subgraph Registry[&quot;Confluent Schema Registry&quot;]
+SR[&quot;REST API: :8081&lt;br&gt;Compatibility Engine&quot;]
+Cache[(&quot;Локальный кэш схем в RAM&quot;)]
+SR &lt;--&gt; Cache
+end
+
+subgraph KafkaCluster[&quot;Кластер Kafka&quot;]
+Brokers[&quot;Брокеры (Топик: orders)&quot;]
+InternalTopic[(&quot;Служебный топик: _schemas&lt;br&gt;(compacted)&quot;)]
+end
+
+subgraph Consumers[&quot;Сервисы-консьюмеры&quot;]
+C1[&quot;Billing Service (Go)&quot;]
+C2[&quot;Analytics Service (Python)&quot;]
+end
+
+P1 --&gt;|&quot;1. Регистрация/получение Schema ID&quot;| SR
+P1 --&gt;|&quot;2. Отправка: [Magic+ID+Data]&quot;| Brokers
+Brokers --&gt;|&quot;3. Вычитка батчей&quot;| C1 &amp; C2
+C1 &amp; C2 --&gt;|&quot;4. Запрос схемы по ID (если нет в кэше)&quot;| SR
+SR &lt;--&gt;|&quot;Хранение истории схем&quot;| InternalTopic
+  </pre>
+</div>
+
+
+<p>Ключевые обязанности Schema Registry:<br />
+1. <strong>Хранение схем и версий:</strong> Каждой зарегистрированной схеме присваивается уникальный глобальный целочисленный идентификатор — <strong>Schema ID</strong> (4 байта).<br />
+2. <strong>Гарантия совместимости (Compatibility Rules):</strong> При попытке зарегистрировать новую версию схемы Registry автоматически сопоставляет её с предыдущими версиями и <strong>отклоняет несовместимые изменения</strong> еще до того, как продюсер успеет отправить хотя бы один байт в топик!<br />
+3. <strong>Кэширование контрактов:</strong> Продюсеры и консьюмеры кэшируют схемы в оперативной памяти, поэтому сетевой запрос к Registry происходит всего один раз при первом старте сервиса.<br />
+4. <strong>Минимизация сетевого и дискового трафика:</strong> Сообщение в топике не несет в себе громоздкое описание полей — в заголовок вшивается только 4-байтный Schema ID.</p>
+<hr />
 <h2 id="formaty-serializatsii-pochemu-avro-a-ne-tolko-json">Форматы сериализации: почему Avro, а не только JSON</h2>
 
-<p>Schema Registry поддерживает несколько форматов, но исторически и архитектурно центральным является <strong>Apache Avro</strong>. Выбор не случаен:</p>
+<p>Schema Registry поддерживает три основных формата сериализации: <strong>Apache Avro</strong>, <strong>Protocol Buffers (Protobuf)</strong> и <strong>JSON Schema</strong>. Однако исторически и концептуально центральным форматом в экосистеме Kafka является <strong>Apache Avro</strong>.</p>
+<p>Сравним форматы на уровне аппаратуры и сетевого конвейера:</p>
 <div class="table-container"><table>
 <thead>
 <tr>
 <th>Критерий</th>
-<th>JSON</th>
-<th>Avro</th>
-<th>Protobuf</th>
+<th>Сырой JSON</th>
+<th>Apache Avro</th>
+<th>Protocol Buffers (Protobuf)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Компактность</td>
-<td>Текстовый, избыточный</td>
-<td>Бинарный, сжатие полей</td>
-<td>Бинарный, компактный</td>
+<td><strong>Формат представления</strong></td>
+<td>Текстовый ASCII / UTF-8</td>
+<td>Бинарный, плотная упаковка</td>
+<td>Бинарный, теговая упаковка</td>
 </tr>
 <tr>
-<td>Схема в сообщении</td>
-<td>Нет, полагается на внешнее знание</td>
-<td>Требуется внешняя схема, внутри только ID</td>
-<td>Похоже, но можно с дескриптором</td>
+<td><strong>Передача названий полей</strong></td>
+<td><strong>В каждом сообщении!</strong> (Огромный оверхед)</td>
+<td><strong>Никогда!</strong> (Имена полей только в схеме)</td>
+<td>Номера тегов полей (1-2 байта на поле)</td>
 </tr>
 <tr>
-<td>Эволюция</td>
-<td>Ручная, легко сломать</td>
-<td>Встроенные правила совместимости</td>
-<td>Строгие правила, но менее гибкие</td>
+<td><strong>Объем типового сообщения</strong></td>
+<td>100% (базовый размер, например 300B)</td>
+<td><strong>15–25%</strong> (50–70B)</td>
+<td>20–30% (60–90B)</td>
 </tr>
 <tr>
-<td>Динамическая типизация</td>
-<td>Да</td>
-<td>Строгая статическая</td>
-<td>Строгая статическая</td>
+<td><strong>Эволюция схем</strong></td>
+<td>Ручная, легко ломается</td>
+<td>Встроенные математические правила</td>
+<td>Строгие правила по номерам тегов</td>
 </tr>
 <tr>
-<td>Экосистема</td>
-<td>Универсально</td>
-<td>Глубокая интеграция с Hadoop, Kafka</td>
-<td>Популярен в gRPC</td>
+<td><strong>Скорость парсинга CPU</strong></td>
+<td>Медленно (парсинг строк, escaping)</td>
+<td>Молниеносно (прямое чтение байт)</td>
+<td>Молниеносно (прямое чтение байт)</td>
 </tr>
 </tbody>
 </table></div>
-<p><strong>Avro</strong> выигрывает тем, что хранит схему отдельно от данных, а в сообщение помещает лишь идентификатор схемы и затем бинарно упакованные значения полей в порядке, заданном схемой. Это исключает дублирование метаданных в каждом сообщении, что критично для высоконагруженной потоковой передачи (тысячи и миллионы сообщений). Кроме того, Avro предоставляет развитые правила разрешения эволюции: значение по умолчанию, псевдонимы, промоции типов.</p>
+<p>Почему <strong>Avro</strong> настолько эффективен?<br />
+В формате Avro бинарные данные сообщения состоят исключительно из <strong>значений полей</strong>, уложенных в строгой последовательности байтов без каких-либо имен ключей, разделителей или метаданных! Если схема говорит: <code>int, string, double</code>, то тело сообщения — это просто <code>[4 байта varint][длина строки + байты строки][8 байт float64]</code>. </p>
+<p>Вынос схемы за пределы сообщения сокращает размер сетевого трафика и файлов логов на диске в 4–8 раз!</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Confluent Wire Format</span>
   </div>
   <div class="callout-body">
-    <p>Формат Avro-сообщения с Confluent Wire Format состоит из:<br />
-- <strong>Magic Byte</strong> (1 байт, всегда <code>0x00</code>).<br />
-- <strong>Schema ID</strong> (4 байта, big-endian, идентификатор схемы в Registry).<br />
-- <strong>Avro-encoded данные</strong>, следующие сразу за заголовком.</p>
-<p>При десериализации консьюмер считывает первый байт, убеждается в валидности, извлекает Schema ID, запрашивает схему из реестра (или локального кеша) и затем интерпретирует оставшиеся байты согласно схеме. Схема читателя и схема писателя могут различаться, но Avro-ридер автоматически разрешает поля, используя значения по умолчанию для отсутствующих и пропуская неизвестные.</p>
+    <p>Сообщения, публикуемые в Kafka через экосистему Schema Registry, упаковываются в специальный стандартизированный бинарный конверт — <strong>Confluent Wire Format</strong>:</p>
+<pre><code>+---------------------------------------------------------------+
+| Magic Byte (1B) | Schema ID (4B, Big Endian) | Payload (Avro) |
+|      0x00       |      0x00 0x00 0x00 0x2A   |   ... биты ... |
++---------------------------------------------------------------+
+</code></pre>
+<ul>
+<li><strong>Magic Byte</strong> (1 байт, всегда <code>0x00</code>) — признак того, что сообщение упаковано по стандарту Confluent Wire Format;</li>
+<li><strong>Schema ID</strong> (4 байта, big-endian) — уникальный 32-битный целочисленный идентификатор схемы в реестре (например, ID 42);</li>
+<li><strong>Avro Payload</strong> — бинарные данные, закодированные строго по правилам Avro Binary Encoding.</li>
+</ul>
+<p>При получении батча консьюмер считывает первый байт: если он равен <code>0x00</code>, консьюмер извлекает следующие 4 байта, находит соответствующую схему в локальном кэше (или один раз запрашивает её у Registry) и мгновенно десериализует байты в Go-структуру.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="arkhitektura-vzaimodeystviya">Архитектура взаимодействия</h2>
 
+<p>Рассмотрим сквозной жизненный цикл публикации и чтения сообщения:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2276,54 +2347,91 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant P as Продюсер
-participant SR as Schema Registry
-participant K as Kafka
-participant C as Консьюмер
+autonumber
+actor P as Продюсер (Go-сервис)
+participant SR as Schema Registry (:8081)
+participant K as Брокер Kafka
+actor C as Консьюмер (Go-сервис)
 
-P-&gt;&gt;SR: POST /subjects/orders-value/versions&lt;br&gt;регистрирует схему
-SR--&gt;&gt;P: Schema ID = 42
-P-&gt;&gt;K: Отправляет сообщение&lt;br&gt;префикс: 0x00 + 42 + Avro-данные
-K--&gt;&gt;C: Получает сообщение
-C-&gt;&gt;C: Извлекает Schema ID = 42
-alt Схема не в кеше
+Note over P: Старт сервиса с локальным Avro-контрактом
+P-&gt;&gt;SR: POST /subjects/orders-value/versions (схема Order)
+Note over SR: Проверка правил совместимости!&lt;br&gt;Если совместимо — регистрация.
+SR--&gt;&gt;P: Assigned Schema ID = 42
+
+Note over P: Продюсер пакует Wire Format: [0x00][ID 42][Avro Bytes]
+P-&gt;&gt;K: Produce(orders, message)
+
+K--&gt;&gt;C: Fetch(orders, message)
+Note over C: Извлечение байтов: Magic 0x00, ID = 42
+
+alt Schema ID 42 уже в локальном кэше консьюмера
+Note over C: Мгновенная десериализация без выхода в сеть!
+else Schema ID 42 встречен впервые
 C-&gt;&gt;SR: GET /schemas/ids/42
-SR--&gt;&gt;C: JSON-схема
+SR--&gt;&gt;C: JSON-описание схемы версии 42
+Note over C: Сохранение схемы в кэш
 end
-C-&gt;&gt;C: Десериализует Avro-данные по схеме
+Note over C: Успешная обработка типизированного события!
   </pre>
 </div>
 
 
-<p>Реестр сам хранит соответствие Schema ID → схема, а также мягкое отображение «subject» (логическое имя, например <code>orders-value</code> или <code>orders-key</code>) на версии схем в этом subject'е. Subject — это область пространства имён, по которой проверяется совместимость. Обычно схема ключа и схема значения топика идут в разных subject'ах.</p>
+<p>В терминологии Schema Registry логическое пространство имен схемы называется <strong>Subject</strong> (Субъект). По умолчанию используется стратегия именования <code>TopicNameStrategy</code>:<br />
+- Схема ключа топика <code>orders</code> регистрируется под именем <code>orders-key</code>;<br />
+- Схема значения топика <code>orders</code> регистрируется под именем <code>orders-value</code>.</p>
+<hr />
 <h2 id="khranenie-skhem-pod-kapotom-topik-schemas">Хранение схем под капотом: топик `_schemas`</h2>
 
-<p>Вся персистентность Schema Registry обеспечивается через <strong>обычный топик Kafka</strong> с именем <code>_schemas</code> (по умолчанию), который создаётся с политикой compaction. Каждая запись в этом топике имеет ключ — уникальный идентификатор схемы или версии subject-а, а значение — JSON-представление схемы или метаданных. Такое решение даёт несколько уровней надёжности:</p>
+<p>Schema Registry спроектирован в соответствии с лучшими практиками распределенных систем: он полностью <strong>stateless</strong> на уровне вычислительных узлов. </p>
+<p>Реестр не требует базы данных PostgreSQL или Oracle для хранения схем. Вся персистентность опирается на <strong>внутренний системный топик Kafka</strong> с именем <code>_schemas</code> (по умолчанию):</p>
 <ul>
-<li>Схемы реплицируются синхронно/асинхронно на другие брокеры согласно фактору репликации топика.</li>
-<li>Compaction (<a href="8-retention-i-compaction.html" class="wikilink">8. Retention и compaction</a>) гарантирует, что последняя версия каждой сущности никогда не будет удалена, даже при переполнении лога, а старые версии схем могут быть удалены после истечения компактификатора.</li>
-<li>При перезапуске Schema Registry он просто перечитывает <code>_schemas</code> с самого начала, восстанавливая все глобальные идентификаторы и маппинги в памяти.</li>
+<li>Топик <code>_schemas</code> имеет ровно <strong>1 партицию</strong>, что гарантирует строго последовательный глобальный порядок регистрации всех версий и исключает коллизии идентификаторов;</li>
+<li>Используется политика уплотнения лога <strong><code>cleanup.policy=compact</code></strong> (<a href="8-retention-i-compaction.html" class="wikilink">8. Retention и compaction</a>), благодаря чему топик никогда не теряет активные схемы, но автоматически очищается от промежуточных черновиков;</li>
+<li>При старте любого инстанса Schema Registry он просто вычитывает топик <code>_schemas</code> с начала (<code>offset = 0</code>) и за несколько миллисекунд полностью восстанавливает все зарегистрированные схемы в оперативной памяти.</li>
 </ul>
-<p>Таким образом, Schema Registry не имеет своей базы данных; вся персистентность поручена самому брокеру, что изящно решает проблему отказоустойчивости и резервного копирования.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph SchemaRegistryNodes[&quot;Кластер Schema Registry&quot;]
+SR1[&quot;Реестр 1 (Лидер)&quot;]
+SR2[&quot;Реестр 2 (Фолловер)&quot;]
+end
+
+subgraph KafkaStorage[&quot;Кластер Kafka&quot;]
+Topic[(&quot;Топик: _schemas&lt;br&gt;(Partitions: 1, Compacted, RF: 3)&quot;)]
+end
+
+SR1 &lt;--&gt;|&quot;Чтение лога и запись новых схем&quot;| Topic
+SR2 &lt;--&gt;|&quot;Чтение лога в локальный кэш&quot;| Topic
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Мягкое удаление схем</span>
   </div>
   <div class="callout-body">
-    <p>Удаление схемы через REST API (<code>DELETE /subjects/...</code>) не удаляет данные из <code>_schemas</code>, а лишь записывает tombstone. Компактификация топика со временем уберёт старую версию, но schema ID уже занят и не переиспользуется. Это предотвращает коллизии идентификаторов, но означает, что при интенсивной регистрации/удалении идентификаторы могут быстро расти.</p>
+    <p>Удаление схемы через REST API (<code>DELETE /subjects/...</code>) не удаляет данные из <code>_schemas</code>, а лишь записывает tombstone. Компактификация топика со временем уберёт старую версию, но schema ID уже занят и не переиспользуется. Это предотвращает коллизии идентификаторов, но означает, что при интенсивной регистрации/удалении идентификаторы могут быстро расти. Никогда не используйте удаление схем в продакшене без крайней необходимости — исторические сообщения в топиках перестанут читаться!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="evolyutsiya-skhem-pravila-spasayushchie-ot-polomok">Эволюция схем: правила, спасающие от поломок</h2>
 
-<p>Управляемая эволюция схем — главная ценность Schema Registry. Без неё ценность централизованного хранения схем резко падает. Compatibility Checker реестра автоматически отклоняет регистрацию новой версии, если она нарушает заданную стратегию совместимости. Стратегии определены в спецификации Avro и расширены в экосистеме:</p>
-<ul>
-<li><strong>BACKWARD</strong> (обратная совместимость) — новая схема может быть прочитана старыми консьюмерами. Это означает: можно удалять поля с дефолтными значениями, добавлять поля только с дефолтными значениями, не менять типы существующих полей. Это самый безопасный и рекомендуемый подход: продюсер обновляется раньше консьюмеров.</li>
-<li><strong>FORWARD</strong> (прямая совместимость) — старая схема может быть прочитана новыми консьюмерами. Применимо, когда консьюмеры обновляются раньше продюсеров. Допускает добавление полей без дефолтных значений (только опциональные), удаление полей возможно, если они не использовались новыми потребителями.</li>
-<li><strong>FULL</strong> — обратная и прямая одновременно. Схемы полностью взаимозаменяемы. Требует максимальной дисциплины.</li>
-<li><strong>NONE</strong> — проверка совместимости отключена. Схемы регистрируются без проверок, опасен для production.</li>
-</ul>
+<p>Главная суперсила Schema Registry — это автоматический валидатор совместимости (<strong>Compatibility Engine</strong>). Реестр поддерживает несколько режимов совместимости:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2353,9 +2461,27 @@ FL --&gt;|&quot;Нет&quot;| REJ
 </div>
 
 
+<p>Разберем ключевые режимы эволюции:</p>
+<ol>
+<li><strong><code>BACKWARD</code> (Обратная совместимость — режим по умолчанию):</strong><br />
+   - <strong>Правило:</strong> Потребители, использующие новую схему, могут читать данные, созданные со старой схемой.<br />
+   - <strong>Порядок деплоя:</strong> Сначала обновляются все консьюмеры, затем продюсеры.<br />
+   - <strong>Разрешенные изменения:</strong> Добавление полей со значением по умолчанию (<code>default</code>), удаление полей, не имевших дефолта.</li>
+<li><strong><code>FORWARD</code> (Прямая совместимость):</strong><br />
+   - <strong>Правило:</strong> Потребители, использующие старую схему, могут продолжать читать данные, созданные новой схемой продюсера.<br />
+   - <strong>Порядок деплоя:</strong> Сначала обновляются продюсеры, затем консьюмеры.<br />
+   - <strong>Разрешенные изменения:</strong> Добавление любых полей, удаление полей, имевших значение по умолчанию.</li>
+<li><strong><code>FULL</code> (Полная совместимость):</strong><br />
+   - <strong>Правило:</strong> Сочетает правила <code>BACKWARD</code> и <code>FORWARD</code>. Старые и новые схемы полностью взаимозаменяемы.<br />
+   - <strong>Порядок деплоя:</strong> Любой (консьюмеры и продюсеры обновляются независимо).<br />
+   - <strong>Разрешенные изменения:</strong> Добавлять и удалять разрешено <strong>только поля, имеющие значение <code>default</code></strong>!</li>
+<li><strong><code>NONE</code>:</strong> Проверка совместимости полностью отключена. Крайне опасный режим, запрещенный в продакшене.</li>
+</ol>
+<p>Существуют также транзитивные варианты (<code>BACKWARD_TRANSITIVE</code>, <code>FORWARD_TRANSITIVE</code>, <code>FULL_TRANSITIVE</code>), проверяющие совместимость новой схемы не только с предыдущей версией, но и со <strong>всеми историческими версиями схемы</strong>, когда-либо зарегистрированными в данном subject!</p>
+<hr />
 <h3 id="primery-evolyutsii-avro-skhem">Примеры эволюции Avro-схем</h3>
 
-<p>Исходная схема:</p>
+<p>Рассмотрим исходную схему заказа:</p>
 
 <div class="code-block" data-lang="json">
   <div class="code-header">
@@ -2368,6 +2494,7 @@ FL --&gt;|&quot;Нет&quot;| REJ
   <pre class="language-json"><code class="language-json">{
   &quot;type&quot;: &quot;record&quot;,
   &quot;name&quot;: &quot;Order&quot;,
+  &quot;namespace&quot;: &quot;com.example.orders&quot;,
   &quot;fields&quot;: [
     {&quot;name&quot;: &quot;orderId&quot;, &quot;type&quot;: &quot;string&quot;},
     {&quot;name&quot;: &quot;amount&quot;, &quot;type&quot;: &quot;double&quot;},
@@ -2378,20 +2505,19 @@ FL --&gt;|&quot;Нет&quot;| REJ
 </div>
 
 <ul>
-<li><strong>Добавление поля</strong> (BACKWARD): добавить поле <code>discount</code> с <code>"default": 0.0</code> — допустимо. Старый консьюмер, не зная о <code>discount</code>, подставит 0.0.</li>
-<li><strong>Удаление поля</strong> (BACKWARD): удалить поле <code>currency</code> — допустимо, потому что у него есть default, и старый консьюмер его проигнорирует.</li>
-<li><strong>Изменение типа</strong> (BACKWARD): поменять <code>amount</code> с <code>double</code> на <code>string</code> — <strong>запрещено</strong>, так как старый консьюмер ожидает double и не сможет десериализовать строку.</li>
-<li><strong>Удаление поля без default</strong>: удалить <code>orderId</code> — <strong>запрещено</strong>, так как старый консьюмер ожидает это поле как обязательное (нет default) и упадёт.</li>
+<li><strong>Добавление поля (BACKWARD):</strong> Добавить поле <code>discount</code> со значением по умолчанию <code>"default": 0.0</code> — <strong>допустимо</strong>. Старый консьюмер, не знающий о <code>discount</code>, просто подставит <code>0.0</code>.</li>
+<li><strong>Удаление поля (BACKWARD):</strong> Удалить поле <code>currency</code> — <strong>допустимо</strong>, потому что у него есть default, и старый консьюмер его проигнорирует.</li>
+<li><strong>Изменение типа поля (BACKWARD):</strong> Поменять <code>amount</code> с типа <code>double</code> на тип <code>string</code> — <strong>категорически запрещено</strong>! Реестр вернет ошибку <code>422 Unprocessable Entity</code>, так как старый консьюмер ожидает бинарный float и упадет при попытке десериализации строки.</li>
+<li><strong>Удаление обязательного поля:</strong> Удалить поле <code>orderId</code> — <strong>запрещено</strong>, так как старый консьюмер ожидает это поле как обязательное (нет <code>default</code>) и не сможет обработать запись.</li>
 </ul>
+<hr />
 <h2 id="mechanical-sympathy-avro-v-go">Mechanical Sympathy: Avro в Go</h2>
 
-<p>В мире Go существуют несколько библиотек для работы с Avro и Schema Registry:</p>
-<ul>
-<li><strong>github.com/hamba/avro</strong> — высокопроизводительный Avro-кодер/декодер, поддерживает code generation из Avro-схем.</li>
-<li><strong>github.com/linkedin/goavro</strong> — один из первых, но менее активен.</li>
-<li><strong>github.com/confluentinc/confluent-kafka-go</strong> — официальная обёртка librdkafka, включает встроенную поддержку Avro и Schema Registry через CGO, что добавляет накладные расходы.</li>
-</ul>
-<p>Ручная работа с Avro: сериализация начинается с получения схемы из Registry (или использования кешированного ID), затем кодирование структуры в бинарный Avro согласно схеме писателя. Пример:</p>
+<p>В экосистеме Go исторически существовало три подхода к работе с Avro и Schema Registry:<br />
+1. <code>github.com/confluentinc/confluent-kafka-go</code> — официальная библиотека Confluent. Главный недостаток: построена поверх C-библиотеки <code>librdkafka</code> через CGO. Это усложняет кросс-компиляцию, увеличивает потребление стека горутин и приводит к дорогостоящему копированию памяти между C и Go.<br />
+2. <code>github.com/linkedin/goavro</code> — историческая библиотека на чистом Go, использующая динамическую типизацию через <code>map[string]interface{}</code> (высокие накладные расходы на аллокации памяти).<br />
+3. <strong><code>github.com/hamba/avro/v2</code></strong> — современный, экстремально быстрый генератор и кодер Avro на чистом Go, компилирующий парсеры прямо в машинный код и работающий со статически типизированными структурами Go без единой аллокации памяти в горячем цикле!</p>
+<p>Ниже представлен эталонный пример сериализации Avro с поддержкой Confluent Wire Format на чистом Go без CGO:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2401,16 +2527,18 @@ FL --&gt;|&quot;Нет&quot;| REJ
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import (
+  <pre class="language-go"><code class="language-go">package main
+
+import (
     &quot;context&quot;
     &quot;fmt&quot;
     &quot;log&quot;
-    &quot;time&quot;
 
     &quot;github.com/hamba/avro/v2&quot;
     &quot;github.com/twmb/franz-go/pkg/kgo&quot;
 )
 
+// Order структура бизнес-события
 type Order struct {
     OrderID  string  `avro:&quot;orderId&quot;`
     Amount   float64 `avro:&quot;amount&quot;`
@@ -2418,58 +2546,84 @@ type Order struct {
 }
 
 func main() {
-    schema := `{&quot;type&quot;:&quot;record&quot;,&quot;name&quot;:&quot;Order&quot;,&quot;fields&quot;:[
-        {&quot;name&quot;:&quot;orderId&quot;,&quot;type&quot;:&quot;string&quot;},
-        {&quot;name&quot;:&quot;amount&quot;,&quot;type&quot;:&quot;double&quot;},
-        {&quot;name&quot;:&quot;currency&quot;,&quot;type&quot;:&quot;string&quot;,&quot;default&quot;:&quot;USD&quot;}
-    ]}`
+    schemaJSON := `{
+        &quot;type&quot;: &quot;record&quot;,
+        &quot;name&quot;: &quot;Order&quot;,
+        &quot;namespace&quot;: &quot;com.example.orders&quot;,
+        &quot;fields&quot;: [
+            {&quot;name&quot;: &quot;orderId&quot;, &quot;type&quot;: &quot;string&quot;},
+            {&quot;name&quot;: &quot;amount&quot;, &quot;type&quot;: &quot;double&quot;},
+            {&quot;name&quot;: &quot;currency&quot;, &quot;type&quot;: &quot;string&quot;, &quot;default&quot;: &quot;USD&quot;}
+        ]
+    }`
 
-    // Парсинг схемы
-    avroSchema, err := avro.Parse(schema)
+    // Парсинг схемы в память один раз при старте
+    avroSchema, err := avro.Parse(schemaJSON)
     if err != nil {
         log.Fatalf(&quot;parse schema: %v&quot;, err)
     }
 
-    // Заглушка: получение schema ID из Registry или локального кеша
+    // Schema ID, полученный от Schema Registry (например, ID = 42)
     schemaID := uint32(42)
 
-    // Сериализация
-    order := Order{OrderID: &quot;order-123&quot;, Amount: 99.99}
-    avroBytes, err := avro.Marshal(avroSchema, order)
+    // Создание полезной нагрузки
+    order := Order{
+        OrderID:  &quot;order-xyz-100&quot;,
+        Amount:   250.50,
+        Currency: &quot;USD&quot;,
+    }
+
+    // Бинарная сериализация полезной нагрузки
+    avroPayload, err := avro.Marshal(avroSchema, order)
     if err != nil {
         log.Fatalf(&quot;avro marshal: %v&quot;, err)
     }
 
-    // Префикс Confluent Wire Format: magic + 4 байта ID
-    msg := make([]byte, 1+4+len(avroBytes))
-    msg[0] = 0x00
-    msg[1] = byte(schemaID &gt;&gt; 24)
-    msg[2] = byte(schemaID &gt;&gt; 16)
-    msg[3] = byte(schemaID &gt;&gt; 8)
-    msg[4] = byte(schemaID)
+    // Формирование Confluent Wire Format: 1 байт magic (0x00) + 4 байта Schema ID (big-endian)
+    wireMessage := make([]byte, 1+4+len(avroPayload))
+    wireMessage[0] = 0x00
+    wireMessage[1] = byte(schemaID &gt;&gt; 24)
+    wireMessage[2] = byte(schemaID &gt;&gt; 16)
+    wireMessage[3] = byte(schemaID &gt;&gt; 8)
+    wireMessage[4] = byte(schemaID)
+    copy(wireMessage[5:], avroPayload)
 
-    copy(msg[5:], avroBytes)
+    // Отправка через производительный чистый Go-клиент franz-go
+    cl, err := kgo.NewClient(kgo.SeedBrokers(&quot;localhost:9092&quot;))
+    if err != nil {
+        log.Fatalf(&quot;failed to create client: %v&quot;, err)
+    }
+    defer cl.Close()
 
-    // Отправка через продюсера
-    cl, _ := kgo.NewClient(kgo.SeedBrokers(&quot;localhost:9092&quot;))
-    cl.Produce(context.Background(), &amp;kgo.Record{
+    ctx := context.Background()
+    cl.Produce(ctx, &amp;kgo.Record{
         Topic: &quot;orders&quot;,
-        Value: msg,
-    }, nil)
-    cl.Close()
+        Key:   []byte(order.OrderID),
+        Value: wireMessage,
+    }, func(r *kgo.Record, err error) {
+        if err != nil {
+            log.Printf(&quot;delivery failed: %v&quot;, err)
+            return
+        }
+        fmt.Printf(&quot;Message with Schema ID %d delivered to partition %d\n&quot;, schemaID, r.Partition)
+    })
+
+    _ = cl.Flush(ctx)
 }
 </code></pre>
 </div>
 
-<p>Такой подход позволяет полностью контролировать сериализацию, избегая CGO и минимизируя накладные расходы на каждое сообщение. Особенно это критично для Go-сервисов, обрабатывающих сотни тысяч сообщений в секунду.</p>
+<hr />
 <h2 id="svyaz-s-kafka-connect-i-streams">Связь с Kafka Connect и Streams</h2>
 
-<p>Schema Registry глубоко интегрирован в экосистему:</p>
+<p>Schema Registry — это нервная система всей платформы Kafka:</p>
 <ul>
-<li><strong>Kafka Connect</strong> (<a href="10-kafka-connect.html" class="wikilink">10. Kafka Connect</a>) использует AvroConverter для автоконвертации записей из внешних систем в Avro с регистрацией схемы. Это обеспечивает сквозную типизацию от источника до приёмника без ручного кодирования.</li>
-<li><strong>Kafka Streams</strong> (<a href="9-kafka-streams.html" class="wikilink">9. Kafka Streams</a>) автоматически работает с Avro через Serdes, сериализуя/десериализуя состояние в RocksDB и топики changelog-а, гарантируя совместимость при эволюции схем даже для stateful-операций.</li>
+<li><strong>Kafka Connect</strong> (<a href="10-kafka-connect.html" class="wikilink">10. Kafka Connect</a>) использует конвертер <code>AvroConverter</code> (или <code>ProtobufConverter</code>). При чтении из базы данных Debezium автоматически преобразует типы SQL в поля схемы Avro и регистрирует их в Registry. Консьюмер на Go получает строго типизированные сообщения без ручной настройки!</li>
+<li><strong>Kafka Streams</strong> (<a href="9-kafka-streams.html" class="wikilink">9. Kafka Streams</a>) опирается на классы <code>SpecificAvroSerde</code>, обеспечивая прозрачную сериализацию локального состояния RocksDB и changelog-топиков.</li>
 </ul>
-<p>В Go-мире аналогичная интеграция достигается через вышеупомянутые библиотеки и ручную реализацию совместимости, однако отсутствие стандартного фреймворка требует внимательности.</p>
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2492,6 +2646,7 @@ func main() {
   </div>
 </div>
 
+<hr />
 <h2 id="zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</h2>
 
 <p>Schema Registry — это не просто репозиторий схем, а активный страж совместимости в асинхронном мире. Он превращает непредсказуемые поломки при изменении форматов в контролируемый процесс с чёткими правилами, делая эволюцию данных безопасной и предсказуемой даже в распределённых командах.</p>
@@ -2523,7 +2678,7 @@ func main() {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#problema-nevidimykh-kontraktov">Проблема невидимых контрактов</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-schema-registry">Что такое Schema Registry</a></li><li class="toc-item toc-h2"><a href="#formaty-serializatsii-pochemu-avro-a-ne-tolko-json">Форматы сериализации: почему Avro, а не только JSON</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-vzaimodeystviya">Архитектура взаимодействия</a></li><li class="toc-item toc-h2"><a href="#khranenie-skhem-pod-kapotom-topik-schemas">Хранение схем под капотом: топик schemas</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-skhem-pravila-spasayushchie-ot-polomok">Эволюция схем: правила, спасающие от поломок</a></li><li class="toc-item toc-h3"><a href="#primery-evolyutsii-avro-skhem">Примеры эволюции Avro-схем</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-avro-v-go">Mechanical Sympathy: Avro в Go</a></li><li class="toc-item toc-h2"><a href="#svyaz-s-kafka-connect-i-streams">Связь с Kafka Connect и Streams</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</a></li>
+    <li class="toc-item toc-h2"><a href="#problema-nevidimykh-kontraktov">Проблема невидимых контрактов</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-schema-registry">Что такое Schema Registry</a></li><li class="toc-item toc-h2"><a href="#formaty-serializatsii-pochemu-avro-a-ne-tolko-json">Форматы сериализации: почему Avro, а не только JSON</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-vzaimodeystviya">Архитектура взаимодействия</a></li><li class="toc-item toc-h2"><a href="#khranenie-skhem-pod-kapotom-topik-schemas">Хранение схем под капотом: топик schemas</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-skhem-pravila-spasayushchie-ot-polomok">Эволюция схем: правила, спасающие от поломок</a></li><li class="toc-item toc-h3"><a href="#primery-evolyutsii-avro-skhem">Примеры эволюции Avro-схем</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-avro-v-go">Mechanical Sympathy: Avro в Go</a></li><li class="toc-item toc-h2"><a href="#svyaz-s-kafka-connect-i-streams">Связь с Kafka Connect и Streams</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#zaklyuchenie-i-dalneyshie-shagi">Заключение и дальнейшие шаги</a></li>
   </ul>
 </aside>
 
