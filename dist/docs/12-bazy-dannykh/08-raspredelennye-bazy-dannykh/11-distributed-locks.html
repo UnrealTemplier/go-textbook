@@ -2168,7 +2168,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~13 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">11. Distributed locks</h1>
@@ -2177,23 +2177,30 @@
           <div class="article-markdown">
             <h2 id="raspredelennye-blokirovki-kogda-odnogo-sync-mutex-nedostatochno">Распределенные блокировки: Когда одного sync.Mutex недостаточно</h2>
 
-<p>В однопоточном приложении или даже в рамках одного инстанса Go мы используем <code>sync.Mutex</code> или <code>sync.RWMutex</code>. Они работают на уровне разделяемой памяти процесса. Но в распределенной системе, где ваш бэкенд запущен в 10 подах Kubernetes, обычный мьютекс бесполезен. Каждому инстансу нужно гарантировать, что критическую секцию (например, списание бонусов или генерацию сложного отчета) в конкретный момент времени выполняет <strong>ровно один</strong> процесс во всем кластере.</p>
-<p>Для этого используются <strong>Распределенные блокировки (Distributed Locks)</strong>. Это механизм координации, который выносит состояние блокировки во внешнее хранилище, доступное всем узлам системы.</p>
+<p>В пределах одного процесса Go синхронизация параллельных горутин решается тривиально и изящно: мы используем стандартные примитивы <code>sync.Mutex</code> или <code>sync.RWMutex</code>. Они опираются на атомарные процессорные инструкции (CAS — Compare-And-Swap) и разделяемую память операционной системы, обеспечивая практически нулевые накладные расходы при отсутствии конкуренции.</p>
+<p>Однако в реальной микросервисной архитектуре, где ваш Go-сервис масштабирован на десятки изолированных подов в Kubernetes или развернут на нескольких физических серверах, локальный мьютекс становится абсолютно бесполезным: у независимых процессов нет общей оперативной памяти. </p>
+<p>При этом бизнес-логика часто бескомпромиссно требует эксклюзивности:<br />
+- Ровно один воркер во всем кластере должен рассчитывать ежемесячные финансовые начисления в полночь.<br />
+- Ровно один инстанс должен списывать бонусы клиента при параллельных кликах.<br />
+- Ровно один процесс должен генерировать тяжелый аналитический отчет, не допуская дублирования вычислений.</p>
+<p>Для решения этой задачи применяются <strong>Распределенные блокировки (Distributed Locks)</strong> — механизм синхронизации, который выносит состояние взаимного исключения во внешнее отказоустойчивое сетевое хранилище, доступное всем узлам кластера.</p>
 <hr />
 <h2 id="1-fundamentalnaya-problema-vremya-i-pauzy">1. Фундаментальная проблема: Время и Паузы</h2>
 
-<p>Распределенные блокировки — это гораздо сложнее, чем кажется на первый взгляд. Основная опасность кроется в <strong>Mechanical Sympathy</strong> на уровне ОС и рантайма.</p>
+<p>Распределенные блокировки — один из самых коварных разделов computer science. Главная опасность кроется в непонимании физики рантайма операционной системы и непредсказуемости асинхронных сетей (<strong>Mechanical Sympathy</strong>).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Проблема GC и &quot;Стоп-мир&quot;</span>
+    <span class="callout-title">Ловушка / Gotcha: Проблема GC и &quot;Стоп-мир&quot; (Process Pauses)</span>
   </div>
   <div class="callout-body">
-    <p>Представьте: горутина захватила лок в Redis на 10 секунд. Сразу после этого в Go-рантайме случается тяжелый <strong>GC (Garbage Collection) Stop The World</strong> или ОС решает приостановить поток (Scheduling pause) на 11 секунд. <br />
-1. Пока горутина «спит», TTL лока в Redis истекает.<br />
-2. Другой инстанс захватывает этот же лок.<br />
-3. Первая горутина «просыпается» и продолжает работу, считая, что она всё еще владеет локом.<br />
-<strong>Итог:</strong> Нарушение эксклюзивного доступа и повреждение данных.</p>
+    <p>Представьте типичный сценарий:<br />
+1. Горутина сервиса А успешно захватывает распределенный лок в Redis с временем жизни (TTL) в 10 секунд.<br />
+2. Сразу после получения подтверждения в рантайме Go запускается тяжелый цикл сборки мусора <strong>GC (Garbage Collection) Stop The World</strong>, либо гипервизор облака приостанавливает поток ОС (Scheduling Pause) на 11 секунд из-за миграции виртуальной машины.<br />
+3. Пока сервис А находится в глубокой системной «коме», таймер TTL в 10 секунд на стороне Redis благополучно истекает, и Redis удаляет ключ.<br />
+4. Сервис Б запрашивает тот же ресурс, видит, что лок свободен, успешно захватывает его и начинает изменять данные в базе.<br />
+5. Сервис А наконец-то «просыпается» из паузы! Будучи уверенным, что он всё еще монопольно владеет локом, он также начинает писать в базу данных!</p>
+<p><strong>Итог:</strong> Фатальное состояние гонки (Race Condition), одновременная запись двух независимых процессов и тихое разрушение консистентности данных.</p>
   </div>
 </div>
 
@@ -2211,19 +2218,20 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant G as Приложение 1
-participant R as Redis / etcd
-participant G2 as Приложение 2
+autonumber
+participant G as Сервис 1 (Go App)
+participant R as Координатор (Redis / etcd)
+participant G2 as Сервис 2 (Go App)
 
-G-&gt;&gt;R: Захват лока - TTL 10с
-R--&gt;&gt;G: OK
-Note over G: Пауза рантайма - GC STW&lt;br&gt;на 12 секунд
-Note over R: TTL истек, лок удален
-G2-&gt;&gt;R: Захват лока
-R--&gt;&gt;G2: OK
-Note over G2: Выполнение критической секции
-Note over G: Проснулся!
-Note over G, G2: СОСТОЯНИЕ ГОНКИ!
+G-&gt;&gt;R: 1. Захват лока (TTL = 10s)
+R--&gt;&gt;G: 2. OK (Лок выдан)
+Note over G: Пауза рантайма (GC STW / OS Freeze)&lt;br&gt;на 12 секунд!
+Note over R: TTL истек! Лок автоматически удален
+G2-&gt;&gt;R: 3. Захват того же лока
+R--&gt;&gt;G2: 4. OK (Лок выдан)
+Note over G2: Выполнение критической секции...
+Note over G: Проснулся из комы!
+Note over G, G2: КАТАСТРОФА: Два процесса пишут одновременно!
   </pre>
 </div>
 
@@ -2231,27 +2239,47 @@ Note over G, G2: СОСТОЯНИЕ ГОНКИ!
 <hr />
 <h2 id="2-strategii-realizatsii">2. Стратегии реализации</h2>
 
-<p>Существует три основных подхода к хранению состояния лока, каждый из которых соотносится с <a href="7-cap-teorema.html" class="wikilink">7. CAP теорема</a>.</p>
-<h3 id="a-blokirovki-na-baze-bd-sql">А. Блокировки на базе БД (SQL)</h3>
-<p>Самый простой вариант. Создается таблица <code>locks</code> с уникальным индексом по имени ресурса.<br />
-* <strong>Механизм:</strong> <code>INSERT INTO locks (resource_name) VALUES ('order_123')</code>. Если вставка успешна — лок ваш. <code>DELETE</code> — освобождение.<br />
-* <strong>Плюсы:</strong> Не нужно новых инструментов.<br />
-* <strong>Минусы:</strong> Плохо масштабируется, требует ручной очистки «протухших» локов, если процесс упал до удаления строки.</p>
-<h3 id="b-redis-i-redlock">Б. Redis и Redlock</h3>
-<p>Самый популярный и быстрый вариант. Обычно используется библиотека <code>redsync</code>.<br />
-* <strong>Механизм:</strong> <code>SET resource_name my_random_value NX PX 30000</code> (установить, если нет, с TTL 30с).<br />
-* <strong>Алгоритм Redlock:</strong> Попытка захватить лок в N независимых инстансах Redis. Лок считается захваченным, если большинство (N/2 + 1) ответили успехом за время, меньшее чем TTL.<br />
-* <strong>Плюсы:</strong> Сверхвысокая производительность.<br />
-* <strong>Минусы:</strong> Спорная надежность при сетевых разделениях и системных паузах (критика Мартина Клеппманна).</p>
-<h3 id="v-konsensus-sistemy-etcd-consul-zookeeper">В. Консенсус-системы (etcd, Consul, Zookeeper)</h3>
-<p>Самый надежный (CP) вариант.<br />
-* <strong>Механизм:</strong> Использование <strong>Leases</strong> (аренд) и <strong>Watchers</strong>. Клиент создает эфемерный узел. Если клиент пропадает (Keep-Alive не пришел), узел удаляется автоматически.<br />
-* <strong>Плюсы:</strong> Строгая консистентность. etcd гарантирует, что лок не будет перехвачен, пока жива сессия.</p>
+<p>Существует три фундаментальных подхода к организации распределенных блокировок, каждый из которых соотносится с компромиссами <a href="7-cap-teorema.html" class="wikilink">7. CAP теорема</a>.</p>
+<h3 id="a-blokirovki-na-baze-relyatsionnoy-bd-sql">А. Блокировки на базе реляционной БД (SQL)</h3>
+<p>Самый простой и прямолинейный подход для монолитных или небольших проектов. В базе создается таблица <code>locks</code> с уникальным индексом по названию ресурса:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">CREATE TABLE distributed_locks (
+    resource_name VARCHAR(128) PRIMARY KEY,
+    owner_id      VARCHAR(64) NOT NULL,
+    acquired_at   TIMESTAMP NOT NULL DEFAULT NOW()
+);
+</code></pre>
+</div>
+
+<ul>
+<li><strong>Механизм:</strong> Попытка захвата — это <code>INSERT INTO distributed_locks (resource_name, owner_id) VALUES ('order_123', 'worker-pod-4')</code>. Если строка уже существует, СУБД возвращает ошибку нарушения уникального ключа (Duplicate Key Error) — значит, ресурс занят. Освобождение — обычный <code>DELETE</code>.</li>
+<li><strong>Плюсы:</strong> Не требует внедрения новых инфраструктурных компонентов.</li>
+<li><strong>Минусы:</strong> Плохая масштабируемость при частом взятии локов (дисковый I/O на WAL), отсутствие автоматического TTL: если под упадет до вызова <code>DELETE</code>, лок навсегда зависнет («мертвая блокировка»), требуя фоновых демонов для очистки устаревших записей.</li>
+</ul>
+<h3 id="b-redis-i-algoritm-redlock">Б. Redis и алгоритм Redlock</h3>
+<p>Экстремально быстрый и популярный подход, часто реализуемый через библиотеки вроде <code>redsync</code>:<br />
+* <strong>Базовый примитив:</strong> Атомарная команда <code>SET resource_name my_random_value NX PX 30000</code> (установить ключ, только если он не существует (<code>NX</code>), с миллисекундным временем жизни в 30 секунд (<code>PX</code>)).<br />
+* <strong>Алгоритм Redlock (Сальваторе Санфилиппо / Antirez):</strong> Захват лока в $N$ независимых инстансах Redis (обычно 5 нод). Лок считается успешно захваченным, если большинство ($N/2 + 1$) ответили согласием за время, существенно меньшее, чем общий TTL.<br />
+* <strong>Плюсы:</strong> Сверхвысокая пропускная способность (сотни тысяч операций в секунду из памяти).<br />
+* <strong>Минусы:</strong> Известная математическая критика Мартина Клеппманна (Martin Kleppmann): в асинхронных сетях без синхронизированных физических часов Redlock не способен дать строгую математическую гарантию безопасности при системных паузах рантайма.</p>
+<h3 id="v-konsensus-sistemy-etcd-consul-apache-zookeeper">В. Консенсус-системы (etcd, Consul, Apache ZooKeeper)</h3>
+<p>Безоговорочный стандарт для критически важных распределенных систем (<strong>CP-класс</strong> по CAP):<br />
+* <strong>Механизм:</strong> Использование протоколов консенсуса (Raft / Paxos) в связке с механизмами <strong>аренд (Leases)</strong> и <strong>наблюдателей (Watchers)</strong>. Клиент создает эфемерный ключ с ассоциированной арендой и фоновым потоком подтверждения жизни (<strong>Heartbeat / Keep-Alive</strong>). Если сервис погибает, etcd автоматически удаляет аренду и ключ по таймауту.<br />
+* <strong>Плюсы:</strong> Строгая математическая линеаризуемость. Гарантируется, что лок никогда не будет перехвачен другим процессом, пока жива сессия текущего владельца.</p>
 <hr />
 <h2 id="3-reshenie-problemy-zasnuvshego-klienta-fencing-tokens">3. Решение "проблемы заснувшего клиента": Fencing Tokens</h2>
 
-<p>Чтобы защититься от ситуации, когда клиент проснулся после паузы и считает, что лок его, используется механизм <strong>Fencing Tokens</strong> (защитные токены).</p>
-<p>Суть проста: каждое получение лока выдает строго возрастающее число (ID транзакции или Epoch). База данных или ресурс, который вы обновляете, должны принимать изменения только в том случае, если присланный токен <strong>больше</strong>, чем последний успешно примененный.</p>
+<p>Как защитить базу данных от «заснувшего» клиента, который проснулся после паузы GC и наивно считает, что лок все еще принадлежит ему?</p>
+<p>Мартин Клеппманн доказал: единственный математически надежный способ решения этой проблемы — использование <strong>Fencing Tokens (Защитных токенов)</strong>.</p>
+<p>Суть механизма проста: при каждом успешном захвате блокировки сервер координации (etcd или ZK) возвращает монотонно возрастающее число (Epoch / Revision / Transaction ID). Целевое хранилище (БД, S3 или файловый сервис) обязано проверять этот токен перед выполнением любой записи:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2266,23 +2294,28 @@ Note over G, G2: СОСТОЯНИЕ ГОНКИ!
   </div>
   <pre class="mermaid">
 flowchart TD
-App1[&quot;App 1&lt;br&gt;Захватил лок&lt;br&gt;Token: 33&quot;]
-App2[&quot;App 2&lt;br&gt;Захватил лок&lt;br&gt;Token: 34&quot;]
-Storage[(&quot;Storage&lt;br&gt;Last Token: 33&quot;)]
+App1[&quot;Сервис 1&lt;br&gt;(Захватил лок)&lt;br&gt;&lt;b&gt;Token = 33&lt;/b&gt;&quot;]
+App2[&quot;Сервис 2&lt;br&gt;(Перехватил лок)&lt;br&gt;&lt;b&gt;Token = 34&lt;/b&gt;&quot;]
+Storage[(&quot;База данных Storage&lt;br&gt;Last Seen Token: 33&quot;)]
 
-App1 --&gt;|&quot;Пауза...&quot;| App1
-App2 --&gt;|&quot;Запись (Token 34)&quot;| Storage
-Storage --&gt;|&quot;Обновлено&lt;br&gt;Last Token = 34&quot;| Storage
-App1 --&gt;|&quot;Проснулся!&lt;br&gt;Запись (Token 33)&quot;| Storage
-Storage --x|&quot;ОТКАЗ!&lt;br&gt;33 меньше 34&quot;| App1
+App1 --&gt;|&quot;1. Заснул в GC STW...&quot;| App1
+App2 --&gt;|&quot;2. Успешная запись (Token 34)&quot;| Storage
+Storage --&gt;|&quot;3. Обновлено состояние:&lt;br&gt;Last Seen Token = 34&quot;| Storage
+App1 --&gt;|&quot;4. Проснулся!&lt;br&gt;Попытка записи с устаревшим Token 33&quot;| Storage
+Storage --x|&quot;5. ОТКАЗ!&lt;br&gt;Токен 33 &lt; 34 (Запрос отклонен)&quot;| App1
+
+style App1 fill:#1e293b,stroke:#f43f5e,stroke-width:1px
+style App2 fill:#1e293b,stroke:#34d399,stroke-width:1px
+style Storage fill:#0f172a,stroke:#38bdf8,stroke-width:2px
   </pre>
 </div>
 
 
+<p>Любая попытка заснувшего процесса совершить запись отвергается самой базой данных, так как номер токена устарел ($33 &lt; 34$). Целостность данных спасена!</p>
 <hr />
-<h2 id="4-idiomatichnyy-go-realizatsiya-na-etcd">4. Идиоматичный Go: Реализация на etcd</h2>
+<h2 id="4-idiomatichnyy-go-promyshlennaya-realizatsiya-na-etcd">4. Идиоматичный Go: Промышленная реализация на etcd</h2>
 
-<p>В Go для работы с распределенными локами лучше всего использовать официальный клиент <code>etcd/clientv3</code>. Он предоставляет готовую абстракцию <code>concurrency</code>, которая под капотом обрабатывает аренды и продление (keep-alive).</p>
+<p>В экосистеме Go эталоном надежности является официальный клиент <code>go.etcd.io/etcd/client/v3</code> и его пакет <code>concurrency</code>. Он берет на себя создание сессии, автоматический фоновый heartbeat для продления аренды (Lease Keep-Alive) и освобождение ресурсов при сбоях:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2296,44 +2329,55 @@ Storage --x|&quot;ОТКАЗ!&lt;br&gt;33 меньше 34&quot;| App1
 
 import (
     &quot;context&quot;
+    &quot;fmt&quot;
     &quot;log&quot;
     &quot;time&quot;
 
-    &quot;go.etcd.io/etcd/client/v3&quot;
+    clientv3 &quot;go.etcd.io/etcd/client/v3&quot;
     &quot;go.etcd.io/etcd/client/v3/concurrency&quot;
 )
 
 func main() {
-    cli, _ := clientv3.New(clientv3.Config{Endpoints: []string{&quot;localhost:2379&quot;}})
+    // 1. Подключаемся к отказоустойчивому кластеру etcd
+    cli, err := clientv3.New(clientv3.Config{
+        Endpoints:   []string{&quot;localhost:2379&quot;},
+        DialTimeout: 5 * time.Second,
+    })
+    if err != nil {
+        log.Fatalf(&quot;connect to etcd: %v&quot;, err)
+    }
     defer cli.Close()
 
-    // 1. Создаем сессию с TTL (Lease)
-    // Если процесс упадет, etcd удалит лок через 5 секунд
-    s, err := concurrency.NewSession(cli, concurrency.WithTTL(5))
+    // 2. Создаем сессию с арендой (Lease TTL = 5 секунд).
+    // Клиент etcd автоматически запускает горутину, которая шлет Heartbeats в фоне,
+    // пока процесс жив. Если процесс рухнет, аренда истечет через 5 секунд.
+    session, err := concurrency.NewSession(cli, concurrency.WithTTL(5))
     if err != nil {
-        log.Fatal(err)
+        log.Fatalf(&quot;create session: %v&quot;, err)
     }
-    defer s.Close()
+    defer session.Close()
 
-    m := concurrency.NewMutex(s, &quot;/distributed-lock/my-resource&quot;)
+    // Создаем распределенный мьютекс
+    mutex := concurrency.NewMutex(session, &quot;/distributed-lock/billing-report&quot;)
 
-    // 2. Захват лока
+    // 3. Захват блокировки с ограничением по контексту
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
 
-    if err := m.Lock(ctx); err != nil {
-        log.Fatal(&quot;Не удалось захватить лок: &quot;, err)
+    log.Println(&quot;Пытаемся захватить распределенный лок...&quot;)
+    if err := mutex.Lock(ctx); err != nil {
+        log.Fatalf(&quot;Не удалось захватить лок: %v&quot;, err)
     }
 
-    // КРИТИЧЕСКАЯ СЕКЦИЯ
-    log.Println(&quot;Лок захвачен! Работаем...&quot;)
-    time.Sleep(2 * time.Second)
+    // 4. КРИТИЧЕСКАЯ СЕКЦИЯ (Выполняется строго одним процессом в кластере)
+    log.Printf(&quot;Лок успешно захвачен! Header Revision (Fencing Token): %d&quot;, session.Lease())
+    time.Sleep(2 * time.Second) // Имитация полезной работы
 
-    // 3. Освобождение
-    if err := m.Unlock(context.Background()); err != nil {
-        log.Fatal(err)
+    // 5. Грациозное освобождение блокировки
+    if err := mutex.Unlock(context.Background()); err != nil {
+        log.Fatalf(&quot;unlock error: %v&quot;, err)
     }
-    log.Println(&quot;Лок освобожден&quot;)
+    log.Println(&quot;Лок успешно освобожден&quot;)
 }
 </code></pre>
 </div>
@@ -2341,21 +2385,40 @@ func main() {
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Безопасное снятие лока в Redis</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как реализовать лок в Redis так, чтобы его не удалил другой процесс?<br />
-<strong>Ответ:</strong> При установке ключа (<code>SET NX</code>) нужно генерировать уникальный <code>request_id</code> (например, UUID). При удалении (<code>DELETE</code>) нужно использовать <strong>Lua-скрипт</strong>, который сначала проверит, совпадает ли <code>request_id</code> в Redis с тем, что у клиента. Это гарантирует атомарность проверки и удаления (защита от ситуации, когда лок истек, его занял другой, а первый пришел и удалил «чужой» ключ).</p>
+    <p><strong>Вопрос:</strong> Как корректно освобождать распределенный лок в Redis, чтобы случайно не снять чужую блокировку?</p>
+<p><strong>Ответ:</strong> При установке ключа (<code>SET NX</code>) нужно обязательно генерировать уникальный <code>request_id</code> (например, UUID).<br />
+Нельзя просто вызвать команду <code>DELETE</code> (<code>DEL resource_name</code>), ведь лок мог истечь, и его уже мог занять параллельный воркер!<br />
+Освобождение обязано выполняться через <strong>атомарный Lua-скрипт</strong>, который сначала проверяет, совпадает ли <code>request_id</code> в Redis с тем, что у клиента:</p>
+
+<div class="code-block" data-lang="lua">
+  <div class="code-header">
+    <span class="code-lang-tag">LUA</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-lua"><code class="language-lua">if redis.call(&quot;get&quot;, KEYS[1]) == ARGV[1] then
+    return redis.call(&quot;del&quot;, KEYS[1])
+else
+    return 0
+end
+</code></pre>
+</div>
+
   </div>
 </div>
 
 <hr />
-<h2 id="5-vybor-instrumenta-shpargalka">5. Выбор инструмента: Шпаргалка</h2>
+<h2 id="5-vybor-instrumenta-shpargalka-arkhitektora">5. Выбор инструмента: Шпаргалка архитектора</h2>
 
 <div class="table-container"><table>
 <thead>
 <tr>
-<th style="text-align: left;">Инструмент</th>
+<th style="text-align: left;">Технология</th>
 <th style="text-align: left;">Скорость</th>
 <th style="text-align: left;">Надежность</th>
 <th style="text-align: left;">Когда использовать</th>
@@ -2363,34 +2426,38 @@ func main() {
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>MySQL/Postgres</strong></td>
+<td style="text-align: left;"><strong>MySQL / PostgreSQL</strong></td>
 <td style="text-align: left;">Низкая</td>
 <td style="text-align: left;">Средняя</td>
-<td style="text-align: left;">Если нагрузка мала и не хочется тянуть инфраструктуру.</td>
+<td style="text-align: left;">Если нагрузка мала, локи берутся редко, и не хочется разворачивать новую инфраструктуру.</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Redis (Redlock)</strong></td>
-<td style="text-align: left;">Высокая</td>
+<td style="text-align: left;"><strong>Redis (Redlock / Redsync)</strong></td>
+<td style="text-align: left;">Экстремально высокая</td>
 <td style="text-align: left;">Средняя</td>
-<td style="text-align: left;">Если важна скорость и кратковременное нарушение эксклюзивности не фатально.</td>
+<td style="text-align: left;">Если важна скорость (тысячи локов/сек), а кратковременная накладка из-за GC не приведет к финансовому краху (soft-locking, дедупликация писем).</td>
 </tr>
 <tr>
 <td style="text-align: left;"><strong>etcd / Consul</strong></td>
 <td style="text-align: left;">Средняя</td>
-<td style="text-align: left;">Высокая</td>
-<td style="text-align: left;">Для критичных финансовых операций и управления конфигурацией.</td>
+<td style="text-align: left;">Абсолютная (CP)</td>
+<td style="text-align: left;">Для критических бизнес-процессов (биллинг, лидер-элекшн, миграции схемы), где нарушение взаимного исключения недопустимо.</td>
 </tr>
 </tbody>
 </table></div>
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Распределенный лок</strong> — это не только про "захватить ключ", но и про "управлять его временем жизни".</li>
-<li><strong>Паузы рантайма (STW)</strong> и задержки сети могут привести к тому, что два узла будут считать себя владельцами лока.</li>
-<li>Используйте <strong>Leases</strong> для автоматической очистки и <strong>Fencing Tokens</strong> для защиты ресурсов.</li>
-<li>В Go-экосистеме <code>etcd</code> является наиболее надежным стандартом для таких задач.</li>
+<li><strong>Распределенный лок</strong> необходим, когда несколько независимых процессов должны монопольно координировать доступ к разделяемому ресурсу без общей оперативной памяти.</li>
+<li><strong>Паузы рантайма (GC Stop The World)</strong> и нестабильность сетей делают наивные тайм-ауты (TTL) уязвимыми к состояниям гонки.</li>
+<li>Единственная математически строгая защита от «заснувшего клиента» — использование <strong>Fencing Tokens</strong> (монотонно возрастающих номеров ревизий).</li>
+<li>В экосистеме Go библиотека <code>etcd/clientv3/concurrency</code> является промышленным эталоном для построения отказоустойчивой синхронизации на базе протокола Raft.</li>
 </ol>
-<p>Мы закончили масштабный раздел по распределенным базам данных. Теперь мы переходим к изучению специализированных хранилищ, которые отказываются от SQL ради гибкости и производительности в специфических сценариях: <a href="../09-nosql-bazy/1-chto-takoe-nosql.html" class="wikilink">1. Что такое NoSQL</a>.</p>
+<hr />
+<p>Мы полностью завершили фундаментальный восьмой подраздел, посвященный распределенным базам данных, репликации, шардингу, консенсусу и транзакциям. </p>
+<p>Теперь мы готовы перешагнуть границу классического реляционного мира и отправиться в царство нереляционных специализированных хранилищ, принесших в жертву привычный SQL ради колоссальной гибкости и пропускной способности.</p>
+<p>В следующем подразделе нас ждет погружение в мир NoSQL: <span class="wikilink-unresolved" title="Заметка в разработке">09. NoSQL базы/1. Что такое NoSQL</span>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2418,7 +2485,7 @@ func main() {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#raspredelennye-blokirovki-kogda-odnogo-sync-mutex-nedostatochno">Распределенные блокировки: Когда одного sync.Mutex недостаточно</a></li><li class="toc-item toc-h2"><a href="#1-fundamentalnaya-problema-vremya-i-pauzy">1. Фундаментальная проблема: Время и Паузы</a></li><li class="toc-item toc-h2"><a href="#2-strategii-realizatsii">2. Стратегии реализации</a></li><li class="toc-item toc-h3"><a href="#a-blokirovki-na-baze-bd-sql">А. Блокировки на базе БД (SQL)</a></li><li class="toc-item toc-h3"><a href="#b-redis-i-redlock">Б. Redis и Redlock</a></li><li class="toc-item toc-h3"><a href="#v-konsensus-sistemy-etcd-consul-zookeeper">В. Консенсус-системы (etcd, Consul, Zookeeper)</a></li><li class="toc-item toc-h2"><a href="#3-reshenie-problemy-zasnuvshego-klienta-fencing-tokens">3. Решение &quot;проблемы заснувшего клиента&quot;: Fencing Tokens</a></li><li class="toc-item toc-h2"><a href="#4-idiomatichnyy-go-realizatsiya-na-etcd">4. Идиоматичный Go: Реализация на etcd</a></li><li class="toc-item toc-h2"><a href="#5-vybor-instrumenta-shpargalka">5. Выбор инструмента: Шпаргалка</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#raspredelennye-blokirovki-kogda-odnogo-sync-mutex-nedostatochno">Распределенные блокировки: Когда одного sync.Mutex недостаточно</a></li><li class="toc-item toc-h2"><a href="#1-fundamentalnaya-problema-vremya-i-pauzy">1. Фундаментальная проблема: Время и Паузы</a></li><li class="toc-item toc-h2"><a href="#2-strategii-realizatsii">2. Стратегии реализации</a></li><li class="toc-item toc-h3"><a href="#a-blokirovki-na-baze-relyatsionnoy-bd-sql">А. Блокировки на базе реляционной БД (SQL)</a></li><li class="toc-item toc-h3"><a href="#b-redis-i-algoritm-redlock">Б. Redis и алгоритм Redlock</a></li><li class="toc-item toc-h3"><a href="#v-konsensus-sistemy-etcd-consul-apache-zookeeper">В. Консенсус-системы (etcd, Consul, Apache ZooKeeper)</a></li><li class="toc-item toc-h2"><a href="#3-reshenie-problemy-zasnuvshego-klienta-fencing-tokens">3. Решение &quot;проблемы заснувшего клиента&quot;: Fencing Tokens</a></li><li class="toc-item toc-h2"><a href="#4-idiomatichnyy-go-promyshlennaya-realizatsiya-na-etcd">4. Идиоматичный Go: Промышленная реализация на etcd</a></li><li class="toc-item toc-h2"><a href="#5-vybor-instrumenta-shpargalka-arkhitektora">5. Выбор инструмента: Шпаргалка архитектора</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

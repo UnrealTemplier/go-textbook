@@ -2168,36 +2168,41 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~11 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Distributed transactions</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Разработка распределенных систем на Go неизбежно приводит к ситуации, когда одна бизнес-операция должна затронуть несколько независимых баз данных или микросервисов. Например, при оформлении заказа нам нужно:<br />
-1. Заблокировать деньги в сервисе биллинга (PostgreSQL).<br />
-2. Списать товар в сервисе склада (MySQL).<br />
-3. Начислить кэшбэк в сервисе лояльности (MongoDB).</p>
-<p>В монолитной архитектуре мы бы просто открыли <code>BEGIN</code> и <code>COMMIT</code> в одной БД, полагаясь на ACID. В распределенной среде классические транзакции не работают, так как у каждой базы свой журнал <a href="../05-tranzaktsii-i-vnutrennosti/8-wal-write-ahead-log.html" class="wikilink">8. WAL. Write Ahead Log</a> и свой менеджер транзакций.</p>
-<p><strong>Распределенная транзакция</strong> — это механизм, обеспечивающий выполнение набора операций на нескольких узлах сети так, чтобы соблюдались свойства атомарности и консистентности.</p>
+            <p>В архитектуре современных распределенных систем на Go рано или поздно наступает момент, когда тривиальная бизнес-операция перерастает границы одной базы данных. </p>
+<p>Представьте стандартный сценарий оформления заказа в современном интернет-гипермаркете:<br />
+1. Заблокировать и списать денежные средства в сервисе биллинга (PostgreSQL).<br />
+2. Зарезервировать и списать остатки физических товаров в сервисе склада (MySQL).<br />
+3. Начислить бонусные баллы и кэшбэк в сервисе лояльности (MongoDB).</p>
+<p>В классическом монолите мы бы просто открыли блок <code>BEGIN TRANSACTION</code>, выполнили три SQL-запроса и зафиксировали результат через <code>COMMIT</code>, переложив всю ответственность на ACID-гарантии локального движка. </p>
+<p>Однако в распределенной микросервисной среде такой магии больше не существует: у каждой базы данных функционирует собственный изолированный журнал <a href="../05-tranzaktsii-i-vnutrennosti/8-wal-write-ahead-log.html" class="wikilink">8. WAL. Write Ahead Log</a>, независимый менеджер блокировок и раздельная оперативная память.</p>
+<p><strong>Распределенная транзакция</strong> — это архитектурный механизм, координирующий согласованное выполнение группы операций на множестве физически независимых узлов сети так, чтобы вся цепочка обладала свойствами атомарности (Atomicity) и согласованности (Consistency).</p>
 <hr />
 <h2 id="problema-chastichnye-otkazy">Проблема: Частичные отказы</h2>
 
-<p>В распределенной системе всё, что может пойти не так, пойдет не так:<br />
-* Сеть может моргнуть между шагом 1 и 2.<br />
-* Сервис склада может упасть из-за OOM (Out Of Memory) прямо в момент списания.<br />
-* База данных лояльности может отклонить запрос из-за нарушения уникального ключа.</p>
-<p>Если мы просто последовательно вызываем HTTP/gRPC методы, мы рискуем оставить систему в <strong>несогласованном состоянии</strong>: деньги сняты, а товара нет.</p>
+<p>В распределенной системе действует суровый эмпирический закон: всё, что способно сломаться, обязательно сломается в самый неподходящий момент:<br />
+* Сетевой стек может моргнуть (Packet Drop) ровно между шагом списания денег и шагом резервирования товара.<br />
+* Сервис склада может внезапно упасть под ударом OOM-Killer ядра Linux прямо в процессе выполнения транзакции.<br />
+* База данных программы лояльности может отклонить транзакцию из-за конфликта уникального ключа.</p>
+<p>Если микросервисы на Go просто выполняют последовательные вызовы по HTTP или gRPC, система гарантированно окажется в катастрофическом <strong>несогласованном состоянии (Inconsistent State)</strong>: деньги с банковской карты клиента списаны, но товар на складе не забронирован, а заказ в системе не существует.</p>
 <hr />
 <h2 id="strategiya-1-atomarnaya-fiksatsiya-2pc">Стратегия 1: Атомарная фиксация (2PC)</h2>
 
-<p><strong>Two-Phase Commit (Двухфазный коммит)</strong> — это классический протокол, который пытается перенести опыт локальных транзакций в распределенную среду. В нем появляется новая роль — <strong>Координатор</strong>.</p>
-<h3 id="fazy-2pc">Фазы 2PC:</h3>
+<p><strong>Two-Phase Commit (Двухфазный коммит / 2PC)</strong> — классический протокол распределенного консенсуса, созданный в попытке перенести бескомпромиссные гарантии локального ACID в распределенную сеть. В этой схеме появляется выделенная системная роль — <strong>Координатор транзакции (Transaction Coordinator)</strong>.</p>
+<h3 id="fazy-protokola-2pc">Фазы протокола 2PC:</h3>
 <ol>
-<li><strong>Prepare (Подготовка):</strong> Координатор спрашивает все узлы: «Готовы ли вы закоммитить изменения?». Узлы проверяют ограничения, блокируют строки и отвечают «Да» или «Нет».</li>
-<li><strong>Commit / Rollback (Фиксация или Откат):</strong> - Если <strong>все</strong> ответили «Да», координатор рассылает команду на коммит.<br />
-   - Если хотя бы <strong>один</strong> ответил «Нет» или не ответил вовремя, координатор рассылает команду на откат.</li>
+<li><strong>Фаза 1: Prepare (Подготовка к фиксации):</strong><br />
+   Координатор отправляет всем базам данных команду: <em>«Можете ли вы зафиксировать изменения?»</em>.<br />
+   Каждый узел локально выполняет валидацию, сбрасывает дельту изменений в WAL, накладывает строгие эксклюзивные блокировки (X-Locks) на строки и голосует: <code>YES</code> (готов) или <code>NO</code> (отказ).</li>
+<li><strong>Фаза 2: Commit / Rollback (Фиксация или Откат):</strong><br />
+   - Если <strong>все до единого</strong> участника проголосовали <code>YES</code>, координатор рассылает команду <code>COMMIT</code>. Узлы применяют транзакцию и снимают блокировки.<br />
+   - Если хотя бы <strong>один</strong> узел проголосовал <code>NO</code> (или не ответил по таймауту), координатор рассылает команду <code>ROLLBACK</code>. Все узлы откатывают изменения по своим журналам.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2213,21 +2218,24 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
+autonumber
 participant C as Координатор (Go Service)
-participant DB1 as Billing DB
-participant DB2 as Inventory DB
+participant DB1 as Billing DB (PostgreSQL)
+participant DB2 as Inventory DB (MySQL)
 
-Note over C, DB2: Фаза 1: Prepare
-C-&gt;&gt;DB1: Prepare (T1)
-C-&gt;&gt;DB2: Prepare (T2)
-DB1--&gt;&gt;C: OK (Ready)
-DB2--&gt;&gt;C: OK (Ready)
+Note over C, DB2: Фаза 1: Prepare (Голосование)
+C-&gt;&gt;DB1: 1. Prepare (T1) - XA PREPARE
+C-&gt;&gt;DB2: 2. Prepare (T2) - XA PREPARE
+DB1-&gt;&gt;DB1: Запись в WAL, наложение локов
+DB2-&gt;&gt;DB2: Запись в WAL, наложение локов
+DB1--&gt;&gt;C: 3. OK (Ready to Commit)
+DB2--&gt;&gt;C: 4. OK (Ready to Commit)
 
-Note over C, DB2: Фаза 2: Commit
-C-&gt;&gt;DB1: Commit
-C-&gt;&gt;DB2: Commit
-DB1--&gt;&gt;C: Ack
-DB2--&gt;&gt;C: Ack
+Note over C, DB2: Фаза 2: Commit (Фиксация)
+C-&gt;&gt;DB1: 5. Commit (XA COMMIT)
+C-&gt;&gt;DB2: 6. Commit (XA COMMIT)
+DB1--&gt;&gt;C: 7. Ack (Завершено)
+DB2--&gt;&gt;C: 8. Ack (Завершено)
   </pre>
 </div>
 
@@ -2238,18 +2246,55 @@ DB2--&gt;&gt;C: Ack
     <span class="callout-title">Ловушка / Gotcha: Блокировки и SPOF</span>
   </div>
   <div class="callout-body">
-    <p>2PC — это <strong>блокирующий</strong> протокол. Пока узлы ждут вторую фазу, они держат блокировки на строки БД. Если координатор упадет между фазами, все участвующие базы останутся заблокированными ("зависшие транзакции"), пока координатор не поднимется. Из-за этого 2PC крайне плохо масштабируется и редко используется в Highload микросервисах.</p>
+    <p>2PC — это <strong>тяжелый синхронно блокирующий протокол</strong>.<br />
+На всем протяжении между отправкой <code>Prepare</code> и получением <code>Commit</code> строки в базах данных остаются намертво заблокированными на запись для всех остальных клиентов!<br />
+Если координатор упадет после фазы Prepare, участвующие базы останутся в подвешенном состоянии (<strong>In-Doubt Transactions</strong>): они не имеют права ни накатить транзакцию, ни откатить ее, удерживая блокировки часами. Из-за чудовищного падения пропускной способности и риска каскадного отказа протокол 2PC практически не используется в современных микросервисных Highload-системах.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="strategiya-2-sagas-sagi">Стратегия 2: Sagas (Саги)</h2>
 
-<p>В современной микросервисной архитектуре на Go стандартом де-факто является паттерн <strong>Saga</strong>. Сага — это последовательность локальных транзакций. Если одна из транзакций завершается неудачей, Сага запускает <strong>компенсирующие транзакции</strong>, чтобы откатить изменения, внесенные предыдущими шагами.</p>
-<h3 id="vidy-sag">Виды Саг:</h3>
+<p>В микросервисной индустрии и мире облачных Go-систем золотым стандартом реализации распределенных транзакций стал архитектурный паттерн <strong>Saga (Сага)</strong>, впервые описанный Гектором Гарсия-Молиной еще в 1987 году.</p>
+<p><strong>Сага</strong> — это цепочка независимых локальных транзакций в отдельных сервисах. Каждый шаг саги фиксирует локальную транзакцию немедленно, не удерживая глобальных сетевых блокировок.<br />
+Если на определенном этапе происходит сбой (например, на складе закончился товар), сага запускает в обратном порядке цепочку <strong>компенсирующих транзакций (Compensating Transactions)</strong>, ликвидирующих последствия предыдущих успешных шагов.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph HappyPath [&quot;Успешное выполнение&quot;]
+T1[&quot;1. Списание денег&lt;br&gt;(Local Commit)&quot;] --&gt; T2[&quot;2. Резерв склада&lt;br&gt;(Local Commit)&quot;]
+T2 --&gt; T3[&quot;3. Начисление бонусов&lt;br&gt;(Успех)&quot;]
+end
+
+subgraph CompensationPath [&quot;Откат через компенсации при сбое шага 2&quot;]
+Fail[&quot;Сбой шага 2!&lt;br&gt;(Товара нет)&quot;] -.-&gt; C1[&quot;&lt;b&gt;Компенсация C1:&lt;/b&gt;&lt;br&gt;Возврат списанных денег&lt;br&gt;(Новая транзакция!)&quot;]
+end
+
+style HappyPath fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style CompensationPath fill:#0f172a,stroke:#f43f5e,stroke-width:2px
+style T1 fill:#1e293b,stroke:#34d399,stroke-width:1px
+style T2 fill:#1e293b,stroke:#34d399,stroke-width:1px
+style T3 fill:#1e293b,stroke:#34d399,stroke-width:1px
+style C1 fill:#1e293b,stroke:#f87171,stroke-width:2px
+  </pre>
+</div>
+
+
+<h3 id="arkhitekturnye-stili-realizatsii-sag">Архитектурные стили реализации Саг:</h3>
 <ol>
-<li><strong>Choreography (Хореография):</strong> Сервисы обмениваются событиями (через Kafka/NATS). Каждый знает, что делать дальше.</li>
-<li><strong>Orchestration (Оркестрация):</strong> Центральный сервис (Оркестратор) управляет логикой и вызывает методы других сервисов.</li>
+<li><strong>Choreography (Хореография):</strong> Сервисы не имеют централизованного координатора. Они реагируют на доменные события, передаваемые через шины сообщений (Kafka, RabbitMQ, NATS). Сервис биллинга опубликовал <code>PaymentCompleted</code> $\to$ сервис склада поймал событие и попытался списать товар. Если товар закончился, склад публикует <code>StockReservationFailed</code> $\to$ биллинг ловит событие и запускает компенсацию.</li>
+<li><strong>Orchestration (Оркестрация):</strong> Выделенный сервис-оркестратор последовательно отправляет gRPC/REST команды участникам саги, сохраняет статус выполнения каждого шага в базу и при необходимости централизованно рассылает компенсирующие команды.</li>
 </ol>
 <div class="callout callout-interview">
   <div class="callout-header">
@@ -2257,16 +2302,74 @@ DB2--&gt;&gt;C: Ack
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между откатом (Rollback) в БД и компенсацией в Саге?<br />
-<strong>Ответ:</strong> Откат в БД — это физическое удаление данных из WAL до того, как их кто-то увидел. Компенсация в Саге — это <strong>новая запись</strong>, которая логически отменяет предыдущую (например, возврат денег на счет). Система проходит через промежуточное неконсистентное состояние, которое видно другим пользователям.</p>
+    <p><strong>Вопрос:</strong> В чем фундаментальное различие между откатом (<code>ROLLBACK</code>) в реляционной СУБД и компенсирующей транзакцией в Саге?</p>
+<p><strong>Ответ:</strong> <br />
+* <strong>Локальный откат (Rollback):</strong> Стирает следы незакоммиченной транзакции из оперативной памяти и WAL. Ни один сторонний читатель ни на мгновение не видел промежуточных изменений (гарантия изоляции <code>Isolation</code>).<br />
+* <strong>Компенсация в Саге:</strong> Это <strong>новая, полноценно закоммиченная транзакция</strong>, которая логически нейтрализует эффект предыдущей операции (например, операция пополнения баланса на ту же сумму).<br />
+Поскольку локальные транзакции саги коммитятся сразу, система проходит через стадию временного неконсистентного состояния (<strong>Semantic Inconsistency</strong>), которое открыто для наблюдения другим пользователям.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="mechanical-sympathy-idempotentnost">Mechanical Sympathy: Идемпотентность</h2>
 
-<p>В распределенных транзакциях сетевые повторы (retries) неизбежны. Если ваш Go-сервис переповторяет запрос на списание денег из-за таймаута, он должен быть уверен, что деньги не спишутся дважды.</p>
-<p>Это достигается через <strong>Идемпотентность</strong>. Каждый запрос должен нести уникальный <code>Request-ID</code> (или <code>Transaction-ID</code>), который база проверяет перед выполнением.</p>
+<p>В любых распределенных транзакциях сетевые сбои делают <strong>повторные запросы (Retries)</strong> математически неизбежными. Если Go-клиент отправил команду списания денег, но сетевое соединение оборвалось до прихода ответа, клиент не знает: выполнилась ли операция на сервере, или запрос даже не покинул сетевой буфер?</p>
+<p>При повторной отправке запроса система обязана гарантировать <strong>Идемпотентность</strong>: многократное применение одного и того же запроса дает абсолютно идентичный результат, не приводя к двойному списанию средств.</p>
+<p>Для этого каждый распределенный запрос снабжается уникальным ключом идемпотентности — <code>Request-ID</code> (или <code>Transaction-ID</code> / <code>Idempotency-Key</code>):</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package billing
+
+import (
+    &quot;context&quot;
+    &quot;database/sql&quot;
+    &quot;fmt&quot;
+)
+
+// ChargeAccount выполняет атомарное и идемпотентное списание средств
+func ChargeAccount(ctx context.Context, tx *sql.Tx, idempotencyKey string, accountID int, amount int64) error {
+    // 1. Проверяем, не обрабатывался ли данный ключ ранее
+    var exists bool
+    checkQuery := `SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE key = $1)`
+    if err := tx.QueryRowContext(ctx, checkQuery, idempotencyKey).Scan(&amp;exists); err != nil {
+        return fmt.Errorf(&quot;check idempotency: %w&quot;, err)
+    }
+
+    if exists {
+        // Запрос уже был успешно обработан ранее: повторное списание запрещено!
+        return nil
+    }
+
+    // 2. Выполняем полезную операцию списания
+    updateQuery := `UPDATE accounts SET balance = balance - $1 WHERE id = $2 AND balance &gt;= $1`
+    res, err := tx.ExecContext(ctx, updateQuery, amount, accountID)
+    if err != nil {
+        return fmt.Errorf(&quot;debit balance: %w&quot;, err)
+    }
+
+    rows, err := res.RowsAffected()
+    if err != nil || rows == 0 {
+        return fmt.Errorf(&quot;insufficient funds or account not found&quot;)
+    }
+
+    // 3. Сохраняем ключ идемпотентности в той же локальной транзакции
+    insertKey := `INSERT INTO idempotency_keys (key, account_id, created_at) VALUES ($1, $2, NOW())`
+    if _, err := tx.ExecContext(ctx, insertKey, idempotencyKey, accountID); err != nil {
+        return fmt.Errorf(&quot;store idempotency key: %w&quot;, err)
+    }
+
+    return nil
+}
+</code></pre>
+</div>
+
 <hr />
 <h2 id="sravnenie-podkhodov">Сравнение подходов</h2>
 
@@ -2280,41 +2383,51 @@ DB2--&gt;&gt;C: Ack
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>Изоляция</strong></td>
-<td style="text-align: left;">Высокая (ACID-like)</td>
-<td style="text-align: left;">Низкая (состояние видно всем)</td>
+<td style="text-align: left;"><strong>Изоляция (Isolation)</strong></td>
+<td style="text-align: left;">Высокая (ACID-подобная, строгие локи)</td>
+<td style="text-align: left;">Низкая (промежуточные состояния видны)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Доступность</strong></td>
-<td style="text-align: left;">Низкая (блокировки)</td>
-<td style="text-align: left;">Высокая</td>
+<td style="text-align: left;"><strong>Доступность (Availability)</strong></td>
+<td style="text-align: left;">Низкая (блокировка строк парализует БД)</td>
+<td style="text-align: left;">Высокая (локальные коммиты без удержания локов)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Сложность</strong></td>
-<td style="text-align: left;">Реализовано в БД (XA)</td>
-<td style="text-align: left;">Нужно писать код компенсации</td>
+<td style="text-align: left;"><strong>Сложность разработки</strong></td>
+<td style="text-align: left;">Реализована внутри СУБД (XA-стандарт)</td>
+<td style="text-align: left;">Требует написания кода компенсирующих действий</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Консистентность</strong></td>
-<td style="text-align: left;">Strong</td>
-<td style="text-align: left;">Eventual</td>
+<td style="text-align: left;"><strong>Модель консистентности</strong></td>
+<td style="text-align: left;">Строгая (Strong Consistency)</td>
+<td style="text-align: left;">В конечном счете (<a href="6-consistency-modeli.html" class="wikilink">Eventual Consistency</a>)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Применимость</strong></td>
+<td style="text-align: left;">Локальные шарды одной базы, enterprise ERP</td>
+<td style="text-align: left;">Распределенные микросервисы, облачный highload</td>
 </tr>
 </tbody>
 </table></div>
+<hr />
 <h2 id="realizatsiya-na-go-instrumentariy">Реализация на Go: Инструментарий</h2>
 
-<p>Для реализации надежных распределенных транзакций в Go-сообществе принято использовать специализированные движки, которые берут на себя логику ретраев и хранения состояний:<br />
-* <strong>Temporal.io / Cadence:</strong> Самый мощный инструмент для оркестрации саг. Позволяет писать логику транзакции как обычный Go-код, обеспечивая его выполнение даже при падении серверов.<br />
-* <strong>DTM (Distributed Transaction Manager):</strong> Легковесный менеджер транзакций специально для Go, поддерживающий TCC, Saga и 2PC.</p>
-<h2 id="itog">Итог</h2>
+<p>Писать сложную логику отслеживания состояний, таймаутов и ретраев саг на голых горутинах и каналах крайне рискованно. В профессиональной экосистеме Go принято использовать специализированные платформы:</p>
+<ul>
+<li><strong>Temporal.io / Cadence:</strong> Доминирующий промышленный стандарт оркестрации рабочих процессов и саг. Разработчик пишет код распределенной бизнес-логики как обычную линейную функцию на Go, а движок Temporal гарантирует ее детерминированное выполнение, автоматические ретраи и вызовы компенсаций даже при внезапной перезагрузке серверов.</li>
+<li><strong>DTM (Distributed Transaction Manager):</strong> Высокопроизводительный распределенный координатор транзакций с открытым исходным кодом, созданный специально для Go. Поддерживает паттерны Saga, TCC (Try-Confirm-Cancel) и двухфазный коммит XA.</li>
+</ul>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Распределенные транзакции</strong> сложнее локальных, так как не имеют общей памяти и часов.</li>
-<li><strong>2PC</strong> гарантирует строгую консистентность, но убивает производительность блокировками.</li>
-<li><strong>Saga</strong> — основной выбор для облачных систем, полагающийся на компенсирующие транзакции и <a href="6-consistency-modeli.html" class="wikilink">Eventual Consistency</a>.</li>
-<li><strong>Идемпотентность</strong> — обязательное условие для любого узла, участвующего в распределенной транзакции.</li>
+<li><strong>Распределенная транзакция</strong> координирует модификации между изолированными хранилищами, решая проблему неизбежных частичных сетевых отказов.</li>
+<li><strong>Протокол 2PC (Двухфазный коммит)</strong> обеспечивает строгую атомарность, но платит за это жесткими блокировками и риском зависания кластера при отказе координатора.</li>
+<li><strong>Паттерн Saga</strong> делит процесс на цепочку локальных транзакций с компенсирующими действиями при авариях, являясь де-факто стандартом для микросервисов.</li>
+<li><strong>Идемпотентность</strong> — абсолютное обязательное требование для каждого сетевого эндпоинта, участвующего в распределенных цепочках.</li>
 </ol>
-<p>Одной из самых популярных реализаций атомарной фиксации является протокол, который мы упомянули лишь вскользь. Чтобы понять, почему он считается "золотым стандартом" классических систем и почему от него отказываются в пользу Саг, мы разберем его отдельно: <a href="9-two-phase-commit.html" class="wikilink">9. Two Phase Commit</a>.</p>
+<p>Мы рассмотрели общий ландшафт распределенных транзакций. Однако протокол двухфазного коммита заслуживает максимально детального вскрытия: именно на нем исторически строились распределенные транзакции в классических РСУБД (XA-транзакции в MySQL и Postgres).</p>
+<p>В следующей лекции мы разберем механику 2PC на уровне системных вызовов и отказов координатора: <a href="9-two-phase-commit.html" class="wikilink">9. Two Phase Commit</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2342,7 +2455,7 @@ DB2--&gt;&gt;C: Ack
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#problema-chastichnye-otkazy">Проблема: Частичные отказы</a></li><li class="toc-item toc-h2"><a href="#strategiya-1-atomarnaya-fiksatsiya-2pc">Стратегия 1: Атомарная фиксация (2PC)</a></li><li class="toc-item toc-h3"><a href="#fazy-2pc">Фазы 2PC:</a></li><li class="toc-item toc-h2"><a href="#strategiya-2-sagas-sagi">Стратегия 2: Sagas (Саги)</a></li><li class="toc-item toc-h3"><a href="#vidy-sag">Виды Саг:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-idempotentnost">Mechanical Sympathy: Идемпотентность</a></li><li class="toc-item toc-h2"><a href="#sravnenie-podkhodov">Сравнение подходов</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-na-go-instrumentariy">Реализация на Go: Инструментарий</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#problema-chastichnye-otkazy">Проблема: Частичные отказы</a></li><li class="toc-item toc-h2"><a href="#strategiya-1-atomarnaya-fiksatsiya-2pc">Стратегия 1: Атомарная фиксация (2PC)</a></li><li class="toc-item toc-h3"><a href="#fazy-protokola-2pc">Фазы протокола 2PC:</a></li><li class="toc-item toc-h2"><a href="#strategiya-2-sagas-sagi">Стратегия 2: Sagas (Саги)</a></li><li class="toc-item toc-h3"><a href="#arkhitekturnye-stili-realizatsii-sag">Архитектурные стили реализации Саг:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-idempotentnost">Mechanical Sympathy: Идемпотентность</a></li><li class="toc-item toc-h2"><a href="#sravnenie-podkhodov">Сравнение подходов</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-na-go-instrumentariy">Реализация на Go: Инструментарий</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

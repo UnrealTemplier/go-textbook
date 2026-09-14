@@ -2168,7 +2168,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">9. Two Phase Commit</h1>
@@ -2177,25 +2177,27 @@
           <div class="article-markdown">
             <h2 id="two-phase-commit-2pc-klassika-raspredelennogo-konsensusa">Two-Phase Commit (2PC): Классика распределенного консенсуса</h2>
 
-<p>В прошлой статье <a href="../../14-raspredelennye-sistemy-na-go/03-dannye-i-soglasovannost/8-distributed-transactions.html" class="wikilink">8. Distributed transactions</a> мы обсудили теоретическую сложность атомарности в распределенных системах. Сегодня мы разберем «золотой стандарт» (и одновременно «старое проклятие») системного дизайна — протокол <strong>Двухфазной фиксации (Two-Phase Commit, 2PC)</strong>.</p>
-<p>Если вам нужно, чтобы транзакция либо применилась на всех узлах (например, в PostgreSQL и Kafka одновременно), либо не применилась нигде, 2PC — это первое, что приходит в голову архитектору. Но за эту гарантию приходится платить огромную цену в виде задержек (Latency) и риска полной блокировки системы.</p>
+<p>В предыдущей лекции (<a href="../../14-raspredelennye-sistemy-na-go/03-dannye-i-soglasovannost/8-distributed-transactions.html" class="wikilink">8. Distributed transactions</a>) мы исследовали теоретический ландшафт межузловых транзакций и анатомию частичных отказов. Сегодня мы с инженерной дотошностью разберем исторический «золотой стандарт» (и одновременно «тяжелое проклятие») системной архитектуры — протокол <strong>Двухфазной фиксации (Two-Phase Commit, 2PC)</strong>.</p>
+<p>Если вашей распределенной системе жизненно необходимо, чтобы комплексная операция гарантированно применилась на всех гетерогенных узлах (например, синхронно зафиксировалась в PostgreSQL и отправилась в Kafka) либо бесследно испарилась отовсюду при малейшем сбое, 2PC — это первое математическое решение, приходящее на ум архитектору. </p>
+<p>Однако за безупречную строгость атомарности распределенная природа взимает колоссальную дань: драматический рост сетевых задержек (Latency), парализующие блокировки таблиц и уязвимость перед падением узлов.</p>
 <hr />
 <h2 id="1-roli-i-stsenariy">1. Роли и сценарий</h2>
 
-<p>В протоколе 2PC участвуют две стороны:<br />
-1.  <strong>Координатор (Coordinator):</strong> Узел, который инициирует транзакцию и управляет её жизненным циклом.<br />
-2.  <strong>Участники (Participants / Cohorts):</strong> Ресурсы (БД, очереди сообщений), которые должны выполнить работу.</p>
-<p>Протокол разделен на две фазы, что отражено в его названии.</p>
+<p>Архитектура протокола 2PC базируется на стандарте <strong>X/Open DTP (Distributed Transaction Processing)</strong> и делит участников на две строгие роли:<br />
+1. <strong>Координатор (Transaction Coordinator / TM — Transaction Manager):</strong> Выделенный компонент (часто сам сервис на Go), который инициирует распределенную транзакцию, дирижирует голосованием и принимает окончательный вердикт.<br />
+2. <strong>Участники (Participants / Cohorts / RM — Resource Managers):</strong> Независимые подсистемы хранения (реляционные СУБД, очереди сообщений), выполняющие полезную работу над локальными данными.</p>
+<p>Протокол разделен на две последовательные фазы, что и дало ему имя.</p>
 <h3 id="faza-1-golosovanie-prepare-phase">Фаза 1: Голосование (Prepare Phase)</h3>
-<p>Координатор отправляет всем участникам запрос <code>PREPARE</code>. Каждый участник проверяет, может ли он зафиксировать транзакцию:<br />
-* Проверяет ограничения (constraints).<br />
-* Записывает данные в свой локальный лог (WAL), но <strong>не коммитит</strong>.<br />
-* Удерживает все необходимые блокировки (Locks).<br />
-* Отвечает <code>VOTE_COMMIT</code> (готов) или <code>VOTE_ABORT</code> (ошибка).</p>
+<p>Координатор генерирует глобальный идентификатор транзакции (<code>XID</code>) и отправляет всем участникам команду <code>PREPARE</code>.<br />
+Каждый участник локально выполняет проверку:<br />
+* Проверяет ограничения схемы (Constraints, Foreign Keys, Unique Indexes).<br />
+* Выполняет изменения в памяти, сбрасывает дельту в локальный журнал предзаписи (WAL) с пометкой <code>PREPARED</code>, но <strong>ни в коем случае не коммитит</strong> данные.<br />
+* Навешивает строгие эксклюзивные строчные блокировки (X-Locks) на все модифицируемые записи.<br />
+* Отправляет координатору сетевой голос: <code>VOTE_COMMIT</code> (готов зафиксировать) или <code>VOTE_ABORT</code> (ошибка, отказ).</p>
 <h3 id="faza-2-zavershenie-commit-phase">Фаза 2: Завершение (Commit Phase)</h3>
-<p>Координатор собирает голоса:<br />
-* <strong>Если ВСЕ ответили «ДА»:</strong> Координатор пишет финальное решение в свой лог и отправляет команду <code>COMMIT</code> всем участникам. Участники фиксируют изменения и отпускают блокировки.<br />
-* <strong>Если ХОТЯ БЫ ОДИН ответил «НЕТ» (или таймаут):</strong> Координатор отправляет команду <code>ROLLBACK</code>.</p>
+<p>Координатор анализирует полученные голоса:<br />
+* <strong>Если ВСЕ участники ответили «ДА» (<code>VOTE_COMMIT</code>):</strong> Координатор делает обязательную синхронную запись в свой локальный журнал и рассылает всем участникам финальную команду <code>COMMIT</code>. Участники применяют изменения, открывают видимость данных и снимают блокировки строк.<br />
+* <strong>Если ХОТЯ БЫ ОДИН ответил «НЕТ» (<code>VOTE_ABORT</code>) или не ответил по таймауту:</strong> Координатор рассылает всем участникам команду <code>ROLLBACK</code>. Участники откатывают подготовленные изменения по WAL и освобождают заблокированные строки.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2210,26 +2212,27 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant C as Координатор
-participant P1 as Участник А
-participant P2 as Участник Б
+autonumber
+participant C as Координатор (Go Service)
+participant P1 as Участник А (Billing PostgreSQL)
+participant P2 as Участник Б (Stock MySQL)
 
-Note over C, P2: ФАЗА 1: ПОДГОТОВКА
-C-&gt;&gt;P1: PREPARE (ID транзакции)
-C-&gt;&gt;P2: PREPARE (ID транзакции)
+Note over C, P2: ФАЗА 1: ПОДГОТОВКА (Prepare Phase)
+C-&gt;&gt;P1: 1. PREPARE (ID транзакции XID)
+C-&gt;&gt;P2: 2. PREPARE (ID транзакции XID)
 P1-&gt;&gt;P1: Запись в WAL, захват локов
 P2-&gt;&gt;P2: Запись в WAL, захват локов
-P1--&gt;&gt;C: VOTE_COMMIT
-P2--&gt;&gt;C: VOTE_COMMIT
+P1--&gt;&gt;C: 3. VOTE_COMMIT
+P2--&gt;&gt;C: 4. VOTE_COMMIT
 
-Note over C, P2: ФАЗА 2: ФИКСАЦИЯ
-C-&gt;&gt;C: Запись COMMIT в свой лог
-C-&gt;&gt;P1: COMMIT
-C-&gt;&gt;P2: COMMIT
+Note over C, P2: ФАЗА 2: ФИКСАЦИЯ (Commit Phase)
+C-&gt;&gt;C: Запись COMMIT в свой лог на диск (fsync)
+C-&gt;&gt;P1: 5. COMMIT
+C-&gt;&gt;P2: 6. COMMIT
 P1-&gt;&gt;P1: Фиксация данных, отпуск локов
 P2-&gt;&gt;P2: Фиксация данных, отпуск локов
-P1--&gt;&gt;C: ACK
-P2--&gt;&gt;C: ACK
+P1--&gt;&gt;C: 7. ACK
+P2--&gt;&gt;C: 8. ACK
   </pre>
 </div>
 
@@ -2237,26 +2240,32 @@ P2--&gt;&gt;C: ACK
 <hr />
 <h2 id="2-pod-kapotom-mekhanika-nadezhnosti">2. Под капотом: Механика надежности</h2>
 
-<p>2PC — это <strong>CP-система</strong> по <a href="7-cap-teorema.html" class="wikilink">7. CAP теорема</a>. Она выбирает консистентность любой ценой. Чтобы протокол пережил падение любого узла, он опирается на логирование.</p>
+<p>В терминах классификации <a href="7-cap-teorema.html" class="wikilink">7. CAP теорема</a> протокол 2PC представляет собой строгую <strong>CP-систему</strong>. Он выбирает консистентность любой ценой, жертвуя доступностью при сетевых сбоях.</p>
+<p>Чтобы протокол переживал аварии питания и внезапные падения операционной системы, каждый шаг фиксируется в журналах:</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Лог Координатора</span>
   </div>
   <div class="callout-body">
-    <p>Самый критичный момент — запись решения координатором в свой лог перед отправкой фазы 2. Как только координатор записал <code>COMMIT</code> на диск, транзакция считается завершенной. Даже если координатор упадет сразу после записи, при рестарте он прочитает лог и «дожмет» участников, отправив им <code>COMMIT</code> повторно. Без этого лога система превратилась бы в неконсистентный хаос.</p>
+    <p>Самый критический момент во всем протоколе 2PC — <strong>момент записи решения координатора в собственный лог перед рассылкой второй фазы</strong>.<br />
+Как только координатор сбросил запись <code>COMMIT</code> на диск через системный вызов <code>fsync</code>, транзакция юридически считается зафиксированной на вечные времена.<br />
+Если координатор внезапно сгорит или перезагрузится через микросекунду после записи в лог (до отправки сетевых пакетов участникам), при рестарте процесс Crash Recovery прочитает файл лога, обнаружит статус <code>COMMIT</code> и «дожмет» участников, повторно отправив им подтверждение фиксации. Без этого журнала система моментально скатилась бы в неконсистентный хаос.</p>
   </div>
 </div>
 
-<h3 id="xa-transactions">XA Transactions</h3>
-<p>В мире энтерпрайза 2PC часто реализуется через стандарт <strong>XA (eXtended Architecture)</strong>. Большинство реляционных БД (MySQL, PostgreSQL, Oracle) поддерживают XA. Это позволяет вашему Go-приложению выступать в роли менеджера транзакций, связывая две разные базы данных.</p>
+<h3 id="xa-transactions-standart-industrii">XA Transactions: Стандарт индустрии</h3>
+<p>В промышленном сегменте реляционных СУБД протокол 2PC стандартизован спецификацией <strong>XA (eXtended Architecture)</strong>. Практически все взрослые реляционные базы данных — PostgreSQL, MySQL (InnoDB), Oracle и Microsoft SQL Server — нативно поддерживают синтаксис XA. Это позволяет бэкенд-приложению на Go выступать в роли внешнего менеджера транзакций, связывающего две совершенно разные физические СУБД в единую неделимую операцию.</p>
 <hr />
 <h2 id="3-glavnaya-problema-blokirovki-i-tochka-otkaza">3. Главная проблема: Блокировки и "Точка отказа"</h2>
 
-<p>Почему 2PC называют «протоколом-убийцей производительности»?</p>
+<p>Почему в среде современных распределенных систем протокол 2PC называют «протоколом-убийцей производительности»?</p>
 <ol>
-<li><strong>Длительные блокировки:</strong> Участники держат блокировки строк с момента получения <code>PREPARE</code> до получения <code>COMMIT/ROLLBACK</code>. В распределенной системе это время включает в себя сетевые задержки (RTT). Если сеть мигнет, вся база будет стоять на блокировках, ожидая решения.</li>
-<li><strong>Проблема падения Координатора:</strong> Если координатор упал <em>после</em> того, как участники ответили «ДА», но <em>до</em> того, как разослал решение, участники оказываются в «подвешенном» состоянии. Они не знают, чем закончился коммит, и <strong>не могут отпустить блокировки</strong>, так как это нарушит атомарность.</li>
+<li><strong>Длительные блокировки (Lock Amplification):</strong><br />
+   Участники удерживают эксклюзивные блокировки строк с момента получения команды <code>PREPARE</code> вплоть до получения <code>COMMIT/ROLLBACK</code>. Если в локальной базе это занимает доли миллисекунды, то в 2PC это время включает в себя сетевой round-trip по всей распределенной инфраструктуре. Пока сеть передает пакеты, все параллельные транзакции, желающие модифицировать те же строки, выстраиваются в мертвую очередь ожидания.</li>
+<li><strong>Проблема падения Координатора (In-Doubt State):</strong><br />
+   Представьте ситуацию: все участники успешно выполнили <code>PREPARE</code> и ответили <code>VOTE_COMMIT</code>. В этот момент координатор внезапно умирает (Kernel Panic, сбой питания).<br />
+   Участники оказываются в катастрофическом <strong>подвешенном состоянии (In-Doubt State)</strong>: они <strong>не имеют права самостоятельно закоммитить</strong> транзакцию (вдруг координатор упал из-за того, что соседний участник ответил отказом?), но и <strong>не имеют права откатить ее</strong> (вдруг координатор успел закоммитить ее у себя в логе!). Участники вынуждены бесконечно удерживать блокировки строк, парализуя работу всей базы данных, пока упавший координатор не восстановится.</li>
 </ol>
 <div class="callout callout-interview">
   <div class="callout-header">
@@ -2264,20 +2273,24 @@ P2--&gt;&gt;C: ACK
     <span class="callout-title">Собеседование: Блокирующий протокол</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Является ли 2PC блокирующим протоколом?<br />
-<strong>Ответ:</strong> Да. Это его главный недостаток. В случае падения координатора в определенный момент времени, участники вынуждены ждать его восстановления, блокируя ресурсы. Это радикально снижает доступность (<strong>Availability</strong>) системы.</p>
+    <p><strong>Вопрос:</strong> Является ли протокол Two-Phase Commit блокирующим протоколом и можно ли считать его полностью отказоустойчивым?</p>
+<p><strong>Ответ:</strong> <strong>Да, 2PC — строго блокирующий протокол.</strong> Это его главный архитектурный изъян. В случае падения координатора в фазе фиксации участники вынуждены ждать его восстановления неопределенное время, блокируя ресурсы операционной системы.<br />
+Это радикально снижает доступность (<strong>Availability</strong>) кластера. Попытка устранить блокировки привела к созданию протокола Three-Phase Commit (3PC), однако в условиях реальных сетевых разделений (Network Partitions) 3PC не гарантирует консистентность при разорванной сети.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="4-mechanical-sympathy-tsena-setevykh-raundov">4. Mechanical Sympathy: Цена сетевых раундов</h2>
 
-<p>Для бэкенд-инженера важно понимать физику: 2PC требует как минимум два полных сетевых раунда (Round-trips) между координатором и всеми участниками. </p>
-<p>Если задержка между ДЦ составляет 20мс, то только на «общение» уйдет минимум 80мс. В это время CPU простаивает в ожидании сетевого IO, а горутины в Go висят, занимая память. В высоконагруженных системах это приводит к исчерпанию пула соединений БД и лимитов на дескрипторы файлов.</p>
+<p>С точки зрения аппаратных ресурсов и сетевого стека Linux, выполнение 2PC обходится крайне дорого: протокол требует как минимум <strong>два полных сетевых раунда (Round-Trips)</strong> между координатором и всеми узлами кластера.</p>
+<p>Если межсерверная задержка (RTT) между дата-центрами составляет 20 мс, то чистый сетевой оверхед на координацию одной транзакции составит не менее:<br />
+$$20\text{ мс} \times 2 \times 2 = 80\text{ мс}$$<br />
+(плюс время вызовов <code>fsync</code> журналов WAL на всех узлах).</p>
+<p>В течение этих 80 миллисекунд процессор простаивает в ожидании сетевого ввода-вывода (I/O Wait), горутины в Go висят на сетевых полингах, а соединения в пуле <code>database/sql</code> остаются занятыми. В высоконагруженных системах с десятками тысяч RPS это приводит к мгновенному исчерпанию пула соединений СУБД, переполнению дескрипторов файлов ОС и падению всей системы.</p>
 <hr />
 <h2 id="5-2pc-protiv-sagas">5. 2PC против Sagas</h2>
 
-<p>Когда мы проектируем микросервисы на Go, мы часто выбираем между 2PC и <a href="10-saga-pattern.html" class="wikilink">10. Saga pattern</a>.</p>
+<p>При проектировании архитектуры микросервисов на Go инженеры регулярно сопоставляют классический 2PC и распределенные саги (<a href="10-saga-pattern.html" class="wikilink">10. Saga pattern</a>):</p>
 <div class="table-container"><table>
 <thead>
 <tr>
@@ -2289,23 +2302,28 @@ P2--&gt;&gt;C: ACK
 <tbody>
 <tr>
 <td style="text-align: left;"><strong>Консистентность</strong></td>
-<td style="text-align: left;">Строгая (ACID)</td>
-<td style="text-align: left;">В конечном счете (Eventual)</td>
+<td style="text-align: left;">Строгая линеаризуемость (ACID)</td>
+<td style="text-align: left;">В конечном счете (Eventual Consistency)</td>
 </tr>
 <tr>
 <td style="text-align: left;"><strong>Изоляция</strong></td>
-<td style="text-align: left;">Высокая (локи на уровне БД)</td>
-<td style="text-align: left;">Низкая (эффект «грязного чтения»)</td>
+<td style="text-align: left;">Высокая (локи на уровне движков СУБД)</td>
+<td style="text-align: left;">Низкая (эффект «грязного чтения» бизнес-логики)</td>
 </tr>
 <tr>
 <td style="text-align: left;"><strong>Сложность</strong></td>
-<td style="text-align: left;">На уровне инфраструктуры (XA)</td>
-<td style="text-align: left;">На уровне бизнес-логики</td>
+<td style="text-align: left;">На уровне инфраструктуры и драйверов (XA)</td>
+<td style="text-align: left;">На уровне прикладного бизнес-кода и компенсаций</td>
 </tr>
 <tr>
 <td style="text-align: left;"><strong>Производительность</strong></td>
-<td style="text-align: left;">Низкая (из-за блокировок)</td>
-<td style="text-align: left;">Высокая (асинхронно)</td>
+<td style="text-align: left;">Экстремально низкая (из-за блокировок)</td>
+<td style="text-align: left;">Высокая (асинхронная реактивная обработка)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Отказоустойчивость</strong></td>
+<td style="text-align: left;">Блокируется при отказе координатора</td>
+<td style="text-align: left;">Продолжает работать через очереди сообщений</td>
 </tr>
 </tbody>
 </table></div>
@@ -2315,13 +2333,16 @@ P2--&gt;&gt;C: ACK
     <span class="callout-title">Ловушка / Gotcha: 2PC в микросервисах</span>
   </div>
   <div class="callout-body">
-    <p>Использование 2PC между микросервисами через HTTP/gRPC — это архитектурный антипаттерн. 2PC требует «доверия» на уровне ресурсов. Если один сервис упадет и не поднимется, он заблокирует базу данных другого сервиса. В микросервисной среде всегда отдавайте предпочтение паттерну <strong>Saga</strong> или <strong>Outbox pattern</strong>.</p>
+    <p>Попытка натянуть протокол 2PC на межсервисное взаимодействие микросервисов через HTTP/REST или gRPC — это хрестоматийный архитектурный антипаттерн.<br />
+2PC требует глубокого доверия на уровне системных ресурсов: если микросервис склада упадет посреди транзакции, он заблокирует строки в базе данных биллинга, парализовав прием оплат по всему сервису. В распределенной микросервисной среде стандартом де-факто являются <strong>Saga</strong> или <strong>Transactional Outbox pattern</strong>.</p>
   </div>
 </div>
 
-<h2 id="praktika-v-go">Практика в Go</h2>
+<hr />
+<h2 id="praktika-v-go-rabota-s-xa-v-sql">Практика в Go: Работа с XA в SQL</h2>
 
-<p>Стандартная библиотека <code>database/sql</code> не поддерживает распределенные транзакции XA «из коробки» (нет метода <code>Prepare()</code>). Для реализации 2PC в Go обычно требуются специализированные драйверы или внешние менеджеры транзакций (например, <strong>dtm</strong> — Distributed Transaction Manager).</p>
+<p>Стандартная библиотека <code>database/sql</code> в Go не содержит нативных методов для управления фазами XA-транзакций (в интерфейсе <code>sql.Tx</code> нет метода <code>Prepare()</code> для фиксации двухфазного коммита, а есть только локальные <code>Commit</code> и <code>Rollback</code>). </p>
+<p>Однако при необходимости связать две базы данных MySQL или PostgreSQL разработчик на Go может управлять XA-состоянием напрямую через сырые SQL-команды протокола XA:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2331,41 +2352,78 @@ P2--&gt;&gt;C: ACK
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Пример концептуальной реализации (требуется поддержка драйвера)
-func DistributedTx(db1, db2 *sql.DB) error {
-    // 1. Начинаем XA транзакции на обеих БД
-    _, _ = db1.Exec(&quot;XA START 'tx123'&quot;)
-    _, _ = db2.Exec(&quot;XA START 'tx123'&quot;)
+  <pre class="language-go"><code class="language-go">package main
 
-    // 2. Выполняем работу...
+import (
+    &quot;context&quot;
+    &quot;database/sql&quot;
+    &quot;fmt&quot;
+    &quot;log&quot;
 
-    // 3. Фаза 1: PREPARE
-    _, err1 := db1.Exec(&quot;XA PREPARE 'tx123'&quot;)
-    _, err2 := db2.Exec(&quot;XA PREPARE 'tx123'&quot;)
+    _ &quot;github.com/go-sql-driver/mysql&quot;
+)
 
-    if err1 == nil &amp;&amp; err2 == nil {
-        // 4. Фаза 2: COMMIT
-        db1.Exec(&quot;XA COMMIT 'tx123'&quot;)
-        db2.Exec(&quot;XA COMMIT 'tx123'&quot;)
-    } else {
-        // Или ROLLBACK
-        db1.Exec(&quot;XA ROLLBACK 'tx123'&quot;)
-        db2.Exec(&quot;XA ROLLBACK 'tx123'&quot;)
+// DistributedTx демонстрирует концептуальное выполнение XA 2PC в Go
+func DistributedTx(ctx context.Context, db1, db2 *sql.DB) error {
+    const xid = &quot;'tx_order_12345'&quot;
+
+    // 1. Старт транзакций на обеих БД
+    if _, err := db1.ExecContext(ctx, &quot;XA START &quot;+xid); err != nil {
+        return fmt.Errorf(&quot;db1 xa start: %w&quot;, err)
     }
-    return nil
+    if _, err := db2.ExecContext(ctx, &quot;XA START &quot;+xid); err != nil {
+        _, _ = db1.ExecContext(ctx, &quot;XA END &quot;+xid)
+        _, _ = db1.ExecContext(ctx, &quot;XA ROLLBACK &quot;+xid)
+        return fmt.Errorf(&quot;db2 xa start: %w&quot;, err)
+    }
+
+    // 2. Выполнение полезной бизнес-логики (DML)
+    _, err1 := db1.ExecContext(ctx, &quot;UPDATE billing SET balance = balance - 100 WHERE id = 1&quot;)
+    _, err2 := db2.ExecContext(ctx, &quot;UPDATE stock SET count = count - 1 WHERE id = 42&quot;)
+
+    // Переводим транзакции в состояние IDLE
+    _, _ = db1.ExecContext(ctx, &quot;XA END &quot;+xid)
+    _, _ = db2.ExecContext(ctx, &quot;XA END &quot;+xid)
+
+    if err1 != nil || err2 != nil {
+        _, _ = db1.ExecContext(ctx, &quot;XA ROLLBACK &quot;+xid)
+        _, _ = db2.ExecContext(ctx, &quot;XA ROLLBACK &quot;+xid)
+        return fmt.Errorf(&quot;business logic failed: err1=%v, err2=%v&quot;, err1, err2)
+    }
+
+    // 3. ФАЗА 1: PREPARE (Голосование)
+    _, prepErr1 := db1.ExecContext(ctx, &quot;XA PREPARE &quot;+xid)
+    _, prepErr2 := db2.ExecContext(ctx, &quot;XA PREPARE &quot;+xid)
+
+    // 4. ФАЗА 2: COMMIT или ROLLBACK
+    if prepErr1 == nil &amp;&amp; prepErr2 == nil {
+        // Оба узла подтвердили готовность: фиксируем изменения
+        _, _ = db1.ExecContext(ctx, &quot;XA COMMIT &quot;+xid)
+        _, _ = db2.ExecContext(ctx, &quot;XA COMMIT &quot;+xid)
+        log.Println(&quot;Distributed transaction committed successfully&quot;)
+        return nil
+    }
+
+    // Хотя бы один узел упал или не готов: откатываем обоих
+    _, _ = db1.ExecContext(ctx, &quot;XA ROLLBACK &quot;+xid)
+    _, _ = db2.ExecContext(ctx, &quot;XA ROLLBACK &quot;+xid)
+    return fmt.Errorf(&quot;prepare failed: p1=%v, p2=%v&quot;, prepErr1, prepErr2)
 }
 </code></pre>
 </div>
 
-<h2 id="itog">Итог</h2>
+<p>Для промышленных задач в экосистеме Go рекомендуется использовать проверенные специализированные менеджеры транзакций, такие как <strong>DTM (Distributed Transaction Manager)</strong>, который берет на себя надежное ведение журнала координатора и разрешение In-Doubt состояний.</p>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>2PC</strong> обеспечивает строгую атомарность в распределенной среде через две фазы: Голосование и Фиксация.</li>
-<li>Это <strong>синхронный и блокирующий</strong> протокол, который плохо масштабируется и чувствителен к сетевым задержкам.</li>
-<li>Главная уязвимость — «зависание» участников при падении координатора.</li>
-<li>В современном облачном бэкенде 2PC заменяется более гибким паттерном <strong>Saga</strong>, который мы разберем в следующей статье: <a href="10-saga-pattern.html" class="wikilink">10. Saga pattern</a>.</li>
+<li><strong>Two-Phase Commit (2PC)</strong> — классический протокол строгой атомарности распределенных данных, состоящий из фазы голосования (<code>PREPARE</code>) и фазы фиксации (<code>COMMIT</code>).</li>
+<li>Это <strong>жестко синхронный и блокирующий</strong> протокол: строки баз данных остаются заблокированными на все время сетевого обмена.</li>
+<li>Главная архитектурная уязвимость 2PC — <strong>зависание участников в In-Doubt состоянии</strong> при внезапном падении координатора после первой фазы.</li>
+<li>В современной микросервисной разработке 2PC практически полностью уступил место событийно-ориентированному паттерну <strong>Saga</strong>, который решает проблему распределенной согласованности без блокировок ресурсов.</li>
 </ol>
-<p>Мы закончили с классическими методами консенсуса. Теперь пора переходить к тому, как современные распределенные системы решают проблему атомарности без жестких блокировок, используя событийную модель. В следующей статье: <a href="10-saga-pattern.html" class="wikilink">10. Saga pattern</a>.</p>
+<p>Теперь мы готовы погрузиться в архитектурный стандарт современных распределенных систем, позволяющий микросервисам жить в гармонии без глобальных блокировок.</p>
+<p>В следующей лекции мы досконально разберем проектирование саг — <a href="10-saga-pattern.html" class="wikilink">10. Saga pattern</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2393,7 +2451,7 @@ func DistributedTx(db1, db2 *sql.DB) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#two-phase-commit-2pc-klassika-raspredelennogo-konsensusa">Two-Phase Commit (2PC): Классика распределенного консенсуса</a></li><li class="toc-item toc-h2"><a href="#1-roli-i-stsenariy">1. Роли и сценарий</a></li><li class="toc-item toc-h3"><a href="#faza-1-golosovanie-prepare-phase">Фаза 1: Голосование (Prepare Phase)</a></li><li class="toc-item toc-h3"><a href="#faza-2-zavershenie-commit-phase">Фаза 2: Завершение (Commit Phase)</a></li><li class="toc-item toc-h2"><a href="#2-pod-kapotom-mekhanika-nadezhnosti">2. Под капотом: Механика надежности</a></li><li class="toc-item toc-h3"><a href="#xa-transactions">XA Transactions</a></li><li class="toc-item toc-h2"><a href="#3-glavnaya-problema-blokirovki-i-tochka-otkaza">3. Главная проблема: Блокировки и &quot;Точка отказа&quot;</a></li><li class="toc-item toc-h2"><a href="#4-mechanical-sympathy-tsena-setevykh-raundov">4. Mechanical Sympathy: Цена сетевых раундов</a></li><li class="toc-item toc-h2"><a href="#5-2pc-protiv-sagas">5. 2PC против Sagas</a></li><li class="toc-item toc-h2"><a href="#praktika-v-go">Практика в Go</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#two-phase-commit-2pc-klassika-raspredelennogo-konsensusa">Two-Phase Commit (2PC): Классика распределенного консенсуса</a></li><li class="toc-item toc-h2"><a href="#1-roli-i-stsenariy">1. Роли и сценарий</a></li><li class="toc-item toc-h3"><a href="#faza-1-golosovanie-prepare-phase">Фаза 1: Голосование (Prepare Phase)</a></li><li class="toc-item toc-h3"><a href="#faza-2-zavershenie-commit-phase">Фаза 2: Завершение (Commit Phase)</a></li><li class="toc-item toc-h2"><a href="#2-pod-kapotom-mekhanika-nadezhnosti">2. Под капотом: Механика надежности</a></li><li class="toc-item toc-h3"><a href="#xa-transactions-standart-industrii">XA Transactions: Стандарт индустрии</a></li><li class="toc-item toc-h2"><a href="#3-glavnaya-problema-blokirovki-i-tochka-otkaza">3. Главная проблема: Блокировки и &quot;Точка отказа&quot;</a></li><li class="toc-item toc-h2"><a href="#4-mechanical-sympathy-tsena-setevykh-raundov">4. Mechanical Sympathy: Цена сетевых раундов</a></li><li class="toc-item toc-h2"><a href="#5-2pc-protiv-sagas">5. 2PC против Sagas</a></li><li class="toc-item toc-h2"><a href="#praktika-v-go-rabota-s-xa-v-sql">Практика в Go: Работа с XA в SQL</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

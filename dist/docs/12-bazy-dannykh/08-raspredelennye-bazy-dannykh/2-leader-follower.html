@@ -2168,7 +2168,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Leader Follower</h1>
@@ -2177,33 +2177,22 @@
           <div class="article-markdown">
             <h2 id="arkhitektura-leader-follower">Архитектура Leader-Follower</h2>
 
-<p>В предыдущей статье мы разобрали, <em>как</em> данные передаются (синхронно или асинхронно). Теперь поговорим о том, <em>кто</em> именно передает данные и как устроена иерархия узлов.</p>
-<p>Самая распространенная топология в мире реляционных баз данных (PostgreSQL, MySQL) и даже в некоторых NoSQL (Redis) — это <strong>Leader-Follower</strong> (ранее известная как Master-Slave).</p>
-<p>Это асимметричная архитектура. В ней существует строгое разделение ролей:<br />
-1.  <strong>Leader (Primary/Master):</strong> Единственный узел, который принимает запросы на запись (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>).<br />
-2.  <strong>Follower (Replica/Slave/Standby):</strong> Узлы, которые копируют изменения с лидера и обслуживают только запросы на чтение (<code>SELECT</code>).</p>
+<p>В предыдущей лекции (<a href="1-replikatsiya-sync-vs-async.html" class="wikilink">1. Репликация. Sync vs Async</a>) мы детально исследовали физику передачи байтов по сети: разницу между синхронной фиксацией транзакций и асинхронным сбросом журналов. Теперь пришло время подняться на уровень выше и ответить на фундаментальный топологический вопрос: <em>кто именно в кластере наделен правом изменять состояние мира, а кто обязан послушно следовать за изменениями?</em></p>
+<p>В мире реляционных систем управления базами данных (PostgreSQL, MySQL), а также во многих масштабируемых NoSQL-хранилищах (Redis, MongoDB) безусловным стандартом де-факто является топология <strong>Leader-Follower</strong> (исторически именовавшаяся Master-Slave или Primary-Standby).</p>
+<p>Это классическая асимметричная архитектура, построенная на жестком, бескомпромиссном разделении ролей:<br />
+1. <strong>Leader (Primary / Master):</strong> Единственный, полномочный узел кластера, которому прикладные сервисы имеют право отправлять модифицирующие операции (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>ALTER TABLE</code>).<br />
+2. <strong>Follower (Replica / Slave / Standby):</strong> Подчиненные узлы, непрерывно считывающие поток журналов репликации (WAL / Binlog) с лидера и обслуживающие исключительно запросы на чтение (<code>SELECT</code>).</p>
 <hr />
 <h2 id="pochemu-tolko-odin-leader">Почему только один Leader?</h2>
 
-<p>Вы можете спросить: «Почему бы не разрешить запись всем узлам? Это же увеличит производительность записи!»</p>
-<p>Проблема кроется в <strong>конфликтах</strong>. Если два клиента одновременно обновят одну и ту же строку на разных узлах, возникнет конфликт записи. В распределенной системе разрешение таких конфликтов — это сложнейшая задача, требующая либо блокировок на кластере (что убивает производительность), либо сложных алгоритмов слияния данных (CRDTs).</p>
-<p>Ограничение записи одним узлом (Leader) решает эту проблему радикально: на Leader-е сохраняется естественный для однопоточных (или многопоточных с локальными блокировками) баз данных порядок операций. Лидер становится <strong>единым источником истины</strong> (Source of Truth) для порядка изменений.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>В классических РСУБД (PostgreSQL, MySQL) транзакции и блокировки (Locks) работают корректно только в рамках одного процесса/инстанса. Чтобы перенести механизм блокировок на распределенный уровень (Distributed Locks), требуются внешние системы вроде ZooKeeper или etcd, что добавляет огромную сложность и задержки.</p>
-  </div>
-</div>
-
-<hr />
-<h2 id="zhiznennyy-tsikl-zapisi-i-chteniya">Жизненный цикл записи и чтения</h2>
-
-<h3 id="1-stsenariy-zapisi-write-path">1. Сценарий записи (Write Path)</h3>
-
-<p>Клиент <strong>всегда</strong> отправляет запросы на модификацию данных только на Leader.</p>
+<p>Естественный инженерный порыв разработчика, столкнувшегося с потолком производительности записи, звучит так: <em>«Почему бы нам не открыть на запись все узлы кластера сразу? Мы сможем кратно увеличить суммарный входящий RPS!»</em></p>
+<p>Однако за этой иллюзорной простотой скрывается главный кошмар распределенных систем — <strong>конкурентные конфликты записи (Write Conflicts)</strong>. </p>
+<p>Представьте, что две параллельные горутины в разных концах света одновременно отправляют запрос на списание последних 100 рублей со счета клиента. Если оба узла имеют право писать, узел А успешно спишет деньги в адрес банка Х, а узел Б — в адрес банка Y. Когда эти транзакции попытаются реплицироваться друг на друга, данные разойдутся, а баланс станет неконсистентным. </p>
+<p>Разрешение подобных коллизий постфактум требует либо тяжелых распределенных двухфазных блокировок (что убивает производительность на корню), либо сложных математических моделей вроде бескликовых типов данных (<strong>CRDTs</strong>).</p>
+<p>Архитектура с <strong>одним лидером (Single-Leader)</strong> устраняет эту проблему радикально и элегантно:<br />
+- Все запросы на модификацию выстраиваются в единую детерминированную очередь на одном узле.<br />
+- Лидер накладывает стандартные локальные строчные блокировки ядра ОС и фиксирует хронологический порядок коммитов.<br />
+- Лидер становится <strong>единым источником истины (Single Source of Truth)</strong> для глобальной истории изменений.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2218,52 +2207,80 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Клиент App&quot;] --&gt;|&quot;INSERT/UPDATE&quot;| B[&quot;Leader&lt;br&gt;Принимает запись&quot;]
-B --&gt;|&quot;Запись в WAL&quot;| C[&quot;Локальный диск&quot;]
-B --&gt;|&quot;Отправка логов&quot;| D[&quot;Follower 1&quot;]
-B --&gt;|&quot;Отправка логов&quot;| E[&quot;Follower 2&quot;]
-D --&gt;|&quot;ACK&quot;| B
-E --&gt;|&quot;ACK&quot;| B
+subgraph Clients [&quot;Прикладные сервисы на Go&quot;]
+App1[&quot;Go Service (Writer)&quot;]
+App2[&quot;Go Service (Reader 1)&quot;]
+App3[&quot;Go Service (Reader 2)&quot;]
+end
 
-style B fill:#ff9999,stroke:#333,stroke-width:2px
-style D fill:#99ccff,stroke:#333
-style E fill:#99ccff,stroke:#333
+subgraph Cluster [&quot;Кластер Leader-Follower&quot;]
+L[&quot;&lt;b&gt;Leader (Primary Node)&lt;/b&gt;&lt;br&gt;Единственный узел записи&lt;br&gt;Локальный Lock Manager&quot;]
+WAL[&quot;Локальный WAL на NVMe&quot;]
+F1[&quot;&lt;b&gt;Follower 1 (Read-Only)&lt;/b&gt;&lt;br&gt;Применение WAL&quot;]
+F2[&quot;&lt;b&gt;Follower 2 (Read-Only)&lt;/b&gt;&lt;br&gt;Применение WAL&quot;]
+end
+
+App1 --&gt;|&quot;INSERT / UPDATE&lt;br&gt;(Строго на Leader)&quot;| L
+L --&gt;|&quot;fsync&quot;| WAL
+L --&gt;|&quot;Репликация WAL&quot;| F1
+L --&gt;|&quot;Репликация WAL&quot;| F2
+F1 --&gt;|&quot;ACK&quot;| L
+F2 --&gt;|&quot;ACK&quot;| L
+
+App2 -.-&gt;|&quot;SELECT (Чтение)&quot;| F1
+App3 -.-&gt;|&quot;SELECT (Чтение)&quot;| F2
+
+style Cluster fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style L fill:#1e293b,stroke:#f43f5e,stroke-width:2px
+style F1 fill:#1e293b,stroke:#34d399,stroke-width:1px
+style F2 fill:#1e293b,stroke:#34d399,stroke-width:1px
+style WAL fill:#1e293b,stroke:#818cf8,stroke-width:1px
   </pre>
 </div>
 
 
-<p>Leader обрабатывает транзакцию, записывает её в свой журнал предзаписи (WAL) и, в зависимости от настроек (Sync/Async), отправляет данные_FOLLOWERS.</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом</span>
+  </div>
+  <div class="callout-body">
+    <p>В классических СУБД (PostgreSQL, MySQL) менеджер блокировок (Lock Manager) и разделяемая память транзакций (<code>shared_buffers</code>, <code>Buffer Pool</code>) спроектированы для работы строго в рамках одного физического сервера. Попытка вынести строчные блокировки в распределенную сеть (Distributed Locks) потребовала бы сетевого консенсуса (на базе etcd, ZooKeeper или Raft) на каждый чих, увеличив время выполнения простейшего <code>UPDATE</code> с 0.2 мс до 15–20 мс.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="zhiznennyy-tsikl-zapisi-i-chteniya">Жизненный цикл записи и чтения</h2>
+
+<h3 id="1-stsenariy-zapisi-write-path">1. Сценарий записи (Write Path)</h3>
+
+<p>Прикладной клиент на Go <strong>всегда и без исключений</strong> направляет запросы на изменение данных на текущий Leader-узел. </p>
+<p>Лидер обрабатывает транзакцию, проверяет внешние ключи и уникальные индексы, записывает изменения в свой журнал предзаписи (WAL) и, в зависимости от режима (Sync, Semi-Sync или Async), пересылает события подчиненным узлам. После подтверждения локальной или кластерной фиксации клиент получает статус успеха.</p>
 <h3 id="2-stsenariy-chteniya-read-path">2. Сценарий чтения (Read Path)</h3>
 
-<p>Запросы на чтение (<code>SELECT</code>) могут быть направлены как на Leader, так и на Follower-ов. Это позволяет масштабировать чтение горизонтально. Если у вас 5 реплик, вы можете обрабатывать в 5 раз больше запросов на чтение (теоретически), чем при одной ноде.</p>
-<p>Однако, здесь кроется подвох, о котором мы говорили в прошлой статье: <strong>Replication Lag</strong>.</p>
-<p>Если вы используете асинхронную репликацию (стандарт для 99% высоконагруженных систем), чтение с Follower-а может вернуть устаревшие данные.</p>
+<p>Запросы на чтение (<code>SELECT</code>) могут обрабатываться как лидером, так и распределяться между любым количеством реплик (Followers). Это открывает возможность практически линейного горизонтального масштабирования операций чтения (<strong>Read Scaling</strong>): если одна нода способна отдавать 10 000 SELECT в секунду, кластер из 5 реплик теоретически обслужит до 50 000 RPS.</p>
+<p>Однако за масштабирование чтения приходится платить фундаментальным компромиссом распределенных систем: <strong>Replication Lag (Отставание реплики)</strong>.</p>
+<p>В асинхронном режиме репликации Follower неизбежно отстает от Leader на несколько миллисекунд (а при тяжелых фоновых миграциях — на секунды или минуты).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Аномалия Read-After-Write Consistency</span>
   </div>
   <div class="callout-body">
-    <p><strong>Read-After-Write Consistency.</strong><br />
-Пользователь меняет аватарку (запись на Leader). Страница перезагружается, и запрос на получение аватарки идет на Follower.<br />
-Из-за лага репликации Follower еще не знает про новую аватарку. Пользователь видит старую.<br />
-<strong>Решение:</strong> Для данных, которые только что изменил пользователь, направлять чтение принудительно на Leader. Это можно реализовать в Go-мидлвари, проверяя, есть ли в сессии пользователя флаг "недавняя запись".</p>
+    <p><strong>Сценарий сбоя:</strong><br />
+Пользователь загружает новую аватарку в профиль. Запрос уходит на Leader, файл сохраняется, транзакция коммитится за 2 мс.<br />
+Браузер немедленно перегружает страницу и запрашивает URL аватарки. Балансировщик направляет этот <code>SELECT</code> на Follower 2.  </p>
+<p>Из-за сетевой задержки или занятости CPU реплика отстает на 40 мс: она еще не применила WAL-запись с новой аватаркой. Пользователь видит пустой экран со старой фотографией, считает, что сервис завис, и начинает повторно загружать файл, перегружая бэкенд.  </p>
+<p><strong>Решение Senior-уровня:</strong><br />
+В Go-мидлварях для эндпоинтов профиля реализуется паттерн <strong>Sticky Master</strong>: после любой успешной операции записи в сессию пользователя (или в cookie / JWT / Redis) пишется временная метка <code>last_write_at</code>. Все последующие операции чтения этого пользователя в течение ближайших 2–3 секунд принудительно направляются на Leader, минуя отстающие реплики.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="otkazoustoychivost-i-failover">Отказоустойчивость и Failover</h2>
 
-<p>Что происходит, когда Leader падает (отказ диска, сбой питания, сетевая изоляция)?</p>
-<p>Поскольку запись может делать только он, кластер становится <strong>недоступным для записи</strong>. Системе нужно выбрать нового лидера. Этот процесс называется <strong>Failover</strong>.</p>
-<h3 id="etapy-failover">Этапы Failover</h3>
-
-<ol>
-<li><strong>Обнаружение сбоя (Failure Detection):</strong> Follow-еры или внешний наблюдатель (Sentinel, Patroni, Orchestrator) замечают, что Leader не отвечает на "сердцебиение" (heartbeats) в течение таймаута.</li>
-<li><strong>Выбор нового лидера (Leader Election):</strong> Среди Follower-ов выбирается кандидат с самыми свежими данными (минимальный Lag). Обычно это реплика с наибольшим LSN (Log Sequence Number) в PostgreSQL или GTID в MySQL.</li>
-<li><strong>Повышение (Promotion):</strong> Выбранный Follower становится новым Leader-ом и начинает принимать запросы на запись.</li>
-<li><strong>Переконфигурация (Reconfiguration):</strong> Остальные Follower-ы должны начать читать логи уже с нового Leader-а. Клиенты (ваше Go-приложение) должны узнать новый адрес Leader-а.</li>
-</ol>
+<p>Что произойдет, если Leader внезапно выйдет из строя (отказ контроллера накопителя, сбой питания серверной стойки, Kernel Panic или потеря сетевой связности)?</p>
+<p>Поскольку принимать запись уполномочен только он, весь кластер мгновенно <strong>теряет способность к записи (Write Unavailability)</strong>. Чтобы вернуть систему к жизни, кластер обязан выбрать нового лидера. Этот процесс называется <strong>Failover (Аварийное переключение)</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2278,42 +2295,55 @@ style E fill:#99ccff,stroke:#333
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant App as Go App
-participant L as Leader - FAILED
-participant F1 as Follower 1
-participant Monitor as Monitor - Patroni
+autonumber
+participant App as Go Microservice
+participant Leader as Leader (Primary - FAILED)
+participant Monitor as HA Manager (Patroni / Raft / etcd)
+participant Follower as Follower 1 (Candidate)
 
-L--xMonitor: Heartbeats stopped
-Note over Monitor: Timeout exceeded
-Monitor-&gt;&gt;F1: Promote to Leader
-F1-&gt;&gt;F1: Open for writes
-Monitor-&gt;&gt;App: Update DNS - VIP
-App-&gt;&gt;F1: Writes go here now
+Leader--xMonitor: Потеря Heartbeat (Сбой питания / Сети)
+Note over Monitor: Истек TTL аренды (Lease Timeout: 10s)
+Monitor-&gt;&gt;Leader: STONITH / Fencing (Принудительная изоляция)
+Monitor-&gt;&gt;Follower: Leader Election (Наибольший LSN / GTID)
+Follower-&gt;&gt;Follower: Promote to Primary (Открытие на запись)
+Monitor-&gt;&gt;App: Обновление Service Discovery / DNS / VIP
+App-&gt;&gt;Follower: Новые запросы на запись идут сюда!
   </pre>
 </div>
 
 
+<h3 id="etapy-klassicheskogo-failover">Этапы классического Failover:</h3>
+<ol>
+<li><strong>Обнаружение сбоя (Failure Detection):</strong> Внешний наблюдатель (Watchdog / HA-оркестратор вроде Patroni, Stolon, Orchestrator или Redis Sentinel) непрерывно опрашивает лидера через «сердцебиения» (<strong>Heartbeats</strong>). Если лидер не отвечает в течение заданного порога (например, 10 секунд), объявляется аварийная ситуация.</li>
+<li><strong>Выбор нового лидера (Leader Election):</strong> Среди всех доступных реплик оркестратор проводит аудит состояния. Лидером может стать только тот узел, который обладает наиболее актуальными данными (минимальным лагом). В PostgreSQL для этого сравнивается номер позиции в журнале — <strong>LSN (Log Sequence Number)</strong>, в MySQL — глобальный счетчик <strong>GTID</strong>.</li>
+<li><strong>Повышение роли (Promotion):</strong> Выбранный Follower выходит из режима репликации (Standby Mode), накатывает остаток локального журнала и открывается для приема запросов на запись (<code>Read-Write</code>).</li>
+<li><strong>Переконфигурация (Reconfiguration):</strong> Оставшиеся реплики переподключаются к новому лидеру и начинают получать WAL от него. Прикладные сервисы на Go через механизмы Service Discovery (Consul, DNS, etcd) или переключение плавающего виртуального IP (<strong>VIP</strong>) направляют трафик записи на новый адрес.</li>
+</ol>
 <h3 id="problemy-failover">Проблемы Failover</h3>
 
-<p>Failover — это момент максимальной уязвимости системы. Здесь возникают сложные кейсы:</p>
+<p>Failover — это момент максимальной уязвимости системы. Здесь возникают сложные распределенные сценарии:</p>
 <ol>
-<li>
-<p><strong>Split-Brain (Расщепление мозга):</strong> Сетевой сбой изолировал старого Leader-а от остального кластера. Follower-ы выбрали нового Leader-а. Но старый Leader всё еще жив и думает, что он главный. Теперь у вас два узла, принимающих запись. Данные расходятся.</p>
-<ul>
-<li><em>Решение:</em> Fencing (отстрел) старого лидера. Система должна гарантировать, что старый лидер окончательно изолирован или выключен (например, через STONITH — Shoot The Other Node In The Head).</li>
-</ul>
-</li>
-<li>
-<p><strong>Потеря данных:</strong> Если использовалась асинхронная репликация, а старый лидер упал до того, как успел передать последние транзакции, эти данные потеряны навсегда при промоушене нового лидера.</p>
-</li>
+<li><strong>Split-Brain (Расщепление мозга):</strong><br />
+   Самая опасная катастрофа распределенных систем. Предположим, сетевой сбой разделил дата-центр пополам. Реплики в зоне Б перестали видеть Лидера из зоны А, посчитали его погибшим и выбрали своего нового Лидера.<br />
+   Но старый Лидер в зоне А жив и продолжает принимать запись от локальных клиентов! В этот момент в кластере образуются <strong>два независимых Лидера</strong>, принимающих несогласованные записи. Слить такие данные обратно без ручного вмешательства практически невозможно.<br />
+<em>Защита:</em> Механизм <strong>Fencing</strong> и концепция <strong>STONITH (Shoot The Other Node In The Head)</strong>. Прежде чем активировать нового лидера, распределенный консенсус (etcd/Consul) обязан гарантированно изолировать старого лидера (через аппаратное отключение питания по IPMI, отстрел виртуальной машины через Cloud API или сброс сетевых правил eBPF/iptables).</li>
+<li><strong>Потеря последних данных (Data Loss):</strong><br />
+   Если в кластере использовалась асинхронная репликация, а старый лидер погиб до того, как успел прокачать последние транзакции на реплики, эти данные будут безвозвратно утеряны при промоушене реплики.</li>
 </ol>
 <hr />
-<h2 id="praktika-v-go-kak-rabotat-s-leader-follower">Практика в Go: Как работать с Leader-Follower?</h2>
+<h2 id="praktika-v-go-kak-proektirovat-klient-pod-leader-follower">Практика в Go: Как проектировать клиент под Leader-Follower</h2>
 
-<p>Ваше Go-приложение должно знать, куда слать запросы. Существует несколько стратегий.</p>
+<p>Go-бэкенд не должен быть жестко привязан к одному захардкоженному IP-адресу. Разработчик обязан предусмотреть автоматическое обнаружение ролей и прозрачную обработку смены лидера.</p>
 <h3 id="1-raznye-dsn-data-source-name-v-kode">1. Разные DSN (Data Source Name) в коде</h3>
-
-<p>Самый простой вариант для небольших проектов. Вы создаете два пула соединений.</p>
+<p>Самый простой вариант для небольших проектов: в конфигурации приложения заводятся два независимых DSN (Master DSN и Replica DSN), по которым инициализируются два раздельных пула соединений. <br />
+* <em>Минус:</em> При смене лидера (Failover) приложению требуется перезапуск или ручное обновление конфига, так как адрес нового мастера код не знает.</p>
+<h3 id="2-ispolzovanie-promezhutochnykh-proksi-rekomenduemyy-podkhod">2. Использование промежуточных прокси (Рекомендуемый подход)</h3>
+<p>В зрелых Highload-инфраструктурах микросервисы никогда не подключаются к нодам БД напрямую. Между ними ставится отказоустойчивый слой прокси:<br />
+* <strong>Для PostgreSQL:</strong> PgBouncer в паре с <strong>HAProxy</strong> или кластерным менеджером <strong>Patroni</strong>.<br />
+* <strong>Для MySQL:</strong> <strong>ProxySQL</strong> или MySQL Router.</p>
+<p>Приложение подключается к локальному порту прокси: <code>host=proxy-service port=6432</code>. При возникновении Failover менеджер кластера обновляет состояние бэкендов в HAProxy за доли секунды. Для Go-сервиса это выглядит как микросекундный сетевой разрыв, который легко парируется стандартным пулом соединений и ретраями.</p>
+<h3 id="3-ispolzovanie-umnykh-drayverov-topology-aware-drivers">3. Использование умных драйверов (Topology-Aware Drivers)</h3>
+<p>Если промежуточный прокси отсутствует, современный драйвер PostgreSQL для Go — <code>jackc/pgx</code> — умеет самостоятельно опрашивать список хостов и динамически определять текущего лидера с помощью параметра <code>target_session_attrs</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2323,62 +2353,111 @@ App-&gt;&gt;F1: Writes go here now
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type DBCluster struct {
-    Leader  *sql.DB
-    Replica *sql.DB
+  <pre class="language-go"><code class="language-go">package database
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;fmt&quot;
+    &quot;time&quot;
+
+    &quot;github.com/jackc/pgx/v5/pgxpool&quot;
+)
+
+// PostgresCluster инкапсулирует умные пулы pgxpool с разделением ролей.
+type PostgresCluster struct {
+    WriterPool *pgxpool.Pool
+    ReaderPool *pgxpool.Pool
 }
 
-func (d *DBCluster) Write(ctx context.Context, query string, args ...any) (sql.Result, error) {
-    // Всегда идем в мастер
-    return d.Leader.ExecContext(ctx, query, args...)
+// NewPostgresCluster инициализирует отказоустойчивое подключение к кластеру.
+func NewPostgresCluster(ctx context.Context, hosts string) (*PostgresCluster, error) {
+    // target_session_attrs=read-write заставляет pgx опрашивать переданные хосты
+    // и подключаться строго к текущему Primary-узлу.
+    writeDSN := fmt.Sprintf(&quot;postgres://user:secret@%s/shop_db?target_session_attrs=read-write&quot;, hosts)
+    writerConfig, err := pgxpool.ParseConfig(writeDSN)
+    if err != nil {
+        return nil, fmt.Errorf(&quot;parse write config: %w&quot;, err)
+    }
+    writerConfig.MaxConns = 25
+
+    writerPool, err := pgxpool.NewWithConfig(ctx, writerConfig)
+    if err != nil {
+        return nil, fmt.Errorf(&quot;connect writer: %w&quot;, err)
+    }
+
+    // target_session_attrs=read-only направляет запросы на подчиненные реплики.
+    readDSN := fmt.Sprintf(&quot;postgres://user:secret@%s/shop_db?target_session_attrs=read-only&quot;, hosts)
+    readerConfig, err := pgxpool.ParseConfig(readDSN)
+    if err != nil {
+        return nil, fmt.Errorf(&quot;parse read config: %w&quot;, err)
+    }
+    readerConfig.MaxConns = 100
+
+    readerPool, err := pgxpool.NewWithConfig(ctx, readerConfig)
+    if err != nil {
+        return nil, fmt.Errorf(&quot;connect reader: %w&quot;, err)
+    }
+
+    return &amp;PostgresCluster{
+        WriterPool: writerPool,
+        ReaderPool: readerPool,
+    }, nil
 }
 
-func (d *DBCluster) Read(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-    // Идем в реплику (с риском прочитать старые данные)
-    return d.Replica.QueryContext(ctx, query, args...)
+// ExecWithRetry выполняет запись с экспоненциальным откатом на случай кратковременного Failover
+func (c *PostgresCluster) ExecWithRetry(ctx context.Context, query string, args ...any) error {
+    const maxAttempts = 3
+    backoff := 100 * time.Millisecond
+
+    for attempt := 1; attempt &lt;= maxAttempts; attempt++ {
+        _, err := c.WriterPool.Exec(ctx, query, args...)
+        if err == nil {
+            return nil
+        }
+
+        if attempt == maxAttempts {
+            return fmt.Errorf(&quot;exec failed after %d attempts: %w&quot;, maxAttempts, err)
+        }
+
+        select {
+        case &lt;-ctx.Done():
+            return ctx.Err()
+        case &lt;-time.After(backoff):
+            backoff *= 2 // Экспоненциальный откат
+        }
+    }
+
+    return errors.New(&quot;max retry attempts exceeded&quot;)
 }
 </code></pre>
 </div>
 
-<p><strong>Минус:</strong> При смене лидера (Failover) вам нужно перезапускать приложение или реализовывать динамическое обновление конфига. Адрес нового лидера вы не знаете.</p>
-<h3 id="2-ispolzovanie-proxy-middleware">2. Использование Proxy / Middleware</h3>
-
-<p>В продакшене инженеры редко хардкодят адреса лидеров. Между приложением и базой ставят специализированный прокси.<br />
-*   <strong>PostgreSQL:</strong> PgBouncer (в режиме session pooling), HAProxy, Patroni (с callback скриптами).<br />
-*   <strong>MySQL:</strong> ProxySQL, MySQL Router.</p>
-<p>Прокси держит связь с кластером и знает, кто сейчас лидер.<br />
-Ваше приложение подключается к прокси:<br />
-<code>host=proxy-service port=6432</code></p>
-<p>Если происходит Failover, прокси обновляет маршрут, а ваше Go-приложение ничего не замечает (кроме, возможно, кратковременной ошибки соединения, которую нужно ретраить).</p>
-<h3 id="3-drayvery-s-podderzhkoy-topologii">3. Драйверы с поддержкой топологии</h3>
-
-<p>Некоторые продвинутые драйверы умеют сами опрашивать кластер и находить лидера.<br />
-*   Для PostgreSQL: <code>pgx</code> (в режиме "Target Session Attrs").<br />
-*   Для MongoDB: Официальный драйвер Go для MongoDB умеет это "из коробки" (Discovery and Monitoring).</p>
-<p>Пример для <code>pgx</code>:<br />
-Вы можете указать несколько хостов в DSN, и драйвер сам найдет мастер:<br />
-<code>postgres://user:pass@host1:5432,host2:5432,host3:5432/db?target_session_attrs=read-write</code></p>
-<p>Драйвер перебирает хосты и ищет тот, который принимает запись.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как обрабатывать ошибки подключения во время Failover в Go?<br />
-<strong>Ответ:</strong> База данных — это внешняя система, которая может быть временно недоступна. Запросы к БД должны быть обернуты в ретраи (библиотеки <code>avast/retry-go</code> или самописные циклы) с экспоненциальным откатом (exponential backoff). Это особенно важно в момент смены лидера, который может длиться 10-30 секунд.</p>
+    <p><strong>Вопрос:</strong> Как грамотно обрабатывать ошибки подключения в Go в момент смены лидера (Failover)?</p>
+<p><strong>Ответ:</strong> В момент смены лидера старый сокет принудительно разрывается, а новый лидер может выбираться в течение 5–15 секунд. Приложение обязано:<br />
+1. Заворачивать идемпотентные модифицирующие операции в цикл повторных попыток (<strong>Retry with Exponential Backoff и Jitter</strong> с помощью проверенных библиотек вроде <code>avast/retry-go</code> или самописных циклов).<br />
+2. Использовать контексты с явным таймаутом (<code>context.WithTimeout</code>), чтобы горутины не зависали навечно при сетевых изоляциях.<br />
+3. Отслеживать коды сетевых ошибок драйвера (<code>connection refused</code>, <code>read: connection reset by peer</code>, <code>driver: bad connection</code>) для мгновенного сброса сломанных коннектов из пула.</p>
   </div>
 </div>
 
 <hr />
-<h2 id="itog">Итог</h2>
+<h2 id="rezyume">Резюме</h2>
 
-<p>Архитектура <strong>Leader-Follower</strong> — это стандарт де-факто для обеспечения отказоустойчивости и масштабирования чтения.<br />
-1.  Один Leader обрабатывает все записи, гарантируя порядок (linearizability для записи).<br />
-2.  Множество Follower-ов снимают нагрузку на чтение.<br />
-3.  Главный вызов — <strong>Failover</strong>. Процесс выбора нового лидера сложен, может привести к потере данных (при асинхронной репликации) и требует внешнего наблюдателя (Consul, Patroni, etcd).<br />
-4.  В Go-коде желательно не хардкодить роли узлов, а использовать либо умные драйверы, либо промежуточные прокси.</p>
-<p>Но что, если одного лидера на весь мир недостаточно? Если пользователи находятся в разных регионах (например, США и Европа), запись в один лидер будет давать огромную задержку для половины пользователей. В следующей статье мы разберем архитектуру <a href="3-multi-leader.html" class="wikilink">3. Multi Leader</a>, которая решает эту проблему, создавая новые.</p>
+<ol>
+<li><strong>Топология Leader-Follower</strong> решает фундаментальную проблему согласованности распределенных данных: один узел берет на себя монопольное упорядочивание операций записи, устраняя риск конфликтов модификации.</li>
+<li>Множество подчиненных реплик (Followers) позволяют линейно масштабировать чтение, но требуют от архитектора учета феномена <strong>Replication Lag</strong> и реализации паттернов защиты (Sticky Master, причинно-следственная согласованность).</li>
+<li>Процедура смены лидера (<strong>Failover</strong>) — зона наивысшей уязвимости системы. Для исключения катастрофы <strong>Split-Brain</strong> кластер обязан использовать кворумный консенсус (etcd, Raft) и жесткие механизмы изоляции старого лидера (Fencing / STONITH).</li>
+<li>В кодовой базе на Go критически важно абстрагировать топологию кластера: использовать интеллектуальные прокси (PgBouncer, HAProxy, ProxySQL) или адаптивные драйверы (<code>pgx</code> с <code>target_session_attrs</code>), защищая бизнес-логику механизмами повторных попыток (Retry).</li>
+</ol>
+<p>Модель Leader-Follower прекрасна, пока весь поток записи способен поместиться в одно физическое горлышко основного лидера. Но что делать, если сервис глобален, а пользователи распределены между Европой, Азией и Америкой? Задержка передачи пакетов через Тихий океан (150–200 мс) сделает запись мучительно долгой для половины планеты.</p>
+<p>Чтобы преодолеть эту географическую преграду, инженеры обращаются к более сложной топологии, где узлы записи размещаются в разных дата-центрах: <a href="3-multi-leader.html" class="wikilink">3. Multi Leader</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2406,7 +2485,7 @@ func (d *DBCluster) Read(ctx context.Context, query string, args ...any) (*sql.R
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#arkhitektura-leader-follower">Архитектура Leader-Follower</a></li><li class="toc-item toc-h2"><a href="#pochemu-tolko-odin-leader">Почему только один Leader?</a></li><li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-zapisi-i-chteniya">Жизненный цикл записи и чтения</a></li><li class="toc-item toc-h3"><a href="#1-stsenariy-zapisi-write-path">1. Сценарий записи (Write Path)</a></li><li class="toc-item toc-h3"><a href="#2-stsenariy-chteniya-read-path">2. Сценарий чтения (Read Path)</a></li><li class="toc-item toc-h2"><a href="#otkazoustoychivost-i-failover">Отказоустойчивость и Failover</a></li><li class="toc-item toc-h3"><a href="#etapy-failover">Этапы Failover</a></li><li class="toc-item toc-h3"><a href="#problemy-failover">Проблемы Failover</a></li><li class="toc-item toc-h2"><a href="#praktika-v-go-kak-rabotat-s-leader-follower">Практика в Go: Как работать с Leader-Follower?</a></li><li class="toc-item toc-h3"><a href="#1-raznye-dsn-data-source-name-v-kode">1. Разные DSN (Data Source Name) в коде</a></li><li class="toc-item toc-h3"><a href="#2-ispolzovanie-proxy-middleware">2. Использование Proxy / Middleware</a></li><li class="toc-item toc-h3"><a href="#3-drayvery-s-podderzhkoy-topologii">3. Драйверы с поддержкой топологии</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#arkhitektura-leader-follower">Архитектура Leader-Follower</a></li><li class="toc-item toc-h2"><a href="#pochemu-tolko-odin-leader">Почему только один Leader?</a></li><li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-zapisi-i-chteniya">Жизненный цикл записи и чтения</a></li><li class="toc-item toc-h3"><a href="#1-stsenariy-zapisi-write-path">1. Сценарий записи (Write Path)</a></li><li class="toc-item toc-h3"><a href="#2-stsenariy-chteniya-read-path">2. Сценарий чтения (Read Path)</a></li><li class="toc-item toc-h2"><a href="#otkazoustoychivost-i-failover">Отказоустойчивость и Failover</a></li><li class="toc-item toc-h3"><a href="#etapy-klassicheskogo-failover">Этапы классического Failover:</a></li><li class="toc-item toc-h3"><a href="#problemy-failover">Проблемы Failover</a></li><li class="toc-item toc-h2"><a href="#praktika-v-go-kak-proektirovat-klient-pod-leader-follower">Практика в Go: Как проектировать клиент под Leader-Follower</a></li><li class="toc-item toc-h3"><a href="#1-raznye-dsn-data-source-name-v-kode">1. Разные DSN (Data Source Name) в коде</a></li><li class="toc-item toc-h3"><a href="#2-ispolzovanie-promezhutochnykh-proksi-rekomenduemyy-podkhod">2. Использование промежуточных прокси (Рекомендуемый подход)</a></li><li class="toc-item toc-h3"><a href="#3-ispolzovanie-umnykh-drayverov-topology-aware-drivers">3. Использование умных драйверов (Topology-Aware Drivers)</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 
