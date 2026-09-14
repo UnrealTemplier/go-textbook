@@ -2168,20 +2168,21 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~13 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">13. NewSQL. CockroachDB</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Мир баз данных долгое время был расколот на два лагеря: <strong>SQL</strong> (строгая консистентность, ACID, но плохая горизонтальная масштабируемость) и <strong>NoSQL</strong> (<a href="1-chto-takoe-nosql.html" class="wikilink">1. Что такое NoSQL</a> — бесконечный масштаб, но слабая консистентность и отсутствие JOIN). </p>
+            <h1>NewSQL: архитектура CockroachDB, распределенный Raft и Serializable изоляция в Go</h1>
+<p>Мир баз данных долгое время был расколот на два лагеря: <strong>SQL</strong> (строгая консистентность, ACID, но плохая горизонтальная масштабируемость) и <strong>NoSQL</strong> (<a href="1-chto-takoe-nosql.html" class="wikilink">1. Что такое NoSQL</a> — бесконечный масштаб, но слабая консистентность и отсутствие JOIN). </p>
 <p><strong>NewSQL</strong> — это современная попытка взять лучшее от обоих миров. <strong>CockroachDB (CRDB)</strong> — пожалуй, самый яркий представитель этого класса. Это распределенная SQL-база данных, которая из коробки дает вам честный <strong>Serializable ACID</strong>, но при этом масштабируется так же легко, как Cassandra, просто добавлением новых узлов (нод).</p>
 <p>Для бэкенд-разработчика CockroachDB интересен тем, что он «прикидывается» обычным PostgreSQL (совместим по протоколу), но внутри работает как гигантское распределенное Key-Value хранилище.</p>
 <hr />
 <h2 id="arkhitektura-cockroachdb-sloenyy-pirog">Архитектура CockroachDB: Слоеный пирог</h2>
 
-<p>В отличие от монолитного Postgres, архитектура CRDB разделена на 5 четких слоев. Понимание этого разделения — ключ к прохождению интервью на позицию Senior/Lead.</p>
+<p>В отличие от монолитного Postgres, архитектура CRDB разделена на 5 четких слоев. Понимание этого разделения — ключ к проектированию надежных систем и прохождению интервью на позицию Senior/Lead:</p>
 <ol>
 <li><strong>SQL Layer:</strong> Принимает запрос от вашего Go-приложения, парсит его и строит план.</li>
 <li><strong>Transactional Layer:</strong> Гарантирует атомарность и изоляцию.</li>
@@ -2203,22 +2204,26 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-App[&quot;Go Application &lt;br&gt; pgx driver&quot;] --&gt; SQL[&quot;SQL Layer &lt;br&gt; Парсинг и оптимизация&quot;]
-SQL --&gt; Trans[&quot;Transactional Layer &lt;br&gt; Контроль консистентности&quot;]
-Trans --&gt; Dist[&quot;Distribution Layer &lt;br&gt; Поиск Range-а в кластере&quot;]
-Dist --&gt; Repl[&quot;Replication Layer &lt;br&gt; Raft-консенсус между нодами&quot;]
-Repl --&gt; Store[&quot;Storage Layer &lt;br&gt; Запись в Pebble /LSM-Tree/&quot;]
+App[&quot;Go Application&lt;br&gt;(pgx driver)&quot;] --&gt; SQL[&quot;SQL Layer&lt;br&gt;Парсинг и оптимизация&quot;]
+SQL --&gt; Trans[&quot;Transactional Layer&lt;br&gt;Контроль консистентности&quot;]
+Trans --&gt; Dist[&quot;Distribution Layer&lt;br&gt;Поиск Range-а в кластере&quot;]
+Dist --&gt; Repl[&quot;Replication Layer&lt;br&gt;Raft-консенсус между нодами&quot;]
+Repl --&gt; Store[&quot;Storage Layer&lt;br&gt;Запись в Pebble (LSM-Tree)&quot;]
 
-subgraph &quot;Node 1&quot;
+subgraph Node1[&quot;Node 1 (Coordinator)&quot;]
 SQL
 Trans
 end
 
-subgraph &quot;Node 2&quot;
-Repl2[&quot;Replica&quot;]
+subgraph Node2[&quot;Node 2 (Follower)&quot;]
+Repl2[&quot;Replica Log&quot;]
 end
 
-Repl &lt;--&gt;|&quot;Raft Log&quot;| Repl2
+Repl &lt;--&gt;|&quot;Raft Log Sync&quot;| Repl2
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef highlight fill:#312e81,stroke:#6366f1,color:#ffffff;
+class SQL,Trans,Repl highlight;
   </pre>
 </div>
 
@@ -2271,7 +2276,7 @@ Repl &lt;--&gt;|&quot;Raft Log&quot;| Repl2
 <hr />
 <h2 id="ispolzovanie-s-go">Использование с Go</h2>
 
-<p>Поскольку CockroachDB поддерживает протокол PostgreSQL, вы можете использовать идиоматичный драйвер <code>pgx</code>.</p>
+<p>Поскольку CockroachDB поддерживает протокол PostgreSQL, вы можете использовать идиоматичный драйвер <code>pgx</code> (или официальный пакет <code>github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgx</code> для автоматических ретраев).</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2281,19 +2286,56 @@ Repl &lt;--&gt;|&quot;Raft Log&quot;| Repl2
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import (
+  <pre class="language-go"><code class="language-go">package main
+
+import (
     &quot;context&quot;
-    &quot;[github.com/jackc/pgx/v5/pgxpool](https://github.com/jackc/pgx/v5/pgxpool)&quot;
+    &quot;fmt&quot;
+    &quot;log&quot;
+
+    &quot;github.com/jackc/pgx/v5&quot;
+    &quot;github.com/jackc/pgx/v5/pgxpool&quot;
 )
 
 func main() {
     // Строка подключения почти такая же, как для Postgres
     // Единственное отличие - порт 26257 по умолчанию
     dsn := &quot;postgresql://root@localhost:26257/defaultdb?sslmode=disable&quot;
-    pool, _ := pgxpool.New(context.Background(), dsn)
+    pool, err := pgxpool.New(context.Background(), dsn)
+    if err != nil {
+        log.Fatalf(&quot;Ошибка подключения: %v&quot;, err)
+    }
+    defer pool.Close()
 
     // Важно: CockroachDB рекомендует использовать логику ретраев
     // pgx не делает это автоматически для Serializable конфликтов!
+    ctx := context.Background()
+    err = runWithRetry(ctx, pool, func(tx pgx.Tx) error {
+        _, err := tx.Exec(ctx, &quot;UPDATE accounts SET balance = balance - 100 WHERE id = 1&quot;)
+        return err
+    })
+    if err != nil {
+        log.Printf(&quot;Транзакция не удалась после ретраев: %v&quot;, err)
+    }
+}
+
+func runWithRetry(ctx context.Context, pool *pgxpool.Pool, fn func(tx pgx.Tx) error) error {
+    const maxRetries = 5
+    for attempt := 0; attempt &lt; maxRetries; attempt++ {
+        tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+        if err != nil {
+            return err
+        }
+        if err := fn(tx); err != nil {
+            tx.Rollback(ctx)
+            // При ошибке Serializable (SQLSTATE 40001) повторяем
+            continue
+        }
+        if err := tx.Commit(ctx); err == nil {
+            return nil
+        }
+    }
+    return fmt.Errorf(&quot;превышен лимит ретраев&quot;)
 }
 </code></pre>
 </div>
@@ -2317,6 +2359,7 @@ func main() {
 <li><strong>Нулевой простой:</strong> Вам нужна база, которая не падает, когда вы выключаете целый дата-центр.</li>
 <li><strong>Горизонтальный масштаб:</strong> Когда вы понимаете, что один инстанс Postgres уже не тянет, а <a href="../08-raspredelennye-bazy-dannykh/4-sharding.html" class="wikilink">4. Sharding</a> вручную на уровне приложения — это архитектурный ад.</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
@@ -2326,8 +2369,6 @@ func main() {
 <li>Ваш Go-код должен быть готов к <strong>Serializable Retries</strong> — это цена за строгую согласованность.</li>
 </ol>
 <p>Мир баз данных движется в сторону специализации. Мы разобрали реляционные, колоночные и NewSQL системы. Но с развитием ИИ и поиска по сходству появился совершенно новый класс баз, которые оперируют не числами и строками, а многомерными векторами. Об этом в следующей статье: <a href="14-vektornye-bazy-dannykh.html" class="wikilink">14. Векторные базы данных</a>.</p>
-<p>Следующая статья: <a href="14-vektornye-bazy-dannykh.html" class="wikilink">14. Векторные базы данных</a>.<br />
-У тебя остались вопросы по архитектуре распределенного консенсуса в CRDB?</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

@@ -2168,21 +2168,24 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Redis. Архитектура и применение</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie">Введение</h2>
+            <h1>Redis: архитектура, структуры данных и паттерны в Go</h1>
+<h2 id="vvedenie">Введение</h2>
 
-<p>Redis (Remote Dictionary Server) — это не просто key-value хранилище, а <strong>структурированный сервер данных в памяти</strong>, который по духу гораздо ближе к «инструментальному ящику» распределённого бэкенда, чем к классической базе данных. Если Memcached даёт вам голый <code>map[string][]byte</code>, то Redis предлагает десятки структур данных, транзакции, pub/sub, стримы, гео-индексы и модульную экосистему.</p>
-<p>В Go-разработке Redis — стандартный фундамент для кэширования, координации сервисов, rate limiting, очередей и управления состоянием, требующего микросекундной задержки. Чтобы использовать его идиоматично и без катастроф в продакшене, нужно понимать не только команды, но и как Redis устроен под капотом, как он взаимодействует с ОС и как ваш Go-код взаимодействует с ним.</p>
+<p>Redis (Remote Dictionary Server) — это не просто key-value хранилище, а <strong>структурированный сервер данных в оперативной памяти</strong>, который по духу гораздо ближе к универсальному «швейцарскому ножу» распределенного бэкенда, чем к классической реляционной СУБД. Если простейший Memcached предоставляет вам лишь абстрактный <code>map[string][]byte</code>, то Redis предлагает богатую палитру встроенных структур данных, атомарные транзакции, pub/sub каналы, потоки сообщений (streams), геопространственные индексы и расширяемую экосистему модулей.</p>
+<p>В современной Go-разработке Redis — отраслевой стандарт де-факто для высокопроизводительного кэширования, распределенной координации сервисов, rate limiting, очередей задач и управления состоянием сессий с задержками на уровне микросекунд.</p>
 <p>Мы уже обсудили общую концепцию KV-хранилищ в статье <a href="2-key-value-bazy.html" class="wikilink">2. Key Value базы</a> — сейчас пришло время детально разобрать лидера этого класса.</p>
+<hr />
 <h2 id="arkhitektura-redis-odnopotochnyy-event-loop">Архитектура Redis: однопоточный event loop</h2>
 
-<p>С момента появления и по сей день (с важными нюансами) Redis использует модель <strong>однопоточного event loop</strong> для выполнения команд. Это одно из тех архитектурных решений, которые удивляют новичков, но дают колоссальные преимущества.</p>
+<p>С момента появления и по сей день (с важными нюансами, о которых мы поговорим ниже) Redis использует модель <strong>однопоточного event loop</strong> для выполнения команд над структурами данных. Для многих инженеров, привыкших к многопоточности и пулам воркеров, это звучит парадоксально: «Как сервис, обслуживающий 100 000+ RPS на одном сервере, может быть однопоточным?».</p>
+<p>Разгадка кроется в физике вычислений: узким местом in-memory систем является не вычислительная мощность CPU, а задержки синхронизации памяти (lock contention) и сетевой стек.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2197,25 +2200,30 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Сетевые соединения&lt;br&gt;клиентов Go/Python/etc.&quot;] --&gt; B[&quot;Очередь событий&lt;br&gt;epoll_wait / kqueue&quot;]
-B --&gt; C[&quot;Event Loop&lt;br&gt;единственный поток выполнения команд&quot;]
-C --&gt; D[&quot;Парсер RESP&lt;br&gt;и поиск команды&quot;]
-D --&gt; E[&quot;Выполнение команды&lt;br&gt;in-memory структурах данных&quot;]
-E --&gt; F[&quot;Формирование ответа&lt;br&gt;и запись в сокет&quot;]
-F --&gt; B
+Clients[&quot;Сетевые соединения клиентов&lt;br&gt;(Go / Python / Java)&quot;] --&gt; EpollQueue[&quot;Очередь событий ядра ОС&lt;br&gt;(epoll_wait / kqueue / IOCP)&quot;]
+EpollQueue --&gt; MainLoop[&quot;Event Loop&lt;br&gt;(Единственный главный поток выполнения команд)&quot;]
+MainLoop --&gt; RespParser[&quot;Парсер RESP&lt;br&gt;и диспетчеризация команд&quot;]
+RespParser --&gt; MemOps[&quot;Выполнение команды в RAM&lt;br&gt;(хеш-таблицы, skiplist, quicklist)&quot;]
+MemOps --&gt; WriteBack[&quot;Формирование ответа&lt;br&gt;и буферизация в сокет&quot;]
+WriteBack --&gt; EpollQueue
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef loop fill:#312e81,stroke:#6366f1,color:#ffffff,stroke-width:2px;
+class MainLoop loop;
   </pre>
 </div>
 
 
-<p><strong>Как это работает:</strong><br />
-- Redis регистрирует все клиентские сокеты в <strong>epoll</strong> (Linux), kqueue (macOS/BSD) или IOCP (Windows).<br />
-- Главный поток блокируется на <code>epoll_wait</code>, ожидая событий на сокетах.<br />
-- Когда приходят данные, поток читает запрос, парсит RESP, выполняет команду (операции в памяти) и пишет ответ обратно в сокет.<br />
-- Следующий запрос от другого клиента обрабатывается только после завершения текущей команды.</p>
-<p><strong>Почему это быстро:</strong> <br />
-- Нет накладных расходов на блокировки, мьютексы и конкуренцию за память.<br />
-- Данные живут в оперативной памяти, доступ — O(1) через хеш-таблицу и прямые указатели.<br />
-- Выполнение команды — это обычно десятки-сотни наносекунд (хеш-функция и разыменование указателей).</p>
+<p><strong>Как устроен этот конвейер:</strong><br />
+1. Сервер Redis регистрирует все клиентские сокеты в мультиплексоре ввода-вывода ядра ОС: <strong>epoll</strong> (в Linux), <strong>kqueue</strong> (в macOS/BSD) или <strong>IOCP</strong> (в Windows).<br />
+2. Главный поток засыпает в системном вызове <code>epoll_wait</code>, не расходуя такты CPU впустую.<br />
+3. Как только на одном или нескольких сокетах появляются входящие TCP-пакеты, ядро ОС пробуждает поток Redis.<br />
+4. Поток последовательно считывает байты запроса, парсит спецификацию RESP, находит запрашиваемую команду в таблице команд и исполняет ее непосредственно в памяти.<br />
+5. После формирования ответа поток буферизует его для отправки обратно клиенту и переходит к следующему событию.</p>
+<p><strong>Почему это работает феноменально быстро:</strong><br />
+- <strong>Нулевая синхронизация:</strong> Никаких мьютексов (<code>pthread_mutex</code>), спинлоков, CAS-инструкций и race conditions внутри структур данных. Нет риска взаимных блокировок (deadlocks) и затрат на когерентность процессорных кэшей (протокол MESI).<br />
+- <strong>Максимальная локальность кэша (Cache Locality):</strong> Все данные активного потока идеально ложатся в L1d и L2 кэши выделенного ядра CPU.<br />
+- <strong>Микросекундное исполнение:</strong> Большинство операций с хэш-таблицами требуют от 50 до 200 наносекунд — это быстрее, чем стоимость переключения контекста потоков ОС (context switch, занимающий 1–2 микросекунды).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2227,11 +2235,12 @@ F --&gt; B
   </div>
 </div>
 
+<hr />
 <h2 id="struktury-dannykh-bolshe-chem-prosto-klyuch-znachenie">Структуры данных: больше чем просто ключ-значение</h2>
 
-<p>Redis заслужил звание «швейцарского ножа» благодаря встроенным структурам, каждая из которых оптимизирована под определённые паттерны.</p>
+<p>Главное преимущество Redis — возможность оперировать специализированными структурами данных прямо на стороне сервера, не гоняя мегабайты сырых данных по сети.</p>
 <h3 id="strings-stroki">Strings (строки)</h3>
-<p>Базовый тип, может хранить бинарные данные до 512 МБ. Используется для кэширования HTML, JSON-блобы, счётчики (через <code>INCR</code>, атомарный инкремент).</p>
+<p>Базовый универсальный тип. Может содержать любой бинарно-безопасный контент объемом до 512 МБ: текстовые строки, JSON-документы, сериализованные Protobuf-сообщения или сжатые изображения. Кроме того, строки поддерживают атомарные математические операции: <code>INCR</code>, <code>INCRBY</code>, <code>DECR</code>, <code>INCRBYFLOAT</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2253,7 +2262,7 @@ if errors.Is(err, redis.Nil) {
 </div>
 
 <h3 id="lists-spiski">Lists (списки)</h3>
-<p>Связанный список (реализован как quicklist — гибрид ziplist и обычного списка). Идеален для очередей (<code>LPUSH</code> + <code>RPOP</code>) и ленты активности.</p>
+<p>Двусвязные упорядоченные списки строк (под капотом сжатые структуры quicklist — гибрид ziplist и классического связанного списка). Идеальны для очередей задач (<code>LPUSH</code> + <code>RPOP</code> или блокирующий <code>BRPOP</code>) и лент активности:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2270,8 +2279,8 @@ rdb.LPush(ctx, &quot;task_queue&quot;, taskData)
 
 <h3 id="sets-mnozhestva-i-sorted-sets-uporyadochennye-mnozhestva">Sets (множества) и Sorted Sets (упорядоченные множества)</h3>
 <ul>
-<li><strong>Set</strong> — неупорядоченная коллекция уникальных строк, операции объединения, пересечения.</li>
-<li><strong>Sorted Set</strong> — элементы имеют score (float64), упорядочены по нему. Внутри — skip list + хеш-таблица. Лидерборды, задержки, приоритетные очереди.</li>
+<li><strong>Set (множество)</strong> — неупорядоченная коллекция уникальных строк. Гарантирует $O(1)$ проверку наличия элемента (<code>SISMEMBER</code>), а также эффективные теоретико-множественные операции на стороне сервера: объединение (<code>SUNION</code>), пересечение (<code>SINTER</code>), разность (<code>SDIFF</code>).</li>
+<li><strong>Sorted Set (ZSet, упорядоченное множество)</strong> — каждый строковый элемент ассоциирован с числовым весом (Score типа <code>float64</code>). Элементы автоматически упорядочиваются по значению score. Внутри реализован как симбиоз SkipList (вероятностная структура списка с пропусками) и хэш-таблицы. Идеально подходит для лидербордов в играх, планировщиков отложенных задач и скользящих временных окон:</li>
 </ul>
 
 <div class="code-block" data-lang="go">
@@ -2284,13 +2293,13 @@ rdb.LPush(ctx, &quot;task_queue&quot;, taskData)
   </div>
   <pre class="language-go"><code class="language-go">// Обновление рейтинга в лидерборде
 rdb.ZAdd(ctx, &quot;leaderboard&quot;, redis.Z{Score: 1523, Member: &quot;user:42&quot;})
-// Топ-10
+// Топ-10 игроков с наивысшим баллом
 top, _ := rdb.ZRevRangeWithScores(ctx, &quot;leaderboard&quot;, 0, 9).Result()
 </code></pre>
 </div>
 
 <h3 id="hashes-kheshi">Hashes (хеши)</h3>
-<p>Хранит поля и значения, как <code>map[string]string</code>. Отлично подходит для объектов типа «пользователь», когда не нужна сериализация всего объекта целиком.</p>
+<p>Отображение строковых полей на строковые значения (<code>map[string]string</code>). Позволяет хранить объекты предметной области (например, профиль пользователя) компактно и обновлять отдельные свойства без полной перезаписи и повторной сериализации всего JSON-объекта:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2311,10 +2320,11 @@ rdb.HIncrBy(ctx, &quot;user:42&quot;, &quot;login_count&quot;, 1)
 <p>Аппенд-онли лог, похожий на Apache Kafka, но легковесный. Группы потребителей, подтверждение обработки. Прекрасен для легковесных событийных потоков и используется в библиотеках наподобие <code>watermill</code>.</p>
 <h3 id="prochie">Прочие</h3>
 <ul>
-<li><strong>Bitmaps / HyperLogLog</strong> — для аналитики уникальных посетителей.</li>
+<li><strong>Bitmaps / HyperLogLog</strong> — побитовые операции (<code>SETBIT</code>, <code>BITCOUNT</code>) и вероятностный алгоритм HyperLogLog (<code>PFADD</code>, <code>PFCOUNT</code>), позволяющий с погрешностью ~0.81% оценивать кардинальность миллионов уникальных посетителей в фиксированных 12 КБ памяти.</li>
 <li><strong>Geospatial</strong> — <code>GEOADD</code>, <code>GEORADIUS</code> для координат, под капотом sorted set с Geohash.</li>
-<li><strong>Redis Stack:</strong> Модули RedisJSON, RediSearch, TimeSeries расширяют возможности до документной и полнотекстовой БД.</li>
+<li><strong>Redis Stack:</strong> Модули RedisJSON, RediSearch, TimeSeries расширяют возможности до полноценной документной и полнотекстовой БД.</li>
 </ul>
+<hr />
 <h2 id="model-persistentnosti-pamyat-vs-dolgovechnost">Модель персистентности: память vs долговечность</h2>
 
 <p>Redis — in-memory база, что порождает компромисс между скоростью и сохранностью данных при перезапуске. Реализовано два механизма.</p>
@@ -2326,6 +2336,39 @@ rdb.HIncrBy(ctx, &quot;user:42&quot;, &quot;login_count&quot;, 1)
 <p>Журнал всех операций записи, в точности как WAL в PostgreSQL (см. <a href="../05-tranzaktsii-i-vnutrennosti/8-wal-write-ahead-log.html" class="wikilink">Write Ahead Log</a> в подразделе транзакций). Каждая команда записывается синхронно или асинхронно в лог. При перезагрузке — повторное проигрывание команд.</p>
 <p><strong>Плюсы:</strong> Максимальная сохранность данных (при <code>appendfsync always</code> теряется не более одной операции).<br />
 <strong>Минусы:</strong> Файл лога растёт, может быть больше, чем RDB. Redis делает периодическое сжатие AOF (rewrite).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph RDB_Mechanism[&quot;RDB Снимки&quot;]
+R1[&quot;fork() процесса&quot;] --&gt; R2[&quot;Copy-on-Write (COW)&quot;]
+R2 --&gt; R3[&quot;Файл dump.rdb на SSD&quot;]
+end
+
+subgraph AOF_Mechanism[&quot;AOF Журнал&quot;]
+A1[&quot;Команды модификации&quot;] --&gt; A2[&quot;Буфер aof_buf&quot;]
+A2 --&gt; A3[&quot;appendfsync (always/everysec/no)&quot;]
+A3 --&gt; A4[&quot;Файл appendonly.aof&quot;]
+end
+
+classDef rdb fill:#1e293b,stroke:#38bdf8,color:#f8fafc;
+classDef aof fill:#1e293b,stroke:#10b981,color:#f8fafc;
+class RDB_Mechanism rdb;
+class AOF_Mechanism aof;
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2336,6 +2379,7 @@ rdb.HIncrBy(ctx, &quot;user:42&quot;, &quot;login_count&quot;, 1)
   </div>
 </div>
 
+<hr />
 <h2 id="replikatsiya-i-klasterizatsiya">Репликация и кластеризация</h2>
 
 <p>Redis предоставляет несколько уровней масштабирования.</p>
@@ -2346,6 +2390,7 @@ rdb.HIncrBy(ctx, &quot;user:42&quot;, &quot;login_count&quot;, 1)
 <h3 id="redis-cluster">Redis Cluster</h3>
 <p>Шардирование данных по N нодам. Ключи распределяются в 16384 хеш-слотов. Каждая нода отвечает за диапазон слотов. Клиент определяет нужную ноду по хешу ключа и обращается напрямую. При добавлении/удалении нод слоты мигрируют. Жертвуем транзакциями, охватывающими ключи в разных слотах, но получаем горизонтальное масштабирование на сотни нод.</p>
 <p>Для Go-разработчика важно включить <code>route by latency</code> и <code>route randomly</code> в драйвере кластера, чтобы балансировать запросы.</p>
+<hr />
 <h2 id="patterny-ispolzovaniya-v-go">Паттерны использования в Go</h2>
 
 <h3 id="keshirovanie">Кэширование</h3>
@@ -2433,6 +2478,7 @@ go func() {
 
 <h3 id="sessii-polzovateley">Сессии пользователей</h3>
 <p>Хранение сессий с TTL. Гибкая структура: хеш, где поля — детали сессии.</p>
+<hr />
 <h2 id="mechanical-sympathy-redis-s-tochki-zreniya-protsessora-i-os">Mechanical Sympathy: Redis с точки зрения процессора и ОС</h2>
 
 <p>Понимание физического взаимодействия Go-сервиса с Redis критично для достижения высокой производительности.</p>
@@ -2453,6 +2499,7 @@ go func() {
   </div>
 </div>
 
+<hr />
 <h2 id="tipichnye-lovushki-i-kak-ikh-izbezhat">Типичные ловушки и как их избежать</h2>
 
 <div class="callout callout-warning">
@@ -2471,6 +2518,7 @@ go func() {
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Redis для Go-разработчика — это гораздо больше, чем кэш. Это координационный центр распределённых систем, обеспечивающий предсказуемую микросекундную задержку, атомарные структуры и богатую экосистему. Понимание однопоточной модели, механизма персистентности, структуры памяти и сетевого взаимодействия с Go-рантаймом позволяет вам не просто «вызывать команды», а системно проектировать high-performance решения, избегая классических ошибок.</p>

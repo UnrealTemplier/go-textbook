@@ -2168,20 +2168,23 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~36 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~39 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Memcached</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie">Введение</h2>
+            <h1>Memcached: архитектура, slab allocator и высокопроизводительное кэширование в Go</h1>
+<h2 id="vvedenie">Введение</h2>
 
-<p>В предыдущих статьях мы изучили архитектуру и внутреннее устройство <a href="3-redis-arkhitektura-i-primenenie.html" class="wikilink">Redis</a> — самого многофункционального in-memory хранилища. Теперь пришло время рассмотреть его более легковесного, но не менее мощного собрата — <strong>Memcached</strong>. Если Redis — это швейцарский нож с десятками структур данных, персистентностью и кластеризацией, то Memcached — остро заточенный монолезвийный клинок: чистый кэш, только строки, только скорость и максимальная утилизация многоядерных процессоров.</p>
-<p>Memcached был создан в 2003 году Брэдом Фитцпатриком для LiveJournal и с тех пор стал стандартом де-факто для простого кэширования в веб-архитектуре. Его философия — «никаких излишеств, только O(1) операции и отсутствие блокировок там, где это возможно». Для Go-разработчика понимание Memcached важно в ситуациях, когда нужна максимальная пропускная способность на многоядерном сервере, а сложные структуры данных или персистентность не требуются.</p>
+<p>В предыдущих статьях мы подробно изучили архитектуру и внутреннее устройство <a href="3-redis-arkhitektura-i-primenenie.html" class="wikilink">Redis</a> — самого многофункционального in-memory хранилища данных. Теперь пришло время рассмотреть его более легковесного, но не менее мощного собрата — <strong>Memcached</strong>. Если Redis — это универсальный швейцарский нож с десятками специализированных структур данных, персистентностью и кластеризацией, то Memcached — остро заточенный монолезвийный скальпель: чистый кэш, только плоские байтовые строки, бескомпромиссная скорость и максимальная утилизация всех доступных ядер процессора.</p>
+<p>Memcached был создан в 2003 году Брэдом Фитцпатриком (Brad Fitzpatrick, который впоследствии стал одним из ключевых авторов языка Go и стандартной библиотеки <code>net/http</code>) для проекта LiveJournal. С тех пор Memcached стал признанным мировым стандартом де-факто для высоконагруженного кэширования в веб-архитектуре. Его инженерная философия предельно лаконична: «никаких излишеств, только $O(1)$ операции и отсутствие глобальных блокировок там, где это физически возможно».</p>
+<p>Для Go-разработчика понимание Memcached важно в ситуациях, когда сервису требуется максимальная пропускная способность (миллионы RPS) на многоядерном сервере, а сложные агрегации, очереди или персистентность на диск абсолютно не требуются.</p>
+<hr />
 <h2 id="arkhitektura-mnogopotochnyy-event-loop">Архитектура: многопоточный event loop</h2>
 
-<p>Главное архитектурное отличие Memcached от Redis — <strong>многопоточная обработка запросов с самого рождения</strong>. Redis исторически однопоточный (лишь с 6.0 появился многопоточный I/O), в то время как Memcached изначально проектировался для использования всех доступных ядер CPU.</p>
+<p>Главное фундаментальное отличие Memcached от Redis — <strong>многопоточная параллельная обработка запросов, заложенная в архитектуру с самого рождения</strong>. Redis исторически опирается на однопоточный event loop (лишь в версии 6.0 появился опциональный многопоточный I/O для сокетов), в то время как Memcached изначально проектировался для честного распределения вычислений по всем доступным аппаратным ядрам CPU.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2196,21 +2199,26 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Client[&quot;Клиент Go&lt;br&gt;TCP-соединение&quot;] --&gt; LB[&quot;Прослушивающий сокет&quot;]
-LB --&gt; |&quot;распределение соединений&quot;| W1[&quot;Worker Thread 1&lt;br&gt;libevent loop&quot;]
-LB --&gt; W2[&quot;Worker Thread 2&lt;br&gt;libevent loop&quot;]
-LB --&gt; WN[&quot;Worker Thread N&lt;br&gt;libevent loop&quot;]
-W1 --&gt; Slabs[&quot;Slab Allocator&lt;br&gt;общие slab классы&quot;]
+Client[&quot;Клиенты Go&lt;br&gt;(Пул TCP-соединений)&quot;] --&gt; LB[&quot;Прослушивающий сокет ядра ОС&lt;br&gt;(SO_REUSEPORT)&quot;]
+LB --&gt;|&quot;Параллельный dispatch&quot;| W1[&quot;Worker Thread 1&lt;br&gt;(libevent loop + epoll)&quot;]
+LB --&gt;|&quot;Параллельный dispatch&quot;| W2[&quot;Worker Thread 2&lt;br&gt;(libevent loop + epoll)&quot;]
+LB --&gt;|&quot;Параллельный dispatch&quot;| WN[&quot;Worker Thread N&lt;br&gt;(libevent loop + epoll)&quot;]
+
+W1 --&gt; Slabs[&quot;Slab Allocator&lt;br&gt;(Изолированные Slab-классы с точечными спинлоками)&quot;]
 W2 --&gt; Slabs
 WN --&gt; Slabs
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef worker fill:#312e81,stroke:#6366f1,color:#ffffff;
+class W1,W2,WN worker;
   </pre>
 </div>
 
 
 <p><strong>Как это работает:</strong><br />
-- При запуске Memcached создаёт master-поток и заданное число worker-потоков (по умолчанию 4, настраивается через <code>-t</code>).<br />
-- Все потоки слушают те же TCP/UDP порты через общий сокет, используя <code>SO_REUSEPORT</code>.<br />
-- Входящее соединение прикрепляется к одному из worker’ов. Внутри каждого worker’а работает собственный event loop на базе <code>libevent</code>.<br />
+- При запуске Memcached создаёт master-поток и заданное число worker-потоков (по умолчанию 4, настраивается через флаг командной строки <code>-t</code>).<br />
+- Все потоки слушают те же TCP/UDP порты через общий сокет, используя флаг ядра Linux <code>SO_REUSEPORT</code>.<br />
+- Входящее соединение прикрепляется к одному из worker’ов. Внутри каждого worker’а работает собственный event loop на базе библиотеки <code>libevent</code>.<br />
 - Запросы на запись/чтение обрабатываются на том же worker’е, включая поиск в хеш-таблице и работу с памятью.</p>
 <p>Это даёт <strong>настоящий параллелизм</strong> без координации команд из одного потока: каждый worker абсолютно независим и не ждёт других. Блокировки нужны только для синхронизации доступа к глобальным структурам — кэшу и слабам, но они спроектированы так, чтобы быть крайне короткими.</p>
 <div class="callout callout-info">
@@ -2224,20 +2232,21 @@ WN --&gt; Slabs
   </div>
 </div>
 
+<hr />
 <h2 id="slab-allocator-upravlenie-pamyatyu-bez-fragmentatsii">Slab allocator: управление памятью без фрагментации</h2>
 
 <p>Если в Redis память выделяется через jemalloc для каждого объекта, то Memcached использует <strong>slab allocator</strong>, радикально снижающий фрагментацию и накладные расходы на частое выделение/освобождение.</p>
 <h3 id="kak-ustroen-slab">Как устроен Slab</h3>
 
 <ol>
-<li><strong>Страница</strong> (page) — минимальный блок, запрашиваемый у ОС. Обычно 1 МБ.</li>
-<li><strong>Slab class</strong> — класс, объединяющий чанки (chunks) одного размера. Например, класс 1 — чанки по 80 байт, класс 2 — 100 байт, класс 3 — 128 байт и так далее с ростом фактором (по умолчанию 1.25). Каждый класс содержит несколько страниц, разбитых на чанки.</li>
-<li><strong>Chunk</strong> — элементарный контейнер для хранения одного объекта (ключа, значения, метаданных). Размер чанка фиксирован для класса.</li>
+<li><strong>Страница (Page)</strong> — минимальный неделимый блок физической памяти, запрашиваемый у ОС через <code>malloc</code>/<code>mmap</code>. По умолчанию размер страницы равен 1 МБ.</li>
+<li><strong>Slab class</strong> — класс аллокатора, объединяющий чанки (chunks) строго фиксированного размера. Например, класс 1 — чанки по 80 байт, класс 2 — 100 байт, класс 3 — 128 байт и так далее с фактором геометрического роста (по умолчанию <code>-f 1.25</code>). Каждый класс содержит несколько страниц памяти, предварительно нарезанных на одинаковые чанки.</li>
+<li><strong>Chunk</strong> — элементарный контейнер для хранения ровно одного объекта: ключа, значения, флагов и метаданных структуры <code>item</code>.</li>
 </ol>
 <p>Когда приходит команда <code>set</code>:<br />
-- Вычисляется общий размер элемента (ключ + значение + overhead структуры <code>item</code>).<br />
+- Вычисляется общий размер элемента (длина ключа + длина значения + overhead метаданных <code>item</code>).<br />
 - Подбирается ближайший сверху slab class, чей размер чанка вмещает элемент.<br />
-- Внутри класса просматривается список свободных чанков. Если свободных нет — ищется страница, где можно выделить новый чанк или вытесняется старый элемент (LRU).</p>
+- Внутри класса просматривается свободный список (free list) чанков. Если свободного чанка нет — выделяется новая страница для этого класса или вытесняется старый элемент по алгоритму LRU.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2252,11 +2261,15 @@ WN --&gt; Slabs
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Запрос на SET&lt;br&gt;размер 200 байт&quot;] --&gt; B[&quot;Поиск slab class&lt;br&gt;с чанком &gt;= 200 байт&quot;]
+A[&quot;Запрос на SET&lt;br&gt;(Размер payload: 200 байт)&quot;] --&gt; B[&quot;Поиск slab class&lt;br&gt;(Чанк &gt;= 200 байт, например 256B)&quot;]
 B --&gt; C{&quot;Есть свободный чанк?&quot;}
-C -- &quot;Да&quot; --&gt; D[&quot;Выделить чанк&lt;br&gt;записать данные&quot;]
-C -- &quot;Нет&quot; --&gt; E[&quot;Освободить чанк&lt;br&gt;по LRU внутри класса&quot;]
+C -- &quot;Да&quot; --&gt; D[&quot;Выделить чанк из Free List&lt;br&gt;Записать данные в RAM&quot;]
+C -- &quot;Нет&quot; --&gt; E[&quot;Освободить чанк по LRU&lt;br&gt;внутри данного slab class&quot;]
 E --&gt; D
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef action fill:#312e81,stroke:#6366f1,color:#ffffff;
+class D,E action;
   </pre>
 </div>
 
@@ -2281,6 +2294,7 @@ E --&gt; D
   </div>
 </div>
 
+<hr />
 <h2 id="struktura-elementa-item">Структура элемента (item)</h2>
 
 <p>Каждый объект в Memcached представлен структурой <code>item</code>, которая размещается в начале чанка и управляет LRU-связями:</p>
@@ -2315,6 +2329,7 @@ E --&gt; D
 </div>
 
 <p>Элемент содержит и ключ, и значение, и флаги внутри одного блока памяти — никаких дополнительных указателей на разрозненные буферы. Это улучшает локальность данных и сокращает количество аллокаций. Для сравнения: Redis хранит ключ в SDS, а значение — отдельным объектом внутри value-структуры.</p>
+<hr />
 <h2 id="khesh-tablitsa-i-poisk-klyuchey">Хеш-таблица и поиск ключей</h2>
 
 <p>Глобальная хеш-таблица Memcached — это массив указателей на цепочки <code>item</code>. Хеш-функция по умолчанию — <strong>Jenkins one-at-a-time</strong> (может быть заменена на murmur3 в новых версиях). Размер таблицы динамически увеличивается, но в отличие от Redis, <strong>рехэширование не инкрементальное</strong>. При росте таблицы Memcached выделяет новую, большую таблицу и за один проход переносит все элементы, <strong>блокируя весь кэш</strong> на время переноса. Это — одна из причин, почему Memcached не рекомендуется для сценариев с сотнями миллионов ключей. Однако разработчики пошли на это, так как в типичных нагрузках таблица перестраивается редко и быстро.</p>
@@ -2329,6 +2344,7 @@ E --&gt; D
   </div>
 </div>
 
+<hr />
 <h2 id="upravlenie-vremenem-zhizni-i-vytesnenie">Управление временем жизни и вытеснение</h2>
 
 <p>Memcached не удаляет просроченные ключи немедленно. Вместо этого используется ленивый подход, дополненный фоновым потоком.</p>
@@ -2337,22 +2353,35 @@ E --&gt; D
 <li><strong>Фоновый сборщик (crawler):</strong> Начиная с версии 1.4.25, в Memcached появился фоновый поток, который периодически обходит LRU-списки каждого slab class и удаляет истекшие элементы. Это позволяет освобождать память без ожидания обращений к «мёртвым» ключам.</li>
 </ul>
 <p>Вытеснение (eviction) происходит <strong>только внутри того slab class</strong>, в котором закончились свободные чанки. Используется LRU: удаляется самый старый по времени последнего доступа элемент из хвоста двойного связного списка. Это означает, что если у вас активный класс с чанками 256 байт переполнен, а соседний класс 1 МБ пустует — вытесняться будут только 256-байтовые элементы, и память не переиспользуется между классами. Отсюда вытекает необходимость тщательно планировать распределение размеров ключей.</p>
+<hr />
 <h2 id="persistentnost-i-nadyozhnost">Персистентность и надёжность</h2>
 
 <p>Memcached <strong>не имеет персистентности от слова «совсем»</strong>. Нет ни RDB, ни AOF, ни даже опции dump на диск. Рестарт Memcached = полная потеря всех данных. Его философия — «кэш должен быть легкозаменяемым и восстанавливаемым из основного источника данных». Это упрощает код, не требует fork и не создаёт нагрузки на диск, что даёт ещё больший прирост производительности.</p>
 <p>В Go-экосистеме это означает, что вы должны проектировать систему, где падение Memcached или его перезапуск не вызывают деградацию бизнес-логики, кроме временного повышения latency из-за cache miss. Обычно это решается запасным инстансом или деградацией к прямому запросу в PostgreSQL (см. <a href="../10-praktika-i-arkhitektura/7-keshirovanie-poverkh-bd.html" class="wikilink">7. Кэширование поверх БД</a>).</p>
+<hr />
 <h2 id="protokol-vzaimodeystviya">Протокол взаимодействия</h2>
 
 <p>Memcached поддерживает два протокола: текстовый и бинарный.</p>
 <p><strong>Текстовый протокол</strong> — это ASCII строки:</p>
-<pre><code>get mykey\r\n
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">get mykey\r\n
 VALUE mykey 0 5\r\n
 hello\r\n
 END\r\n
 </code></pre>
+</div>
+
 <p>Команды <code>set</code>, <code>add</code>, <code>replace</code>, <code>append</code>, <code>prepend</code>, <code>incr</code>, <code>decr</code>, <code>delete</code>. Простой, удобный для отладки <code>telnet</code>.</p>
 <p><strong>Бинарный протокол</strong> — фиксированные заголовки, компактные байты. Устраняет некоторые проблемы текстового (например, невозможность отправлять бинарные данные в ключе без экранирования). Но он всё равно крайне прост.</p>
-<p>В Go наиболее популярна библиотека <code>github.com/bradfitz/gomemcache/memcache</code>. Она работает с текстовым протоколом, предоставляя удобные методы и управление пулом соединений.</p>
+<p>В Go наиболее популярна библиотека <code>github.com/bradfitz/gomemcache/memcache</code>. Она работает с текстовым протоколом, предоставляя удобные методы и управление пулом соединений:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2362,20 +2391,38 @@ END\r\n
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import &quot;github.com/bradfitz/gomemcache/memcache&quot;
+  <pre class="language-go"><code class="language-go">package main
 
-mc := memcache.New(&quot;10.0.0.1:11211&quot;, &quot;10.0.0.2:11211&quot;)
-mc.Set(&amp;memcache.Item{
-    Key:        &quot;user:session:abc123&quot;,
-    Value:      []byte(`{&quot;user_id&quot;:42}`),
-    Expiration: 300, // 5 минут
-})
+import (
+    &quot;fmt&quot;
+    &quot;log&quot;
 
-item, err := mc.Get(&quot;user:session:abc123&quot;)
-if err == memcache.ErrCacheMiss {
-    // Пересоздать сессию
-} else if err != nil {
-    // Обработка ошибки соединения
+    &quot;github.com/bradfitz/gomemcache/memcache&quot;
+)
+
+func main() {
+    // Подключение к нескольким узлам Memcached (клиент сам выполняет consistent hashing)
+    mc := memcache.New(&quot;10.0.0.1:11211&quot;, &quot;10.0.0.2:11211&quot;)
+
+    // Сохранение элемента
+    err := mc.Set(&amp;memcache.Item{
+        Key:        &quot;user:session:abc123&quot;,
+        Value:      []byte(`{&quot;user_id&quot;:42}`),
+        Expiration: 300, // 5 минут
+    })
+    if err != nil {
+        log.Fatalf(&quot;Set failed: %v&quot;, err)
+    }
+
+    // Чтение элемента
+    item, err := mc.Get(&quot;user:session:abc123&quot;)
+    if err == memcache.ErrCacheMiss {
+        fmt.Println(&quot;Элемент не найден (Cache Miss) - читаем из основной БД&quot;)
+    } else if err != nil {
+        log.Printf(&quot;Ошибка сетевого соединения: %v&quot;, err)
+    } else {
+        fmt.Printf(&quot;Успешно прочитано: %s\n&quot;, string(item.Value))
+    }
 }
 </code></pre>
 </div>
@@ -2390,9 +2437,10 @@ if err == memcache.ErrCacheMiss {
   </div>
 </div>
 
+<hr />
 <h2 id="sravnenie-memcached-i-redis">Сравнение Memcached и Redis</h2>
 
-<p>Держите в голове эту таблицу, когда выбираете инструмент:</p>
+<p>Держите в голове эту сводную инженерную таблицу при проектировании архитектуры:</p>
 <div class="table-container"><table>
 <thead>
 <tr>
@@ -2403,54 +2451,54 @@ if err == memcache.ErrCacheMiss {
 </thead>
 <tbody>
 <tr>
-<td>Модель обработки</td>
-<td>Многопоточная (несколько worker’ов)</td>
+<td><strong>Модель обработки</strong></td>
+<td>Многопоточная (несколько worker-потоков с libevent)</td>
 <td>Однопоточная (с опциональным многопоточным I/O)</td>
 </tr>
 <tr>
-<td>Структуры данных</td>
-<td>Только строки (плоские значения)</td>
-<td>Строки, списки, множества, хеши, потоки ...</td>
+<td><strong>Структуры данных</strong></td>
+<td>Только плоские байтовые строки (Opaque Blobs)</td>
+<td>Строки, списки, множества, хеши, потоки, ZSet</td>
 </tr>
 <tr>
-<td>Память</td>
-<td>Slab allocator, только RAM</td>
-<td>Jemalloc, RAM с персистентностью на диск</td>
+<td><strong>Управление памятью</strong></td>
+<td>Slab allocator (надежная защита от внешней фрагментации)</td>
+<td>Jemalloc (динамические аллокации в куче)</td>
 </tr>
 <tr>
-<td>Персистентность</td>
-<td>Отсутствует</td>
-<td>RDB, AOF</td>
+<td><strong>Персистентность</strong></td>
+<td>Полностью отсутствует (Zero Persistence)</td>
+<td>RDB-снимки, инкрементальный AOF-журнал</td>
 </tr>
 <tr>
-<td>Репликация</td>
-<td>Нет</td>
-<td>Master-Replica, Sentinel, Cluster</td>
+<td><strong>Кластеризация</strong></td>
+<td>Шардирование на клиенте (Consistent Hashing)</td>
+<td>Встроенный Redis Cluster (16384 слота) + Sentinel</td>
 </tr>
 <tr>
-<td>Expire</td>
-<td>Ленивая + фоновый crawler</td>
-<td>Ленивая + активная (serverCron)</td>
+<td><strong>Очистка ключей (TTL)</strong></td>
+<td>Ленивая (Lazy) + фоновый crawler потоков</td>
+<td>Ленивая + активная (serverCron 100 раз/сек)</td>
 </tr>
 <tr>
-<td>Поддержка Lua</td>
-<td>Нет</td>
-<td>Есть</td>
+<td><strong>Исполнение скриптов</strong></td>
+<td>Нет поддержки скриптов</td>
+<td>Встроенный Lua-интерпретатор, Redis Functions</td>
 </tr>
 <tr>
-<td>Макс. размер значения</td>
-<td>1 МБ (настраивается)</td>
-<td>512 МБ</td>
+<td><strong>Макс. размер значения</strong></td>
+<td>По умолчанию 1 МБ (настраивается флагами)</td>
+<td>До 512 МБ на ключ</td>
 </tr>
 <tr>
-<td>Сетевая модель</td>
-<td>libevent, TCP/UDP</td>
-<td>Собственный ae, TCP</td>
+<td><strong>Сетевая библиотека</strong></td>
+<td>libevent, поддержка TCP и UDP</td>
+<td>Собственная библиотека ae, TCP</td>
 </tr>
 <tr>
-<td>Подходит для</td>
-<td>Простое кэширование, высокий RPS</td>
-<td>Кэширование, координация, очереди, стримы</td>
+<td><strong>Целевой сценарий</strong></td>
+<td>Однородный простой кэш, предельный RPS</td>
+<td>Кэширование, распределенные блокировки, очереди</td>
 </tr>
 </tbody>
 </table></div>
@@ -2474,6 +2522,7 @@ if err == memcache.ErrCacheMiss {
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-memcached-na-golom-zheleze">Mechanical Sympathy: Memcached на голом железе</h2>
 
 <p>Рассмотрим физический путь запроса <code>GET</code> из Go-сервиса до Memcached и обратно.</p>
@@ -2483,6 +2532,7 @@ if err == memcache.ErrCacheMiss {
 <li><strong>Ответ:</strong> Worker формирует заголовок <code>VALUE ...</code> и пишет данные в сокет клиента. Все операции с памятью происходят в рамках одного чанка, без лишних копирований. На стороне Go горутина пробуждается через netpoller, читает ответ и возвращает байты.</li>
 </ol>
 <p>Благодаря slab’ам, данные чанка находятся в непрерывном блоке памяти, и процессор подгружает их в L1/L2 кэши с высокой вероятностью попадания. Многопоточность позволяет параллельно обслуживать столько запросов, сколько ядер, без координации. Именно поэтому Memcached достигает 1+ миллионов GET’ов в секунду на одном мощном сервере.</p>
+<hr />
 <h2 id="tipichnye-problemy-i-lovushki">Типичные проблемы и ловушки</h2>
 
 <div class="callout callout-warning">
@@ -2501,6 +2551,7 @@ if err == memcache.ErrCacheMiss {
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Memcached — это чистейший пример in-memory кэша, доведённого до совершенства. Его многопоточная архитектура и slab-аллокатор позволяют выжать максимум из многоядерных процессоров при кэшировании простых строк. Отсутствие персистентности, структур данных и сложной кластеризации делает его неподходящим для задач, требующих долговременного хранения или сложных запросов, но даёт непревзойдённую скорость и предсказуемость.</p>

@@ -2168,22 +2168,23 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~37 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Key Value базы</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie">Введение</h2>
-
-<p>Key-Value (KV) хранилище — это простейшая и одновременно одна из самых мощных абстракций в мире NoSQL. Всё вращается вокруг единственной операции: по заданному уникальному ключу получить значение. Никаких схем, никаких связей, никаких сложных языков запросов. Именно эта простота позволяет добиться экстремальной производительности и предсказуемости, которые недостижимы в реляционных или даже документных базах.</p>
-<p>В экосистеме Go key-value хранилища занимают центральное место: от кэширования ответов API до распределённых блокировок и координации сервисов. Понимание их внутреннего устройства необходимо для архитектора, проектирующего высоконагруженные системы.</p>
+            <h1>Key-Value базы данных: архитектура, структуры памяти и паттерны в Go</h1>
+<p>Key-Value (KV) хранилище — это простейшая и одновременно одна из самых мощных инженерных абстракций в мире баз данных. Вся парадигма вращается вокруг элементарного контракта: по уникальному ключу атомарно сохранить или извлечь значение. Здесь нет таблиц, внешних ключей, колонок, триггеров и тяжеловесных оптимизаторов запросов.</p>
+<p>Именно эта радикальная простота позволяет выжать максимум из современного кремния. Когда реляционная СУБД тратит сотни тысяч тактов CPU на парсинг SQL, проверку прав, построение плана выполнения, блокировку страниц и обход B-Tree, KV-хранилище вычисляет хэш ключа и читает данные из памяти за десятки наносекунд.</p>
+<p>В экосистеме Go key-value хранилища занимают центральное место: от многоуровневого кэширования ответов API до распределенных блокировок, скользящих счетчиков rate limiting и координации микросервисов.</p>
+<hr />
 <h2 id="model-dannykh">Модель данных</h2>
 
-<p>Математически KV-хранилище — это ассоциативный массив (map, dictionary), где:<br />
-- <strong>Ключ</strong> — уникальный идентификатор, обычно строка (но может быть бинарным).<br />
-- <strong>Значение</strong> — произвольный набор байтов. Хранилище не интерпретирует значение: для него это opaque blob. Вся логика работы с данными (сериализация, schema-on-read) лежит на приложении.</p>
+<p>Математически KV-хранилище представляет собой ассоциативный массив (отображение, хэш-таблицу), где:<br />
+- <strong>Ключ (Key)</strong> — уникальный идентификатор, чаще всего текстовая строка произвольного формата, но на уровне движка — непрерывная последовательность байт.<br />
+- <strong>Значение (Value)</strong> — неинтерпретируемый набор байтов (opaque BLOB). Хранилище не валидирует внутреннюю структуру данных: для него это просто массив байт в памяти. Вся логика валидации схемы (schema-on-read), сериализации и десериализации полностью возлагается на клиентское приложение.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2193,30 +2194,66 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Пример мысленной модели KV в Go
+  <pre class="language-go"><code class="language-go">// Концептуальная ментальная модель KV-хранилища в Go
 store := make(map[string][]byte)
 store[&quot;user:session:abc123&quot;] = []byte(`{&quot;user_id&quot;:42,&quot;expires&quot;:&quot;2026-04-25T12:00:00Z&quot;}`)
 </code></pre>
 </div>
 
-<p>Такая простота устраняет целые классы сложности: нет необходимости в парсере SQL, планировщике запросов, оптимизаторе join’ов, транзакциях на уровне нескольких записей (хотя атомарность для одного ключа часто предоставляется). Взамен мы получаем O(1) доступ по ключу, который можно реализовать практически без накладных расходов.</p>
+<p>Такая лаконичность устраняет целые классы вычислительной сложности:<br />
+- Нет синтаксического анализатора SQL и построителя дерева выражений (AST).<br />
+- Нет оптимизатора реляционных соединений (<code>Hash Join</code>, <code>Merge Join</code>, <code>Nested Loops</code>).<br />
+- Нет накладных расходов на координацию транзакций между несколькими независимыми таблицами.</p>
+<p>Взамен мы получаем гарантированный доступ $O(1)$ по ключу с минимальной латентностью и нулевыми накладными расходами на трансляцию абстракций.</p>
+<hr />
 <h2 id="tipy-key-value-khranilishch">Типы Key-Value хранилищ</h2>
 
-<p>Хотя модель одна, реализации резко отличаются по области применения. Полезно разделять их по двум осям.</p>
+<p>Хотя концептуальная модель едина, физическая реализация и архитектура KV-движков разделяются по двум ключевым измерениям: среде хранения и топологии развертывания.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Storage_Media[&quot;1. Среда хранения данных&quot;]
+SM1[&quot;In-Memory (Оперативная память)&quot;] --- SM1_Ex[&quot;Redis, Memcached, Valkey&lt;br&gt;Латентность: микросекунды (0.1–0.5 ms)&lt;br&gt;Ограничено объемом RAM&quot;]
+SM2[&quot;Persistent (Дисковые накопители)&quot;] --- SM2_Ex[&quot;RocksDB, LevelDB, BadgerDB, DynamoDB&lt;br&gt;Архитектура: LSM-Tree / B-Tree&lt;br&gt;Объем: терабайты на узел&quot;]
+end
+
+subgraph Architecture_Topology[&quot;2. Архитектура развертывания&quot;]
+AT1[&quot;Embedded (Встраиваемые библиотеки)&quot;] --- AT1_Ex[&quot;bbolt, BadgerDB, RocksDB&lt;br&gt;Вызовы внутри процесса (CGO / Pure Go)&lt;br&gt;Zero Network Hop, Shared Memory&quot;]
+AT2[&quot;Client-Server (Сетевые сервисы)&quot;] --- AT2_Ex[&quot;Redis, Memcached, Valkey, etcd&lt;br&gt;Сетевой оверхед (TCP / RESP)&lt;br&gt;Общий доступ сотен сервисов, шардирование&quot;]
+end
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef highlight fill:#312e81,stroke:#6366f1,color:#ffffff;
+class Storage_Media,Architecture_Topology highlight;
+  </pre>
+</div>
+
+
 <h3 id="1-osnovnoe-khranilishche-dannykh">1. Основное хранилище данных</h3>
 <ul>
-<li><strong>In-memory</strong> — весь набор данных находится в оперативной памяти. Примеры: <a href="3-redis-arkhitektura-i-primenenie.html" class="wikilink">Redis</a>, <a href="5-memcached.html" class="wikilink">Memcached</a>, <a href="6-valkey.html" class="wikilink">Valkey</a>. Скорость доступа измеряется микросекундами. Персистентность опциональна (снапшоты, AOF) и не гарантирует долговечность каждой записи.</li>
-<li><strong>Persistent (на диске)</strong> — данные живут на SSD/HDD. Примеры: RocksDB, LevelDB (встраиваемые библиотеки), Amazon DynamoDB (облачный сервис). Используют LSM-Tree или B-Tree для организации данных на диске. Скорость ниже, но объёмы могут превышать RAM.</li>
+<li><strong>In-memory</strong> — весь активный набор данных постоянно находится в оперативной памяти (DRAM). Примеры: <a href="3-redis-arkhitektura-i-primenenie.html" class="wikilink">Redis</a>, <a href="5-memcached.html" class="wikilink">Memcached</a>, <a href="6-valkey.html" class="wikilink">Valkey</a>. Скорость доступа измеряется микросекундами. Персистентность опциональна (периодические RDB-снапшоты, инкрементальный append-only журнал AOF) и не гарантирует мгновенную долговечность каждой транзакции без вызова <code>fsync</code>.</li>
+<li><strong>Persistent (на диске)</strong> — данные упорядоченно сбрасываются на SSD/NVMe. Примеры: RocksDB, LevelDB (встраиваемые библиотеки на C++), BadgerDB (pure Go), Amazon DynamoDB (облачный сервис). Они опираются на структуры LSM-Tree (Log-Structured Merge-tree) или B+Tree, где оперативная память используется в качестве write-буфера (memtable) и блочного кэша. Скорость операций здесь уступает DRAM в сотни раз, но емкость ограничена терабайтами диска, а не объемом планок памяти.</li>
 </ul>
 <h3 id="2-arkhitektura-razvyortyvaniya">2. Архитектура развёртывания</h3>
 <ul>
-<li><strong>Embedded</strong> — база работает как библиотека внутри вашего процесса. Нет сетевого стека, нет сериализации. Вызов — это прямой вызов функции, работающий с локальной памятью/диском. Go-порты: bbolt, badger. Идеально для локальных хранилищ, например, хранения метаданных на одном хосте.</li>
-<li><strong>Client-server</strong> — выделенный процесс (или кластер), к которому подключаются клиенты по сети (TCP). Примеры: Redis, Memcached. Добавляется latency сети, но даёт разделение ответственности, масштабирование и переиспользование данных многими сервисами.</li>
+<li><strong>Embedded (встраиваемые)</strong> — база данных компилируется прямо в бинарник вашего Go-приложения как обычный Go-пакет. Нет сетевого стека, нет сериализации по TCP. Доступ к данным — это прямой вызов функции в памяти с нулевым копированием (zero-copy). Яркие представители экосистемы Go: <code>bbolt</code> (форк BoltDB, лежащий в основе <code>etcd</code>), <code>badger</code> (от Dgraph Labs). Идеально подходят для локальных хранилищ метаданных, очередей на хосте и граничных вычислений (Edge computing).</li>
+<li><strong>Client-server (клиент-серверные)</strong> — самостоятельные сетевые демоны, принимающие соединения сотен микросервисов по протоколу TCP. Примеры: Redis, Memcached, Valkey. Появляется накладной расход на сериализацию, сетевой round-trip (RTT) и системные вызовы сокетов, но взамен мы получаем независимое масштабирование, централизованный пул памяти и общий источник состояния для распределенного кластера.</li>
 </ul>
-<p>В бэкенд-разработке на Go абсолютно доминирует client-server подход с in-memory хранилищами, поэтому именно им мы и посвятим основной фокус.</p>
+<hr />
 <h2 id="pod-kapotom-kak-realizovana-o1-magiya">Под капотом: как реализована O(1) магия</h2>
 
-<p>С точки зрения Mechanical Sympathy, главное, что нужно понять о быстрых KV-хранилищах — это как они организуют данные в памяти, чтобы процессор находил их почти мгновенно.</p>
+<p>С точки зрения Mechanical Sympathy, скорость KV-хранилищ базируется на двух китах: устранении дискового случайного ввода-вывода (Random I/O) и выравнивании структур данных под кэш-линии современных процессоров.</p>
 <h3 id="khesh-tablitsa-fundament">Хеш-таблица — фундамент</h3>
 
 <p>Внутри Redis, Memcached, Valkey и многих других используется классическая хеш-таблица с цепочками (chaining) или открытой адресацией.</p>
@@ -2234,40 +2271,71 @@ store[&quot;user:session:abc123&quot;] = []byte(`{&quot;user_id&quot;:42,&quot;e
   </div>
   <pre class="mermaid">
 flowchart TD
-Client[&quot;Клиент Go&lt;br&gt;Send GET &#x27;user:42&#x27;&quot;] --&gt;|&quot;TCP / RESP&quot;| Server[&quot;Сервер KV&quot;]
-Server --&gt; HashFunc[&quot;Вычисление хеша&lt;br&gt;от ключа&lt;br&gt;hash = siphash/crc16&quot;]
-HashFunc --&gt; Buckets[&quot;Массив bucket-ов&lt;br&gt;в куче процесса&quot;]
-Buckets --&gt; Chain[&quot;Поиск в цепочке&lt;br&gt;сравнение строк&lt;br&gt;возврат значения&quot;]
-Chain --&gt; Mem[&quot;Участок памяти&lt;br&gt;с хранимым blob&quot;]
-Mem --&gt; Response[&quot;Ответ клиенту&quot;]
+Client[&quot;Клиент Go&lt;br&gt;Send GET &#x27;user:42&#x27;&quot;] --&gt;|&quot;TCP / RESP&quot;| Server[&quot;Сервер KV (Event Loop)&quot;]
+Server --&gt; HashFunc[&quot;Вычисление хеша от ключа&lt;br&gt;hash = siphash/crc16&quot;]
+HashFunc --&gt; Buckets[&quot;Массив bucket-ов в куче процесса&lt;br&gt;index = hash &amp; (size - 1)&quot;]
+Buckets --&gt; Chain[&quot;Поиск в цепочке коллизий&lt;br&gt;Сравнение указателей и строк&lt;br&gt;Возврат значения&quot;]
+Chain --&gt; Mem[&quot;Участок памяти с хранимым blob&lt;br&gt;(robj / sds-строка)&quot;]
+Mem --&gt; Response[&quot;Ответ клиенту: $14\r\n{...}\r\n&quot;]
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef nodeAct fill:#312e81,stroke:#6366f1,color:#ffffff;
+class Server,HashFunc,Buckets nodeAct;
   </pre>
 </div>
 
 
-<p>Разберём ключевые моменты.</p>
-<p><strong>Хеш-функция.</strong> Используются быстрые некриптографические функции: SipHash (в Redis), MurmurHash, CityHash. Они спроектированы так, чтобы за несколько десятков тактов CPU давать равномерное распределение по бакетам, избегая коллизий. Для Go-разработчика, знающего <span class="wikilink-unresolved" title="Заметка в разработке">Устройство и работа ОС</span>, важно, что вычисление хеша происходит в user space, без syscall’ов, и полностью ложится на АЛУ процессора.</p>
-<p><strong>Массив бакетов.</strong> Ядро таблицы — это непрерывный кусок памяти, выделенный через <code>malloc</code> (в C-реализации Redis) или аналогичный механизм. Обращение по индексу — это O(1) с использованием L1/L2 кэша процессора. Именно поэтому KV-хранилище может обслуживать ~100 000 операций в секунду на одно ядро: данные, нужные для поиска, помещаются в кэш-линии.</p>
-<p><strong>Коллизии.</strong> Когда два ключа попадают в один бакет, Redis использует связанный список (до Redis 7) или skip list для упорядоченных данных, а Memcached — свою slab-аллокацию с цепочками в пределах одного slab'а. Детали специфичны, но общая идея: переход от O(1) к O(N) по длине цепочки. Поэтому важно не допускать слишком длинных цепочек (решается рехэшированием при росте таблицы).</p>
+<p>Разберём ключевые инженерные элементы этой архитектуры:</p>
+<ol>
+<li><strong>Хеш-функция.</strong> Используются быстрые некриптографические функции: SipHash (в Redis), MurmurHash, CityHash. Они спроектированы так, чтобы за несколько десятков тактов CPU давать равномерное распределение по бакетам, избегая коллизий. Для Go-разработчика, знающего <span class="wikilink-unresolved" title="Заметка в разработке">Устройство и работа ОС</span>, важно, что вычисление хеша происходит в user space, без syscall’ов, и полностью ложится на АЛУ процессора. Кроме того, SipHash защищает сервис от атак типа HashDoS (умышленная генерация ключей с одинаковым хэшем для деградации поиска в $O(N)$).</li>
+<li><strong>Массив бакетов.</strong> Ядро таблицы — это непрерывный кусок памяти, выделенный через <code>malloc</code> (в C-реализации Redis) или аналогичный механизм. Обращение по индексу — это O(1) с использованием L1/L2 кэша процессора. Обращение к бакету <code>table[index]</code> — это прямое чтение по адресу <code>base_addr + index * sizeof(pointer)</code>. Если бакет уже закэширован в L1d-кэше процессора (доступ ~1 нс), процессор тратит минимум тактов.</li>
+<li><strong>Разрешение коллизий.</strong> Когда два разных ключа дают одинаковый индекс бакета, они организуются в связный список (chaining). В наихудшем случае цепочка превращает поиск в $O(N)$. Чтобы предотвратить деградацию производительности, движок мониторит коэффициент заполнения (load factor). При превышении порога (обычно 1.0) запускается динамическое рехэширование.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>В Redis хеш-таблица — это <code>dictht</code>, содержащая массив <code>dictEntry*</code>. При рехэшировании Redis использует инкрементальный подход: операция переноса ключей из старой таблицы в новую выполняется понемногу при каждом обращении к базе, чтобы не блокировать сервер на длительный период. Это классический пример избегания «stop-the-world» пауз в конкурентной среде.</p>
+    <p>В Redis хеш-таблица — это <code>dictht</code>, содержащая массив <code>dictEntry*</code>. При рехэшировании Redis использует инкрементальный подход: операция переноса ключей из старой таблицы в новую выполняется понемногу при каждом обращении к базе, чтобы не блокировать сервер на длительный период. Это классический пример избегания «stop-the-world» пауз в конкурентной среде. Во время рехэширования в структуре присутствуют две таблицы (<code>ht[0]</code> и <code>ht[1]</code>). Новые записи всегда идут в <code>ht[1]</code>, а поиск проверяет сначала старую, затем новую.</p>
   </div>
 </div>
 
 <h3 id="struktury-dannykh-dlya-znacheniy">Структуры данных для значений</h3>
 
-<p>В отличие от Memcached, который хранит только плоские строки, Redis и Valkey предлагают богатые структуры: строки, списки, множества, хеши, sorted sets. Но с точки зрения KV-модели — значение остаётся единым blob’ом. Тип структуры — это метаданные, которые говорят серверу, как интерпретировать байты, чтобы выполнить операции вроде <code>LPUSH</code> или <code>ZADD</code>.</p>
+<p>В отличие от Memcached, который хранит только плоские байтовые строки, Redis и Valkey предлагают богатые структуры: строки (SDS — Simple Dynamic Strings), списки (Quicklist / Listpack), множества (Intset / Hashtable), хэши (Dict / Listpack), упорядоченные множества (Sorted Sets на базе SkipList). Но с точки зрения KV-модели — значение остаётся единым blob’ом. Тип структуры — это метаданные, которые говорят серверу, как интерпретировать байты, чтобы выполнить операции вроде <code>LPUSH</code> или <code>ZADD</code>.</p>
 <p>Для Go-разработчика это означает, что даже самый сложный объект нужно сериализовать перед отправкой в KV-хранилище. Чаще всего выбирают JSON, MessagePack, Protobuf. При этом нужно помнить о влиянии на кучу Go: большие аллокации увеличивают давление на GC. Рассмотрите возможность переиспользования буферов через <code>sync.Pool</code> при частой сериализации.</p>
+<hr />
 <h2 id="protokoly-vzaimodeystviya-kak-go-obshchaetsya-s-kv-khranilishchem">Протоколы взаимодействия: как Go общается с KV-хранилищем</h2>
 
 <p>Когда ваш Go-сервис выполняет <code>client.Get(ctx, "key")</code>, происходит цепочка событий, включающая сокеты, системные вызовы и парсинг.</p>
-<p><strong>RESP (REdis Serialization Protocol).</strong> Классический протокол Redis, используемый также Valkey и многими другими. Он текстовый и бинарно-безопасный. Запрос выглядит как <code>*2\r\n$3\r\nGET\r\n$7\r\nuser:42\r\n</code>. Ответ — либо bulk string, либо число, либо ошибка. Парсинг RESP — один из самых горячих путей в драйвере go-redis. Именно здесь нужно проявлять осторожность с аллокациями: наивный парсинг может порождать тысячи временных слайсов. Библиотека go-redis/v9 использует пул буферов и zero-copy парсинг, чтобы снизить нагрузку на GC.</p>
-<p><strong>Memcached протокол.</strong> Более простой, текстовый. Команды: <code>get key\r\n</code>, <code>set key flags exptime length\r\n&lt;data&gt;\r\n</code>. Здесь нет вложенных структур, всё очень линейно.</p>
-<p><strong>Соединения и пулы.</strong> В Go для общения с KV-хранилищем драйверы управляют пулом TCP-соединений. В отличие от <code>database/sql</code> с его строгой моделью, в go-redis используется собственная реализация пула на основе каналов. Важный нюанс: при использовании пайплайнов (pipelining) клиент может отправлять несколько команд по одному соединению, не дожидаясь ответа. Это снижает latency за счёт устранения round-trip времени. Но нужно быть осторожным: если одна команда в пайплайне вызовет ошибку, последующие всё равно выполнятся, и нужно корректно разбирать ответы.</p>
+<h3 id="resp-redis-serialization-protocol">RESP (REdis Serialization Protocol)</h3>
+<p>Классический протокол Redis, используемый также Valkey и многими другими. Он текстовый и бинарно-безопасный (binary safe), так как длина payload всегда явно передается префиксом.<br />
+Запрос выглядит как:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">*2\r\n$3\r\nGET\r\n$7\r\nuser:42\r\n
+</code></pre>
+</div>
+
+<p>Разбор по токенам:<br />
+- <code>*2</code> — массив из 2 аргументов.<br />
+- <code>$3\r\nGET\r\n</code> — bulk string длиной 3 байта со словом <code>GET</code>.<br />
+- <code>$7\r\nuser:42\r\n</code> — bulk string длиной 7 байт со значением <code>user:42</code>.</p>
+<p>Ответ — либо bulk string (<code>$10\r\nvalue_data\r\n</code>), либо целочисленное значение (<code>:1\r\n</code>), либо ошибка (<code>-ERR ...\r\n</code>). Парсинг RESP — один из самых горячих путей в драйвере <code>go-redis</code>. Библиотека <code>go-redis/v9</code> использует пул буферов и zero-copy парсинг, чтобы снизить нагрузку на сборщик мусора Go.</p>
+<h3 id="memcached-protokol">Memcached протокол</h3>
+<p>Более простой, текстовый (хотя есть и бинарная спецификация). Базовые команды: <code>get key\r\n</code>, <code>get &lt;key&gt;\r\n</code>, либо сохранение: <code>set key flags exptime length\r\n&lt;data&gt;\r\n</code>. Здесь нет вложенных структур, всё максимально оптимизировано под плоский memcopy в кэш.</p>
+<h3 id="soedineniya-puly-i-pipelining-v-go">Соединения, пулы и Pipelining в Go</h3>
+
+<p>В Go для общения с сетевым KV-хранилищем клиентские библиотеки поддерживают внутренний connection pool. В отличие от <code>database/sql</code>, где драйвер оперирует стандартным пулом соединений базы, в <code>github.com/redis/go-redis/v9</code> реализован специализированный пул на каналах и мьютексах, поддерживающий безопасное мультиплексирование горутин.</p>
+<p>Один из мощнейших инструментов повышения пропускной способности — <strong>Pipelining</strong>. Клиент отправляет пачку команд подряд в один сокет без ожидания подтверждения каждой команды (устраняя Round-Trip Time для каждого сетевого пакета):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2277,30 +2345,76 @@ Mem --&gt; Response[&quot;Ответ клиенту&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">pipe := rdb.Pipeline()
-getCmd := pipe.Get(ctx, &quot;key1&quot;)
-setCmd := pipe.Set(ctx, &quot;key2&quot;, &quot;val&quot;, 0)
-_, err := pipe.Exec(ctx)
-if err != nil {
-    // ошибка на уровне соединения, а не отдельных команд
-}
-// Теперь можно проверить отдельные команды
-if err := getCmd.Err(); err != nil {
-    // ...
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;log&quot;
+    &quot;time&quot;
+
+    &quot;github.com/redis/go-redis/v9&quot;
+)
+
+func runPipelineDemo(ctx context.Context, rdb *redis.Client) {
+    // Создаем пайплайн
+    pipe := rdb.Pipeline()
+
+    // Наполняем буфер командами (команды еще не улетели в сеть!)
+    getCmd := pipe.Get(ctx, &quot;session:101&quot;)
+    setCmd := pipe.Set(ctx, &quot;session:102&quot;, &quot;token_xyz&quot;, 10*time.Minute)
+    incrCmd := pipe.Incr(ctx, &quot;counter:global&quot;)
+
+    // Отправляем все команды за один системный вызов write()
+    _, err := pipe.Exec(ctx)
+    if err != nil &amp;&amp; err != redis.Nil {
+        log.Printf(&quot;Сетевая ошибка при исполнении пайплайна: %v&quot;, err)
+    }
+
+    // Читаем индивидуальные ответы после прогона
+    if val, err := getCmd.Result(); err == nil {
+        fmt.Println(&quot;Значение session:101:&quot;, val)
+    } else if err == redis.Nil {
+        fmt.Println(&quot;Ключ session:101 не найден&quot;)
+    }
+
+    fmt.Println(&quot;Результат SET session:102:&quot;, setCmd.Val())
+    fmt.Println(&quot;Новое значение счетчика:&quot;, incrCmd.Val())
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="patterny-ispolzovaniya-i-mechanical-sympathy">Паттерны использования и Mechanical Sympathy</h2>
 
 <p>Давайте взглянем на KV-хранилище глазами процессора, планировщика горутин и ядра ОС.</p>
 <h3 id="keshirovanie-samyy-goryachiy-stsenariy">Кэширование — самый горячий сценарий</h3>
-
-<p>Ваш Go-сервис обращается к PostgreSQL за данными пользователя, запрос занимает 5 мс (дисковый ввод-вывод, парсинг, передача по сети). Если вы сохраните результат в Redis с TTL 60 секунд, последующие запросы будут выполняться за 0.1–0.3 мс (сетевая задержка + поиск в памяти). Разница в 20–50 раз.</p>
+<p>Ваш Go-сервис обращается к PostgreSQL за данными пользователя. Запрос занимает 5 мс (дисковый ввод-вывод, парсинг, передача по сети). Если вы сохраните результат в Redis с TTL 60 секунд, последующие запросы будут выполняться за 0.1–0.3 мс (сетевая задержка + поиск в памяти). Разница в 20–50 раз.</p>
 <p>С точки зрения процессора: вместо тысяч тактов на ожидание <code>preadv</code> (чтение страниц с диска), вы тратите несколько тактов на хеш-функцию и проверку указателя в таблице. Горутина, ожидающая ответ от Redis, блокируется на сетевом I/O (syscall <code>epoll_wait</code>), но это уже не дисковое ожидание, а управляемая асинхронная операция, переиспользующая тот же системный вызов, что и встроенный netpoller Go. Подробнее о взаимодействии с ОС — в разделе <span class="wikilink-unresolved" title="Заметка в разработке">Устройство и работа ОС</span>.</p>
 <h3 id="raspredelyonnye-blokirovki-i-koordinatsiya">Распределённые блокировки и координация</h3>
+<p>Redis с командой <code>SET NX EX</code> (или <code>SET key val NX PX milliseconds</code>) предоставляет фундамент для распределенных локов. Когда десятки экземпляров Go-сервиса борются за право выполнить задачу, они обращаются к Redis. Здесь критична не только скорость, но и атомарность: <code>SETNX</code> (set if not exists) выполняется на сервере как одна инструкция без гонок.</p>
 
-<p>Redis с командой <code>SET NX EX</code> или Redlock (несмотря на критику) часто применяется для распределённых блокировок. Когда десятки экземпляров Go-сервиса борются за право выполнить задачу, они обращаются к Redis. Здесь критична не только скорость, но и атомарность: <code>SETNX</code> (set if not exists) выполняется на сервере как одна инструкция без гонок.</p>
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Пример надежной установки распределенной блокировки в Go
+func acquireLock(ctx context.Context, rdb *redis.Client, lockKey string, token string, ttl time.Duration) bool {
+    // Атомарная команда: установить только если ключ отсутствует (NX) с автоматическим TTL (PX)
+    ok, err := rdb.SetNX(ctx, lockKey, token, ttl).Result()
+    if err != nil {
+        log.Printf(&quot;Ошибка при взятии блокировки: %v&quot;, err)
+        return false
+    }
+    return ok
+}
+</code></pre>
+</div>
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2312,11 +2426,10 @@ if err := getCmd.Err(); err != nil {
 </div>
 
 <h3 id="rate-limiting">Rate limiting</h3>
-
 <p>Алгоритм Token Bucket или Sliding Window Log легко реализуется с помощью команд <code>INCR</code> и <code>EXPIRE</code>. За счёт того, что инкремент — атомарная операция, работающая полностью в памяти Redis, он идеально подходит для ограничения запросов на уровне сотен тысяч RPS. Если бы вы попытались делать это в PostgreSQL, каждая проверка оборачивалась бы в транзакцию с <code>UPDATE ... WHERE</code> и блокировками — нагрузка, убийственная для базы.</p>
 <h3 id="ocheredi-zadach">Очереди задач</h3>
-
 <p>Redis позволяет строить простые очереди через <code>LPUSH</code> / <code>BRPOP</code>. Но для продакшена обычно используют <span class="wikilink-unresolved" title="Заметка в разработке">выделенные брокеры</span>, так как Redis не гарантирует надёжную доставку при сбоях. Тем не менее, для легковесных задач он прекрасен.</p>
+<hr />
 <h2 id="ogranicheniya-i-kompromissy">Ограничения и компромиссы</h2>
 
 <p>Платой за скорость и простоту становится потеря возможностей, привычных по SQL.</p>
@@ -2326,6 +2439,22 @@ if err := getCmd.Err(); err != nil {
 <li><strong>Отсутствие транзакций над несколькими ключами.</strong> Можно собрать пайплайн или Lua-скрипт, который будет выполнен атомарно, но откатить изменения при падении средины скрипта нельзя. ACID не гарантируется. Это фундаментально отличает KV от PostgreSQL с полноценными транзакциями и уровнями изоляции (<a href="../05-tranzaktsii-i-vnutrennosti/3-read-committed-repeatable-read-serializable.html" class="wikilink">3. Read Committed, Repeatable Read, Serializable</a>).</li>
 <li><strong>Согласованность в кластере.</strong> В режиме кластера Redis или в распределённых KV (Dynamo) нарушается линеаризуемость. Появляются сценарии, когда прочитанные данные не совпадают с последней записью. См. <a href="../../14-raspredelennye-sistemy-na-go/03-dannye-i-soglasovannost/8-distributed-transactions.html" class="wikilink">8. Distributed transactions</a>, <a href="../08-raspredelennye-bazy-dannykh/6-consistency-modeli.html" class="wikilink">6. Consistency модели</a>.</li>
 </ol>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Что происходит, когда оперативная память in-memory KV хранилища (Redis/Memcached) заполняется на 100%, и как это контролировать в Go-приложении?<br />
+<strong>Ответ:</strong> Поведение зависит от настроенной политики вытеснения (<code>maxmemory-policy</code>):<br />
+1. <code>noeviction</code> (по умолчанию в Redis): база возвращает ошибку <code>OOM command not allowed when used memory &gt; 'maxmemory'</code> на все пишущие команды (<code>SET</code>, <code>HSET</code>). Приложение на Go обязано быть готово обрабатывать эту ошибку и не падать в panic.<br />
+2. <code>allkeys-lru</code> / <code>volatile-lru</code>: база автоматически удаляет наименее используемые (Least Recently Used) ключи — либо среди всех ключей, либо только среди тех, для которых установлен TTL.<br />
+3. <code>allkeys-lfu</code> / <code>volatile-lfu</code>: вытеснение по наименьшей частоте обращений (Least Frequently Used) с логарифмическим счетчиком доступа.<br />
+При проектировании кэшей критически важно всегда задавать TTL и настраивать адекватную политику вытеснения, иначе сервис захлебнется ошибками при всплеске нагрузки.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="klyuchevye-predstaviteli-kuda-smotret-dalshe">Ключевые представители: куда смотреть дальше</h2>
 
 <p>Теперь, когда у вас есть фундаментальное понимание, можно углубляться в конкретные технологии, которые используются в реальных проектах.</p>
@@ -2335,6 +2464,7 @@ if err := getCmd.Err(); err != nil {
 <li><a href="5-memcached.html" class="wikilink">5. Memcached</a> — легковесный, многопоточный, идеален для простого кэширования без навороченных структур.</li>
 <li><a href="6-valkey.html" class="wikilink">6. Valkey</a> — форк Redis под управлением Linux Foundation, полностью совместимый, с открытой моделью разработки.</li>
 </ul>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Key-Value хранилища — это квинтэссенция NoSQL: они сводят задачу к простейшей абстракции, позволяя процессору и памяти работать на пределе возможностей. Для Go-разработчика это означает несколько сценариев, где вы получаете максимальную отдачу: кэши, сессии, координация, счётчики, очереди. Но за скорость и простоту вы расплачиваетесь гибкостью запросов, транзакционностью и стоимостью RAM. Понимание того, как внутри устроены хеш-таблицы, как парсится RESP и как ваш код взаимодействует с сетью через netpoller — это основа для принятия правильных архитектурных решений.</p>
@@ -2366,7 +2496,7 @@ if err := getCmd.Err(); err != nil {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vvedenie">Введение</a></li><li class="toc-item toc-h2"><a href="#model-dannykh">Модель данных</a></li><li class="toc-item toc-h2"><a href="#tipy-key-value-khranilishch">Типы Key-Value хранилищ</a></li><li class="toc-item toc-h3"><a href="#1-osnovnoe-khranilishche-dannykh">1. Основное хранилище данных</a></li><li class="toc-item toc-h3"><a href="#2-arkhitektura-razvyortyvaniya">2. Архитектура развёртывания</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-kak-realizovana-o1-magiya">Под капотом: как реализована O(1) магия</a></li><li class="toc-item toc-h3"><a href="#khesh-tablitsa-fundament">Хеш-таблица — фундамент</a></li><li class="toc-item toc-h3"><a href="#struktury-dannykh-dlya-znacheniy">Структуры данных для значений</a></li><li class="toc-item toc-h2"><a href="#protokoly-vzaimodeystviya-kak-go-obshchaetsya-s-kv-khranilishchem">Протоколы взаимодействия: как Go общается с KV-хранилищем</a></li><li class="toc-item toc-h2"><a href="#patterny-ispolzovaniya-i-mechanical-sympathy">Паттерны использования и Mechanical Sympathy</a></li><li class="toc-item toc-h3"><a href="#keshirovanie-samyy-goryachiy-stsenariy">Кэширование — самый горячий сценарий</a></li><li class="toc-item toc-h3"><a href="#raspredelyonnye-blokirovki-i-koordinatsiya">Распределённые блокировки и координация</a></li><li class="toc-item toc-h3"><a href="#rate-limiting">Rate limiting</a></li><li class="toc-item toc-h3"><a href="#ocheredi-zadach">Очереди задач</a></li><li class="toc-item toc-h2"><a href="#ogranicheniya-i-kompromissy">Ограничения и компромиссы</a></li><li class="toc-item toc-h2"><a href="#klyuchevye-predstaviteli-kuda-smotret-dalshe">Ключевые представители: куда смотреть дальше</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#model-dannykh">Модель данных</a></li><li class="toc-item toc-h2"><a href="#tipy-key-value-khranilishch">Типы Key-Value хранилищ</a></li><li class="toc-item toc-h3"><a href="#1-osnovnoe-khranilishche-dannykh">1. Основное хранилище данных</a></li><li class="toc-item toc-h3"><a href="#2-arkhitektura-razvyortyvaniya">2. Архитектура развёртывания</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-kak-realizovana-o1-magiya">Под капотом: как реализована O(1) магия</a></li><li class="toc-item toc-h3"><a href="#khesh-tablitsa-fundament">Хеш-таблица — фундамент</a></li><li class="toc-item toc-h3"><a href="#struktury-dannykh-dlya-znacheniy">Структуры данных для значений</a></li><li class="toc-item toc-h2"><a href="#protokoly-vzaimodeystviya-kak-go-obshchaetsya-s-kv-khranilishchem">Протоколы взаимодействия: как Go общается с KV-хранилищем</a></li><li class="toc-item toc-h3"><a href="#resp-redis-serialization-protocol">RESP (REdis Serialization Protocol)</a></li><li class="toc-item toc-h3"><a href="#memcached-protokol">Memcached протокол</a></li><li class="toc-item toc-h3"><a href="#soedineniya-puly-i-pipelining-v-go">Соединения, пулы и Pipelining в Go</a></li><li class="toc-item toc-h2"><a href="#patterny-ispolzovaniya-i-mechanical-sympathy">Паттерны использования и Mechanical Sympathy</a></li><li class="toc-item toc-h3"><a href="#keshirovanie-samyy-goryachiy-stsenariy">Кэширование — самый горячий сценарий</a></li><li class="toc-item toc-h3"><a href="#raspredelyonnye-blokirovki-i-koordinatsiya">Распределённые блокировки и координация</a></li><li class="toc-item toc-h3"><a href="#rate-limiting">Rate limiting</a></li><li class="toc-item toc-h3"><a href="#ocheredi-zadach">Очереди задач</a></li><li class="toc-item toc-h2"><a href="#ogranicheniya-i-kompromissy">Ограничения и компромиссы</a></li><li class="toc-item toc-h2"><a href="#klyuchevye-predstaviteli-kuda-smotret-dalshe">Ключевые представители: куда смотреть дальше</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

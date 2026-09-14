@@ -2175,10 +2175,12 @@
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie">Введение</h2>
+            <h1>Архитектура Apache Cassandra: распределенное кольцо токенов, gossip и Paxos</h1>
+<h2 id="vvedenie">Введение</h2>
 
 <p>В <a href="9-column-bazy-cassandra.html" class="wikilink">предыдущей статье</a> мы рассмотрели Cassandra как представителя колоночных (wide-column) NoSQL-систем, изучили модель данных, LSM-дерево и границы применимости. Теперь мы погрузимся в её архитектуру — топологию кластера, механизмы репликации, координации и восстановления. Понимание этих элементов абсолютно необходимо Senior Go-инженеру, проектирующему высоконагруженные сервисы, где ставки на доступность и линейную масштабируемость превыше немедленной строгой консистентности.</p>
 <p>Cassandra не просто распределённая база данных — это децентрализованная система без единой точки отказа, где каждый узел равноправен и способен обслужить запрос. Её архитектура воплощает принципы Amazon Dynamo и Google Bigtable, сплавленные в единое целое.</p>
+<hr />
 <h2 id="koltso-i-consistent-hashing">Кольцо и consistent hashing</h2>
 
 <p>В основе распределения данных в Cassandra лежит концепция <strong>consistent hashing</strong>. Все узлы кластера логически располагаются на кольце, охватывающем весь диапазон хеш-значений (от -2^63 до 2^63-1 при использовании Murmur3Partitioner).</p>
@@ -2200,6 +2202,10 @@ K[&quot;Ключ партиции&lt;br&gt;user:42&quot;] --&gt; Hash[&quot;Murm
 Hash --&gt; Token[&quot;Токен = -54321&quot;]
 Token --&gt; Ring[&quot;Кольцо токенов&lt;br&gt;от -2^63 до 2^63-1&quot;]
 Ring --&gt; Owner[&quot;Нода-владелец&lt;br&gt;и её реплики&quot;]
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef ring fill:#312e81,stroke:#6366f1,color:#ffffff;
+class Ring,Owner ring;
   </pre>
 </div>
 
@@ -2224,18 +2230,21 @@ Ring --&gt; Owner[&quot;Нода-владелец&lt;br&gt;и её реплик�
   </div>
   <pre class="mermaid">
 flowchart LR
-subgraph Ring[&quot;Кольцо токенов&quot;]
-N1a[&quot;Нода A&lt;br&gt;диапазон 1&quot;]
-N2a[&quot;Нода B&lt;br&gt;диапазон 1&quot;]
-N1b[&quot;Нода A&lt;br&gt;диапазон 2&quot;]
-N3a[&quot;Нода C&lt;br&gt;диапазон 1&quot;]
-N2b[&quot;Нода B&lt;br&gt;диапазон 2&quot;]
+subgraph Ring[&quot;Кольцо токенов кластера&quot;]
+N1a[&quot;Нода A (vnode 1)&quot;] --&gt; N2a[&quot;Нода B (vnode 1)&quot;]
+N2a --&gt; N1b[&quot;Нода A (vnode 2)&quot;]
+N1b --&gt; N3a[&quot;Нода C (vnode 1)&quot;]
+N3a --&gt; N2b[&quot;Нода B (vnode 2)&quot;]
+N2b --&gt; N1a
 end
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
   </pre>
 </div>
 
 
 <p>Для Go-драйвера <code>gocql</code> это знание критично: драйвер получает метаданные топологии (карту токенов и узлов) и может отправлять запрос напрямую на реплику, владеющую данными (<strong>TokenAwareHostPolicy</strong>). Это устраняет лишний сетевой прыжок через координатор и снижает latency.</p>
+<hr />
 <h2 id="replikatsiya-faktor-i-strategii">Репликация: фактор и стратегии</h2>
 
 <p>Каждая партиция хранится на нескольких узлах — фактор репликации (<code>replication_factor</code>, RF) определяет количество копий. Доступны две главные стратегии размещения реплик:</p>
@@ -2262,6 +2271,7 @@ cql := `CREATE KEYSPACE myks WITH replication = {
 </div>
 
 <p>При записи координатор отправляет запрос всем репликам и ждёт подтверждений в соответствии с указанным consistency level. Внутренне Cassandra использует <strong>Gossip-подобный протокол</strong> для мониторинга состояния узлов и быстрого обнаружения отказов.</p>
+<hr />
 <h2 id="gossip-protokol-i-obnaruzhenie-sboev">Gossip-протокол и обнаружение сбоев</h2>
 
 <p>Узлы Cassandra постоянно общаются между собой с помощью gossip-протокола (вариант Scuttlebutt). Каждую секунду узел случайно выбирает один-два других узла и синхронизирует с ними состояние кластера:<br />
@@ -2279,6 +2289,7 @@ cql := `CREATE KEYSPACE myks WITH replication = {
   </div>
 </div>
 
+<hr />
 <h2 id="hinted-handoff-i-read-repair">Hinted Handoff и Read Repair</h2>
 
 <p>Даже при временном отказе отдельных реплик Cassandra гарантирует, что данные в итоге станут консистентными, благодаря двум механизмам:</p>
@@ -2301,20 +2312,21 @@ sequenceDiagram
 participant Client as Клиент Go
 participant Coordinator as Координатор
 participant Replica1 as Реплика 1
-participant Replica2 as Реплика 2 недоступна
+participant Replica2 as Реплика 2 (Down)
 Coordinator-&gt;&gt;Replica1: Write
-Coordinator--&gt;&gt;Coordinator: Сохранить Hint для Реплики 2
-Note over Replica2: Узел восстанавливается
+Coordinator--&gt;&gt;Coordinator: Сохранить Hint для Реплики 2 в system.hints
+Note over Replica2: Узел восстанавливается в кольце
 Coordinator-&gt;&gt;Replica2: Hint: доставка пропущенных данных
 Client-&gt;&gt;Coordinator: Read
 Coordinator-&gt;&gt;Replica1: Read
 Coordinator-&gt;&gt;Replica2: Read
-Coordinator-&gt;&gt;Coordinator: Read Repair, если расхождение
+Coordinator-&gt;&gt;Coordinator: Read Repair, если обнаружено расхождение
   </pre>
 </div>
 
 
 <p>С точки зрения Mechanical Sympathy, hinted handoff — это фоновый процесс, генерирующий дополнительный сетевой трафик и дисковые записи (hints пишутся на диск). В высоконагруженных Go-сервисах важно следить за накоплением hints (метрика <code>pending_hints</code>) — их большой объём говорит о долговременной недоступности узлов и может забить диск.</p>
+<hr />
 <h2 id="compaction-kak-lsm-derevo-optimiziruet-khranenie">Compaction: как LSM-дерево оптимизирует хранение</h2>
 
 <p>Как мы обсуждали в <a href="9-column-bazy-cassandra.html" class="wikilink">предыдущей статье</a>, данные записываются в Memtable и сбрасываются в SSTable на диск. Но со временем накапливаются десятки и сотни SSTable, что замедляет чтение. <strong>Compaction</strong> объединяет эти файлы, удаляя устаревшие версии данных и освобождая место. Выбор стратегии влияет на производительность кардинально.</p>
@@ -2338,6 +2350,7 @@ Coordinator-&gt;&gt;Coordinator: Read Repair, если расхождение
   </div>
 </div>
 
+<hr />
 <h2 id="vnutrennie-indeksy-i-vtorichnye-indeksy">Внутренние индексы и вторичные индексы</h2>
 
 <p>Cassandra не поддерживает B-Tree индексы в стиле PostgreSQL. Вместо этого:<br />
@@ -2345,11 +2358,23 @@ Coordinator-&gt;&gt;Coordinator: Read Repair, если расхождение
 - <strong>Secondary Index (2i)</strong> — индексы по отдельным колонкам, хранятся на тех же узлах, что и основные данные. Подходят для низко-кардинальных полей, но не для высоко-кардинальных, так как require scatter-gather запросы.<br />
 - <strong>SASI (SSTable Attached Secondary Index)</strong> — улучшенные вторичные индексы, реализованные внутри SSTable, с поддержкой LIKE, range запросов. В Go-драйвере для использования нужно просто объявить индекс при создании таблицы и добавлять условие WHERE.</p>
 <p>Однако, в отличие от SQL, запросы с вторичным индексом всё равно требуют обхода всех партиций, что на больших кластерах неприемлемо. Оптимальный путь — денормализация и проектирование нескольких таблиц под разные запросы.</p>
+<hr />
 <h2 id="legkovesnye-tranzaktsii-lightweight-transactions">Легковесные транзакции (Lightweight Transactions)</h2>
 
 <p>Cassandra обеспечивает сравнительно слабые гарантии по умолчанию (eventual consistency). Для сценариев, где нужна строгая атомарность и изоляция (например, регистрация уникального пользователя), введены легковесные транзакции (LWT) на основе протокола <strong>Paxos</strong>.</p>
-<pre><code>INSERT INTO users (id, name) VALUES (uuid(), 'Alice') IF NOT EXISTS;
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">INSERT INTO users (id, name) VALUES (uuid(), 'Alice') IF NOT EXISTS;
 </code></pre>
+</div>
+
 <p>Под капотом выполняется серия раундов голосования между репликами, что гарантирует линеаризуемость операции. Это значительно дороже обычной записи (в 3–10 раз медленнее), поэтому их используют точечно.</p>
 <p>В Go-коде через gocql можно выполнить LWT:</p>
 
@@ -2365,6 +2390,9 @@ Coordinator-&gt;&gt;Coordinator: Read Repair, если расхождение
 err := session.Query(
     `INSERT INTO users (id, name) VALUES (?, ?) IF NOT EXISTS`,
     id, name).ScanCAS(&amp;applied, nil)
+if err != nil {
+    log.Printf(&quot;Ошибка при выполнении CAS: %v&quot;, err)
+}
 if !applied {
     // пользователь уже существует
 }
@@ -2382,6 +2410,7 @@ if !applied {
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-vliyanie-arkhitektury-na-go-servis">Mechanical Sympathy: влияние архитектуры на Go-сервис</h2>
 
 <p>Рассмотрим физическую картину запроса от Go-сервиса до кластера Cassandra:</p>
@@ -2395,6 +2424,7 @@ if !applied {
 - Размер пула соединений: слишком маленький пул создаёт контенцию, слишком большой — перегружает сервер. gocql по умолчанию использует 2 соединения на ноду для записи и 1 для чтения, но рекомендуется тонкая настройка.<br />
 - Выбор consistency: <code>ONE</code> даст микросекундную задержку, но риск устаревших данных, <code>QUORUM</code> — более высокая latency, особенно при пересечении DC.<br />
 - Размер страницы (<code>fetchSize</code>): при сканировании больших диапазонов не тяните всё сразу, иначе GC Go получит гигантские слайсы.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Архитектура Cassandra — это реализация принципов распределённых систем: consistent hashing, gossip, hinted handoff и настраиваемая консистентность. Она позволяет строить truly линейно-масштабируемые, устойчивые к сбоям кластеры для записи колоссальных объёмов данных. Для Go-разработчика владение этими механизмами означает возможность точно выбирать consistency level, проектировать денормализованные таблицы под запросы и предвидеть поведение системы при сетевых разделениях.</p>

@@ -2175,10 +2175,12 @@
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie">Введение</h2>
+            <h1>Документные базы данных: архитектура MongoDB, BSON и разработка на Go</h1>
+<h2 id="vvedenie">Введение</h2>
 
 <p>Документные базы данных — это второй по популярности класс NoSQL-систем после key-value хранилищ. Если в <a href="2-key-value-bazy.html" class="wikilink">key-value</a> вы оперируете непрозрачным blob’ом по ключу, а в реляционных базах раскладываете данные по строго типизированным строкам и столбцам, то документная модель предлагает промежуточный подход: вы храните <strong>самодостаточные документы</strong> — обычно JSON-подобные структуры, которые база данных понимает и может индексировать.</p>
 <p>MongoDB — безусловный лидер среди документных СУБД, и именно с ним чаще всего сталкивается Go-разработчик, когда проект требует гибкой схемы, горизонтального масштабирования и высокой скорости разработки. В этой статье мы разберём архитектуру MongoDB, модель данных, ключевые механизмы и то, как он взаимодействует с Go-рантаймом на уровне процессора и операционной системы.</p>
+<hr />
 <h2 id="model-dannykh-dokumenty-i-kollektsii">Модель данных: документы и коллекции</h2>
 
 <p>В отличие от реляционной модели, где данные нормализованы (см. <a href="../01-vvedenie-i-fundament/9-normalizatsiya-vvedenie.html" class="wikilink">9. Нормализация. Введение</a>) и распределены по нескольким таблицам, в MongoDB вы храните связанные данные вместе — в одном документе.</p>
@@ -2226,6 +2228,7 @@ type Address struct {
 
 <p>В реляционных базах вы бы разнесли пользователя, адреса и заказы в три таблицы и собрали бы их JOIN’ами. В MongoDB типичный паттерн — встроить адреса прямо в документ пользователя. Это предвосхищает паттерн <a href="../01-vvedenie-i-fundament/14-denormalizatsiya-i-kogda-ona-opravdana.html" class="wikilink">денормализации</a>, оправданный для оптимизации чтения ценой усложнения обновлений и увеличения размера документа.</p>
 <p>Однако MongoDB поддерживает и ссылки между коллекциями (manual references, DBRef), что позволяет в некоторых случаях возвращаться к «реляционному» стилю. Выбор между встраиванием и ссылками — одна из главных проектировочных дилемм.</p>
+<hr />
 <h2 id="bson-kak-dokumenty-khranyatsya-i-peredayutsya">BSON: как документы хранятся и передаются</h2>
 
 <p>BSON — это бинарная запись JSON-подобных структур. Формат спроектирован для быстрого сканирования: строгая типизация (различает int32, int64, double, string, datetime, ObjectId и т.д.), length-префиксы, отсутствие необходимости полного парсинга для извлечения одного поля.</p>
@@ -2243,14 +2246,19 @@ type Address struct {
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Документ JSON&lt;br&gt;{ name: &#x27;Alice&#x27; }&quot;] --&gt; B[&quot;BSON документ&lt;br&gt;\x00 - конец&quot;]
-B --&gt; C[&quot;Элемент 1: тип string, имя name, значение Alice&quot;]
-C --&gt; D[&quot;Хранилище WiredTiger&lt;br&gt;или In-Memory&quot;]
+A[&quot;Документ JSON&lt;br&gt;{ name: &#x27;Alice&#x27; }&quot;] --&gt; B[&quot;BSON документ&lt;br&gt;длина + элементы + \x00&quot;]
+B --&gt; C[&quot;Элемент 1: тип string (0x02), имя name, длина 6, значение Alice\x00&quot;]
+C --&gt; D[&quot;Хранилище WiredTiger&lt;br&gt;или In-Memory Cache&quot;]
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef highlight fill:#312e81,stroke:#6366f1,color:#ffffff;
+class B,C highlight;
   </pre>
 </div>
 
 
 <p>С точки зрения Go-драйвера <code>mongo-go-driver</code>, при выполнении <code>collection.InsertOne(ctx, doc)</code> сериализация в BSON происходит на стороне клиента, используя рефлексию (или кодогенерацию с тегами <code>bson</code>). Это важнейший момент для производительности: BSON-энкодинг может создавать множество временных слайсов и объектов, увеличивая давление на GC. Рекомендуется переиспользовать структуры и по возможности применять <code>bson.M{}</code> только для прототипирования.</p>
+<hr />
 <h2 id="arkhitektura-mongodb-ot-protsessa-do-klastera">Архитектура MongoDB: от процесса до кластера</h2>
 
 <p>Процесс <code>mongod</code> — это основной демон, обслуживающий запросы, управляющий хранением и индексами. Он работает как многопоточный сервер с собственным менеджментом памяти и журналированием.</p>
@@ -2268,24 +2276,32 @@ C --&gt; D[&quot;Хранилище WiredTiger&lt;br&gt;или In-Memory&quot;]
   </div>
   <pre class="mermaid">
 flowchart TD
-App[&quot;Go-приложение&lt;br&gt;mongo-go-driver&quot;] --&gt; Router[&quot;mongos&lt;br&gt;Маршрутизатор запросов&quot;]
-Router --&gt; Shard1[&quot;Shard 1&lt;br&gt;Replica Set&quot;]
-Router --&gt; Shard2[&quot;Shard 2&lt;br&gt;Replica Set&quot;]
-Shard1 --&gt; Primary1[&quot;Primary&quot;]
-Shard1 --&gt; Secondary1[&quot;Secondary&quot;]
-Shard2 --&gt; Primary2[&quot;Primary&quot;]
-Shard2 --&gt; Secondary2[&quot;Secondary&quot;]
-Router --&gt; ConfigSrv[&quot;Config Servers&lt;br&gt;Метаданные кластера&quot;]
+App[&quot;Go-приложение&lt;br&gt;(mongo-go-driver)&quot;] --&gt; Router[&quot;mongos&lt;br&gt;Маршрутизатор запросов&quot;]
+Router --&gt; Shard1[&quot;Shard 1&lt;br&gt;(Replica Set)&quot;]
+Router --&gt; Shard2[&quot;Shard 2&lt;br&gt;(Replica Set)&quot;]
+
+Shard1 --&gt; Primary1[&quot;Primary 1 (Leader)&quot;]
+Shard1 --&gt; Secondary1[&quot;Secondary 1 (Follower)&quot;]
+
+Shard2 --&gt; Primary2[&quot;Primary 2 (Leader)&quot;]
+Shard2 --&gt; Secondary2[&quot;Secondary 2 (Follower)&quot;]
+
+Router --&gt; ConfigSrv[&quot;Config Servers (Replica Set)&lt;br&gt;Метаданные кластера и карты чанков&quot;]
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef nodeAct fill:#312e81,stroke:#6366f1,color:#ffffff;
+class Router,ConfigSrv nodeAct;
   </pre>
 </div>
 
 
 <ul>
-<li><strong>Replica Set</strong> — группа из нескольких <code>mongod</code>-процессов, обеспечивающая отказоустойчивость. Данные реплицируются на все узлы с помощью oplog (журнал операций). Выборы Primary происходят по протоколу Raft. Клиент может читать с Secondary для распределения нагрузки.</li>
+<li><strong>Replica Set</strong> — группа из нескольких <code>mongod</code>-процессов, обеспечивающая отказоустойчивость. Данные реплицируются на все узлы с помощью oplog (журнал операций). Выборы Primary происходят по протоколу Raft (в адаптации MongoDB). Клиент может читать с Secondary для распределения нагрузки.</li>
 <li><strong>Sharding</strong> — горизонтальное масштабирование: коллекции разбиваются на диапазоны по shard key. Компонент <code>mongos</code> выступает прозрачным прокси, направляя запросы в нужные шарды. Config-серверы хранят карту распределения данных.</li>
 <li><strong>Многопоточность</strong>: начиная с версии 4.0, MongoDB использует пул потоков для выполнения операций, а WiredTiger внутри использует свои потоки для сжатия и контрольных точек.</li>
 </ul>
-<p>Go-драйвер знает топологию кластера, обнаруживает Primary через <code>isMaster</code> и автоматически переключается при сбоях. Пул соединений настраивается через <code>options.ClientOptions</code>.</p>
+<p>Go-драйвер знает топологию кластера, обнаруживает Primary через <code>isMaster</code> (в новых версиях <code>hello</code>) и автоматически переключается при сбоях. Пул соединений настраивается через <code>options.ClientOptions</code>.</p>
+<hr />
 <h2 id="indeksy-v-mongodb">Индексы в MongoDB</h2>
 
 <p>Без индексов MongoDB сканирует всю коллекцию (collection scan). Но в отличие от реляционных БД, здесь вы можете индексировать не только скалярные поля, но и вложенные поля, элементы массивов (multikey индексы), гео-координаты и текст.</p>
@@ -2297,6 +2313,7 @@ Router --&gt; ConfigSrv[&quot;Config Servers&lt;br&gt;Метаданные кл�
 - <strong>TTL</strong> — автоматическое удаление документов по времени.<br />
 - <strong>Hashed</strong> — хеш-индекс для равномерного распределения при шардинге.</p>
 <p>С точки зрения производительности индексы в MongoDB хранятся в том же storage engine (WiredTiger) и работают через B-Tree с оптимизациями для сжатия. Как и в реляционных БД, индексы ускоряют чтение, но замедляют запись и потребляют RAM для кэша.</p>
+<hr />
 <h2 id="tranzaktsii-i-acid">Транзакции и ACID</h2>
 
 <p>Долгое время MongoDB поддерживала атомарность только в рамках одного документа — и это было достаточным для многих сценариев. С версии 4.0 появились мультидокументные транзакции с гарантиями ACID (<a href="../05-tranzaktsii-i-vnutrennosti/1-acid-osnovy.html" class="wikilink">ACID</a>), распространяющиеся на целые replica sets, а с 4.2 — и на шардированные кластеры.</p>
@@ -2311,17 +2328,21 @@ Router --&gt; ConfigSrv[&quot;Config Servers&lt;br&gt;Метаданные кл�
     </button>
   </div>
   <pre class="language-go"><code class="language-go">session, err := client.StartSession()
+if err != nil {
+    return err
+}
 defer session.EndSession(ctx)
+
 err = mongo.WithSession(ctx, session, func(sc mongo.SessionContext) error {
     if err := session.StartTransaction(); err != nil {
         return err
     }
     // операции с разными коллекциями
-    if err := collection1.InsertOne(sc, doc1); err != nil {
+    if _, err := collection1.InsertOne(sc, doc1); err != nil {
         session.AbortTransaction(sc)
         return err
     }
-    if err := collection2.UpdateOne(sc, filter, update); err != nil {
+    if _, err := collection2.UpdateOne(sc, filter, update); err != nil {
         session.AbortTransaction(sc)
         return err
     }
@@ -2330,6 +2351,7 @@ err = mongo.WithSession(ctx, session, func(sc mongo.SessionContext) error {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-kak-mongodb-rabotaet-s-zhelezom">Mechanical Sympathy: как MongoDB работает с железом</h2>
 
 <p>В основе MongoDB лежит storage engine WiredTiger (опционально — In-Memory). Понимание его работы важно для прогнозирования производительности Go-сервиса.</p>
@@ -2352,9 +2374,10 @@ err = mongo.WithSession(ctx, session, func(sc mongo.SessionContext) error {
   </div>
   <pre class="language-go"><code class="language-go">cursor, err := collection.Find(ctx, bson.D{{&quot;status&quot;, &quot;active&quot;}})
 if err != nil {
-    // обработка
+    return err
 }
 defer cursor.Close(ctx)
+
 for cursor.Next(ctx) {
     var user User
     if err := cursor.Decode(&amp;user); err != nil {
@@ -2363,9 +2386,13 @@ for cursor.Next(ctx) {
     }
     // обрабатываем user, не накапливая все в памяти
 }
+if err := cursor.Err(); err != nil {
+    return err
+}
 </code></pre>
 </div>
 
+<hr />
 <h2 id="patterny-ispolzovaniya-v-go">Паттерны использования в Go</h2>
 
 <h3 id="crud-operatsii">CRUD операции</h3>
@@ -2391,6 +2418,7 @@ result, err := collection.UpdateOne(ctx, filter, update)
 if err != nil {
     // ...
 }
+_ = result
 </code></pre>
 </div>
 
@@ -2412,6 +2440,10 @@ if err != nil {
     {{&quot;$sort&quot;, bson.D{{&quot;count&quot;, -1}}}},
 }
 cursor, err := collection.Aggregate(ctx, pipeline)
+if err != nil {
+    return err
+}
+defer cursor.Close(ctx)
 // обработка курсора
 </code></pre>
 </div>
@@ -2419,6 +2451,7 @@ cursor, err := collection.Aggregate(ctx, pipeline)
 <h3 id="smena-skhemy-i-migratsii">Смена схемы и миграции</h3>
 
 <p>Из-за отсутствия строгой схемы миграции в MongoDB менее формализованы, чем в реляционном мире (<a href="../10-praktika-i-arkhitektura/4-migratsii-bazy-dannykh.html" class="wikilink">4. Миграции базы данных</a>). Но это не значит, что их нет: вы пишете скрипты (на Go или JS), которые проходят по документам и обновляют их. Популярны библиотеки <code>migrate</code> для MongoDB, которые отслеживают применённые миграции в специальной коллекции.</p>
+<hr />
 <h2 id="lovushki-i-sobesedovanie">Ловушки и собеседование</h2>
 
 <div class="callout callout-warning">
@@ -2445,6 +2478,7 @@ cursor, err := collection.Aggregate(ctx, pipeline)
   </div>
 </div>
 
+<hr />
 <h2 id="mongodb-protiv-postgresql-protiv-key-value">MongoDB против PostgreSQL против Key-Value</h2>
 
 <div class="table-container"><table>
@@ -2458,49 +2492,50 @@ cursor, err := collection.Aggregate(ctx, pipeline)
 </thead>
 <tbody>
 <tr>
-<td>Гибкая, часто меняющаяся схема</td>
+<td><strong>Гибкая, часто меняющаяся схема</strong></td>
 <td>✅</td>
 <td>❌ (нужны миграции)</td>
 <td>✅ (opaque blob)</td>
 </tr>
 <tr>
-<td>Сложные ACID-транзакции через несколько таблиц/коллекций</td>
+<td><strong>Сложные ACID-транзакции через несколько таблиц/коллекций</strong></td>
 <td>⚠️ (возможно, но дорого)</td>
 <td>✅</td>
 <td>❌ (кроме Lua-скриптов)</td>
 </tr>
 <tr>
-<td>Скорость чтения по ключу без JOIN</td>
+<td><strong>Скорость чтения по ключу без JOIN</strong></td>
 <td>✅</td>
 <td>✅ (с индексом)</td>
 <td>✅✅ (микросекунды)</td>
 </tr>
 <tr>
-<td>Аналитические ad-hoc запросы</td>
+<td><strong>Аналитические ad-hoc запросы</strong></td>
 <td>⚠️ (агрегации гибкие, но без полноценного SQL)</td>
 <td>✅ (SQL, оконные функции, CTE)</td>
 <td>❌</td>
 </tr>
 <tr>
-<td>Полнотекстовый поиск</td>
+<td><strong>Полнотекстовый поиск</strong></td>
 <td>✅ (Text Index)</td>
 <td>✅ (GIN, tsvector)</td>
 <td>❌ (требует Redis Stack)</td>
 </tr>
 <tr>
-<td>Хранение огромного количества простых ключей</td>
+<td><strong>Хранение огромного количества простых ключей</strong></td>
 <td>⚠️</td>
 <td>⚠️</td>
 <td>✅✅</td>
 </tr>
 <tr>
-<td>Поддержка в Go</td>
+<td><strong>Поддержка в Go</strong></td>
 <td>Отличная (драйвер mongo-go-driver)</td>
 <td>Отличная (database/sql, pgx)</td>
 <td>Отличная (go-redis)</td>
 </tr>
 </tbody>
 </table></div>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>MongoDB — это зрелая документная СУБД, которая позволяет быстро разрабатывать приложения за счёт гибкой схемы, богатых возможностей вложенных документов и горизонтального масштабирования. Для Go-разработчика она предоставляет зрелый драйвер с поддержкой пула соединений, сессий и конвейерной обработки. Однако выбор MongoDB должен быть осознанным: вместе с гибкостью приходит ответственность за правильное моделирование данных, управление индексами и аккуратное использование транзакций.</p>
