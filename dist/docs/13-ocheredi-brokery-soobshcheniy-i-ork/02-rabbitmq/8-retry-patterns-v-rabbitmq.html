@@ -2168,42 +2168,62 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Retry patterns в RabbitMQ</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="7-dead-letter-exchanges.html" class="wikilink">7. Dead letter exchanges</a> мы узнали, как безопасно "парковать" сообщения, обработка которых завершилась ошибкой. Мы избавились от главной угрозы асинхронных систем — <strong>Poison Message Loop</strong>, когда слепой <code>Nack(requeue=true)</code> заставляет воркер бесконечно переваривать битое сообщение, сжигая 100% CPU.</p>
-<p>Но что, если ошибка была <strong>транзитной (временной)</strong>? <br />
-* Упала сеть между вашим Go-сервисом и базой данных.<br />
-* Внешний HTTP API (например, платежный шлюз) ответил <code>429 Too Many Requests</code> или <code>503 Service Unavailable</code>.<br />
-* Произошел Deadlock в PostgreSQL, транзакция откатилась.</p>
-<p>В этих случаях логично попытаться обработать сообщение снова через некоторое время. И здесь мы подходим к проектированию <strong>Retry Patterns (Паттернов повторных попыток)</strong> в RabbitMQ.</p>
+            <p>В предыдущей статье <a href="7-dead-letter-exchanges.html" class="wikilink">7. Dead letter exchanges</a> мы выяснили, как безопасно «парковать» сообщения, обработка которых завершилась критической ошибкой. Мы защитили систему от главной угрозы асинхронного транспорта — <strong>Poison Message Loop</strong>, когда наивный вызов <code>Nack(requeue=true)</code> заставляет воркер бесконечно переваривать битые данные, сжигая 100% ресурсов CPU.</p>
+<p>Однако в распределенных архитектурах подавляющее большинство сбоев носит <strong>транзитный (временный)</strong> характер:<br />
+- Кратковременная сетевая деградация между подом на Go и базой данных;<br />
+- Внешний платежный шлюз ответил <code>HTTP 429 Too Many Requests</code> или <code>HTTP 503 Service Unavailable</code>;<br />
+- В PostgreSQL возник транзакционный взаимоблокировочный конфликт (Deadlock), и транзакция была принудительно прервана ядром СУБД.</p>
+<p>В таких сценариях выбрасывать сообщение в корзину недопустимо — его необходимо обработать повторно, но <strong>с выверенной паузой (Backoff)</strong>, дав сбоящей системе время восстановиться. В этой лекции мы разберем архитектуру и реализацию <strong>Retry Patterns (Паттернов повторных попыток)</strong> в RabbitMQ.</p>
 <hr />
-<h2 id="1-naivnyy-podkhod-sleep-v-gorutine-antipattern">1. Наивный подход: Sleep в горутине (Антипаттерн)</h2>
+<h2 id="1-naivnyy-podkhod-sleep-v-gorutine-opasnyy-antipattern">1. Наивный подход: Sleep в горутине (Опасный антипаттерн)</h2>
 
-<p>Самая частая ошибка Junior-разработчика при встрече с <code>HTTP 429</code> — сделать <code>time.Sleep</code> прямо в горутине-воркере перед вызовом <code>Nack(requeue=true)</code> или повторным запросом.</p>
-<p><strong>Mechanical Sympathy: Почему это убьет систему?</strong><br />
-Вспомним статью <a href="5-prefetch-i-qos.html" class="wikilink">5. Prefetch и QoS</a>. Ваш консьюмер ограничен параметром <code>prefetch_count</code> (например, 100). Если у вас 10 горутин, и все они словили <code>429</code> от внешнего API, они сделают <code>time.Sleep(10 * time.Second)</code>. <br />
-На 10 секунд <strong>весь ваш сервис перестанет читать из очереди</strong>. Быстрые, валидные сообщения, которым не нужно во внешний API, застрянут заблокированными (Head-of-line blocking). Плюс, висящие <code>Unacked</code> сообщения будут потреблять оперативную память брокера.</p>
-<div class="callout callout-warning">
+<p>Самая распространенная ошибка начинающего разработчика при встрече с ошибками внешних сервисов — поставить <code>time.Sleep</code> прямо в рабочей горутине перед повторным выполнением запроса или перед вызовом <code>Nack(requeue=true)</code>.</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// ❌ АНТИПАТТЕРН: Блокировка воркера через time.Sleep
+if err != nil {
+    time.Sleep(10 * time.Second) // &quot;Дадим базе отдохнуть...&quot;
+    _ = d.Nack(false, true)
+    return
+}
+</code></pre>
+</div>
+
+<h3 id="mechanical-sympathy-pochemu-eto-ubivaet-sistemu">Mechanical Sympathy: Почему это убивает систему?</h3>
+<p>Вспомним лекцию <a href="5-prefetch-i-qos.html" class="wikilink">5. Prefetch и QoS</a>. Сетевой канал воркера жестко ограничен параметром <code>prefetch_count</code> (например, 50). </p>
+<p>Если пул ваших горутин столкнулся с серией <code>HTTP 429</code> от стороннего шлюза, все 50 горутин одновременно уснут в <code>time.Sleep(10 * time.Second)</code>.<br />
+1. <strong>Катастрофический Head-of-line blocking:</strong> На целых 10 секунд весь сервис <strong>полностью перестает вычитывать сообщения из очереди</strong>. Легковесные, валидные сообщения, не требующие обращения к внешнему шлюзу, окажутся намертво заблокированными за уснувшими задачами.<br />
+2. <strong>Иллюзия планировщика:</strong> Хотя функция <code>time.Sleep</code> в Go не блокирует поток операционной системы (сущность <code>M</code> в рантайме <code>G-M-P</code>, а лишь переводит горутину <code>G</code> в режим ожидания таймера), с точки зрения брокера RabbitMQ вы удерживаете структуру <code>amqp.Delivery</code> в памяти и не возвращаете <code>Ack</code>.<br />
+3. Сообщения зависают в брокере в статусе <code>Unacked</code>, раздувая потребление RAM и создавая риск аварийного срабатывания Flow Control.</p>
+<div class="callout callout-important">
   <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Блокировка тредов ОС</span>
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Важно</span>
   </div>
   <div class="callout-body">
-    <p><code>time.Sleep</code> в Go не блокирует тред ОС (M в планировщике G-M-P), он просто снимает горутину (G) с контекста. Но с точки зрения RabbitMQ, вы удерживаете <code>amqp.Delivery</code> в памяти и не отдаете <code>Ack</code>. Брокер считает, что вы работаете, а вы просто спите. <br />
-<strong>Правило:</strong> Воркер должен отпустить сообщение (Ack/Nack) максимально быстро. Любые задержки (delay) должны быть реализованы <strong>на стороне брокера</strong>.</p>
+    <p><strong>Золотое правило асинхронного воркера:</strong><br />
+Потребитель обязан завершить работу с сообщением и вернуть результат брокеру (<code>Ack</code> или <code>Nack</code>) <strong>максимально быстро</strong>. Никаких искусственных пауз внутри цикла обработки! Любая задержка (Delay) обязана реализовываться <strong>на стороне инфраструктуры брокера</strong>.</p>
   </div>
 </div>
 
-<h2 id="2-pattern-ttl-dlx-wait-queues">2. Паттерн: TTL + DLX (Wait Queues)</h2>
+<hr />
+<h2 id="2-pattern-ttl-dlx-ocheredi-ozhidaniya-wait-queues">2. Паттерн: TTL + DLX (Очереди ожидания / Wait Queues)</h2>
 
-<p>Это классический, самый надежный паттерн организации отложенных очередей в чистом RabbitMQ (без плагинов). Он строится на комбинации двух механизмов: <strong>Time-To-Live (TTL)</strong> и <strong>Dead Letter Exchange (DLX)</strong>.</p>
-<p><strong>Архитектура:</strong><br />
-Вместо того чтобы отправлять сообщение сразу обратно в рабочую очередь, мы перекладываем его в специальную "очередь ожидания" (Wait Queue), у которой нет консьюмеров. Сообщение просто лежит там. Когда истекает его TTL, RabbitMQ (как мы помним из прошлой статьи) выталкивает его через DLX обратно в рабочую очередь.</p>
+<p>Это классический, нативный и самый надежный паттерн отложенной повторной обработки в чистом RabbitMQ, не требующий установки сторонних плагинов. Он строится на комбинации двух базовых возможностей брокера: <strong>Time-To-Live (TTL)</strong> и <strong>Dead Letter Exchange (DLX)</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2217,44 +2237,76 @@
     </button>
   </div>
   <pre class="mermaid">
-graph TD
-MEx[&quot;Main Exchange&quot;] --&gt; MQ[&quot;Main Queue&quot;]
-MQ --&gt;|Push| Worker[&quot;Go Worker&quot;]
+flowchart TD
+subgraph ActiveZone [&quot;1. Основной рабочий контур&quot;]
+MainEx[&quot;Main Exchange: &#x27;orders.topic&#x27;&quot;]
+MainQueue[&quot;Main Queue: &#x27;orders.process&#x27;&lt;br&gt;(x-dead-letter-exchange: &#x27;retry.dlx&#x27;)&quot;]
+Worker[&quot;Go Consumer Worker&quot;]
+end
 
-Worker --&gt;|&quot;Nack requeue-false&lt;br&gt;+ Header RetryCount=1&quot;| REx[&quot;Retry Exchange&quot;]
-REx --&gt; WaitQ[&quot;Wait Queue&lt;br&gt;Args: x-message-ttl=5000&lt;br&gt;x-dead-letter-exchange=MainExchange&quot;]
+subgraph DelayZone [&quot;2. Контур отложенного ожидания (Wait Queue)&quot;]
+RetryEx[&quot;Retry Exchange: &#x27;retry.dlx&#x27;&quot;]
+WaitQueue[&quot;Wait Queue: &#x27;orders.wait.10s&#x27;&lt;br&gt;x-message-ttl: 10000&lt;br&gt;x-dead-letter-exchange: &#x27;orders.topic&#x27;&quot;]
+end
 
-WaitQ -.-&gt;|&quot;TTL Expired&lt;br&gt;Auto-Publish&quot;| MEx
+MainEx --&gt;|&quot;Route&quot;| MainQueue
+MainQueue --&gt;|&quot;Deliver&quot;| Worker
+Worker --&gt;|&quot;Временная ошибка:&lt;br&gt;Publish в RetryEx + Ack оригинала&quot;| RetryEx
+
+RetryEx --&gt;|&quot;Route&quot;| WaitQueue
+WaitQueue -.-&gt;|&quot;Через 10 сек (TTL Expired):&lt;br&gt;Auto-Publish через DLX&quot;| MainEx
+
+classDef active fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+classDef delay fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+classDef worker fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+
+class MainEx,MainQueue active;
+class RetryEx,WaitQueue delay;
+class Worker worker;
   </pre>
 </div>
 
 
-<h3 id="problema-head-of-line-blocking-v-rabbitmq">Проблема: Head-of-Line Blocking в RabbitMQ</h3>
+<h3 id="mekhanika-raboty-wait-queue">Механика работы Wait Queue:</h3>
+<ol>
+<li>При сбое воркер не блокируется. Он публикует копию сообщения в обменник ожидания <code>retry.dlx</code>, инкрементируя счетчик попыток в заголовках.</li>
+<li>Воркер немедленно отправляет <code>d.Ack(false)</code> на оригинальное сообщение, полностью освобождая свой слот в окне <code>prefetch_count</code>.</li>
+<li>Сообщение попадает в очередь ожидания <code>orders.wait.10s</code>. К этой очереди <strong>не подключен ни один консьюмер</strong>.</li>
+<li>Сообщение спокойно лежит в буфере очереди 10 секунд.</li>
+<li>По истечении 10 секунд срабатывает таймер <code>x-message-ttl</code>. Процесс очереди RabbitMQ перенаправляет протухшее сообщение через свой <code>x-dead-letter-exchange</code> обратно в рабочий обменник <code>orders.topic</code>!</li>
+<li>Сообщение снова оказывается в основной очереди и попадает к свободному воркеру на повторную обработку.</li>
+</ol>
+<hr />
+<h3 id="podvodnyy-kamen-head-of-line-blocking-na-urovne-ttl-soobshcheniy">Подводный камень: Head-of-Line Blocking на уровне TTL сообщений</h3>
 
-<p>В RabbitMQ можно задать TTL двумя способами:<br />
-1. На всю очередь сразу (аргумент очереди <code>x-message-ttl</code>).<br />
-2. На каждое отдельное сообщение (свойство <code>Expiration</code> при <code>ch.Publish</code>).</p>
-<div class="callout callout-info">
+<p>В протоколе AMQP 0-9-1 время жизни можно задать двумя способами:<br />
+1. На всю очередь целиком через аргумент <code>x-message-ttl</code>.<br />
+2. Индивидуально для каждого отдельного сообщения через свойство <code>Expiration</code> при вызове <code>ch.Publish(...)</code>.</p>
+<p>Казалось бы: почему бы не использовать одну общую очередь ожидания и выставлять индивидуальный заголовок <code>Expiration</code> равным $5\text{ с}$, $25\text{ с}$, $125\text{ с}$? </p>
+<div class="callout callout-warning">
   <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Как RabbitMQ проверяет TTL</span>
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Head-of-Line (HoL) Blocking при индивидуальном TTL</span>
   </div>
   <div class="callout-body">
-    <p>Процесс очереди в Erlang не сканирует всю очередь постоянно на предмет истекших таймеров (это было бы O-N операцией и убило бы CPU). Он проверяет TTL <strong>только у первого сообщения в очереди (на "голове")</strong>. </p>
-<p>Если вы отправите Msg1 с TTL=1 час, а следом Msg2 с TTL=1 секунда в одну и ту же очередь, <strong>Msg2 не выйдет из очереди через секунду</strong>. Оно будет ждать целый час, пока Msg1 не умрет и не освободит проход. Это называется <em>Head-of-Line (HoL) Blocking</em>.</p>
+    <p>Внутренний процесс очереди Erlang не выполняет фоновое сканирование всего массива сообщений на предмет истечения таймеров — для очередей в сотни тысяч элементов обход $O(N)$ уничтожил бы процессор.</p>
+<p>Вместо этого RabbitMQ проверяет истечение срока жизни <strong>строго у первого сообщения в голове очереди (Head of Queue)</strong>!</p>
+<p><em>Что это означает на практике?</em><br />
+Если в очередь ожидания сначала попало сообщение Msg 1 с таймером <code>TTL = 1 час</code>, а следом за ним прилетело сообщение Msg 2 с таймером <code>TTL = 1 секунда</code>, <strong>Msg 2 НЕ выйдет из очереди через 1 секунду!</strong> Оно будет намертво заблокировано за Msg 1 и выйдет только через 60 минут, когда Msg 1 наконец умрет. Это классический <strong>Head-of-Line (HoL) Blocking</strong>.</p>
   </div>
 </div>
 
-<p><strong>Решение:</strong> Для реализации экспоненциальной задержки (Exponential Backoff) нельзя использовать одну Wait Queue с динамическим TTL сообщений. Вы должны создать <strong>фиксированный набор очередей ожидания</strong>:<br />
-* <code>wait_q_5s</code> (TTL = 5000)<br />
-* <code>wait_q_30s</code> (TTL = 30000)<br />
-* <code>wait_q_5m</code> (TTL = 300000)</p>
-<p>Ваш Go-код смотрит на номер попытки и маршрутизирует сообщение в соответствующую очередь.</p>
-<h2 id="3-pattern-delayed-message-plugin">3. Паттерн: Delayed Message Plugin</h2>
+<h3 id="arkhitekturnoe-reshenie-mnogourovnevye-ocheredi-zaderzhki">Архитектурное решение: Многоуровневые очереди задержки</h3>
+<p>Чтобы обойти блокировку головы очереди, для построения экспоненциальной задержки (Exponential Backoff) создают <strong>серию очередей с фиксированным TTL</strong>:<br />
+- <code>wait_q_5s</code> (параметр очереди <code>x-message-ttl = 5000</code>)<br />
+- <code>wait_q_30s</code> (параметр очереди <code>x-message-ttl = 30000</code>)<br />
+- <code>wait_q_5m</code> (параметр очереди <code>x-message-ttl = 300000</code>)</p>
+<p>Воркер на основе текущего номера попытки направляет сообщение в соответствующую очередь задержки. Поскольку внутри каждой очереди все сообщения имеют строго одинаковый TTL, эффект HoL-blocking полностью исключен: сообщения выходят строго в порядке поступления (FIFO).</p>
+<hr />
+<h2 id="3-pattern-delayed-message-plugin-rabbitmq-delayed-message-exchange">3. Паттерн: Delayed Message Plugin (`rabbitmq-delayed-message-exchange`)</h2>
 
-<p>Чтобы не городить десятки очередей ожидания, разработчики RabbitMQ создали официальный плагин: <code>rabbitmq-delayed-message-exchange</code>. </p>
-<p><strong>Как это работает:</strong><br />
-Плагин предоставляет новый тип обменника: <code>x-delayed-message</code>. Вы публикуете в него сообщение с заголовком <code>x-delay: 5000</code> (в мс). Обменник "замораживает" сообщение у себя и маршрутизирует его в очередь <em>только</em> когда таймер истечет.</p>
+<p>Если создание нескольких служебных очередей ожидания кажется вам избыточным, сообщество RabbitMQ разработало официальный плагин — <code>rabbitmq-delayed-message-exchange</code>.</p>
+<p>Плагин вводит специализированный тип обменника: <strong><code>x-delayed-message</code></strong>. </p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2269,36 +2321,55 @@ WaitQ -.-&gt;|&quot;TTL Expired&lt;br&gt;Auto-Publish&quot;| MEx
   </div>
   <pre class="mermaid">
 graph LR
-P[&quot;Go Worker&quot;] --&gt;|&quot;Publish&lt;br&gt;Header x-delay=5000&quot;| DEx[&quot;Delayed Exchange&quot;]
-DEx -.-&gt;|Timer 5s| Q[&quot;Main Queue&quot;]
-Q --&gt;|Push| C[&quot;Go Worker&quot;]
+P[&quot;Go Worker&quot;] --&gt;|&quot;Publish&lt;br&gt;Header: x-delay = 5000&quot;| DEx[&quot;Delayed Exchange&lt;br&gt;(x-delayed-message)&quot;]
+DEx -.-&gt;|&quot;Внутренний таймер Erlang (5s)&quot;| Q[&quot;Main Queue&quot;]
+Q --&gt;|&quot;Deliver&quot;| C[&quot;Go Worker&quot;]
+
+classDef pub fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef dex fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+classDef q fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+
+class P pub;
+class DEx dex;
+class Q,C q;
   </pre>
 </div>
 
 
+<h3 id="mekhanika-raboty">Механика работы:</h3>
+<ol>
+<li>Вы публикуете сообщение в Delayed Exchange, указывая в словаре заголовков параметр <code>x-delay: 5000</code> (время задержки в миллисекундах, например 5 секунд).</li>
+<li>Обменник «замораживает» сообщение у себя и удерживает его до истечения таймера.</li>
+<li>По истечении времени обменник вычисляет маршрут и перекладывает сообщение в целевую очередь.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Mnesia и таймеры</span>
+    <span class="callout-title">Под капотом: Mnesia и пределы масштабирования плагина</span>
   </div>
   <div class="callout-body">
-    <p>В отличие от классических очередей (которые хранят данные в логах на диске или в RAM), Delayed Exchange сохраняет отложенные сообщения во внутренней встроенной СУБД RabbitMQ — <strong>Mnesia</strong> (в виде записей на диске). <br />
-Затем запускается Erlang Timer. Когда таймер срабатывает, сообщение достается из Mnesia и маршрутизируется. </p>
-<p><strong>Ограничение:</strong> Этот плагин <strong>не подходит</strong> для систем, где в отложенном состоянии одновременно находятся миллионы сообщений (Mnesia не выдержит такого объема и убьет кластер по памяти/I-O). Плагин идеален для десятков тысяч сообщений с небольшими задержками (до пары дней).</p>
+    <p>В отличие от стандартных очередей, сохраняющих буферы в специализированных бинарных сегментах диска, Delayed Exchange складывает отложенные сообщения во внутреннюю распределенную СУБД брокера — <strong>Mnesia</strong>.</p>
+<p>Для каждого сообщения создается отдельный таймер Erlang.</p>
+<p><strong>Жесткое архитектурное ограничение:</strong><br />
+Этот плагин <strong>категорически не предназначен для сценариев с миллионами одновременно отложенных сообщений</strong>! При попытке удерживать сотни тысяч таймеров база Mnesia начинает потреблять гигантские объемы памяти и дисквалифицирует кластер по I/O. <br />
+Плагин идеален для десятков тысяч сообщений с небольшим временем ожидания (от нескольких секунд до нескольких часов).</p>
   </div>
 </div>
 
-<h2 id="realizatsiya-exponential-backoff-na-go-cherez-plagin">Реализация Exponential Backoff на Go (через Плагин)</h2>
+<hr />
+<h2 id="realizatsiya-exponential-backoff-na-go">Реализация Exponential Backoff на Go</h2>
 
-<p>Посмотрим, как выглядит идиоматичный код Go-воркера, который реализует ретраи с экспоненциальной задержкой, используя кастомный заголовок <code>X-Retry-Count</code>. </p>
+<p>Ниже приведен эталонный пример реализации функции повторной обработки с нарастающей задержкой (Exponential Backoff), использованием кастомного заголовка <code>x-retry-count</code> и безопасным сбросом в постоянную DLQ при превышении лимита попыток.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Почему x-retry-count лучше, чем массив x-death?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему лучше использовать свой кастомный заголовок <code>X-Retry-Count</code>, а не встроенный RabbitMQ массив <code>x-death</code>?<br />
-<strong>Ответ:</strong> Во-первых, если вы переопубликовываете сообщение руками в Delayed Exchange, <code>x-death</code> не генерируется (он создается только при автоматическом DLX-переходе). Во-вторых, парсинг сложного вложенного массива <code>x-death</code> из <code>amqp.Table</code> в Go — это много аллокаций и рефлексии (медленно). Простой <code>int</code> заголовок читается за O-1.</p>
+    <p><strong>Вопрос:</strong> Почему при реализации прикладных ретраев рекомендуется использовать кастомный заголовок <code>x-retry-count</code>, а не встроенный в RabbitMQ массив <code>x-death</code>?</p>
+<p><strong>Ответ:</strong> <br />
+1. Если мы самостоятельно переопубликовываем сообщение в Delayed Exchange или в очередь ожидания, брокер <strong>не генерирует заголовок <code>x-death</code></strong> (он формируется только при нативном срабатывании механизма DLX).<br />
+2. Парсинг структуры <code>x-death</code> из <code>amqp.Table</code> в Go требует разбора вложенных срезов, маппинга интерфейсов и рефлексии. Это порождает паразитные аллокации памяти в куче. Простой целочисленный заголовок <code>int32</code> извлекается мгновенно за $O(1)$ без накладных расходов.</p>
   </div>
 </div>
 
@@ -2318,95 +2389,111 @@ import (
     &quot;fmt&quot;
     &quot;log&quot;
     &quot;math&quot;
+    &quot;time&quot;
 
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
 const MaxRetries = 3
 
 // processWithRetry читает из очереди и управляет логикой ретраев
-func processWithRetry(ch *amqp.Channel, d amqp.Delivery) {
-    // 1. Выполняем бизнес-логику
+func processWithRetry(ctx context.Context, ch *amqp.Channel, d amqp.Delivery) {
+    // 1. Пытаемся выполнить бизнес-логику
     err := doBusinessLogic(d.Body)
     if err == nil {
-        d.Ack(false)
+        // Успех: мгновенно подтверждаем обработку
+        _ = d.Ack(false)
         return
     }
 
-    // 2. Логика провалилась. Вытаскиваем счетчик попыток из заголовков.
-    retryCount := int32(0)
+    // 2. Обработка провалилась. Извлекаем счетчик попыток из заголовков.
+    var retryCount int32 = 0
     if d.Headers != nil {
         if val, ok := d.Headers[&quot;x-retry-count&quot;]; ok {
-            retryCount = val.(int32)
+            if count, ok := val.(int32); ok {
+                retryCount = count
+            }
         }
     }
 
-    // 3. Проверяем лимит попыток
+    // 3. Проверяем достижение лимита попыток
     if retryCount &gt;= MaxRetries {
-        log.Printf(&quot;Message failed permanently after %d retries. Sending to DLQ.&quot;, retryCount)
-        // Nack без requeue выкинет сообщение в DLX (если он настроен на очереди)
-        d.Nack(false, false) 
+        log.Printf(&quot;Сообщение окончательно провалило %d попыток. Отправка в постоянный DLQ.&quot;, retryCount)
+        // Nack с requeue=false отправит сообщение в Dead Letter Exchange очереди
+        _ = d.Nack(false, false)
         return
     }
 
-    // 4. Вычисляем задержку: 5s, 25s, 125s (экспонента)
+    // 4. Вычисляем экспоненциальную задержку: 5s, 25s, 125s
     retryCount++
-    delayMs := int64(math.Pow(5, float64(retryCount))) * 1000
+    // Формула: 5^retryCount секунд
+    delaySeconds := math.Pow(5, float64(retryCount))
+    delayMs := int64(delaySeconds) * 1000
 
-    // 5. Копируем старые заголовки и добавляем новые
-    headers := d.Headers
-    if headers == nil {
-        headers = make(amqp.Table)
+    log.Printf(&quot;Попытка %d не удалась. Откладываем сообщение на %v сек...&quot;, retryCount, delaySeconds)
+
+    // 5. Клонируем заголовки и обновляем счетчик
+    headers := make(amqp.Table)
+    for k, v := range d.Headers {
+        headers[k] = v
     }
     headers[&quot;x-retry-count&quot;] = retryCount
-    headers[&quot;x-delay&quot;] = delayMs // Указание для Delayed Exchange плагина
+    headers[&quot;x-delay&quot;] = delayMs // Параметр для Delayed Message Plugin
 
-    // 6. Публикуем сообщение в Delayed Exchange
-    err = ch.PublishWithContext(context.Background(),
+    // 6. Публикуем копию сообщения в отложенный обменник
+    pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+    defer cancel()
+
+    err = ch.PublishWithContext(pubCtx,
         &quot;my_delayed_exchange&quot;, // имя delayed обменника
-        d.RoutingKey,          // сохраняем оригинальный роутинг
-        false, false,
+        d.RoutingKey,          // сохраняем исходный ключ маршрутизации
+        false,
+        false,
         amqp.Publishing{
             Headers:      headers,
             Body:         d.Body,
-            DeliveryMode: amqp.Persistent, // Не забываем про надежность
+            DeliveryMode: amqp.Persistent, // Сохраняем надежность
             ContentType:  d.ContentType,
+            Timestamp:    time.Now().UTC(),
         },
     )
 
     if err != nil {
-        log.Printf(&quot;Failed to publish retry message: %v&quot;, err)
-        // Если не смогли сделать ретрай - лучше Nack, чтобы не потерять
-        d.Nack(false, false) 
+        log.Printf(&quot;Критическая ошибка публикации повтора: %v. Отправляем в DLQ.&quot;, err)
+        _ = d.Nack(false, false)
         return
     }
 
-    // 7. Подтверждаем ОРИГИНАЛЬНОЕ сообщение (так как мы создали его копию в будущем)
-    d.Ack(false)
+    // 7. КРИТИЧЕСКИ ВАЖНО: Подтверждаем исходное сообщение!
+    // Мы создали его клона в будущем, поэтому оригинал должен освободить буфер.
+    _ = d.Ack(false)
 }
 
 func doBusinessLogic(payload []byte) error {
-    // Эмуляция вызова внешнего API или транзакции БД
-    return fmt.Errorf(&quot;temporary network error&quot;)
+    // Эмуляция временного сбоя внешнего сервиса
+    return fmt.Errorf(&quot;external payment gateway timeout (503)&quot;)
 }
 </code></pre>
 </div>
 
 <h3 id="razbor-koda">Разбор кода:</h3>
 <ol>
-<li><strong>Асинхронность:</strong> Мы не спим в горутине. Мы мгновенно <code>Ack</code>-аем оригинальное сообщение, освобождая буфер <code>prefetch</code> для новых сообщений.</li>
-<li><strong>Копирование:</strong> Мы вручную публикуем <em>новое</em> сообщение в Delayed Exchange. С точки зрения RabbitMQ — это совершенно новое сообщение (которое содержит payload старого).</li>
-<li><strong>Защита от OOM:</strong> <code>MaxRetries</code> защищает систему от сообщений, которые невозможно обработать в принципе.</li>
+<li><strong>Асинхронность и освобождение буфера:</strong> Мы не спим в горутине. Мы мгновенно подтверждаем обработку оригинального сообщения через <code>d.Ack(false)</code>, полностью освобождая слот в скользящем окне <code>prefetch_count</code> для новых входящих задач.</li>
+<li><strong>Публикация клона:</strong> Мы вручную публикуем новое сообщение в отложенный обменник с полезной нагрузкой оригинала. С точки зрения RabbitMQ — это новое сообщение, которое материализуется в целевой очереди строго после истечения задержки.</li>
+<li><strong>Защита от бесконечного цикла:</strong> Ограничение <code>MaxRetries</code> гарантирует, что фатальные ошибки не останутся в системе навечно, а будут направлены в постоянную очередь брака <code>DLQ</code>.</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Никаких <code>time.Sleep</code> в консьюмерах.</strong> Это ведет к истощению пула соединений, исчерпанию QoS и отказу в обслуживании валидных сообщений.</li>
-<li><strong>Паттерн Wait Queues (TTL + DLX)</strong> — нативный и самый надежный способ. Требует создания отдельной очереди для каждого шага задержки из-за механики <code>Head-of-Line Blocking</code>.</li>
-<li><strong>Delayed Message Plugin</strong> — современный и удобный подход, но с архитектурными ограничениями на количество отложенных сообщений из-за использования внутренней Mnesia DB.</li>
+<li><strong>Запрет <code>time.Sleep</code>:</strong> Никогда не усыпляйте горутины-воркеры. Это исчерпывает окно QoS <code>prefetch_count</code> и блокирует продвижение независимых задач в очереди.</li>
+<li><strong>Wait Queues (TTL + DLX):</strong> Самый отказоустойчивый нативный подход. Для исключения эффекта <strong>Head-of-Line Blocking</strong> используйте отдельные очереди под каждый интервал задержки (<code>5s</code>, <code>30s</code>, <code>5m</code>).</li>
+<li><strong>Delayed Message Plugin:</strong> Удобный механизм для плавной динамической задержки (<code>x-delay</code>). Помните о лимитах масштабирования: не перегружайте внутреннюю СУБД Mnesia сотнями тысяч одновременных таймеров.</li>
+<li><strong>Обязательный Ack оригинала:</strong> При публикации повторной задачи в очередь задержки не забывайте вызывать <code>Ack(false)</code> на оригинальное сообщение, освобождая буфер памяти приложения.</li>
 </ol>
-<p>Теперь, когда наши сообщения надежно паршутизируются, не теряются при падениях (Ack/Nack) и автоматически ретраятся без блокировки системы, нам остается решить последнюю проблему. Что будет, если сервер, на котором крутится сам RabbitMQ, выйдет из строя (сгорит блок питания)? </p>
-<p>Чтобы обеспечить непрерывную доступность на уровне железа и инфраструктуры, в следующей статье мы разберем: <a href="9-cluster-i-ha-v-rabbitmq.html" class="wikilink">9. Cluster и HA в RabbitMQ</a>.</p>
+<p>Мы обеспечили устойчивость на уровне программной логики: сообщения фильтруются, безопасно потребляются, откладываются при сбоях и паркуются в карантин. </p>
+<p>Но что произойдет, если аппаратный сервер, на котором запущен RabbitMQ, физически сгорит или потеряет питание? </p>
+<p>В следующей статье <a href="9-cluster-i-ha-v-rabbitmq.html" class="wikilink">9. Cluster и HA в RabbitMQ</a> мы перейдем на уровень инфраструктуры и разберем архитектуру кластеризации, сетевые расщепления (Split-Brain) и консенсус Raft в Quorum-очередях.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2434,7 +2521,7 @@ func doBusinessLogic(payload []byte) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-naivnyy-podkhod-sleep-v-gorutine-antipattern">1. Наивный подход: Sleep в горутине (Антипаттерн)</a></li><li class="toc-item toc-h2"><a href="#2-pattern-ttl-dlx-wait-queues">2. Паттерн: TTL + DLX (Wait Queues)</a></li><li class="toc-item toc-h3"><a href="#problema-head-of-line-blocking-v-rabbitmq">Проблема: Head-of-Line Blocking в RabbitMQ</a></li><li class="toc-item toc-h2"><a href="#3-pattern-delayed-message-plugin">3. Паттерн: Delayed Message Plugin</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-exponential-backoff-na-go-cherez-plagin">Реализация Exponential Backoff на Go (через Плагин)</a></li><li class="toc-item toc-h3"><a href="#razbor-koda">Разбор кода:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-naivnyy-podkhod-sleep-v-gorutine-opasnyy-antipattern">1. Наивный подход: Sleep в горутине (Опасный антипаттерн)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-pochemu-eto-ubivaet-sistemu">Mechanical Sympathy: Почему это убивает систему?</a></li><li class="toc-item toc-h2"><a href="#2-pattern-ttl-dlx-ocheredi-ozhidaniya-wait-queues">2. Паттерн: TTL + DLX (Очереди ожидания / Wait Queues)</a></li><li class="toc-item toc-h3"><a href="#mekhanika-raboty-wait-queue">Механика работы Wait Queue:</a></li><li class="toc-item toc-h3"><a href="#podvodnyy-kamen-head-of-line-blocking-na-urovne-ttl-soobshcheniy">Подводный камень: Head-of-Line Blocking на уровне TTL сообщений</a></li><li class="toc-item toc-h3"><a href="#arkhitekturnoe-reshenie-mnogourovnevye-ocheredi-zaderzhki">Архитектурное решение: Многоуровневые очереди задержки</a></li><li class="toc-item toc-h2"><a href="#3-pattern-delayed-message-plugin-rabbitmq-delayed-message-exchange">3. Паттерн: Delayed Message Plugin (rabbitmq-delayed-message-exchange)</a></li><li class="toc-item toc-h3"><a href="#mekhanika-raboty">Механика работы:</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-exponential-backoff-na-go">Реализация Exponential Backoff на Go</a></li><li class="toc-item toc-h3"><a href="#razbor-koda">Разбор кода:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

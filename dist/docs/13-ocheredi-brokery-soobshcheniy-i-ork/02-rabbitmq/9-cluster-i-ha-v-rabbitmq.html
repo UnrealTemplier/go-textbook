@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">9. Cluster и HA в RabbitMQ</h1>
           </header>
@@ -2177,29 +2177,66 @@
           <div class="article-markdown">
             <h2 id="illyuziya-edinogo-brokera">Иллюзия единого брокера</h2>
 
-<p>Когда мы разрабатываем локально, RabbitMQ выглядит как простая черная коробка: мы открываем TCP-соединение на <code>localhost:5672</code>, отправляем байты и радуемся. Но в продакшене одиночный узел (Single Node) — это единая точка отказа (Single Point of Failure, SPOF). Если сервер перезагружается для установки обновлений ядра Linux, или его убивает OOM Killer, вся асинхронная архитектура, которую мы строили в разделе "Фундамент асинхронности", встает замертво.</p>
-<p>Чтобы обеспечить <strong>High Availability (HA, Высокую доступность)</strong>, RabbitMQ объединяют в кластеры. Но кластеризация в RabbitMQ полна неочевидных инженерных компромиссов. Зачастую разработчики думают: "Я добавил три узла в кластер, теперь мои данные в безопасности". Это фатальное заблуждение.</p>
-<p>В этой статье мы разберем анатомию кластера RabbitMQ, спустимся на уровень виртуальной машины Erlang, разберем современный стандарт Quorum Queues (алгоритм Raft) и научимся правильно переживать падение узлов в Go-клиенте.</p>
+<p>Когда мы разрабатываем сервис на локальной машине, RabbitMQ кажется монолитным и послушным «черным ящиком»: мы открываем TCP-сокет на <code>localhost:5672</code>, отправляем байты фреймов и наслаждаемся субмиллисекундными ответами. </p>
+<p>Но в суровой реальности продакшена одиночный узел (Single Node) — это классическая критическая точка отказа (<strong>Single Point of Failure, SPOF</strong>). Если физический сервер перезагружается для установки критических обновлений ядра Linux, сетевой коммутатор в дата-центре теряет питание, или процесс брокера внезапно уничтожается системным OOM Killer, вся асинхронная архитектура мгновенно парализуется.</p>
+<p>Чтобы обеспечить <strong>High Availability (HA, Высокую доступность)</strong>, узлы RabbitMQ объединяют в кластеры. Однако кластеризация в мире асинхронных очередей сопряжена с глубокими инженерными компромиссами. </p>
+<p>Часто разработчики ошибочно полагают: <em>«Мы подняли три пода в Kubernetes и объединили их в кластер — теперь наши данные в полной безопасности»</em>. Это опаснейшая иллюзия. В этой лекции мы заглянем под капот распределенного рантайма Erlang, разберем современный стандарт <strong>Quorum Queues</strong> на базе консенсуса <strong>Raft</strong> и научимся безотказно обрабатывать сбои сетевых соединений на языке Go.</p>
+<hr />
 <h2 id="erlang-distribution-magiya-pod-kapotom">Erlang Distribution: Магия под капотом</h2>
 
-<p>RabbitMQ написан на языке Erlang и работает поверх виртуальной машины BEAM. Erlang изначально создавался компанией Ericsson для управления телекоммуникационными коммутаторами, поэтому кластеризация встроена прямо в ядро языка.</p>
-<p>Когда несколько узлов RabbitMQ объединяются в кластер, они формируют <strong>Erlang Distribution</strong> — полносвязную сеть (mesh topology), где каждый узел поддерживает постоянное TCP-соединение с каждым другим узлом.</p>
+<p>RabbitMQ написан на языке Erlang и функционирует внутри виртуальной машины BEAM. Поскольку Erlang создавался компанией Ericsson для управления сверхнадежными телефонными коммутационными станциями, механизмы кластеризации встроены прямо в ядро рантайма.</p>
+<p>Когда несколько экземпляров RabbitMQ объединяются в кластер, они формируют <strong>Erlang Distribution</strong> — полносвязную сеть с топологией «каждый с каждым» (<strong>mesh topology</strong>), где между всеми узлами поддерживаются постоянные мультиплексированные TCP-сессии.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+graph TD
+subgraph ErlangMesh [&quot;Erlang Distribution (Полносвязная топология Mesh)&quot;]
+direction LR
+N1[&quot;Node 1 (Erlang Node)&lt;br&gt;Port: 5672 (AMQP), 4369 (epmd)&quot;]
+N2[&quot;Node 2 (Erlang Node)&lt;br&gt;Port: 5672 (AMQP), 4369 (epmd)&quot;]
+N3[&quot;Node 3 (Erlang Node)&lt;br&gt;Port: 5672 (AMQP), 4369 (epmd)&quot;]
+
+N1 &lt;===&gt;|&quot;Erlang Internal TCP (Net Ticks)&quot;| N2
+N2 &lt;===&gt;|&quot;Erlang Internal TCP (Net Ticks)&quot;| N3
+N1 &lt;===&gt;|&quot;Erlang Internal TCP (Net Ticks)&quot;| N3
+end
+
+classDef node fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+class N1,N2,N3 node;
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: EPMD, Erlang Cookie и база Mnesia</span>
   </div>
   <div class="callout-body">
-    <p>Для обнаружения узлов используется демон <strong>epmd</strong> (Erlang Port Mapper Daemon), который обычно висит на порту 4369. Узлы аутентифицируют друг друга с помощью общего секрета — файла <code>Erlang Cookie</code> (обычно лежит в <code>/var/lib/rabbitmq/.erlang.cookie</code>). Если хэши куки не совпадают, узлы молча сбросят TCP-соединение.<br />
-Внутри кластера вся <strong>метаинформация</strong> (список пользователей, настройки VHosts, конфигурации Exchanges и Bindings) хранится во встроенной распределенной базе данных <strong>Mnesia</strong> (входит в стандартную библиотеку Erlang). Mnesia гарантирует, что метаинформация реплицируется на <em>все</em> узлы кластера.</p>
+    <p>Для взаимного обнаружения и координации узлов задействованы встроенные механизмы OTP:<br />
+1. <strong><code>epmd</code> (Erlang Port Mapper Daemon):</strong> Фоновый системный сервис (по умолчанию слушает порт <code>4369</code>), выполняющий роль локального DNS-регистратора для процессов Erlang на хосте.<br />
+2. <strong><code>Erlang Cookie</code>:</strong> Секретная строка авторизации (обычно располагается по пути <code>/var/lib/rabbitmq/.erlang.cookie</code>). Все узлы кластера обязаны иметь побайтово идентичный файл куки. Если хэш-суммы не совпадают, узел будет отторгнут кластером при попытке установления TCP-сессии.<br />
+3. <strong>Встроенная СУБД <code>Mnesia</code>:</strong> Распределенная транзакционная база данных, хранящая <strong>метаинформацию</strong> кластера: пользователей, права доступа, параметры VHosts, схемы Exchanges и таблицы Bindings. Данные <code>Mnesia</code> синхронно реплицируются на <strong>все</strong> узлы кластера.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="paradoks-klassicheskikh-ocheredey-v-klastere">Парадокс классических очередей в кластере</h2>
 
-<p>Самое опасное заблуждение: <em>«Раз метаданные реплицируются, значит и сами сообщения в очередях тоже реплицируются»</em>. </p>
-<p><strong>По умолчанию это не так!</strong></p>
-<p>Классическая очередь (Classic Queue) в RabbitMQ жестко привязана к тому узлу (физическому серверу), на котором она была создана. </p>
+<p>Из факта полной репликации метаданных через Mnesia у многих инженеров рождается ложная уверенность:<br />
+<em>«Раз метаданные реплицируются на все узлы, значит и сами сообщения в очередях автоматически распределены по кластеру!»</em></p>
+<p><strong>В классической архитектуре RabbitMQ это категорически не так!</strong></p>
+<p>Классическая очередь (<strong>Classic Queue</strong>) в RabbitMQ физически размещается и обслуживается <strong>строго на одном узле кластера</strong> — на том самом сервере, где она была изначально объявлена.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2214,80 +2251,149 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph Кластер RabbitMQ
-A[&quot;Узел 1&lt;br&gt;Exchange X&quot;] --&gt;|&quot;Локальный роутинг&quot;| B[&quot;Очередь Q1&lt;br&gt;Физически на диске Узла 1&quot;]
-C[&quot;Узел 2&lt;br&gt;Exchange X&quot;] --&gt;|&quot;Erlang RPC по сети&quot;| B
-D[&quot;Узел 3&lt;br&gt;Exchange X&quot;]
+subgraph Cluster [&quot;Кластер RabbitMQ (3 узла)&quot;]
+subgraph Node1 [&quot;Узел 1 (Leader / Хозяин очереди)&quot;]
+Ex1[&quot;Exchange X (Mnesia)&quot;]
+Q1[&quot;Classic Queue Q1&lt;br&gt;💾 Физические сообщения в RAM/диске&quot;]
+Ex1 --&gt; Q1
 end
 
-P[&quot;Go-Продюсер&quot;] --&gt;|&quot;TCP Publish&quot;| C
-W[&quot;Go-Консьюмер&quot;] --&gt;|&quot;TCP Consume&quot;| D
+subgraph Node2 [&quot;Узел 2 (Прокси)&quot;]
+Ex2[&quot;Exchange X (Mnesia)&quot;]
+end
 
-W -.-&gt;|&quot;Тянет данные через Узел 3&quot;| B
+subgraph Node3 [&quot;Узел 3 (Прокси)&quot;]
+Ex3[&quot;Exchange X (Mnesia)&quot;]
+end
+
+Ex2 -.-&gt;|&quot;Внутренний Erlang RPC по сети&quot;| Q1
+Q1 -.-&gt;|&quot;Внутренний Erlang RPC по сети&quot;| Node3
+end
+
+Producer[&quot;Go-Продюсер&quot;] --&gt;|&quot;Publish&quot;| Node2
+Consumer[&quot;Go-Консьюмер&quot;] --&gt;|&quot;Consume&quot;| Node3
+
+classDef primary fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+classDef proxy fill:#1e293b,stroke:#818cf8,stroke-width:1px,color:#f8fafc;
+classDef client fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+
+class Node1,Q1 primary;
+class Node2,Node3,Ex1,Ex2,Ex3 proxy;
+class Producer,Consumer client;
   </pre>
 </div>
 
 
-<p><strong>Mechanical Sympathy кластерного роутинга:</strong><br />
-Если Go-продюсер подключается к <code>Узлу 2</code> и публикует сообщение в Exchange, а очередь физически находится на <code>Узле 1</code>, <code>Узел 2</code> прозрачно (через внутренний TCP-канал Erlang) перешлет это сообщение на <code>Узел 1</code>. <br />
-Аналогично, если Go-консьюмер подключится к <code>Узлу 3</code>, чтобы читать из очереди на <code>Узле 1</code>, трафик пойдет через <code>Узел 3</code>. </p>
+<h3 id="mechanical-sympathy-klasternoy-marshrutizatsii">Mechanical Sympathy кластерной маршрутизации</h3>
+<p>Что происходит, когда клиенты подключены к разным узлам?<br />
+1. Продюсер подключается к <code>Узлу 2</code> и делает <code>Publish</code>. <code>Узел 2</code> сверяется с локальной таблицей Mnesia, видит, что очередь <code>Q1</code> физически живет на <code>Узле 1</code>, и прозрачно пересылает фреймы сообщения по внутреннему TCP-каналу Erlang на <code>Узел 1</code>.<br />
+2. Консьюмер подключается к <code>Узлу 3</code> и запрашивает вычитывание. <code>Узел 3</code> тянет сообщения по сети с <code>Узла 1</code> и передает их воркеру.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ложная безопасность кластеризации</span>
   </div>
   <div class="callout-body">
-    <p>Если <code>Узел 1</code> (где физически лежит Classic Queue) упадет, очередь станет <strong>недоступной</strong>. Exchange на <code>Узле 2</code> останется жив (ведь метаданные реплицированы), но при попытке смаршрутизировать сообщение в упавшую очередь, оно просто потеряется (или улетит в Alternate Exchange, если настроен).<br />
-Кластеризация без HA-очередей не спасает данные, она лишь предоставляет единое пространство имен (Namespace) для Exchange и роутинга!</p>
+    <p>Если физический сервер <code>Узел 1</code> неожиданно выйдет из строя:<br />
+- Очередь <code>Q1</code> <strong>становится полностью недоступной</strong>.<br />
+- Обменники <code>Exchange X</code> на <code>Узле 2</code> и <code>Узле 3</code> остаются в полном порядке, но при попытке переслать сообщение в <code>Q1</code> брокер обнаружит отсутствие процесса очереди и просто отбросит сообщение в пустоту (или отправит в Alternate Exchange, если он настроен).</p>
+<p><em>Вывод:</em> Кластеризация RabbitMQ сама по себе не дает репликации данных — она лишь обеспечивает единое пространство имен (Namespace) и маршрутизацию между узлами!</p>
   </div>
 </div>
 
 <hr />
-<h2 id="evolyutsiya-high-availability">Эволюция High Availability</h2>
+<h2 id="evolyutsiya-high-availability-ot-mirroring-k-raft">Эволюция High Availability: от Mirroring к Raft</h2>
 
-<p>Чтобы данные переживали падение физического сервера, их нужно реплицировать. Исторически RabbitMQ прошел через два подхода.</p>
+<p>Чтобы обеспечить реальную сохранность сообщений при гибели физических серверов, данные обязаны реплицироваться. В истории RabbitMQ существовало два фундаментальных подхода:</p>
 <h3 id="1-mirrored-queues-ustarelo-deprecated">1. Mirrored Queues (Устарело / Deprecated)</h3>
+<p>До ветки RabbitMQ 3.8 стандартом высокой доступности были <strong>Classic Mirrored Queues</strong> (настраиваемые через политики <code>ha-mode: all / exactly</code>). Очередь состояла из одного Мастера (Master) и нескольких Зеркал (Mirrors).</p>
+<p><strong>Почему от зеркалирования отказались?</strong><br />
+Синхронизация зеркал страдала от неразрешимых архитектурных проблем:<br />
+- Если зеркало временно отключалось из-за сетевого сбоя на 30 секунд, после реконнекта оно считалось пустым и несинхронизированным.<br />
+- Для синхронизации (Sync) мастер начинал перекачивать весь накопившийся объем сообщений на зеркало.<br />
+- На время этой синхронизации <strong>вся очередь полностью блокировалась</strong>: она переставала принимать публикации от продюсеров и выдавать сообщения воркерам. В production-системах с гигабайтными очередями это приводило к параличу всей инфраструктуры компании.</p>
+<p>В современных версиях RabbitMQ классическое зеркалирование <strong>полностью удалено из ядра</strong>.</p>
+<hr />
+<h3 id="2-quorum-queues-kvorumnye-ocheredi-sovremennyy-zolotoy-standart">2. Quorum Queues (Кворумные очереди) — Современный золотой стандарт</h3>
 
-<p>До версии 3.8 стандартом были <strong>Classic Mirrored Queues</strong>. Очередь имела "Мастера" на одном узле и "Зеркала" (Mirrors) на других.</p>
-<p><strong>Почему от них отказались?</strong><br />
-Синхронизация зеркал работала ужасно. Если зеркало отваливалось на час, а потом возвращалось, оно было пустым. Чтобы зеркало стало актуальным, RabbitMQ начинал перекачивать все сообщения от мастера к зеркалу. На время этой перекачки (которая могла занимать гигабайты и длиться минуты) вся очередь <strong>блокировалась</strong>. Она переставала принимать новые сообщения и отдавать старые. Эта механика убивала продакшен-системы при малейшем "моргании" сети.</p>
-<p>С версии 3.12 классическое зеркалирование удалено из ядра. Забудьте о нем, но помните для собеседований.</p>
-<h3 id="2-quorum-queues-kvorumnye-ocheredi-sovremennyy-standart">2. Quorum Queues (Кворумные очереди) — Современный стандарт</h3>
+<p>В современных версиях RabbitMQ стандартом надежности являются <strong>Quorum Queues (QQ)</strong>, построенные на базе всемирно признанного алгоритма распределенного консенсуса <strong>Raft</strong> (того самого, на котором держатся <code>etcd</code> в Kubernetes и <code>Consul</code>).</p>
+<p>Очередь создается с параметром <code>x-queue-type: quorum</code> и распределяется по нечетному числу серверов (обычно 3 или 5). Один узел избирается <strong>Лидером (Leader)</strong>, остальные становятся <strong>Ведомыми (Followers)</strong>.</p>
 
-<p>RabbitMQ внедрил алгоритм консенсуса <strong>Raft</strong> (тот самый, что используется в etcd и Consul) для создания <strong>Quorum Queues (QQ)</strong>.</p>
-<p>При создании Quorum Queue вы задаете <code>x-queue-type: quorum</code>. Очередь размещается на нечетном количестве узлов (обычно 3 или 5). Один узел выбирается <strong>Лидером (Leader)</strong>, остальные становятся <strong>Ведомыми (Followers)</strong>.</p>
-<p><strong>Как работает запись под капотом (Raft WAL):</strong><br />
-1. Продюсер отправляет сообщение Лидеру.<br />
-2. Лидер записывает сообщение в свой локальный <strong>Write-Ahead Log (WAL)</strong> — лог упреждающей записи на диске.<br />
-3. Лидер рассылает сообщение Фолловерам.<br />
-4. Фолловеры записывают его в свои WAL и отвечают "Ок".<br />
-5. Как только Лидер собирает <strong>кворум</strong> (большинство: 2 из 3, или 3 из 5 узлов подтвердили запись), он фиксирует (Commit) сообщение и только тогда отправляет <code>Ack</code> Go-продюсеру.</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant P as &quot;Go Producer&quot;
+participant L as &quot;Raft Leader (Node 1)&quot;
+participant F1 as &quot;Raft Follower (Node 2)&quot;
+participant F2 as &quot;Raft Follower (Node 3)&quot;
+
+P-&gt;&gt;L: 1. Basic.Publish (Msg)
+Note over L: 2. Запись в локальный WAL + fsync()
+par Репликация по сети
+L-&gt;&gt;F1: 3. AppendEntries (Msg)
+L-&gt;&gt;F2: 3. AppendEntries (Msg)
+end
+Note over F1: 4. Запись в свой WAL + fsync()
+F1--&gt;&gt;L: 5. AppendEntries OK
+Note over L: 6. Кворум достигнут (2 из 3 узлов)!&lt;br&gt;Commit сообщения в стейт-машину
+L--&gt;&gt;P: 7. Publisher Confirm (Basic.Ack)
+Note over F2: Узел 3 может отставать — это не блокирует коммит!
+  </pre>
+</div>
+
+
+<h3 id="kak-rabotaet-konsensus-pod-kapotom-raft-wal">Как работает консенсус под капотом (Raft WAL):</h3>
+<ol>
+<li>Продюсер направляет сообщение Лидеру группы Raft.</li>
+<li>Лидер немедленно сохраняет запись в упреждающий журнал транзакций (<strong>Write-Ahead Log, WAL</strong>) на локальный диск.</li>
+<li>Лидер параллельно рассылает RPC-команду <code>AppendEntries</code> фолловерам.</li>
+<li>Фолловеры записывают операцию в свои дисковые журналы WAL и отвечают подтверждением.</li>
+<li>Как только Лидер собирает <strong>кворум</strong> (строгое большинство: $\lfloor N/2 \rfloor + 1$, то есть 2 узла из 3, или 3 из 5), операция считается зафиксированной (<strong>Committed</strong>).</li>
+<li>Лидер отправляет <code>Basic.Ack</code> продюсеру в рамках Publisher Confirms.</li>
+</ol>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Quorum Queues и теорема CAP</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы создали Quorum Queue на 3 узлах. Сеть упала (Split-Brain), и кластер развалился на две части: [Узел 1, Узел 2] и [Узел 3]. Что будет с очередью?<br />
-<strong>Ответ:</strong> По теореме CAP, Quorum Queues выбирают Consistency (Консистентность) и Partition Tolerance (Терпимость к разделению сети). Группа из [Узел 1, 2] сохраняет кворум (2 из 3) и продолжит работу, выбрав нового Лидера (если старый остался на Узле 3). Узел 3, оказавшись в меньшинстве, <strong>полностью заблокирует</strong> все операции чтения и записи для этой очереди, защищая систему от рассинхронизации данных.</p>
+    <p><strong>Вопрос:</strong> Мы развернули Quorum Queue на 3 узлах. В дата-центре произошла сетевая авария (Split-Brain), разделившая кластер на два изолированных сегмента: Сегмент А <code>[Node 1, Node 2]</code> и Сегмент Б <code>[Node 3]</code>. Как поведет себя очередь?</p>
+<p><strong>Ответ:</strong> В терминах теоремы CAP кворумные очереди выбирают модель <strong>CP (Consistency + Partition Tolerance)</strong>.<br />
+- Сегмент А сохраняет большинство (2 узла из 3). Он благополучно продолжит прием публикаций и выдачу сообщений консьюмерам, при необходимости переизбрав Лидера внутри большинства.<br />
+- Одинокий узел <code>Node 3</code>, оказавшись в изолированном меньшинстве, <strong>полностью заблокирует любые операции чтения и записи</strong>. Он откажет клиентам, защищая кластер от расхождения данных и неконсистентного состояния (защита от Split-Brain).</p>
   </div>
 </div>
 
-<p><strong>Цена кворума (Mechanical Sympathy):</strong><br />
-Quorum Queues требуют <strong>синхронного <code>fsync</code> на диск</strong> перед каждым подтверждением кворума. Это означает, что производительность QQ напрямую упирается в IOPS (операции ввода-вывода в секунду) ваших дисков. На медленных сетевых дисках (например, дешевых AWS EBS) Latency продюсеров взлетит до небес. Для Quorum Queues критически важны быстрые локальные NVMe SSD.</p>
+<h3 id="tsena-kvoruma-mechanical-sympathy">Цена кворума (Mechanical Sympathy)</h3>
+<p>Каждая запись в Quorum Queue требует обязательного синхронного сброса буферов операционной системы на диск (<strong>системный вызов <code>fsync</code></strong>) на большинстве узлов.</p>
+<p>Это означает, что производительность Quorum Queues физически ограничена показателем <strong>IOPS (Input/Output Operations Per Second)</strong> ваших накопителей. <br />
+- На медленных сетевых HDD или дешевых виртуальных дисках в облаке задержка публикации (Latency) вырастет до неприемлемых значений.<br />
+- Для промышленных Quorum-кластеров обязательным требованием является использование высокоскоростных локальных <strong>NVMe SSD</strong> с прямым подключением по шине PCIe.</p>
 <hr />
 <h2 id="setevye-razdeleniya-network-partitions-i-split-brain">Сетевые разделения (Network Partitions) и Split-Brain</h2>
 
-<p>Erlang-кластер крайне чувствителен к сетевым задержкам (Net Ticks). Если узлы не пингуются несколько секунд, кластер распадается. </p>
-<p>Что делать RabbitMQ (для глобального состояния, а не только QQ), когда связь восстанавливается?<br />
-Существует несколько стратегий (Partition Handling), которые настраиваются в <code>rabbitmq.conf</code>:<br />
-1. <code>ignore</code> (По умолчанию): Узлы не делают ничего. Администратор должен вручную убить меньшинство и присоединить их заново. Иначе у вас будут две независимые реальности.<br />
-2. <code>pause_minority</code> <strong>(Рекомендуется для кластеров $\ge$ 3 узлов)</strong>: При разрыве сети RabbitMQ сам считает количество узлов в каждой группе. Узлы, оказавшиеся в меньшинстве, добровольно ставят Erlang VM на паузу (закрывают TCP-порты клиентов), ожидая восстановления связи с большинством.<br />
-3. <code>autoheal</code>: Фокус на доступности (Availability). Меньшинство перезагружается и уничтожает свои локальные стейты, чтобы присоединиться к победителю.</p>
+<p>Erlang-кластер чрезвычайно чувствителен к стабильности сети. Узлы непрерывно обмениваются контрольными импульсами (Net Ticks). Если сетевые пакеты задерживаются дольше сконфигурированного таймаута (по умолчанию 60 секунд), узлы объявляют друг друга умершими.</p>
+<p>Для предотвращения раскола кластера на изолированные враждующие половины в конфигурационном файле <code>rabbitmq.conf</code> настраивается директива <code>cluster_partition_handling</code>:</p>
+<ol>
+<li><strong><code>ignore</code> (По умолчанию):</strong> Ничего не предпринимать. При восстановлении связи администратор обязан вручную останавливать узлы меньшинства. В проде <strong>строго запрещено</strong>, так как гарантирует потерю данных при расщеплении.</li>
+<li><strong><code>pause_minority</code> (Золотой стандарт для кластеров $\ge 3$ узлов):</strong> Узлы непрерывно отслеживают состав кластера. Узел, осознавший, что видит менее половины участников, добровольно ставит процесс Erlang на паузу и закрывает клиентские порты, терпеливо ожидая восстановления связи.</li>
+<li><strong><code>autoheal</code>:</strong> Применяется, если приоритетом является доступность (Availability) ценой возможной потери части последних данных: меньшинство автоматически перезагружается и принимает состояние большинства.</li>
+</ol>
 <hr />
 <h2 id="pravilnaya-rabota-s-klasterom-iz-go">Правильная работа с кластером из Go</h2>
 
-<p>Самая частая архитектурная ошибка при использовании Go-клиента (<code>amqp091-go</code>) — хардкод IP-адреса одного конкретного узла кластера.</p>
+<p>Самая грубая ошибка при интеграции с кластером на Go — указание жестко закодированного IP-адреса одного сервера:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2297,18 +2403,17 @@ Quorum Queues требуют <strong>синхронного <code>fsync</code> �
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Если node-1.rabbit упадет, ваше приложение перестанет работать, 
-// даже если node-2 и node-3 живы!
-conn, err := amqp.Dial(&quot;amqp://user:pass@node-1.rabbit.local:5672/&quot;)
+  <pre class="language-go"><code class="language-go">// ❌ АНТИПАТТЕРН: Если node-1 уйдет в ребут, приложение упадет,
+// даже если node-2 и node-3 идеально здоровы!
+conn, err := amqp.Dial(&quot;amqp://guest:guest@node-1.corp.internal:5672/&quot;)
 </code></pre>
 </div>
 
-<p>Существует два правильных способа работы с кластером RabbitMQ:</p>
-<h3 id="sposob-1-infrastrukturnyy-load-balancer-rekomenduetsya">Способ 1: Инфраструктурный Load Balancer (Рекомендуется)</h3>
-<p>Вы ставите перед кластером RabbitMQ балансировщик L4 (уровня TCP), например, <strong>HAProxy</strong> или внешний LoadBalancer в Kubernetes. <br />
-Go-приложение подключается к IP-адресу балансировщика. HAProxy сам опрашивает узлы (через TCP-чеки) и направляет новые соединения только на живые узлы.</p>
-<h3 id="sposob-2-client-side-failover-v-kode">Способ 2: Client-Side Failover (В коде)</h3>
-<p>Если балансировщика нет, Go-клиент должен сам уметь перебирать узлы кластера при обрыве связи.</p>
+<p>Существует два архитектурно грамотных подхода к подключению:</p>
+<h3 id="1-infrastrukturnyy-l4-balansirovshchik-rekomenduetsya">1. Инфраструктурный L4-балансировщик (Рекомендуется)</h3>
+<p>Перед кластером выставляется отказоустойчивый TCP-балансировщик (<strong>HAProxy</strong>, Nginx Stream или Kubernetes Service). Приложение на Go подключается к виртуальному IP балансировщика, а тот опрашивает узлы по healthcheck-эндпоинтам и направляет TCP-соединения только на активные серверы.</p>
+<h3 id="2-klientskiy-perebor-uzlov-client-side-failover">2. Клиентский перебор узлов (Client-Side Failover)</h3>
+<p>Если внешнего балансировщика нет, Go-сервис обязан содержать логику циклического перебора адресов кластера.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2324,40 +2429,38 @@ import (
     &quot;log&quot;
     &quot;time&quot;
 
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
-// Набор URL всех узлов кластера
+// clusterNodes содержит эндпоинты всех участников кластера
 var clusterNodes = []string{
-    &quot;amqp://user:pass@node-1:5672/&quot;,
-    &quot;amqp://user:pass@node-2:5672/&quot;,
-    &quot;amqp://user:pass@node-3:5672/&quot;,
+    &quot;amqp://guest:guest@rabbit-node-1.internal:5672/&quot;,
+    &quot;amqp://guest:guest@rabbit-node-2.internal:5672/&quot;,
+    &quot;amqp://guest:guest@rabbit-node-3.internal:5672/&quot;,
 }
 
+// ConnectHA циклически пытается подключиться к любому живому узлу кластера
 func ConnectHA() *amqp.Connection {
-    var conn *amqp.Connection
-    var err error
-
     for {
         for _, url := range clusterNodes {
-            log.Printf(&quot;Попытка подключения к %s...&quot;, url)
-            conn, err = amqp.Dial(url)
+            log.Printf(&quot;Попытка установки TCP-соединения с %s...&quot;, url)
+            conn, err := amqp.Dial(url)
             if err == nil {
-                log.Println(&quot;Успешно подключено!&quot;)
+                log.Printf(&quot;Успешное подключение к узлу: %s&quot;, url)
                 return conn
             }
             log.Printf(&quot;Узел недоступен: %v&quot;, err)
         }
-        log.Println(&quot;Весь кластер недоступен. Ждем перед повтором (Exponential Backoff)...&quot;)
-        time.Sleep(5 * time.Second)
+        log.Println(&quot;Все узлы кластера недоступны. Ожидание перед повторным циклом...&quot;)
+        time.Sleep(3 * time.Second)
     }
 }
 </code></pre>
 </div>
 
-<h3 id="perekhvat-obryva-soedineniya-graceful-recovery">Перехват обрыва соединения (Graceful Recovery)</h3>
-<p>Даже если вы подключились через HAProxy, физический узел под балансировщиком может быть перезагружен. В этот момент ваше TCP-соединение разорвется. Go-клиент <strong>не переподключается автоматически</strong> (в отличие от некоторых клиентов Kafka).</p>
-<p>Вы обязаны слушать канал <code>NotifyClose</code> в отдельной горутине и запускать процесс реконнекта:</p>
+<h3 id="perekhvat-obryva-soedineniya-conn-notifyclose">Перехват обрыва соединения: `conn.NotifyClose`</h3>
+<p>Драйвер <code>amqp091-go</code> <strong>не выполняет автоматического переподключения при обрыве сокета</strong>. Если сервер, к которому вы были подключены, перезагрузится, сокет закроется, и все горутины, пытающиеся публиковать сообщения, получат ошибку.</p>
+<p>Вы обязаны слушать канал <code>NotifyClose</code> и инициировать реконнект:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2367,32 +2470,37 @@ func ConnectHA() *amqp.Connection {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func monitorConnection(conn *amqp.Connection) {
-    // Создаем канал, который закроется/отправит ошибку при обрыве TCP
-    closeErr := &lt;-conn.NotifyClose(make(chan *amqp.Error))
+  <pre class="language-go"><code class="language-go">func MonitorConnectionLifecycle(conn *amqp.Connection) {
+    // Создаем канал для получения системных ошибок закрытия соединения
+    closeErrChan := conn.NotifyClose(make(chan *amqp.Error, 1))
 
-    if closeErr != nil {
-        log.Printf(&quot;Критический обрыв связи с кластером RabbitMQ: %v&quot;, closeErr)
-        // Здесь запускается логика переподключения, пересоздания каналов (Channel),
-        // восстановления биндингов и перезапуска консьюмеров.
-        // В production-коде это обычно решается через паттерн State Machine 
-        // или использованием библиотек-оберток, поддерживающих auto-reconnect.
-    } else {
-        log.Println(&quot;Соединение закрыто штатно (Graceful Shutdown).&quot;)
-    }
+    go func() {
+        closeErr := &lt;-closeErrChan
+        if closeErr != nil {
+            log.Printf(&quot;Критический разрыв связи с кластером RabbitMQ: %v&quot;, closeErr)
+            // Инициируем процедуру аварийного переподключения (Reconnection Loop)
+            // и повторной инициализации каналов и консьюмеров.
+        } else {
+            log.Println(&quot;Соединение закрыто штатно (Graceful Shutdown).&quot;)
+        }
+    }()
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Erlang Distribution</strong> делает кластер единым организмом с прозрачным роутингом, но без HA-настроек классические очереди умирают вместе с физическим диском.</li>
-<li><strong>Quorum Queues (Raft)</strong> — это индустриальный стандарт для сохранения сообщений при падении узлов. Они требуют как минимум 3-х серверов и высокоскоростных NVMe дисков из-за жестких требований к <code>fsync</code>.</li>
-<li><strong>Split-Brain</strong> разрушает кластер. Стратегия <code>pause_minority</code> спасает от нарушения консистентности данных.</li>
-<li><strong>Go-клиент</strong> не умеет балансировать нагрузку "из коробки". Используйте HAProxy или прописывайте логику цикличного перебора узлов в <code>amqp.Dial</code>, обязательно обрабатывая обрывы через <code>NotifyClose</code>.</li>
+<li><strong>Erlang Distribution</strong> связывает кластер в единую сеть (Mesh), но метаданные <code>Mnesia</code> и сами сообщения в очередях живут по разным законам.</li>
+<li><strong>Classic Queues беззащитны:</strong> Они привязаны к одному физическому серверу и погибают вместе с ним. Классическое зеркалирование (Mirrored Queues) официально признано устаревшим и удалено.</li>
+<li><strong>Quorum Queues — надежность на базе Raft:</strong> Обеспечивают консенсусную репликацию по модели большинства ($\lfloor N/2 \rfloor + 1$), устойчивы к сетевым разделениям (Split-Brain), но требуют скоростных NVMe SSD для синхронного <code>fsync</code>.</li>
+<li><strong>Защита кластера:</strong> Включайте <code>pause_minority</code> в файле <code>rabbitmq.conf</code> для серверов в составе $\ge 3$ узлов.</li>
+<li><strong>Отказоустойчивость в Go:</strong> Подключайтесь через L4-балансировщик (<strong>HAProxy</strong>) либо используйте клиентский перебор списка адресов, обязательно отслеживая разрывы через <code>conn.NotifyClose</code>.</li>
 </ol>
-<p>Кластер позволяет RabbitMQ переживать железные отказы. Но алгоритмы консенсуса (Raft) и сетевая синхронизация накладывают огромный оверхед на CPU и диски. Если мы начнем вливать в кластер десятки тысяч сообщений в секунду, мы упремся в лимиты виртуальной машины BEAM. О том, как выжать максимум из железа, настроить сборщик мусора Erlang и какие флаги оптимизируют пропускную способность, мы поговорим в следующей статье: <a href="10-proizvoditelnost-i-tuning-rabbitmq.html" class="wikilink">10. Производительность и tuning RabbitMQ</a>.</p>
+<p>Кластеризация закрывает вопрос аппаратной надежности. Но алгоритмы распределенного консенсуса, накладные расходы протокола AMQP и синхронные сбросы на диск создают значительное давление на процессор и память серверов. </p>
+<p>Как выжать максимальную производительность из кластера RabbitMQ, оптимизировать сборщик мусора Erlang, настроить пулы горутин и устранить узкие места в Go? </p>
+<p>Об этом мы поговорим в финальной лекции подраздела: <a href="10-proizvoditelnost-i-tuning-rabbitmq.html" class="wikilink">10. Производительность и tuning RabbitMQ</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2420,7 +2528,7 @@ func ConnectHA() *amqp.Connection {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#illyuziya-edinogo-brokera">Иллюзия единого брокера</a></li><li class="toc-item toc-h2"><a href="#erlang-distribution-magiya-pod-kapotom">Erlang Distribution: Магия под капотом</a></li><li class="toc-item toc-h2"><a href="#paradoks-klassicheskikh-ocheredey-v-klastere">Парадокс классических очередей в кластере</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-high-availability">Эволюция High Availability</a></li><li class="toc-item toc-h3"><a href="#1-mirrored-queues-ustarelo-deprecated">1. Mirrored Queues (Устарело / Deprecated)</a></li><li class="toc-item toc-h3"><a href="#2-quorum-queues-kvorumnye-ocheredi-sovremennyy-standart">2. Quorum Queues (Кворумные очереди) — Современный стандарт</a></li><li class="toc-item toc-h2"><a href="#setevye-razdeleniya-network-partitions-i-split-brain">Сетевые разделения (Network Partitions) и Split-Brain</a></li><li class="toc-item toc-h2"><a href="#pravilnaya-rabota-s-klasterom-iz-go">Правильная работа с кластером из Go</a></li><li class="toc-item toc-h3"><a href="#sposob-1-infrastrukturnyy-load-balancer-rekomenduetsya">Способ 1: Инфраструктурный Load Balancer (Рекомендуется)</a></li><li class="toc-item toc-h3"><a href="#sposob-2-client-side-failover-v-kode">Способ 2: Client-Side Failover (В коде)</a></li><li class="toc-item toc-h3"><a href="#perekhvat-obryva-soedineniya-graceful-recovery">Перехват обрыва соединения (Graceful Recovery)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#illyuziya-edinogo-brokera">Иллюзия единого брокера</a></li><li class="toc-item toc-h2"><a href="#erlang-distribution-magiya-pod-kapotom">Erlang Distribution: Магия под капотом</a></li><li class="toc-item toc-h2"><a href="#paradoks-klassicheskikh-ocheredey-v-klastere">Парадокс классических очередей в кластере</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-klasternoy-marshrutizatsii">Mechanical Sympathy кластерной маршрутизации</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-high-availability-ot-mirroring-k-raft">Эволюция High Availability: от Mirroring к Raft</a></li><li class="toc-item toc-h3"><a href="#1-mirrored-queues-ustarelo-deprecated">1. Mirrored Queues (Устарело / Deprecated)</a></li><li class="toc-item toc-h3"><a href="#2-quorum-queues-kvorumnye-ocheredi-sovremennyy-zolotoy-standart">2. Quorum Queues (Кворумные очереди) — Современный золотой стандарт</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-konsensus-pod-kapotom-raft-wal">Как работает консенсус под капотом (Raft WAL):</a></li><li class="toc-item toc-h3"><a href="#tsena-kvoruma-mechanical-sympathy">Цена кворума (Mechanical Sympathy)</a></li><li class="toc-item toc-h2"><a href="#setevye-razdeleniya-network-partitions-i-split-brain">Сетевые разделения (Network Partitions) и Split-Brain</a></li><li class="toc-item toc-h2"><a href="#pravilnaya-rabota-s-klasterom-iz-go">Правильная работа с кластером из Go</a></li><li class="toc-item toc-h3"><a href="#1-infrastrukturnyy-l4-balansirovshchik-rekomenduetsya">1. Инфраструктурный L4-балансировщик (Рекомендуется)</a></li><li class="toc-item toc-h3"><a href="#2-klientskiy-perebor-uzlov-client-side-failover">2. Клиентский перебор узлов (Client-Side Failover)</a></li><li class="toc-item toc-h3"><a href="#perekhvat-obryva-soedineniya-conn-notifyclose">Перехват обрыва соединения: conn.NotifyClose</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

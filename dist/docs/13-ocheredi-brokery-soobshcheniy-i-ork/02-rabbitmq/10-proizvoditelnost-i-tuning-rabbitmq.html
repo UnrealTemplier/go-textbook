@@ -2168,64 +2168,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">10. Производительность и tuning RabbitMQ</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях (особенно в <a href="9-cluster-i-ha-v-rabbitmq.html" class="wikilink">9. Cluster и HA в RabbitMQ</a>) мы построили отказоустойчивый кластер, который переживет падение дата-центра. Однако надежность всегда имеет цену — и эта цена выражается в снижении производительности (Throughput) и увеличении задержек (Latency).</p>
-<p>RabbitMQ — это невероятно гибкий "умный брокер", но его архитектура на базе Erlang/OTP имеет свои жесткие физические лимиты. Если вы попытаетесь пропустить через него миллион сообщений в секунду "в лоб", кластер просто ляжет от нехватки памяти (OOM) или исчерпания файловых дескрипторов. </p>
-<p>В этой, заключительной статье раздела по RabbitMQ, мы разберем, как выжать максимальный RPS (Requests Per Second) на уровне ОС, виртуальной машины BEAM (Erlang) и клиентского Go-кода.</p>
+            <p>В предыдущих статьях (особенно в <a href="9-cluster-i-ha-v-rabbitmq.html" class="wikilink">9. Cluster и HA в RabbitMQ</a>) мы спроектировали распределенный отказоустойчивый кластер, способный без потери данных пережить падение дата-центра и сетевые разделения Split-Brain. Однако надежность в распределенных системах никогда не дается даром: математический консенсус и гарантии сохранности всегда оплачиваются снижением пропускной способности (<strong>Throughput</strong>) и ростом сетевых и дисковых задержек (<strong>Latency</strong>).</p>
+<p>RabbitMQ — это великолепный представитель архитектуры «Умный брокер» (Smart Broker). Но его виртуальная машина BEAM и модель акторов Erlang/OTP подчиняются строгим законам физики и операционной системы. Если попытаться протолкнуть через кластер миллион сообщений в секунду «в лоб», без глубокого понимания аппаратного контекста, система быстро захлебнется от дефицита файловых дескрипторов, упрется в лимиты оперативной памяти или зависнет на синхронизации диска.</p>
+<p>В этой заключительной лекции подраздела по RabbitMQ мы разберем тюнинг производительности на всех уровнях стека: от системных параметров ядра Linux и рантайма Erlang до оптимизации высоконагруженного клиентского кода на языке Go.</p>
+<hr />
 <h2 id="1-limity-os-i-mechanical-sympathy">1. Лимиты ОС и Mechanical Sympathy</h2>
 
-<p>RabbitMQ — это I/O-bound приложение. Оно держит тысячи открытых TCP-сокетов и постоянно пишет данные на диск (особенно при использовании Quorum очередей). </p>
-<h3 id="faylovye-deskriptory-file-descriptors">Файловые дескрипторы (File Descriptors)</h3>
-<p>В Linux всё есть файл. Каждое TCP-соединение от вашего Go-бэкенда и каждый файл на диске, где RabbitMQ хранит сообщения (или сегменты Raft-лога для Quorum), требуют файлового дескриптора. <br />
-По умолчанию во многих дистрибутивах Linux жесткий лимит (<code>ulimit -n</code>) равен 1024. Это катастрофически мало для брокера. </p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p>Если RabbitMQ исчерпает лимит файловых дескрипторов, он не просто перестанет принимать новые соединения. Он не сможет открывать новые файлы для записи логов, что приведет к немедленной остановке кластера и деградации производительности до нуля.<br />
-<strong>Решение:</strong> Для production-серверов RabbitMQ лимит дескрипторов (в <code>systemd</code> unit файле или <code>limits.conf</code>) должен быть установлен минимум в <code>65536</code>, а лучше <code>1048576</code>.</p>
-  </div>
-</div>
-
-<h3 id="tcp-keepalive-i-heartbeats">TCP Keepalive и Heartbeats</h3>
-<p>Ваши Go-приложения могут падать (OOM, паника, жесткий рестарт пода в K8s). При жестком падении ОС не успевает отправить TCP-пакет <code>FIN</code> или <code>RST</code>. С точки зрения RabbitMQ, соединение остается "живым" (Half-open connection). Такие соединения утекают, потребляя дескрипторы и память.<br />
-На уровне AMQP-протокола есть механизм <strong>Heartbeats</strong> (по умолчанию 60 секунд). Библиотека <code>amqp091-go</code> отправляет пинги брокеру. Если брокер не получает пинг 2 раза подряд, он принудительно закрывает сокет. </p>
-<h2 id="2-tyuning-pamyati-upravlenie-potopom-flow-control">2. Тюнинг памяти: Управление потопом (Flow Control)</h2>
-
-<p>RabbitMQ хранит сообщения в оперативной памяти (для скорости) и сбрасывает их на диск только при необходимости. Как брокер защищает себя от Out-Of-Memory?</p>
-<p>В Erlang реализован механизм <strong>High Watermark</strong>. Главный параметр в <code>rabbitmq.conf</code> — это <code>vm_memory_high_watermark</code> (по умолчанию <code>0.4</code>, то есть 40% от всей RAM сервера).</p>
-<p><strong>Что происходит, когда брокер достигает этого лимита?</strong><br />
-Срабатывает <strong>Global Flow Control (Глобальная блокировка потока)</strong>.<br />
-1. Брокер блокирует <em>все</em> TCP-соединения, которые пытаются опубликовать (Publish) новые сообщения. <br />
-2. На уровне TCP размер окна (TCP Window) сводится к нулю, и ваши Go-приложения блокируются на системном вызове <code>write()</code>.<br />
-3. Консьюмерам при этом разрешено забирать сообщения, чтобы разгрузить память.</p>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Можем ли мы увеличить <code>vm_memory_high_watermark</code> до <code>0.9</code> (90%), чтобы RabbitMQ использовал всю память сервера?<br />
-<strong>Ответ:</strong> Категорически нет. Во-первых, Erlang Garbage Collector требует дополнительной памяти при очистке (до x2 от текущего объема). Во-вторых, операционной системе (Linux) нужна память для Page Cache, чтобы эффективно буферизировать дисковый I/O. Если отдать 90% брокеру, при пиковой нагрузке придет OOM Killer от Linux и убьет процесс RabbitMQ. Максимум для выделенного сервера — <code>0.6</code> (60%).</p>
-  </div>
-</div>
-
-<h2 id="3-arkhitekturnyy-tyuning-ocheredi-i-shardirovanie">3. Архитектурный тюнинг: Очереди и Шардирование</h2>
-
-<p>Как мы упоминали ранее, <strong>одна очередь — это один процесс Erlang</strong>. Этот процесс исполняется строго последовательно на одном ядре CPU. Это фундаментальное бутылочное горлышко архитектуры Smart Broker.</p>
-<p>Если у вас 64-ядерный сервер, а весь трафик идет через одну очередь <code>orders</code>, максимальная утилизация сервера составит <code>1/64</code> (чуть больше 1.5%). </p>
-<h3 id="pattern-consistent-hashing-shardirovanie-ocheredey">Паттерн Consistent Hashing (Шардирование очередей)</h3>
-
-<p>Для преодоления лимита одного ядра в RabbitMQ применяется официальный плагин <code>rabbitmq-consistent-hash-exchange</code>.</p>
-<p>Он позволяет распределять сообщения с одинаковым Routing Key по разным очередям на основе хэша от ключа маршрутизации (или хэша от кастомного заголовка). </p>
+<p>С точки зрения операционной системы Linux процесс RabbitMQ — это типичное <strong>I/O-bound</strong> приложение с интенсивным параллелизмом. Он удерживает десятки тысяч открытых TCP-сокетов и непрерывно выполняет операции дискового ввода-вывода (особенно в режиме Quorum Queues с упреждающим журналом Raft WAL).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2239,27 +2195,173 @@
     </button>
   </div>
   <pre class="mermaid">
-graph TD
-P[&quot;Go Publisher&quot;] --&gt;|&quot;RoutingKey: user_id_777&quot;| CH[&quot;Consistent Hash Exchange&quot;]
+flowchart TD
+subgraph LinuxKernel [&quot;Ядро Linux (OS Level)&quot;]
+direction TB
+FD[&quot;Файловые дескрипторы (ulimit -n)&lt;br&gt;Сокеты клиентов + Raft WAL сегменты&quot;]
+SockMem[&quot;Буферы TCP-сокетов (rmem/wmem)&lt;br&gt;Память сетевого стека ядра&quot;]
+DiskCache[&quot;Page Cache ядра Linux&lt;br&gt;Сглаживание дискового I/O&quot;]
+end
 
-CH --&gt;|&quot;Hash попадает в слот 1&quot;| Q1[&quot;Shard 1&lt;br&gt;Core 1&quot;]
-CH --&gt;|&quot;Hash попадает в слот 2&quot;| Q2[&quot;Shard 2&lt;br&gt;Core 2&quot;]
-CH --&gt;|&quot;Hash попадает в слот 3&quot;| Q3[&quot;Shard 3&lt;br&gt;Core 3&quot;]
+subgraph BEAM [&quot;Виртуальная машина BEAM (Erlang)&quot;]
+direction TB
+ErlangProcs[&quot;Erlang Processes (1 очередь = 1 процесс)&quot;]
+MnesiaDB[&quot;Mnesia DB &amp; ETS таблицы&quot;]
+Watermark[&quot;High Watermark Памяти (0.4 RAM)&quot;]
+end
 
-Q1 --&gt; C1[&quot;Go Worker 1&quot;]
-Q2 --&gt; C2[&quot;Go Worker 2&quot;]
-Q3 --&gt; C3[&quot;Go Worker 3&quot;]
+FD --&gt; BEAM
+SockMem --&gt; BEAM
+DiskCache --&gt; BEAM
+
+classDef os fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef beam fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+
+class FD,SockMem,DiskCache os;
+class ErlangProcs,MnesiaDB,Watermark beam;
   </pre>
 </div>
 
 
-<p>Такой подход позволяет линейно масштабировать throughput, добавляя новые очереди (шарды) и утилизируя все ядра CPU кластера.</p>
+<h3 id="faylovye-deskriptory-file-descriptors">Файловые дескрипторы (File Descriptors)</h3>
+<p>В архитектуре UNIX/Linux практически любой ресурс ввода-вывода представлен файловым дескриптором. Каждое входящее TCP-соединение от вашего Go-бэкенда, каждый внутренний межкластерный RPC-канал Erlang и каждый сегмент лога на диске требуют отдельного дескриптора.</p>
+<p>По умолчанию во многих серверных дистрибутивах Linux лимит на количество открытых файлов для процесса (<code>ulimit -n</code>) составляет скромные <code>1024</code>. Для нагруженного брокера очередей это верный путь к аварии.</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Исчерпание файловых дескрипторов</span>
+  </div>
+  <div class="callout-body">
+    <p>Если RabbitMQ исчерпает лимит файловых дескрипторов:<br />
+1. Он не просто откажется принимать новые подключения от Go-воркеров.<br />
+2. Брокер потеряет возможность открывать новые файлы сегментов для записи журналов транзакций и создания внутренних сокетов синхронизации.<br />
+3. Планировщик Erlang перейдет в аварийный режим, и пропускная способность кластера мгновенно рухнет до нуля.</p>
+<p><strong>Решение:</strong> Для production-серверов лимит дескрипторов в конфигурации <code>systemd</code> (<code>LimitNOFILE</code>) или в файле <code>/etc/security/limits.conf</code> обязан быть выставлен минимум в <code>65536</code>, а для высоконагруженных инсталляций — <strong><code>1048576</code></strong>.</p>
+  </div>
+</div>
+
+<h3 id="tcp-keepalive-i-heartbeats-borba-s-povisshimi-soedineniyami">TCP Keepalive и Heartbeats: Борьба с повисшими соединениями</h3>
+<p>В облачных средах (особенно при работе в Kubernetes) поды приложений могут внезапно погибать: отстрел по <code>OOM Killer</code>, аварийная перезагрузка пода узлом Kubelet, аппаратный сбой физического гипервизора.</p>
+<p>При жестком падении процесса операционная система хоста физически не успевает отправить парному сокету финальные TCP-пакеты <code>FIN</code> или <code>RST</code>. Со стороны RabbitMQ такое соединение выглядит абсолютно здоровым и открытым (<strong>Half-open connection</strong>). Подобные «зомби-соединения» накапливаются сотнями, удерживая дескрипторы, память и закрепленные за ними каналы.</p>
+<p>Для предотвращения этой утечки протокол AMQP 0-9-1 использует механизм <strong>Heartbeats</strong> (по умолчанию интервал равен 60 секундам). Сетевая библиотека <code>amqp091-go</code> в фоновой горутине непрерывно обменивается с брокером легковесными пинг-фреймами. Если брокер не получает подтверждения два периода подряд, он принудительно разрывает TCP-сокет и возвращает все неподтвержденные сообщения (<code>Unacked</code>) обратно в очередь.</p>
+<hr />
+<h2 id="2-tyuning-pamyati-upravlenie-potopom-flow-control">2. Тюнинг памяти: Управление потопом (Flow Control)</h2>
+
+<p>RabbitMQ удерживает сообщения в оперативной памяти для достижения минимального времени отклика и сбрасывает их на накопитель только по мере необходимости. Как брокер страхует себя от неконтролируемого падения по нехватке памяти?</p>
+<p>В рантайме Erlang действует многоуровневый защитный барьер — <strong>High Watermark</strong>. Главным настроечным параметром в файле <code>rabbitmq.conf</code> является директива <code>vm_memory_high_watermark</code> (по умолчанию <code>0.4</code>, то есть 40% от общего объема доступной физической оперативной памяти хоста).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Pub as &quot;Go Publishers&quot;
+participant RMQ as &quot;RabbitMQ (BEAM RAM)&quot;
+participant Sub as &quot;Go Consumers&quot;
+
+Note over RMQ: Потребление памяти достигло 40% (High Watermark)!
+Note over RMQ: Срабатывает Global Flow Control
+
+RMQ--&gt;&gt;Pub: TCP Window Size = 0 (Окно сокета закрыто)
+Note over Pub: Вызовы ch.PublishWithContext() блокируются на write()
+
+Sub-&gt;&gt;RMQ: Basic.Deliver + Basic.Ack (Вычитка сообщений)
+Note over RMQ: Память опускается ниже Watermark (например, 35%)
+
+RMQ--&gt;&gt;Pub: TCP Window Size &gt; 0 (Окно открыто)
+Note over Pub: Разблокировка системных вызовов write()
+  </pre>
+</div>
+
+
+<h3 id="mekhanika-global-flow-control">Механика Global Flow Control:</h3>
+<p>Когда брокер фиксирует, что объем занятой памяти достиг порога <code>vm_memory_high_watermark</code>:<br />
+1. Включается режим <strong>Global Flow Control (Глобальная блокировка потока)</strong>.<br />
+2. Брокер принудительно перестает считывать входящие байты из сокетов всех издателей (Publishers). Размер окна TCP (TCP Window) на приеме урезается до нуля.<br />
+3. Все клиентские приложения на Go мгновенно <strong>блокируются внутри системного вызова <code>write()</code></strong> ядра Linux при попытке отправить очередное сообщение.<br />
+4. При этом консьюмерам (Consumers) выдача данных не блокируется: брокер намеренно позволяет воркерам вычитывать сообщения из буферов, чтобы вернуть уровень занятой памяти в безопасную зону.</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование: Можно ли задрать High Watermark до 90%?</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Можем ли мы на выделенном сервере с 64 ГБ RAM выставить <code>vm_memory_high_watermark = 0.9</code> (90%), чтобы RabbitMQ использовал практически всю память хоста под кэш очередей?</p>
+<p><strong>Ответ:</strong> <strong>Категорически нет.</strong><br />
+1. Сборщик мусора в Erlang работает на уровне изолированных процессов: при мажорной очистке кучи процессу требуется временный буфер в памяти, сопоставимый с его текущим объемом (накладные расходы до x2 от размера кучи).<br />
+2. Ядру операционной системы Linux жизненно необходима оперативная память под <strong>Page Cache</strong>, чтобы эффективно буферизировать и агрегировать дисковый ввод-вывод. <br />
+Если выставить порог в 90%, при малейшем скачке нагрузки операционная система испытает жесточайший дефицит свободных страниц, придет системный <strong>OOM Killer</strong> и мгновенно уничтожит процесс брокера по <code>SIGKILL</code>. Безопасный максимум для выделенных машин — <strong><code>0.6</code></strong> (60%).</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="3-arkhitekturnyy-tyuning-ocheredi-i-shardirovanie">3. Архитектурный тюнинг: Очереди и Шардирование</h2>
+
+<p>Как мы установили в первых статьях раздела, фундаментальным архитектурным ограничением классического RabbitMQ является принцип:<br />
+$$\mathbf{1\text{ Очередь} = 1\text{ Erlang-процесс} = 1\text{ Ядро CPU}}$$</p>
+<p>Внутренний актор очереди исполняет инструкции строго последовательно. Если ваш сервер оснащен 64 или 128 процессорными ядрами, но весь трафик приложения вы направляете в <em>одну-единственную</em> очередь <code>orders</code>, утилизация процессорных ресурсов сервера составит ничтожные $1/64 \approx 1.5\%$. Брокер упрется в 40 000 – 60 000 RPS на одном ядре, а остальные 63 ядра будут бессмысленно простаивать.</p>
+<h3 id="pattern-consistent-hashing-shardirovanie-ocheredey">Паттерн Consistent Hashing (Шардирование очередей)</h3>
+<p>Для полноценной загрузки всех ядер сервера применяется официальный плагин — <strong><code>rabbitmq-consistent-hash-exchange</code></strong>.</p>
+<p>Обменник вычисляет хэш-сумму от <code>Routing Key</code> (или указанного заголовка) входящего сообщения и по кольцу согласованного хэширования (<strong>Consistent Hashing</strong>) направляет его в одну из параллельных очередей-шардов.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Pub[&quot;Go Publishers (Высокий RPS)&quot;] --&gt;|&quot;RoutingKey: &#x27;user_id_9901&#x27;&quot;| CHE[&quot;Consistent Hash Exchange&lt;br&gt;(Вычисление хэша)&quot;]
+
+CHE --&gt;|&quot;Слот кольца #1&quot;| Q1[&quot;Queue Shard 1&lt;br&gt;(Erlang Process / Core 1)&quot;]
+CHE --&gt;|&quot;Слот кольца #2&quot;| Q2[&quot;Queue Shard 2&lt;br&gt;(Erlang Process / Core 2)&quot;]
+CHE --&gt;|&quot;Слот кольца #3&quot;| Q3[&quot;Queue Shard 3&lt;br&gt;(Erlang Process / Core 3)&quot;]
+CHE --&gt;|&quot;Слот кольца #4&quot;| Q4[&quot;Queue Shard 4&lt;br&gt;(Erlang Process / Core 4)&quot;]
+
+Q1 --&gt; W1[&quot;Go Worker Pool 1&quot;]
+Q2 --&gt; W2[&quot;Go Worker Pool 2&quot;]
+Q3 --&gt; W3[&quot;Go Worker Pool 3&quot;]
+Q4 --&gt; W4[&quot;Go Worker Pool 4&quot;]
+
+classDef pub fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef ex fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+classDef q fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+classDef worker fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+
+class Pub pub;
+class CHE ex;
+class Q1,Q2,Q3,Q4 q;
+class W1,W2,W3,W4 worker;
+  </pre>
+</div>
+
+
+<p><strong>Преимущества паттерна:</strong><br />
+1. <strong>Линейное масштабирование:</strong> Нагрузка распределяется по всем физическим ядрам CPU.<br />
+2. <strong>Сохранение локального порядка:</strong> Все сообщения с одинаковым идентификатором (например, <code>user_id</code>) гарантированно попадают в один и тот же шард, сохраняя строгую хронологическую очередность обработки.</p>
+<hr />
 <h2 id="4-optimizatsiya-go-koda-producers-consumers">4. Оптимизация Go-кода (Producers & Consumers)</h2>
 
-<p>Чтобы загрузить RabbitMQ на 100%, ваш Go-код должен быть написан с учетом механической симпатии к сети.</p>
+<p>Чтобы инфраструктурный тюнинг брокера раскрыл свой потенциал, клиентский код на Go должен быть спроектирован с учетом механики протокола AMQP 0-9-1.</p>
 <h3 id="publisher-batching-i-asinkhronnye-confirms">Publisher: Батчинг и Асинхронные Confirms</h3>
-<p>В статье <a href="4-acknowledgements-i-delivery-guarantees.html" class="wikilink">4. Acknowledgements и delivery guarantees</a> мы узнали, что для гарантии доставки отправитель должен использовать <code>Publisher Confirms</code>. Но ждать <code>Ack</code> от брокера после <em>каждого</em> опубликованного сообщения — это убийство производительности (RTT сети + синхронизация диска = миллисекунды простоя на каждое сообщение).</p>
-<p>Идиоматичный высокопроизводительный Go-паблишер должен использовать <strong>асинхронное ожидание подтверждений (Asynchronous Confirms)</strong>.</p>
+<p>В лекции <a href="4-acknowledgements-i-delivery-guarantees.html" class="wikilink">4. Acknowledgements и delivery guarantees</a> мы узнали, что для гарантии надежности издатель обязан использовать <code>Publisher Confirms</code>. </p>
+<p>Однако блокирующее ожидание подтверждения после <em>каждого</em> вызова <code>Publish</code> разрушает производительность: задержка Round-Trip по сети в сочетании с записью брокера на диск снизит скорость публикации до жалких сотен RPS.</p>
+<p>Высокопроизводительный публикатор обязан применять <strong>конвейеризацию (Pipelining)</strong> и <strong>асинхронное получение подтверждений (Asynchronous Confirms)</strong> через метод <code>ch.NotifyPublish</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2273,100 +2375,124 @@ Q3 --&gt; C3[&quot;Go Worker 3&quot;]
 
 import (
     &quot;context&quot;
+    &quot;fmt&quot;
     &quot;log&quot;
     &quot;sync&quot;
     &quot;time&quot;
 
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
-func publishBatchFast(ch *amqp.Channel, messages [][]byte) error {
-    // Включаем режим Publisher Confirms
-    err := ch.Confirm(false)
-    if err != nil {
-        return err
+// publishBatchFast отправляет пачку сообщений с асинхронным подтверждением кворума
+func publishBatchFast(ctx context.Context, ch *amqp.Channel, exchange, routingKey string, messages [][]byte) error {
+    // 1. Переводим канал в режим подтверждений
+    if err := ch.Confirm(false); err != nil {
+        return fmt.Errorf(&quot;ошибка ch.Confirm: %w&quot;, err)
     }
 
-    // Канал для получения подтверждений от брокера
+    // 2. Инициализируем буферизованный канал для получения подтверждений
     confirms := ch.NotifyPublish(make(chan amqp.Confirmation, len(messages)))
 
     var wg sync.WaitGroup
     wg.Add(1)
 
-    // Запускаем горутину, которая асинхронно читает подтверждения
+    var nackCount int
+    // 3. Запускаем фоновую горутину, асинхронно собирающую ответы брокера
     go func() {
         defer wg.Done()
-        confirmedCount := 0
-        for confirmation := range confirms {
-            if confirmation.Ack {
-                confirmedCount++
-            } else {
-                log.Printf(&quot;Message Nacked by broker! DeliveryTag: %d&quot;, confirmation.DeliveryTag)
+        received := 0
+        for c := range confirms {
+            received++
+            if !c.Ack {
+                nackCount++
+                log.Printf(&quot;Сообщение NACK брокером! DeliveryTag: %d&quot;, c.DeliveryTag)
             }
-            // Если дождались ответов на все сообщения - выходим
-            if confirmedCount == len(messages) {
-                return
+            if received == len(messages) {
+                return // Получили ответы на всю пачку
             }
         }
     }()
 
-    // В основном потоке &quot;выстреливаем&quot; все сообщения максимально быстро,
-    // не дожидаясь ответа на каждое (Pipelining)
-    for _, msg := range messages {
-        err := ch.PublishWithContext(context.Background(),
-            &quot;exchange&quot;, &quot;routing_key&quot;, false, false,
+    // 4. В основном потоке непрерывно выстреливаем сообщения в сокет (Pipelining)
+    for _, payload := range messages {
+        err := ch.PublishWithContext(ctx,
+            exchange,
+            routingKey,
+            false,
+            false,
             amqp.Publishing{
-                DeliveryMode: amqp.Persistent,
-                Body:         msg,
+                DeliveryMode: amqp.Persistent, // Фиксация на диске
+                ContentType:  &quot;application/json&quot;,
+                Body:         payload,
+                Timestamp:    time.Now().UTC(),
             },
         )
         if err != nil {
-            log.Printf(&quot;Failed to write to TCP socket: %v&quot;, err)
+            log.Printf(&quot;Ошибка записи в TCP-сокет: %v&quot;, err)
         }
     }
 
-    // Ждем, пока брокер обработает и подтвердит всю пачку
+    // 5. Ожидаем завершения подтверждений всей пачки от сервера
     wg.Wait()
+
+    if nackCount &gt; 0 {
+        return fmt.Errorf(&quot;пачка опубликована с ошибками: %d сообщений отклонено&quot;, nackCount)
+    }
     return nil
 }
 </code></pre>
 </div>
 
-<p><em>В таком режиме брокер группирует дисковый I/O и отправляет подтверждения пачками, что увеличивает throughput в 10-50 раз по сравнению с синхронным ожиданием.</em></p>
-<h3 id="consumer-nastroyka-prefetch-i-pulov">Consumer: Настройка Prefetch и пулов</h3>
-<ul>
-<li><strong>Prefetch Count:</strong> Увеличивайте <code>ch.Qos(prefetchCount, 0, false)</code> до 500-1000 для быстрых консьюмеров. Это нивелирует RTT сети, так как сообщения всегда будут готовы в RAM вашего Go-процесса.</li>
-<li><strong>Каналы (Channels):</strong> Никогда не расшаривайте один <code>amqp.Channel</code> между горутинами, которые делают <code>Publish</code> или <code>Ack</code>. Под капотом библиотеки стоит <code>sync.Mutex</code>, сериализующий запись фреймов в сокет. Конкуренция за этот мьютекс уничтожит производительность. Строго 1 горутина-воркер = 1 канал.</li>
-</ul>
+<p><em>При таком подходе ядро RabbitMQ агрегирует записи в Raft WAL или дисковый лог пачками, что повышает пропускную способность публикации в $10\text{–}50$ раз.</em></p>
+<h3 id="consumer-nastroyka-prefetch-i-izolyatsiya-kanalov">Consumer: Настройка Prefetch и изоляция каналов</h3>
+<ol>
+<li><strong>Prefetch Count:</strong> Для быстрых воркеров (микропакеты, инсерты в кэш) увеличивайте <code>ch.Qos(prefetchCount, 0, false)</code> до <code>200..1000</code>. Это нивелирует сетевой пинг, удерживая готовые к обработке сообщения в RAM процесса Go.</li>
+<li><strong>Изоляция каналов (<code>amqp.Channel</code>):</strong> Никогда не расшаривайте один объект <code>*amqp.Channel</code> между параллельными горутинами. Внутренний мьютекс <code>sync.Mutex</code> в библиотеке <code>amqp091-go</code>, сериализующий фреймы в сокет, станет источником жесточайшего lock contention.<br />
+<strong>Правило архитектуры:</strong> <strong>1 горутина-воркер = 1 выделенный AMQP-канал</strong>.</li>
+</ol>
+<hr />
 <h2 id="5-kompromissy-proizvoditelnost-vs-garantii">5. Компромиссы: Производительность vs Гарантии</h2>
 
-<p>Самый быстрый RabbitMQ — это тот, который ничего не пишет на диск. </p>
-<p>Если в вашем проекте (например, логирование пользовательских кликов, метрики, телеметрия) допустима потеря части данных при падении сервера, вы можете использовать <code>Transient</code> (неперсистентные) сообщения.<br />
-* Установите <code>DeliveryMode = 1 (Transient)</code> при публикации.<br />
-* Используйте <code>Classic</code> очереди, а не <code>Quorum</code> (Quorum всегда пишут на диск через Raft WAL, их нельзя сделать исключительно in-memory).<br />
-В таком режиме RabbitMQ способен маршрутизировать сотни тысяч сообщений в секунду на скромном железе, выступая в роли идеального in-memory роутера.</p>
+<p>Самый быстрый RabbitMQ — это брокер, который <strong>ничего не записывает на диск</strong>.</p>
+<p>Если в вашей системе есть потоки данных, где потеря незначительной части событий при аварии сервера допустима (метрики мониторинга, сырые кликстрим-логи, временная телеметрия датчиков IoT), вы можете задействовать режим <code>Transient</code>:<br />
+- Публикуйте сообщения с флагом <code>DeliveryMode = 1 (Transient)</code>.<br />
+- Используйте стандартные <strong>Classic Queues</strong> без персистентности (Quorum Queues по своей природе всегда принудительно пишут данные в Raft WAL и не могут работать чисто in-memory).</p>
+<p>В этом режиме RabbitMQ превращается в феноменально быстрый in-memory маршрутизатор, способный прокачивать сотни тысяч сообщений в секунду на скромном железе.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Размер сообщений</span>
+    <span class="callout-title">Под капотом: Размер полезной нагрузки (Payload Size) и паттерн Claim Check</span>
   </div>
   <div class="callout-body">
-    <p>RabbitMQ оптимизирован для маленьких сообщений. Идеальный размер payload — от нескольких сотен байт до пары килобайт. <br />
-Если вы начнете слать через RabbitMQ сообщения по 10-50 МБ (например, Base64 картинки), Erlang VM начнет тратить огромное количество ресурсов на аллокации в LOB (Large Object Space) и сборку мусора, а сеть мгновенно захлебнется. <br />
-<strong>Паттерн:</strong> Для больших файлов используйте паттерн <strong>Claim Check</strong> — сохраняйте файл в S3 (MinIO), а через RabbitMQ передавайте только ссылку/ID на этот файл.</p>
+    <p>RabbitMQ исторически спроектирован для работы с компактными сообщениями. Идеальный размер полезной нагрузки — <strong>от нескольких сотен байт до 2–4 килобайт</strong>.</p>
+<p>Если вы начнете пересылать через очереди файлы или тяжелые JSON по $10\text{–}50\text{ МБ}$ (например, закодированные в Base64 изображения или архивы):<br />
+1. Виртуальная машина BEAM начнет испытывать колоссальную нагрузку при аллокациях в пуле больших объектов (LOB, Large Object Space).<br />
+2. Процессы очередей будут тратить львиную долю тактов CPU на постоянный вызов сборщика мусора.<br />
+3. Сетевые сокеты и буферы мгновенно забьются, заблокировав пропускную способность для остальных очередей.</p>
+<p><strong>Архитектурный стандарт:</strong> Для тяжелых бинарных данных используйте паттерн <strong>Claim Check</strong> — сохраняйте полезную нагрузку в объектное хранилище S3 (<strong>MinIO</strong>, Ceph, AWS S3), а через очередь RabbitMQ передавайте только компактный JSON с идентификатором (ID) и URI файла.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog-razdela-po-rabbitmq">Итог раздела по RabbitMQ</h2>
 
-<p>Мы закончили погружение в RabbitMQ. Подведем ключевые итоги всего раздела:<br />
-1. RabbitMQ — это <strong>Smart Broker</strong>, который берет маршрутизацию, фильтрацию и отслеживание статуса доставки (ACK) на себя.<br />
-2. Консьюмеры в RabbitMQ — "глупые". Они просто читают то, что им дали, и говорят "сделано" или "ошибка".<br />
-3. Классическая очередь — это 1 процесс (1 ядро CPU). Для высокой пропускной способности требуется шардирование (<code>Consistent Hash Exchange</code>).<br />
-4. Для гарантии сохранности данных используйте <code>Quorum Queues</code> + <code>Publisher Confirms</code> + <code>Manual Acks</code>.<br />
-5. Управление "ядовитыми" сообщениями реализуется через строгий контроль <code>QoS</code> (Prefetch) и паттерны <code>Dead Letter Exchange</code>.</p>
-<p>Несмотря на всю мощь RabbitMQ, его архитектурные ограничения (Push-модель, удаление сообщений после обработки, лимиты пропускной способности одной очереди) делают его непригодным для некоторых задач Big Data и Event Sourcing. </p>
-<p>Для решения этих задач индустрия использует кардинально иной подход — систему, где брокер является "глупым" персистентным логом на диске, а вся логика переносится на консьюмера. Мы переходим к изучению тяжелой артиллерии распределенных систем. Наша следующая статья открывает новый раздел: <a href="../03-kafka/1-kafka-arkhitektura-i-model-log-based-sistemy.html" class="wikilink">1. Kafka. Архитектура и модель log based системы</a>.</p>
+<p>Мы завершили фундаментальное исследование архитектуры и практики работы с RabbitMQ. Сведем главные тезисы подраздела в единую ментальную карту:</p>
+<ol>
+<li><strong>Smart Broker, Dumb Consumer:</strong> RabbitMQ берет на себя всю сложность маршрутизации, фильтрации, управления очередями и контроля подтверждений (Acks). Клиентский код остается легковесным.</li>
+<li><strong>Анатомия AMQP 0-9-1:</strong> Сообщения никогда не публикуются прямо в очередь. Маршрут строго определен:<br />
+   $$\text{Producer} \xrightarrow{\text{Publish}} \text{Exchange} \xrightarrow{\text{Binding + Routing Key}} \text{Queue} \xrightarrow{\text{Deliver}} \text{Consumer}$$</li>
+<li><strong>Отказоустойчивость:</strong> Для mission-critical систем стандартом индустрии являются <strong>Quorum Queues</strong> на базе консенсуса <strong>Raft</strong> в связке с <code>Publisher Confirms</code> и ручными подтверждениями <code>Manual Acks</code> (<code>autoAck: false</code>).</li>
+<li><strong>Контроль потока (Backpressure):</strong> Каждый консьюмер обязан настраивать <code>ch.Qos(prefetchCount, 0, false)</code> до вызова <code>ch.Consume()</code>, чтобы предотвратить катастрофический эффект пожарного гидранта и OOM Killer.</li>
+<li><strong>Безопасность сбоев:</strong> При транзитных ошибках используйте отложенные ретраи (<strong>Wait Queues</strong> с фиксированным TTL либо <strong>Delayed Message Plugin</strong>). Для бракованных данных настраивайте карантинные очереди <strong>Dead Letter Exchange (DLX)</strong>, избегая опасных циклов <code>Poison Message Loop</code>.</li>
+<li><strong>Производительность:</strong> Классическая очередь упирается в одно процессорное ядро. Для высоких нагрузок шардируйте потоки через <code>Consistent Hash Exchange</code>, расширяйте лимиты файловых дескрипторов (<code>ulimit -n</code>) и применяйте асинхронные пакетные подтверждения в Go.</li>
+</ol>
+<hr />
+<h3 id="most-k-sleduyushchemu-razdelu">Мост к следующему разделу</h3>
+
+<p>RabbitMQ великолепен там, где требуются сложная маршрутизация, индивидуальная адресация задач и немедленное удаление сообщений после подтверждения обработки. </p>
+<p>Однако его архитектурные ограничения — выталкивающая Push-модель, удаление прочитанных данных и накладные расходы на поддержание состояния каждого сообщения в памяти — делают его неоптимальным для задач Event Sourcing, потоковой аналитики реального времени и хранения терабайтов немодифицируемой истории событий.</p>
+<p>Для решения задач сверхвысоких нагрузок индустрия обращается к принципиально иной архитектурной парадигме — распределенному немодифицируемому журналу записей на диске (Append-Only Log), где брокер намеренно сделан предельно простым («Dumb Broker»), а вся ответственность за смещения и параллелизм возлагается на «умного потребителя» («Smart Consumer»).</p>
+<p>Мы переходим к изучению тяжелой артиллерии распределенных систем. Наша следующая статья открывает новый раздел: <a href="../03-kafka/1-kafka-arkhitektura-i-model-log-based-sistemy.html" class="wikilink">1. Kafka. Архитектура и модель log based системы</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2394,7 +2520,7 @@ func publishBatchFast(ch *amqp.Channel, messages [][]byte) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-limity-os-i-mechanical-sympathy">1. Лимиты ОС и Mechanical Sympathy</a></li><li class="toc-item toc-h3"><a href="#faylovye-deskriptory-file-descriptors">Файловые дескрипторы (File Descriptors)</a></li><li class="toc-item toc-h3"><a href="#tcp-keepalive-i-heartbeats">TCP Keepalive и Heartbeats</a></li><li class="toc-item toc-h2"><a href="#2-tyuning-pamyati-upravlenie-potopom-flow-control">2. Тюнинг памяти: Управление потопом (Flow Control)</a></li><li class="toc-item toc-h2"><a href="#3-arkhitekturnyy-tyuning-ocheredi-i-shardirovanie">3. Архитектурный тюнинг: Очереди и Шардирование</a></li><li class="toc-item toc-h3"><a href="#pattern-consistent-hashing-shardirovanie-ocheredey">Паттерн Consistent Hashing (Шардирование очередей)</a></li><li class="toc-item toc-h2"><a href="#4-optimizatsiya-go-koda-producers-consumers">4. Оптимизация Go-кода (Producers &amp; Consumers)</a></li><li class="toc-item toc-h3"><a href="#publisher-batching-i-asinkhronnye-confirms">Publisher: Батчинг и Асинхронные Confirms</a></li><li class="toc-item toc-h3"><a href="#consumer-nastroyka-prefetch-i-pulov">Consumer: Настройка Prefetch и пулов</a></li><li class="toc-item toc-h2"><a href="#5-kompromissy-proizvoditelnost-vs-garantii">5. Компромиссы: Производительность vs Гарантии</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-po-rabbitmq">Итог раздела по RabbitMQ</a></li>
+    <li class="toc-item toc-h2"><a href="#1-limity-os-i-mechanical-sympathy">1. Лимиты ОС и Mechanical Sympathy</a></li><li class="toc-item toc-h3"><a href="#faylovye-deskriptory-file-descriptors">Файловые дескрипторы (File Descriptors)</a></li><li class="toc-item toc-h3"><a href="#tcp-keepalive-i-heartbeats-borba-s-povisshimi-soedineniyami">TCP Keepalive и Heartbeats: Борьба с повисшими соединениями</a></li><li class="toc-item toc-h2"><a href="#2-tyuning-pamyati-upravlenie-potopom-flow-control">2. Тюнинг памяти: Управление потопом (Flow Control)</a></li><li class="toc-item toc-h3"><a href="#mekhanika-global-flow-control">Механика Global Flow Control:</a></li><li class="toc-item toc-h2"><a href="#3-arkhitekturnyy-tyuning-ocheredi-i-shardirovanie">3. Архитектурный тюнинг: Очереди и Шардирование</a></li><li class="toc-item toc-h3"><a href="#pattern-consistent-hashing-shardirovanie-ocheredey">Паттерн Consistent Hashing (Шардирование очередей)</a></li><li class="toc-item toc-h2"><a href="#4-optimizatsiya-go-koda-producers-consumers">4. Оптимизация Go-кода (Producers &amp; Consumers)</a></li><li class="toc-item toc-h3"><a href="#publisher-batching-i-asinkhronnye-confirms">Publisher: Батчинг и Асинхронные Confirms</a></li><li class="toc-item toc-h3"><a href="#consumer-nastroyka-prefetch-i-izolyatsiya-kanalov">Consumer: Настройка Prefetch и изоляция каналов</a></li><li class="toc-item toc-h2"><a href="#5-kompromissy-proizvoditelnost-vs-garantii">5. Компромиссы: Производительность vs Гарантии</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-po-rabbitmq">Итог раздела по RabbitMQ</a></li><li class="toc-item toc-h3"><a href="#most-k-sleduyushchemu-razdelu">Мост к следующему разделу</a></li>
   </ul>
 </aside>
 

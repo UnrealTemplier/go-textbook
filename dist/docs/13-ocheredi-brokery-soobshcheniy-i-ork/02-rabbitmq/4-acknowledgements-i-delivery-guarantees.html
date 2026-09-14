@@ -2168,47 +2168,82 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Acknowledgements и delivery guarantees</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущей статье <a href="3-queues-i-bindings.html" class="wikilink">3. Queues и bindings</a> мы разобрали, как сообщения надежно сохраняются внутри очередей RabbitMQ. Но хранение — это лишь половина дела. Главная задача брокера — передать данные консьюмеру и убедиться, что они обработаны. </p>
-<p>Асинхронные системы по своей природе ненадежны: сеть может моргнуть, процесс Go может упасть с <code>panic</code>, под в Kubernetes может быть убит OOM-киллером (Out Of Memory) ровно в момент вычисления бизнес-логики. Как RabbitMQ понимает, что сообщение действительно обработано и его можно удалять с диска? Для этого существует механизм <strong>Acknowledgements (Подтверждения)</strong>.</p>
+            <p>В предыдущей статье <a href="3-queues-i-bindings.html" class="wikilink">3. Queues и bindings</a> мы подробно изучили, как очереди RabbitMQ сохраняют данные на диске и в оперативной памяти. Но надежное хранение — это лишь половина пути. Фундаментальная задача любого брокера — передать полезную нагрузку потребителю (Consumer) и получить математически строгое подтверждение того, что бизнес-логика успешно отработала.</p>
+<p>Распределенные системы несовершенны по своей природе. Сетевой кабель может моргнуть, процесс воркера на Go может внезапно завершиться <code>panic</code> из-за разыменования <code>nil</code>-указателя, а контейнер в Kubernetes может быть мгновенно уничтожен ядром Linux по сигналу <code>SIGKILL</code> (OOM Killer) прямо посреди финансовой транзакции. </p>
+<p>Как брокер узнает, что сообщение действительно обработано и его можно стереть из буфера? Для решения этой дилеммы в протоколе AMQP 0-9-1 существует механизм <strong>Acknowledgements (Подтверждений)</strong>.</p>
+<hr />
 <h2 id="garantii-dostavki-delivery-guarantees">Гарантии доставки (Delivery Guarantees)</h2>
 
-<p>Прежде чем говорить об ACK, нужно зафиксировать, какие гарантии доставки в принципе существуют в распределенных системах и что из этого поддерживает RabbitMQ.</p>
+<p>Прежде чем погружаться в протокольные тонкости команд <code>Ack</code> и <code>Nack</code>, зафиксируем базовую классификацию гарантий доставки в распределенных системах:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Guarantees [&quot;Модели гарантий доставки&quot;]
+AMO[&quot;1. At-most-once&lt;br&gt;(Не более одного раза)&quot;]
+ALO[&quot;2. At-least-once&lt;br&gt;(Не менее одного раза)&quot;]
+EO[&quot;3. Exactly-once&lt;br&gt;(Строго один раз)&quot;]
+end
+
+AMO --&gt;|&quot;Fire-and-Forget&quot;| R1[&quot;0 или 1 доставка.&lt;br&gt;Дубли исключены, возможна потеря данных.&quot;]
+ALO --&gt;|&quot;Manual Ack + Retries&quot;| R2[&quot;1 или более доставок.&lt;br&gt;Потеря исключена, возможны дубликаты.&quot;]
+EO --&gt;|&quot;At-least-once + Idempotency&quot;| R3[&quot;Строго один логический эффект.&lt;br&gt;Достигается только связкой брокера и консьюмера.&quot;]
+
+classDef gBox fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef rBox fill:#312e81,stroke:#818cf8,stroke-width:1px,color:#f8fafc;
+
+class AMO,ALO,EO gBox;
+class R1,R2,R3 rBox;
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>At-most-once (Не более одного раза):</strong> Сообщение доставляется 0 или 1 раз. Возможна потеря сообщений, но дублей не бывает. (Fire-and-forget).</li>
-<li><strong>At-least-once (Не менее одного раза):</strong> Сообщение доставляется 1 или более раз. Потеря невозможна, но при сбоях сети возможны дубликаты. <strong>Это золотой стандарт RabbitMQ.</strong></li>
-<li><strong>Exactly-once (Строго один раз):</strong> Священный Грааль распределенных систем. На уровне одного только брокера RabbitMQ (как и Kafka) эта гарантия <strong>недостижима</strong>. Брокер может послать сообщение, консьюмер его обработает, но ответный ACK потеряется в сети. Брокер отправит сообщение снова. <br />
-<em>Единственный способ добиться Exactly-once — использовать At-least-once на уровне RabbitMQ и реализовать идемпотентность на стороне консьюмера (об этом будет отдельная статья <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>).</em></li>
+<li><strong>At-most-once (Не более одного раза):</strong> Сообщение доставляется 0 или 1 раз. При сбоях системы данные могут быть безвозвратно утеряны, но дублирование полностью исключено (паттерн Fire-and-Forget). Применяется для низкоприоритетной телеметрии и метрик, где потеря нескольких замеров не критична.</li>
+<li><strong>At-least-once (Не менее одного раза):</strong> Сообщение гарантированно доставляется 1 или более раз. Потеря данных исключена, однако при сбоях сети или падении воркеров возможны повторные доставки (дубликаты). <strong>Это фундаментальный золотой стандарт RabbitMQ.</strong></li>
+<li><strong>Exactly-once (Строго один раз):</strong> Идеальное состояние распределенной системы. На уровне одного лишь брокера сообщений (будь то RabbitMQ, Kafka или NATS) эта гарантия физически <strong>недостижима</strong> из-за классической «задачи двух генералов» (Two Generals' Problem): если воркер успешно выполнил транзакцию в базе данных, но подтверждающий сетевой пакет <code>Ack</code> потерялся из-за сетевого сбоя, брокер сочтет воркера мертвым и переотправит сообщение другому узлу.<br />
+   - <em>Единственный промышленный способ получить Exactly-once обработку:</em> обеспечить доставку <strong>At-least-once</strong> на уровне RabbitMQ и реализовать строгую идемпотентность на стороне консьюмера (этому мы посвятим отдельную лекцию <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>).</li>
 </ol>
 <hr />
 <h2 id="consumer-acknowledgements-podtverzhdeniya-podpischika">Consumer Acknowledgements (Подтверждения подписчика)</h2>
 
-<p>Когда консьюмер (ваше Go-приложение) подключается к очереди и запрашивает сообщения, RabbitMQ может работать в двух режимах подтверждения.</p>
+<p>Когда ваше приложение на Go подключается к очереди через вызов <code>ch.Consume(...)</code>, RabbitMQ может работать в одном из двух режимов подтверждения.</p>
 <h3 id="1-auto-ack-fire-and-forget">1. Auto-Ack (Fire and Forget)</h3>
-
-<p>Если при подписке указать <code>autoAck: true</code>, RabbitMQ пометит сообщение как "удаленное" ровно в тот момент, когда <strong>запишет его фреймы в свой исходящий TCP-буфер</strong>. </p>
+<p>Если при вызове метода подписки передан аргумент <code>autoAck: true</code>, брокер помечает сообщение как успешно выполненное и удаляет его из очереди ровно в тот момент, когда <strong>запишет байты фрейма в свой исходящий TCP-сокет</strong>.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Потеря данных</span>
+    <span class="callout-title">Ловушка / Gotcha: Катастрофическая потеря данных в Auto-Ack</span>
   </div>
   <div class="callout-body">
-    <p>В режиме Auto-Ack брокеру абсолютно неважно, получил ли ваш Go-процесс сообщение, успел ли он его распарсить и не упал ли с паникой при записи в БД. Если приложение падает или TCP-соединение рвется, все сообщения, находившиеся в буфере сокета или в памяти приложения, <strong>исчезают навсегда</strong>. <br />
-<em>Никогда не используйте Auto-Ack в production для критичных бизнес-данных.</em></p>
+    <p>В режиме Auto-Ack брокеру абсолютно безразлично, что произойдет с данными дальше:<br />
+- Долетели ли TCP-пакеты через нестабильную сеть до сервера с приложением;<br />
+- Не упала ли горутина с паникой при <code>json.Unmarshal</code>;<br />
+- Не прибил ли ядро Linux процесс по OOM Killer из-за нехватки памяти.</p>
+<p>Если соединение оборвется, пока сообщение находится в пути или в буфере памяти приложения, данные <strong>исчезнут навсегда без возможности восстановления</strong>. </p>
+<p><em>Инженерное правило:</em> <strong>Никогда не используйте <code>autoAck: true</code> в production-системах</strong> для бизнес-критичных задач (финансы, заказы, биллинг, критические события).</p>
   </div>
 </div>
 
 <h3 id="2-manual-ack-ruchnoe-podtverzhdenie">2. Manual Ack (Ручное подтверждение)</h3>
-
-<p>В production-системах всегда используется <code>autoAck: false</code>. В этом режиме ответственность за удаление сообщения перекладывается на ваше приложение.</p>
-<p><strong>Механика работы "Под капотом":</strong><br />
-Когда брокер отправляет сообщение, он не удаляет его из памяти (или с диска Quorum-очереди). Он переводит его во внутренний статус <strong>Unacked</strong> (Не подтверждено) и закрепляет за конкретным <code>amqp.Channel</code>. </p>
+<p>В промышленных системах стандартным является использование <code>autoAck: false</code>. В этом режиме удаление сообщения из брокера происходит только по явной команде приложения.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2223,42 +2258,51 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant B as RabbitMQ
-participant C as Go Consumer
+autonumber
+participant Broker as &quot;RabbitMQ (Erlang Queue Process)&quot;
+participant Worker as &quot;Go Consumer (Goroutine)&quot;
+participant Storage as &quot;Database (PostgreSQL)&quot;
 
-B-&gt;&gt;C: Basic.Deliver - payload
-Note over B: Перенос в статус Unacked
-C-&gt;&gt;C: Обработка бизнес-логики - БД, API
-C-&gt;&gt;B: Basic.Ack - deliveryTag
-Note over B: Полное удаление сообщения
+Note over Broker: Очередь хранит сообщение (Ready)
+Broker-&gt;&gt;Worker: Basic.Deliver (Payload, deliveryTag: 42)
+Note over Broker: Перенос сообщения в статус Unacked
+
+Worker-&gt;&gt;Storage: Выполнение транзакции (BEGIN ... COMMIT)
+Storage--&gt;&gt;Worker: OK (Данные сохранены в БД)
+
+Worker-&gt;&gt;Broker: Basic.Ack (deliveryTag: 42, multiple: false)
+Note over Broker: Окончательное удаление сообщения из RAM/диска
   </pre>
 </div>
 
 
+<h3 id="mekhanika-statusa-unacked-pod-kapotom">Механика статуса Unacked под капотом</h3>
+<p>Когда брокер передает сообщение клиенту, он не стирает его с диска или из оперативной памяти. Он переводит сообщение из статуса <strong><code>Ready</code></strong> во внутреннее состояние <strong><code>Unacked</code></strong> (ожидает подтверждения) и ассоциирует его с дескриптором конкретного <code>amqp.Channel</code>.</p>
+<p>Каждому сообщению, летящему внутри канала, брокер присваивает монотонно возрастающее 64-битное целое число — <strong><code>deliveryTag</code></strong>. Этот тег уникален строго в рамках данного канала и служит адресом сообщения при отправке подтверждения.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: State &amp; Network Partitions</span>
+    <span class="callout-title">Под капотом: Обработка сбоев сети и статус Unacked</span>
   </div>
   <div class="callout-body">
-    <p>В отличие от Kafka, где брокер ничего не знает о состоянии консьюмера (консьюмер сам двигает свой offset), <strong>RabbitMQ хранит состояние доставки (Unacked) у себя в памяти (в Erlang-процессе очереди)</strong>. <br />
-Если TCP-соединение между вашим Go-приложением и RabbitMQ внезапно рвется (таймаут, падение пода, сетевой сплит), RabbitMQ замечает закрытие сокета и <strong>немедленно возвращает все сообщения со статусом Unacked обратно в статус Ready</strong>, помещая их в начало очереди. Они будут доставлены первому же свободному консьюмеру.</p>
+    <p>В отличие от Kafka, где брокер не отслеживает персональный прогресс вычитывания каждого отдельного сообщения (консьюмер лишь периодически сдвигает смещение — offset партиции), <strong>RabbitMQ держит детальную карту неподтвержденных сообщений в памяти процесса Erlang</strong>.</p>
+<p>Если TCP-соединение между Go-воркером и RabbitMQ неожиданно обрывается (сработал таймаут TCP Keep-Alive, упал под Kubernetes или перезагрузился сервер), брокер мгновенно регистрирует событие закрытия сокета. </p>
+<p>В ту же миллисекунду RabbitMQ <strong>автоматически возвращает все сообщения этого канала из статуса Unacked обратно в статус Ready</strong> и помещает их в голову очереди! Они будут немедленно переданы любому другому свободному воркеру. Ни один байт не теряется.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="negativnye-podtverzhdeniya-nack-i-reject">Негативные подтверждения (Nack и Reject)</h2>
 
-<p>Если во время обработки сообщения в Go произошла ошибка (отвалилась БД, невалидный JSON, ошибка валидации), вы не должны делать <code>Ack</code>. Вы должны явно сказать брокеру, что обработка провалилась. Для этого есть две команды:</p>
+<p>Что делать, если при обработке сообщения в Go что-то пошло не так? Например, сервис базы данных временно недоступен, внешний платежный шлюз вернул HTTP 500 или пришел битый JSON-документ?</p>
+<p>В этом случае отправлять <code>Ack</code> категорически нельзя — иначе брокер сотрет бракованное сообщение, и задача будет потеряна. Для информирования брокера об ошибке в протоколе AMQP предусмотрены две инструкции:</p>
 <ol>
-<li><code>Basic.Reject</code> — отклонить одно конкретное сообщение.</li>
-<li><code>Basic.Nack</code> (Negative Acknowledgement) — расширение протокола от RabbitMQ, позволяющее отклонить сразу пакет сообщений (bulk).</li>
+<li><strong><code>Basic.Reject</code>:</strong> Базовый метод AMQP, позволяющий отклонить одно конкретное сообщение по его <code>deliveryTag</code>.</li>
+<li><strong><code>Basic.Nack</code> (Negative Acknowledgement):</strong> Расширение протокола от RabbitMQ. В отличие от Reject, поддерживает флаг <code>multiple: true</code>, позволяя отклонить сразу пачку сообщений вплоть до указанного тега.</li>
 </ol>
-<p>При вызове <code>Nack</code> или <code>Reject</code> вы обязаны передать критически важный флаг: <strong>requeue</strong> (поместить обратно в очередь).</p>
-<h3 id="requeue-true-ostorozhno-miny">Requeue = true (Осторожно, мины!)</h3>
-
-<p>Если вы говорите <code>requeue: true</code>, брокер вернет сообщение обратно в очередь. <br />
-<strong>Проблема:</strong> Сообщение снова окажется первым в очереди, RabbitMQ снова отдаст его вашему консьюмеру, консьюмер снова упадет с ошибкой (например, из-за битого JSON) и снова сделает <code>Nack(requeue=true)</code>. </p>
+<p>Оба метода принимают критически важный булев аргумент — <strong><code>requeue</code></strong>.</p>
+<h3 id="1-requeue-true-opasneyshaya-lovushka-poison-message-loop">1. Requeue = true (Опаснейшая ловушка: Poison Message Loop)</h3>
+<p>Если консьюмер выполняет вызов с флагом <code>requeue: true</code>, брокер возвращает отклоненное сообщение обратно в очередь.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2273,43 +2317,63 @@ Note over B: Полное удаление сообщения
   </div>
   <pre class="mermaid">
 graph TD
-Q[&quot;Очередь RabbitMQ&quot;] --&gt;|&quot;Basic.Deliver&quot;| C[&quot;Go Воркер&quot;]
-C --&gt;|&quot;Ошибка парсинга&lt;br&gt;Nack requeue-true&quot;| Q
-style C fill:#f99,stroke:#333,stroke-width:2px;
-style Q fill:#9cf,stroke:#333,stroke-width:2px;
+subgraph DangerZone [&quot;Poison Message Loop (100% CPU Churn)&quot;]
+Q[&quot;Очередь RabbitMQ&lt;br&gt;(Head of Queue)&quot;] --&gt;|&quot;1. Basic.Deliver&quot;| W[&quot;Go Воркер&quot;]
+W --&gt;|&quot;2. json.Unmarshal FAILED!&lt;br&gt;d.Nack(requeue=true)&quot;| Q
+end
+
+classDef err fill:#450a0a,stroke:#f87171,stroke-width:2px,color:#fecaca;
+classDef q fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+
+class W err;
+class Q q;
   </pre>
 </div>
 
 
-<p>Это классический <strong>Poison Message Loop</strong> (Цикл отравленного сообщения). Ваш консьюмер начнет бесконечно крутиться в цикле, потребляя 100% CPU, сжигая сеть и блокируя обработку всех остальных (валидных) сообщений в очереди.</p>
-<h3 id="requeue-false-pravilnyy-put">Requeue = false (Правильный путь)</h3>
-
-<p>Если ошибка детерминирована (например, инвалидный payload) или количество ретраев исчерпано, нужно делать <code>Nack(requeue=false)</code>. В этом случае сообщение будет либо удалено навсегда, либо, что более правильно, сброшено в <strong>Dead Letter Exchange (DLX)</strong> для последующего ручного разбора или отложенного ретрая. Подробно эту механику мы разберем в статье <a href="7-dead-letter-exchanges.html" class="wikilink">7. Dead letter exchanges</a>.</p>
-<hr />
-<h2 id="publisher-confirms-kak-otpravitelyu-spat-spokoyno">Publisher Confirms: Как отправителю спать спокойно?</h2>
-
-<p>На собеседованиях часто концентрируются на консьюмерах, забывая про отправителей (Producers). </p>
-<div class="callout callout-interview">
+<div class="callout callout-warning">
   <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Бесконечный цикл отравленных сообщений (Poison Message Loop)</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Вы вызываете <code>ch.Publish(...)</code> в Go, функция возвращает <code>err == nil</code>. Гарантирует ли это, что сообщение сохранено в RabbitMQ?<br />
-<strong>Ответ:</strong> Нет! Функция <code>Publish</code> в библиотеке <code>amqp091-go</code> лишь синхронно пишет байты фрейма в буфер сокета операционной системы (syscall <code>write</code>). Если сервер RabbitMQ выключится через миллисекунду после этого, сообщение потеряется, а ваше приложение об этом даже не узнает.</p>
+    <p>Представьте: воркер получил сообщение с синтаксически невалидным JSON (битый payload). Парсер вернул ошибку, и воркер наивно вызвал <code>d.Nack(false, true)</code>.</p>
+<p><strong>Что происходит дальше?</strong><br />
+1. Брокер немедленно возвращает битое сообщение в начало очереди.<br />
+2. В ту же микросекунду брокер снова отдает это же сообщение тому же воркеру.<br />
+3. Воркер снова падает на парсинге JSON и снова делает <code>Nack(requeue=true)</code>.</p>
+<p>Возникает катастрофический <strong>Poison Message Loop</strong>: воркер и брокер начинают молотить вхолостую со скоростью сотен тысяч вызовов в секунду, загружая CPU на 100%, забивая сеть служебными фреймами и полностью блокируя продвижение остальных валидных сообщений в очереди (Head-of-Line Blocking).</p>
   </div>
 </div>
 
-<p>Чтобы добиться At-least-once на стороне отправителя, нужно использовать <strong>Publisher Confirms</strong> (Подтверждения публикатора).</p>
-<p>Механика:<br />
-1. Вы переводите канал в режим подтверждений: <code>ch.Confirm(false)</code>.<br />
-2. Библиотека начинает асинхронно слушать ответы от брокера.<br />
-3. Брокер присылает <code>Basic.Ack</code> отправителю <strong>только после того</strong>, как сообщение достигнет очередей и будет физически записано на диск (в случае Durable/Quorum очередей).</p>
-<p>Это слегка замедляет отправку (требуется ожидание round-trip по сети и дискового I/O брокера), но является единственным способом не терять данные при публикации.</p>
+<h3 id="2-requeue-false-arkhitekturno-pravilnyy-put">2. Requeue = false (Архитектурно правильный путь)</h3>
+<p>Если ошибка является фатальной (детерминированный баг валидации) либо счетчик повторных попыток исчерпан, воркер обязан передавать флаг отбрасывания — делать <code>Nack(requeue=false)</code>. </p>
+<p>В этом случае сообщение будет либо удалено навсегда, либо, что более правильно, сброшено в <strong>Dead Letter Exchange (DLX)</strong> для последующего анализа инженерами или отложенного ретрая (подробно разберем в лекции <a href="7-dead-letter-exchanges.html" class="wikilink">7. Dead letter exchanges</a>).</p>
+<hr />
+<h2 id="publisher-confirms-kak-otpravitelyu-spat-spokoyno">Publisher Confirms: Как отправителю спать спокойно?</h2>
+
+<p>На технических собеседованиях и при проектировании архитектуры инженеры часто сосредотачиваются на консьюмерах, забывая про сторону отправителя (Producer).</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование: Иллюзия надежности ch.Publish(...)</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Вы вызываете функцию <code>ch.Publish(...)</code> в Go. Функция вернула <code>err == nil</code>. Означает ли это, что сообщение гарантированно попало в очередь и сохранено брокером?</p>
+<p><strong>Ответ:</strong> <strong>Категорически нет!</strong> Метод <code>Publish</code> в сетевом драйвере <code>amqp091-go</code> работает синхронно лишь на уровне операционной системы хоста: он просто копирует срез байт во внутренний буфер сокета ядра Linux (системный вызов <code>write</code>). <br />
+Если через миллисекунду после возврата из функции упадет питание сервера RabbitMQ или сетевой коммутатор разорвет связь, сообщение бесследно растворится в воздухе. Ваше приложение будет уверено, что данные отправлены, хотя брокер их даже не получил.</p>
+  </div>
+</div>
+
+<p>Для устранения этой уязвимости в AMQP 0-9-1 существует механизм <strong>Publisher Confirms (Подтверждения издателя)</strong>:<br />
+1. Канал отправителя переводится в режим подтверждений вызовом <code>ch.Confirm(false)</code>.<br />
+2. Библиотека начинает асинхронно слушать подтверждения от сервера.<br />
+3. Брокер отправляет <code>Basic.Ack</code> публикатору <strong>только после того</strong>, как сообщение было маршрутизировано во все целевые очереди и физически записано на диск (в случае Quorum или Durable-очередей с <code>DeliveryMode = Persistent</code>).</p>
+<p>Использование Publisher Confirms слегка увеличивает Round-Trip Time (RTT) публикации, но является единственным математически строгим способом гарантировать семантику <strong>At-least-once</strong> на стороне отправителя.</p>
 <hr />
 <h2 id="idiomatichnyy-go-kod-konsyumera-s-manual-ack">Идиоматичный Go-код консьюмера с Manual Ack</h2>
 
-<p>Посмотрим на правильную реализацию консьюмера, который защищен от утечек памяти и корректно обрабатывает сообщения:</p>
+<p>Ниже представлен отказоустойчивый пример консьюмера на Go с корректной обработкой контекста, graceful shutdown и защитой от зависших сообщений:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2323,56 +2387,92 @@ style Q fill:#9cf,stroke:#333,stroke-width:2px;
 
 import (
     &quot;context&quot;
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
     &quot;log&quot;
+    &quot;time&quot;
 
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
-func startConsumer(ch *amqp.Channel, queueName string) error {
-    // 1. Подписываемся с autoAck: false
+type OrderTask struct {
+    OrderID   string `json:&quot;order_id&quot;`
+    UserID    int64  `json:&quot;user_id&quot;`
+    Amount    int64  `json:&quot;amount&quot;`
+}
+
+// processOrder выполняет бизнес-логику задачи
+func processOrder(ctx context.Context, body []byte) error {
+    var task OrderTask
+    if err := json.Unmarshal(body, &amp;task); err != nil {
+        // Детерминированная ошибка: битый JSON ретраить бессмысленно
+        return errors.New(&quot;malformed_json&quot;)
+    }
+
+    if task.Amount &lt;= 0 {
+        return errors.New(&quot;invalid_amount&quot;)
+    }
+
+    // Эмуляция полезной работы (запись в БД)
+    log.Printf(&quot;Заказ %s успешно обработан для пользователя %d&quot;, task.OrderID, task.UserID)
+    return nil
+}
+
+// startConsumer запускает цикл вычитывания сообщений с ручным Ack
+func startConsumer(ctx context.Context, ch *amqp.Channel, queueName string) error {
+    // 1. Обязательно регистрируем подписку с autoAck: false!
     msgs, err := ch.Consume(
         queueName,
-        &quot;my_go_consumer&quot;, // consumer tag
-        false,            // autoAck (СТРОГО FALSE)
-        false,            // exclusive
-        false,            // noLocal
-        false,            // noWait
-        nil,              // args
+        &quot;orders-worker-1&quot;, // consumer tag
+        false,             // autoAck (СТРОГО FALSE)
+        false,             // exclusive
+        false,             // noLocal
+        false,             // noWait
+        nil,               // args
     )
     if err != nil {
         return err
     }
 
-    // 2. Читаем канал в горутине
+    // 2. Вычитываем входящий канал доставки в отдельной горутине
     go func() {
-        for d := range msgs {
-            // Обрабатываем сообщение
-            err := processBusinessLogic(d.Body)
+        for {
+            select {
+            case &lt;-ctx.Done():
+                log.Println(&quot;Остановка консьюмера по контексту...&quot;)
+                return
+            case d, ok := &lt;-msgs:
+                if !ok {
+                    log.Println(&quot;AMQP канал доставки закрыт брокером&quot;)
+                    return
+                }
 
-            if err != nil {
-                log.Printf(&quot;Error processing message: %v&quot;, err)
-                // Если ошибка (например, кривой JSON) - Nack без requeue
-                // Сообщение улетит в DLX (если настроено) или удалится
-                _ = d.Nack(false, false) // multiple=false, requeue=false
-                continue
-            }
+                // Обработка сообщения
+                processCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+                err := processOrder(processCtx, d.Body)
+                cancel()
 
-            // 3. Явный Ack при успехе
-            // Важно: Ack отправляется асинхронно по тому же TCP-каналу.
-            err = d.Ack(false) // multiple=false
-            if err != nil {
-                log.Printf(&quot;Failed to Ack message: %v&quot;, err)
-                // Если Ack не прошел, значит канал скорее всего мертв,
-                // при переподключении брокер выдаст это сообщение снова.
+                if err != nil {
+                    log.Printf(&quot;Ошибка обработки сообщения [tag=%d]: %v&quot;, d.DeliveryTag, err)
+
+                    // Критическая ошибка валидации: Nack БЕЗ requeue
+                    // Сообщение улетит в DLX (если настроен) или удалится
+                    if nackErr := d.Nack(false, false); nackErr != nil {
+                        log.Printf(&quot;Сбой отправки Nack: %v&quot;, nackErr)
+                    }
+                    continue
+                }
+
+                // 3. Успешная обработка: отправляем явный Ack
+                if ackErr := d.Ack(false); ackErr != nil {
+                    log.Printf(&quot;Сбой отправки Ack [tag=%d]: %v&quot;, d.DeliveryTag, ackErr)
+                    // Если отправка сорвалась, соединение мертво;
+                    // при переподключении брокер переотправит сообщение снова.
+                }
             }
         }
     }()
 
-    return nil
-}
-
-func processBusinessLogic(data []byte) error {
-    // Эмуляция тяжелой работы с БД
     return nil
 }
 </code></pre>
@@ -2381,23 +2481,31 @@ func processBusinessLogic(data []byte) error {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Утечка памяти (Memory Leak) в RabbitMQ</span>
+    <span class="callout-title">Ловушка / Gotcha: Утечка памяти (Memory Leak) и аварийный Flow Control</span>
   </div>
   <div class="callout-body">
-    <p>Самая частая проблема Junior-разработчиков: они выставили <code>autoAck: false</code>, но забыли написать <code>d.Ack(false)</code> в ветке успешного выполнения или в одном из <code>if err != nil { return }</code>. </p>
-<p><strong>Что произойдет?</strong> Go-приложение успешно потребит сообщение, но брокер навсегда оставит его в статусе <strong>Unacked</strong>. Со временем счетчик Unacked дойдет до десятков или сотен тысяч. RabbitMQ исчерпает всю RAM, упрется в High Watermark, остановит публикацию всех новых сообщений (Global Flow Control) или просто упадет. Мониторинг метрики <code>Unacked Messages</code> в Grafana — обязательное условие для production.</p>
+    <p>Самая распространенная ошибка при переходе на ручные подтверждения (<code>autoAck: false</code>) — это <strong>забытый вызов <code>d.Ack</code></strong>. </p>
+<p>Если в одном из ответвлений бизнес-логики (<code>if err != nil { return }</code>) разработчик написал возврат, забыв вызвать <code>d.Ack(false)</code> или <code>d.Nack(false, false)</code>, сообщение навсегда зависает в памяти брокера со статусом <strong><code>Unacked</code></strong>.</p>
+<p>По мере работы сервиса счетчик Unacked в брокере неумолимо растет: 10 000, 100 000, 1 000 000 сообщений.<br />
+<strong>Последствия для системы:</strong><br />
+1. Erlang-процессы очередей исчерпывают всю оперативную память хоста.<br />
+2. Брокер упирается в лимит памяти (<code>vm_memory_high_watermark</code>).<br />
+3. Включается режим глобальной блокировки (<strong>Global Flow Control</strong>): RabbitMQ перестает считывать входящие сокеты продюсеров, и вся инфраструктура компании встает в ступор.</p>
+<p><em>Мониторинг:</em> Дашборды в <strong>Grafana</strong> с алертом на метрику <code>Unacked Messages &gt; 1000</code> — абсолютный must-have для production-контура RabbitMQ!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Гарантии:</strong> RabbitMQ обеспечивает At-least-once доставку только при использовании Manual ACKs на консьюмере и Publisher Confirms на паблишере.</li>
-<li><strong>State:</strong> Состояние обработки (Unacked) хранится в памяти брокера (Erlang). При обрыве соединения сообщения автоматически возвращаются в очередь (Ready).</li>
-<li><strong>Poison Messages:</strong> Никогда не делайте слепой <code>Nack(requeue=true)</code> при ошибках обработки. Используйте <code>requeue=false</code> и DLX, иначе убьете CPU бесконечным циклом.</li>
-<li><strong>Утечки:</strong> Всегда следите за тем, чтобы каждый путь выполнения (success и все ветки error) заканчивался вызовом <code>Ack</code> или <code>Nack</code>. Забытый Ack убивает кластер RabbitMQ по памяти.</li>
+<li><strong>Гарантия At-least-once:</strong> Достигается исключительно при совместном использовании <strong>Publisher Confirms</strong> на стороне отправителя и <strong>Manual Ack (<code>autoAck: false</code>)</strong> на стороне получателя.</li>
+<li><strong>Управление состоянием в Erlang:</strong> Брокер непрерывно отслеживает сообщения в статусе <code>Unacked</code>. При разрыве TCP-сокета воркера брокер автоматически возвращает их в состояние <code>Ready</code> в голову очереди.</li>
+<li><strong>Опасность Poison Messages:</strong> Никогда не выполняйте <code>Nack(requeue=true)</code> вслепую при сбоях валидации. Это порождает бесконечный цикл загрузки CPU. Используйте <code>requeue=false</code> и направляйте брак в Dead Letter Exchange.</li>
+<li><strong>Опасность утечек Ack:</strong> Каждый путь исполнения в коде консьюмера обязан завершаться вызовом <code>Ack</code> либо <code>Nack</code>. Забытый Ack приводит к переполнению оперативной памяти брокера и аварийной остановке всего кластера.</li>
 </ol>
-<p>Теперь мы умеем надежно забирать сообщения. Но что, если сообщений в очереди миллион, а наш Go-воркер может обрабатывать только 10 в секунду? Как не захлебнуться и не уронить память Go-приложения? Об этом мы поговорим в следующей статье: <a href="5-prefetch-i-qos.html" class="wikilink">5. Prefetch и QoS</a>.</p>
+<p>Мы научились гарантировать доставку каждого сообщения. Но представьте: в очереди накопился миллион задач, и консьюмер на Go подключился с флагом <code>autoAck: false</code>. Сколько сообщений брокер мгновенно вывалит в сокет нашего бедного воркера? Как предотвратить затопление памяти приложения и справедливо распределить работу между горутинами? </p>
+<p>Об этом мы поговорим в следующей лекции: <a href="5-prefetch-i-qos.html" class="wikilink">5. Prefetch и QoS</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2425,7 +2533,7 @@ func processBusinessLogic(data []byte) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#garantii-dostavki-delivery-guarantees">Гарантии доставки (Delivery Guarantees)</a></li><li class="toc-item toc-h2"><a href="#consumer-acknowledgements-podtverzhdeniya-podpischika">Consumer Acknowledgements (Подтверждения подписчика)</a></li><li class="toc-item toc-h3"><a href="#1-auto-ack-fire-and-forget">1. Auto-Ack (Fire and Forget)</a></li><li class="toc-item toc-h3"><a href="#2-manual-ack-ruchnoe-podtverzhdenie">2. Manual Ack (Ручное подтверждение)</a></li><li class="toc-item toc-h2"><a href="#negativnye-podtverzhdeniya-nack-i-reject">Негативные подтверждения (Nack и Reject)</a></li><li class="toc-item toc-h3"><a href="#requeue-true-ostorozhno-miny">Requeue = true (Осторожно, мины!)</a></li><li class="toc-item toc-h3"><a href="#requeue-false-pravilnyy-put">Requeue = false (Правильный путь)</a></li><li class="toc-item toc-h2"><a href="#publisher-confirms-kak-otpravitelyu-spat-spokoyno">Publisher Confirms: Как отправителю спать спокойно?</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-kod-konsyumera-s-manual-ack">Идиоматичный Go-код консьюмера с Manual Ack</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#garantii-dostavki-delivery-guarantees">Гарантии доставки (Delivery Guarantees)</a></li><li class="toc-item toc-h2"><a href="#consumer-acknowledgements-podtverzhdeniya-podpischika">Consumer Acknowledgements (Подтверждения подписчика)</a></li><li class="toc-item toc-h3"><a href="#1-auto-ack-fire-and-forget">1. Auto-Ack (Fire and Forget)</a></li><li class="toc-item toc-h3"><a href="#2-manual-ack-ruchnoe-podtverzhdenie">2. Manual Ack (Ручное подтверждение)</a></li><li class="toc-item toc-h3"><a href="#mekhanika-statusa-unacked-pod-kapotom">Механика статуса Unacked под капотом</a></li><li class="toc-item toc-h2"><a href="#negativnye-podtverzhdeniya-nack-i-reject">Негативные подтверждения (Nack и Reject)</a></li><li class="toc-item toc-h3"><a href="#1-requeue-true-opasneyshaya-lovushka-poison-message-loop">1. Requeue = true (Опаснейшая ловушка: Poison Message Loop)</a></li><li class="toc-item toc-h3"><a href="#2-requeue-false-arkhitekturno-pravilnyy-put">2. Requeue = false (Архитектурно правильный путь)</a></li><li class="toc-item toc-h2"><a href="#publisher-confirms-kak-otpravitelyu-spat-spokoyno">Publisher Confirms: Как отправителю спать спокойно?</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-kod-konsyumera-s-manual-ack">Идиоматичный Go-код консьюмера с Manual Ack</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2168,29 +2168,82 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Prefetch и QoS</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="4-acknowledgements-i-delivery-guarantees.html" class="wikilink">4. Acknowledgements и delivery guarantees</a> мы разобрались, как с помощью ручных подтверждений (Manual Ack) избежать потери данных. Мы научились забирать сообщение, обрабатывать его и только потом говорить брокеру: «Всё ок, удаляй». </p>
-<p>Но здесь кроется фундаментальная проблема архитектуры Push-систем. Что произойдет, если в очереди скопился 1 миллион сообщений (например, после ночного даунтайма БД), а вы запускаете свой Go-воркер?</p>
+            <p>В предыдущей статье <a href="4-acknowledgements-i-delivery-guarantees.html" class="wikilink">4. Acknowledgements и delivery guarantees</a> мы детально разобрали, как с помощью ручных подтверждений (Manual Ack) исключить потерю сообщений при падениях сервисов. Мы научились забирать полезную нагрузку, выполнять бизнес-транзакции и только потом отправлять брокеру команду <code>d.Ack(false)</code>.</p>
+<p>Однако здесь кроется фундаментальная ловушка push-архитектуры. Представьте классическую производственную ситуацию: сервис базы данных ночью ушел в рестарт на 30 минут, и в очереди RabbitMQ скопилось $1\,000\,000$ сообщений. Утром вы выкатываете долгожданный фикс и запускаете ваш воркер на Go. Что произойдет в первую же секунду?</p>
+<hr />
 <h2 id="effekt-pozharnogo-gidranta-the-firehose-problem">Эффект пожарного гидранта (The Firehose Problem)</h2>
 
-<p>По умолчанию, как только вы вызываете <code>ch.Consume()</code> без дополнительных настроек, RabbitMQ начинает выгружать сообщения в ваш консьюмер <strong>на максимально возможной скорости сети</strong>. Брокер не спрашивает, успеваете ли вы их обрабатывать.</p>
-<p><strong>Mechanical Sympathy: Как это убивает Go-приложение?</strong><br />
-1. Брокер непрерывно шлет AMQP-фреймы по TCP.<br />
-2. Сетевой стек Linux на вашем сервере заполняет TCP-буфер (Receive Buffer).<br />
-3. Планировщик Go (<code>netpoll</code>) видит входящие данные, будит горутину, которая читает из сокета (<code>amqp091-go</code> background reader).<br />
-4. На каждое сообщение аллоцируется структура <code>amqp.Delivery</code> и слайс байт (payload) в куче (Heap).<br />
-5. Сообщения складываются во внутренний Go-канал, из которого читает ваш воркер.</p>
-<p>Если ваш воркер обрабатывает 10 сообщений в секунду (тяжелые запросы в БД), а брокер пушит 10 000 сообщений в секунду, внутренний канал мгновенно заполняется. Сборщик мусора (GC) в Go сходит с ума от миллионов живых объектов в памяти. В итоге процесс гарантированно ловит <strong>Out Of Memory (OOM) Killer</strong> от операционной системы.</p>
+<p>В большинстве традиционных очередей брокер работает в модели <strong>Push (выталкивание)</strong>. </p>
+<p>По умолчанию, как только приложение вызывает метод <code>ch.Consume()</code> без предварительной настройки ограничений, RabbitMQ открывает шлюзы настежь и начинает выгружать сообщения в открытый сокет <strong>на максимальной физической скорости сетевого интерфейса</strong>. Брокер не интересуется, сколько у воркера свободной оперативной памяти и успевает ли он переваривать входящий поток.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Broker [&quot;RabbitMQ Broker&quot;]
+Q[&quot;Queue: 1 000 000 сообщений&lt;br&gt;(Durable / Quorum)&quot;]
+end
+
+subgraph NetworkStack [&quot;Сетевой стек Linux&quot;]
+Socket[&quot;TCP Socket&lt;br&gt;(SO_RCVBUF)&quot;]
+end
+
+subgraph GoApp [&quot;Go Process (Воркер)&quot;]
+direction TB
+Reader[&quot;amqp091-go Reader Goroutine&quot;]
+Chan[&quot;Go Channel (Buffered msgs)&quot;]
+Heap[&quot;Go Heap: миллионы аллокаций amqp.Delivery&quot;]
+OOM[&quot;💥 OOM Killer (SIGKILL ядра Linux)&quot;]
+
+Reader --&gt; Chan
+Chan --&gt; Heap
+Heap --&gt; OOM
+end
+
+Q ==&gt;|&quot;Турборежим Push: 50 000 msg/s&lt;br&gt;(Без QoS / Firehose)&quot;| Socket
+Socket ==&gt; Reader
+
+classDef q fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef net fill:#312e81,stroke:#818cf8,stroke-width:1px,color:#f8fafc;
+classDef app fill:#450a0a,stroke:#f87171,stroke-width:2px,color:#fecaca;
+
+class Q q;
+class Socket net;
+class Reader,Chan,Heap,OOM app;
+  </pre>
+</div>
+
+
+<h3 id="mechanical-sympathy-kak-neobuzdannyy-push-ubivaet-go-prilozhenie">Mechanical Sympathy: Как необузданный Push убивает Go-приложение</h3>
+<p>Посмотрим на этот процесс глазами операционной системы и рантайма Go:<br />
+1. Демон RabbitMQ непрерывно генерирует тысячи фреймов <code>Basic.Deliver</code> и прокачивает их в TCP-соединение.<br />
+2. Сетевой стек ядра Linux на принимающей стороне моментально заполняет буфер приема сокета (<code>SO_RCVBUF</code>).<br />
+3. Внутренний сетевой опросчик Go (<strong><code>netpoll</code></strong> на базе <code>epoll</code>/<code>kqueue</code>) сигнализирует о наличии данных в файловом дескрипторе и немедленно пробуждает системную горутину-читатель драйвера <code>amqp091-go</code>.<br />
+4. На каждое входящее сообщение драйвер аллоцирует в куче (<strong>Heap</strong>) структуру <code>amqp.Delivery</code> и копирует срез байт полезной нагрузки (<code>payload</code>).<br />
+5. Декодированные структуры помещаются во внутренний буферизованный Go-канал, из которого читает цикл вашего воркера.</p>
+<p>Если ваш воркер выполняет тяжелую бизнес-логику (например, сложный запрос в PostgreSQL, занимающий 100 мс, выдавая скромные 10 сообщений в секунду на горутину), а брокер вкачивает $20\,000$ сообщений в секунду, внутренний канал и оперативная память заполняются лавинообразно. </p>
+<p>Сборщик мусора (<strong>GC</strong>) начинает задыхаться, пытаясь отслеживать миллионы живых указателей. Задержки Go-рантайма вырастают до секунд, и операционная система принудительно прибивает процесс через <strong>Out Of Memory (OOM) Killer</strong>. Приложение падает, не успев обработать даже сотни сообщений.</p>
+<hr />
 <h2 id="reshenie-prefetch-count-qos">Решение: Prefetch Count (QoS)</h2>
 
-<p>Чтобы защитить консьюмер и реализовать паттерн <strong>Backpressure</strong> (обратное давление), протокол AMQP использует механизм <strong>QoS (Quality of Service)</strong>, а конкретно параметр <code>prefetch_count</code>.</p>
-<p><strong>Prefetch Count</strong> — это лимит на количество <strong>Unacknowledged (неподтвержденных)</strong> сообщений, которые консьюмер может держать у себя одновременно. Это классический механизм <em>скользящего окна (sliding window)</em>, похожий на управление окном в TCP.</p>
+<p>Чтобы защитить микросервисы от захлебывания и реализовать фундаментальный паттерн распределенных систем — <strong>обратное давление (Backpressure)</strong>, протокол AMQP 0-9-1 предоставляет механизм <strong>QoS (Quality of Service)</strong>, сердцем которого является параметр <strong><code>prefetch_count</code></strong>.</p>
+<p><strong>Prefetch Count</strong> — это жесткий лимит на максимальное количество <strong>неподтвержденных (Unacknowledged)</strong> сообщений, которые брокер имеет право одновременно выдать клиенту в рамках сессии. Это классическая реализация механизма <strong>скользящего окна (sliding window)</strong>, аналогичная управлению потоком (Flow Control Window) в протоколе TCP.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2205,69 +2258,123 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant RMQ as RabbitMQ
-participant GO as Go Consumer
+autonumber
+participant Broker as &quot;RabbitMQ Queue&quot;
+participant Worker as &quot;Go Consumer (Worker)&quot;
 
-note over RMQ, GO: Установлен Prefetch = 2
+Note over Broker,Worker: Установлен лимит QoS: Prefetch Count = 2
 
-RMQ-&gt;&gt;GO: Msg 1 (Unacked count: 1)
-RMQ-&gt;&gt;GO: Msg 2 (Unacked count: 2)
-note over RMQ: Лимит достигнут.&lt;br&gt;Брокер приостанавливает отправку.
+Broker-&gt;&gt;Worker: 1. Basic.Deliver (Msg #1) [Unacked: 1]
+Broker-&gt;&gt;Worker: 2. Basic.Deliver (Msg #2) [Unacked: 2]
+Note over Broker: Окно заполнено (Unacked == Prefetch)!&lt;br&gt;Брокер ПРИОСТАНАВЛИВАЕТ отправку фреймов.
 
-GO-&gt;&gt;GO: Обработка Msg 1
-GO-&gt;&gt;RMQ: Ack Msg 1
-note over RMQ: Unacked count: 1.&lt;br&gt;Окно сдвинулось.
+Worker-&gt;&gt;Worker: Обработка Msg #1 в БД (50 мс)
+Worker-&gt;&gt;Broker: 3. Basic.Ack (Msg #1)
+Note over Broker: Unacked уменьшился до 1.&lt;br&gt;Скользящее окно сдвинулось!
 
-RMQ-&gt;&gt;GO: Msg 3 (Unacked count: 2)
-note over RMQ: Лимит достигнут снова.
+Broker-&gt;&gt;Worker: 4. Basic.Deliver (Msg #3) [Unacked: 2]
+Note over Broker: Окно снова заполнено. Ожидание следующего Ack.
   </pre>
 </div>
 
 
-<p>Если вы установили <code>prefetch_count = 100</code>, брокер отправит вам 100 сообщений и остановится. Как только вы сделаете <code>Ack</code> для первого сообщения, лимит освободится на 1, и брокер пришлет 101-е сообщение. Сообщения сверх лимита спокойно лежат на диске или в памяти RabbitMQ, ожидая своей очереди.</p>
+<p>Если вы сконфигурировали <code>prefetch_count = 100</code>, RabbitMQ отправит консьюмеру ровно 100 сообщений и немедленно остановит передачу по каналу. </p>
+<p>Как только воркер закончит обработку первого сообщения и пришлет <code>d.Ack(false)</code>, брокер уменьшит счетчик Unacked до 99 и мгновенно «подтолкнет» в канал 101-е сообщение. Оставшиеся 999 900 сообщений будут в полной безопасности ожидать своей очереди на диске или в оперативной памяти сервера RabbitMQ.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Prefetch Size</span>
+    <span class="callout-title">Под капотом: Загадка параметра Prefetch Size</span>
   </div>
   <div class="callout-body">
-    <p>Спецификация AMQP также описывает параметр <code>prefetch_size</code> (лимит окна в мегабайтах). Однако <strong>RabbitMQ исторически не поддерживает этот параметр</strong> (его реализация требовала бы слишком больших накладных расходов в Erlang). Поэтому в коде мы всегда передаем <code>prefetch_size = 0</code>. Лимитирование происходит только по <em>количеству</em> сообщений.</p>
+    <p>Метод спецификации AMQP <code>Basic.Qos</code> принимает параметр <code>prefetch_size</code> (лимит объема неподтвержденных данных в окне, выраженный в байтах).</p>
+<p>Однако <strong>RabbitMQ исторически не поддерживает ограничение по объему байт (<code>prefetch_size</code>)</strong>! Расчет динамического размера каждого фрейма в памяти кучи Erlang для сотен очередей приводил к неприемлемым накладным расходам на процессор.</p>
+<p>Поэтому в коде на Go мы всегда передаем <code>prefetch_size = 0</code> (что означает «без ограничений по размеру в байтах»). Лимитирование происходит только по <em>количеству</em> сообщений (<code>prefetch_count</code>).</p>
   </div>
 </div>
 
-<h2 id="kak-vybrat-pravilnyy-prefetch">Как выбрать правильный Prefetch?</h2>
+<hr />
+<h2 id="kak-vybrat-optimalnyy-razmer-prefetch">Как выбрать оптимальный размер Prefetch?</h2>
 
-<p>Выбор <code>prefetch_count</code> — это всегда компромисс между <strong>Latency</strong> (задержкой сети) и <strong>Throughput</strong> (пропускной способностью) + <strong>Fairness</strong> (честностью распределения).</p>
-<h3 id="strategiya-1-prefetch-1-maksimalnaya-chestnost">Стратегия 1: `Prefetch = 1` (Максимальная честность)</h3>
+<p>Выбор значения <code>prefetch_count</code> — это классический инженерный компромисс между тремя параметрами: <strong>Latency</strong> (задержка реакции), <strong>Throughput</strong> (пропускная способность) и <strong>Fairness</strong> (честность и равномерность распределения задач между воркерами).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+graph LR
+subgraph LowPrefetch [&quot;Prefetch = 1 (Fair Dispatch)&quot;]
+direction TB
+LP_Desc[&quot;Идеально для тяжелых задач (CPU/IO)&lt;br&gt;Равномерная загрузка всех воркеров.&lt;br&gt;Минус: простой на RTT сети.&quot;]
+end
+
+subgraph HighPrefetch [&quot;Prefetch = 100..500 (High Throughput)&quot;]
+direction TB
+HP_Desc[&quot;Идеально для быстрых задач (кэш, метрики)&lt;br&gt;Маскирует задержки RTT конвейеризацией.&lt;br&gt;Минус: риск монополизации задач одним воркером.&quot;]
+end
+
+classDef low fill:#064e3b,stroke:#34d399,stroke-width:1px,color:#f8fafc;
+classDef high fill:#312e81,stroke:#818cf8,stroke-width:1px,color:#f8fafc;
+
+class LP_Desc low;
+class HP_Desc high;
+  </pre>
+</div>
+
+
+<h3 id="strategiya-1-prefetch-1-chestnoe-raspredelenie-fair-dispatch">Стратегия 1: `Prefetch = 1` (Честное распределение / Fair Dispatch)</h3>
 <ul>
-<li><strong>Когда использовать:</strong> Задачи занимают значительное, но непредсказуемое время (от 1 секунды до нескольких минут). Например, ресайз изображений, генерация PDF, тяжелые ML-инференсы.</li>
-<li><strong>Плюсы:</strong> Идеальное распределение нагрузки (Fair Dispatch). Если у вас 10 воркеров, быстрые воркеры будут забирать новые задачи, пока медленные пыхтят над тяжелым PDF. Ни одно сообщение не будет простаивать в локальном буфере занятого воркера.</li>
-<li><strong>Минусы:</strong> Чудовищный оверхед на сеть. Воркер простаивает (ждет I/O), пока сообщение летит по сети после каждого Ack.</li>
+<li><strong>Сценарий:</strong> Задачи занимают непредсказуемое или длительное время (от нескольких сотен миллисекунд до нескольких минут). Например: генерация сложных PDF-отчетов, транскодирование видео, обработка тяжелых нейросетевых моделей (ML Inference), финансовый клиринг.</li>
+<li><strong>Преимущества:</strong> Абсолютная честность распределения (<strong>Fair Dispatch</strong>). Быстрый воркер успеет обработать 10 коротких задач, пока медленный пыхтит над одной гигантской. Ни одно сообщение не простаивает попусту в очереди ожидания занятого процесса.</li>
+<li><strong>Недостатки:</strong> Накладные расходы на сетевую задержку (<strong>Round-Trip Time, RTT</strong>). После каждого отправленного <code>Ack</code> воркер вынужден ждать доли миллисекунды, пока брокер получит подтверждение и пришлет по сети следующую задачу.</li>
 </ul>
-<h3 id="strategiya-2-prefetch-100-1000-maksimalnaya-propusknaya-sposobnost">Стратегия 2: `Prefetch = 100 - 1000` (Максимальная пропускная способность)</h3>
+<h3 id="strategiya-2-prefetch-100-1000-maksimalnyy-throughput">Стратегия 2: `Prefetch = 100 - 1000` (Максимальный Throughput)</h3>
 <ul>
-<li><strong>Когда использовать:</strong> Обработка очень быстрая (миллисекунды). Например, кэширование, инсерты в Clickhouse, обновление метрик.</li>
-<li><strong>Плюсы:</strong> Пока воркер обрабатывает сообщение N, сообщение N+1 уже лежит в памяти Go-процесса, готовое к моментальной обработке. Сетевая задержка (RTT) полностью нивелируется.</li>
-<li><strong>Минусы:</strong> "Голодание" других консьюмеров. Если один воркер заберет 1000 сообщений в свой буфер и внезапно начнет тормозить, эти сообщения будут недоступны для других (свободных) воркеров, пока первый их не обработает (или пока TCP соединение не умрет).</li>
+<li><strong>Сценарий:</strong> Задачи выполняются за доли миллисекунд (микропакетные операции, запись в Redis, логирование, агрегация метрик в ClickHouse).</li>
+<li><strong>Преимущества:</strong> Полное нивелирование сетевой задержки за счет конвейеризации (<strong>Pipelining</strong>). Пока воркер обрабатывает сообщение №1, сообщения с №2 по №100 уже загружены в оперативную память приложения и ждут своей очереди без миллисекундных сетевых задержек.</li>
+<li><strong>Недостатки:</strong> Опасность монополизации и «голодания» (Starvation) соседних воркеров. Если один воркер заберет себе в локальный буфер 1000 задач и внезапно замедлится (например, из-за долгой паузы GC или сетевого фриза), эти 1000 сообщений окажутся заблокированными для других свободных воркеров кластера.</li>
 </ul>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Голодание новых консьюмеров при prefetch=0</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> У нас есть очередь. Один консьюмер (prefetch=0) читает из нее данные, но медленно. Мы добавили еще 5 консьюмеров, чтобы распараллелить работу, но они простаивают, а очередь не уменьшается. В чем дело?<br />
-<strong>Ответ:</strong> Первый консьюмер (с <code>prefetch=0</code> или без ограничения QoS) уже "высосал" всю очередь в свой локальный буфер (сетевой стек и память процесса). RabbitMQ считает все эти сообщения доставленными (Unacked) и привязанными к первому консьюмеру. Для брокера очередь формально пуста. Новым консьюмерам просто нечего отдавать. Решение — жесткий лимит QoS на всех консьюмерах.</p>
+    <p><strong>Вопрос:</strong> В очереди скопилось 50 000 сообщений. Запущен один воркер с <code>prefetch = 0</code> (без ограничений), который медленно их разгребает. Чтобы ускорить обработку, девопс поднимает еще 10 реплик воркера. Однако все новые воркеры простаивают, а очередь не уменьшается быстрее. В чем причина?</p>
+<p><strong>Ответ:</strong> Первый воркер при подключении без лимита QoS мгновенно «высосал» все 50 000 сообщений в свой локальный буфер сокета и память процесса. На стороне RabbitMQ все эти сообщения перешли в статус <strong><code>Unacked</code></strong> и жестко привязались к каналу первого воркера. <br />
+Для брокера очередь физически пуста! Новым воркерам просто нечего отдавать.<br />
+<strong>Решение:</strong> Всегда настраивать ограниченный <code>prefetch_count</code> на всех потребителях с момента запуска сервиса.</p>
   </div>
 </div>
 
-<h2 id="realizatsiya-na-go-global-flag-gotcha">Реализация на Go: `global` flag gotcha</h2>
+<hr />
+<h2 id="realizatsiya-na-go-tonkosti-flaga-global">Реализация на Go: Тонкости флага `global`</h2>
 
-<p>В клиенте <code>amqp091-go</code> метод настройки QoS выглядит так: <code>ch.Qos(prefetchCount, prefetchSize, global)</code>.</p>
-<p>Здесь кроется важный нюанс с флагом <code>global</code>, который ведет себя в RabbitMQ не совсем так, как в чистой спецификации AMQP:<br />
-* <code>global = false</code> — лимит применяется к <strong>каждому новому Consumer</strong> (вызову <code>ch.Consume</code>), созданному на этом канале.<br />
-* <code>global = true</code> — лимит делится (шарится) между <strong>всеми Consumers</strong> на этом конкретном канале (<code>amqp.Channel</code>).</p>
-<p>В прошлой статье мы договорились, что в Go-приложениях мы создаем <strong>один Channel на одного Consumer</strong> во избежание lock contention. При такой архитектуре разницы между <code>global = true</code> и <code>global = false</code> практически нет. Тем не менее, идиоматично использовать <code>false</code>.</p>
+<p>В сетевом драйвере <code>amqp091-go</code> метод конфигурирования QoS вызывается на объекте канала:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">err := ch.Qos(prefetchCount, prefetchSize, global)
+</code></pre>
+</div>
+
+<p>Здесь разработчиков часто подстерегает путаница с третьим булевым параметром — <strong><code>global</code></strong>:<br />
+- <strong><code>global = false</code> (по умолчанию):</strong> Лимит <code>prefetch_count</code> применяется <strong>к каждому отдельному консьюмеру</strong> (каждому независимому вызову <code>ch.Consume</code> на данном канале). Если на одном канале запущено 2 консьюмера с <code>prefetch = 10</code>, каждый из них сможет держать до 10 неподтвержденных сообщений (суммарно до 20).<br />
+- <strong><code>global = true</code>:</strong> Лимит делится между <strong>всеми консьюмерами суммарно</strong>, открытыми на данном <code>amqp.Channel</code>.</p>
+<p>Поскольку в идиоматичном коде на Go мы следуем правилу <strong>«1 Channel = 1 Consumer/Worker»</strong> во избежание взаимных блокировок мьютексов (<code>lock contention</code>), флаг <code>global</code> практически всегда выставляется в <code>false</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2280,44 +2387,74 @@ note over RMQ: Лимит достигнут снова.
   <pre class="language-go"><code class="language-go">package main
 
 import (
+    &quot;context&quot;
     &quot;log&quot;
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    &quot;time&quot;
+
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
-func startWorker(ch *amqp.Channel, queueName string) error {
-    // 1. Устанавливаем QoS ДО подписки на очередь!
-    // Это критически важно. Если сделать Consume до Qos,
-    // брокер успеет &quot;выплюнуть&quot; тысячи сообщений.
-    err := ch.Qos(
-        100,   // prefetch count: держим не более 100 сообщений в памяти
-        0,     // prefetch size: всегда 0 в RabbitMQ
+func runWorkerWithQoS(ctx context.Context, conn *amqp.Connection, queueName string) error {
+    // 1. Открываем выделенный канал для данного воркера
+    ch, err := conn.Channel()
+    if err != nil {
+        return err
+    }
+    defer ch.Close()
+
+    // 2. КРИТИЧЕСКИ ВАЖНО: Вызываем Qos ДО вызова Consume!
+    // Если вызвать Consume раньше, брокер успеет выплюнуть в сокет пачку сообщений
+    // до того, как ограничение вступит в силу.
+    err = ch.Qos(
+        50,    // prefetch_count: максимум 50 неподтвержденных задач в буфере
+        0,     // prefetch_size: всегда 0 в RabbitMQ
         false, // global: лимит привязан к конкретному консьюмеру
     )
     if err != nil {
         return err
     }
 
-    // 2. Только после настройки Qos начинаем чтение
+    // 3. Запускаем получение потока сообщений
     msgs, err := ch.Consume(
         queueName,
-        &quot;&quot;,    // генерируем случайный тег
-        false, // autoAck = false (обязательно при Qos!)
-        false, false, false, nil,
+        &quot;worker-orders-eu&quot;, // consumer tag
+        false,              // autoAck = false (ОБЯЗАТЕЛЬНО при использовании QoS!)
+        false,              // exclusive
+        false,              // noLocal
+        false,              // noWait
+        nil,                // args
     )
     if err != nil {
         return err
     }
 
-    for d := range msgs {
-        process(d)
-        d.Ack(false)
-    }
+    log.Println(&quot;Воркер запущен с QoS Prefetch = 50. Ожидание задач...&quot;)
 
-    return nil
+    for {
+        select {
+        case &lt;-ctx.Done():
+            log.Println(&quot;Завершение работы воркера...&quot;)
+            return nil
+        case d, ok := &lt;-msgs:
+            if !ok {
+                log.Println(&quot;AMQP канал закрыт брокером&quot;)
+                return nil
+            }
+
+            // Выполнение полезной работы
+            processTask(d.Body)
+
+            // Подтверждение обработки
+            if err := d.Ack(false); err != nil {
+                log.Printf(&quot;Ошибка отправки Ack: %v&quot;, err)
+            }
+        }
+    }
 }
 
-func process(d amqp.Delivery) {
-    // Бизнес-логика
+func processTask(payload []byte) {
+    // Эмуляция обработки (20 мс)
+    time.Sleep(20 * time.Millisecond)
 }
 </code></pre>
 </div>
@@ -2325,22 +2462,28 @@ func process(d amqp.Delivery) {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: QoS и Auto-Ack</span>
+    <span class="callout-title">Ловушка / Gotcha: QoS полностью игнорируется в связке с Auto-Ack</span>
   </div>
   <div class="callout-body">
-    <p>Настройка <code>QoS</code> работает <strong>только в связке с ручными подтверждениями</strong> (<code>autoAck = false</code>). <br />
-Если вы вызовете <code>ch.Consume(..., autoAck=true, ...)</code>, брокер будет полностью игнорировать ваши настройки Prefetch и продолжит спамить вас сообщениями на максимальной скорости. Механизм скользящего окна опирается на Ack-сигналы, а в режиме fire-and-forget их нет.</p>
+    <p>Механизм <code>QoS</code> опирается на баланс отправленных сообщений и полученных брокером сигналов <code>Basic.Ack</code>.</p>
+<p>Если вы вызовете метод <code>ch.Consume(..., autoAck=true, ...)</code>, брокер <strong>будет полностью игнорировать любые ранее выставленные параметры Prefetch Count!</strong> Сообщения будут выдаваться в сокет с максимальной скоростью, поскольку в режиме <code>autoAck: true</code> брокер удаляет сообщение сразу при отправке и не ведет учет статуса <code>Unacked</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Backpressure:</strong> Ни один production-ready консьюмер не должен работать без явно заданного <code>Qos()</code>. Иначе — OOM.</li>
-<li><strong>Баланс:</strong> Для тяжелых задач (секунды) ставьте <code>Prefetch = 1..5</code>. Для быстрых легковесных (миллисекунды) — <code>Prefetch = 100..500</code>.</li>
-<li><strong>Порядок:</strong> Вызов метода <code>ch.Qos()</code> всегда должен происходить <strong>до</strong> вызова <code>ch.Consume()</code>. </li>
+<li><strong>Защита от OOM:</strong> Ни один консьюмер в производственной среде не должен запускаться без явной настройки <code>ch.Qos()</code>. По умолчанию RabbitMQ работает как пожарный гидрант, способный мгновенно затопить память Go-приложения.</li>
+<li><strong>Золотая середина Prefetch:</strong><br />
+   - Для тяжелых, вариативных по времени задач (секунды/минуты) используйте <code>prefetch = 1..5</code> (Fair Dispatch).<br />
+   - Для ультрабыстрых операций (инсерты в базу данных, инвалидация кэшей) используйте <code>prefetch = 50..250</code> (Pipelining для маскировки RTT сети).</li>
+<li><strong>Строгая последовательность инициализации:</strong> Метод <code>ch.Qos()</code> всегда вызывается <strong>строго до</strong> метода <code>ch.Consume()</code>.</li>
+<li><strong>QoS требует Manual Ack:</strong> Ограничение окна сообщений функционирует только при <code>autoAck: false</code>.</li>
 </ol>
-<p>Итак, мы умеем создавать очереди, настраивать надежную доставку и защищать наш сервис от потопа сообщений. Но до сих пор мы рассматривали простую маршрутизацию. Что если нам нужно перенаправлять потоки логов в разные системы в зависимости от уровня критичности, динамически создавая правила? Для этого мы переходим к изучению сложных топологий в статье <a href="6-routing-patterns.html" class="wikilink">6. Routing patterns</a>.</p>
+<p>Теперь мы умеем не только маршрутизировать и сохранять сообщения, но и надежно контролировать объем потока данных в памяти наших сервисов. </p>
+<p>Однако в реальных проектах топологии редко бывают тривиальными: нам часто требуется объединять несколько обменников в цепочки, динамически менять маршруты и разделять потоки по приоритетам. </p>
+<p>В следующей лекции <a href="6-routing-patterns.html" class="wikilink">6. Routing patterns</a> мы детально разберем ключевые паттерны маршрутизации в RabbitMQ: Publish/Subscribe, Work Queues, RPC и Exchange-to-Exchange Bindings.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2368,7 +2511,7 @@ func process(d amqp.Delivery) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#effekt-pozharnogo-gidranta-the-firehose-problem">Эффект пожарного гидранта (The Firehose Problem)</a></li><li class="toc-item toc-h2"><a href="#reshenie-prefetch-count-qos">Решение: Prefetch Count (QoS)</a></li><li class="toc-item toc-h2"><a href="#kak-vybrat-pravilnyy-prefetch">Как выбрать правильный Prefetch?</a></li><li class="toc-item toc-h3"><a href="#strategiya-1-prefetch-1-maksimalnaya-chestnost">Стратегия 1: Prefetch = 1 (Максимальная честность)</a></li><li class="toc-item toc-h3"><a href="#strategiya-2-prefetch-100-1000-maksimalnaya-propusknaya-sposobnost">Стратегия 2: Prefetch = 100 - 1000 (Максимальная пропускная способность)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-na-go-global-flag-gotcha">Реализация на Go: global flag gotcha</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#effekt-pozharnogo-gidranta-the-firehose-problem">Эффект пожарного гидранта (The Firehose Problem)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-kak-neobuzdannyy-push-ubivaet-go-prilozhenie">Mechanical Sympathy: Как необузданный Push убивает Go-приложение</a></li><li class="toc-item toc-h2"><a href="#reshenie-prefetch-count-qos">Решение: Prefetch Count (QoS)</a></li><li class="toc-item toc-h2"><a href="#kak-vybrat-optimalnyy-razmer-prefetch">Как выбрать оптимальный размер Prefetch?</a></li><li class="toc-item toc-h3"><a href="#strategiya-1-prefetch-1-chestnoe-raspredelenie-fair-dispatch">Стратегия 1: Prefetch = 1 (Честное распределение / Fair Dispatch)</a></li><li class="toc-item toc-h3"><a href="#strategiya-2-prefetch-100-1000-maksimalnyy-throughput">Стратегия 2: Prefetch = 100 - 1000 (Максимальный Throughput)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-na-go-tonkosti-flaga-global">Реализация на Go: Тонкости флага global</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2168,52 +2168,122 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Queues и bindings</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="2-exchanges-direct-fanout-topic-headers.html" class="wikilink">2. Exchanges. Direct, Fanout, Topic, Headers</a> мы разобрались, как RabbitMQ принимает решения о маршрутизации с помощью обменников. Теперь мы переходим к финальной точке маршрута внутри брокера — <strong>Очередям (Queues)</strong>, а также к клею, который связывает их с обменниками — <strong>Привязкам (Bindings)</strong>.</p>
-<p>Очередь в RabbitMQ — это не просто абстрактный буфер. Это физическая сущность с выделенной памятью, процессом операционной системы (в контексте виртуальной машины Erlang) и строгими правилами управления состоянием.</p>
+            <p>В предыдущей статье <a href="2-exchanges-direct-fanout-topic-headers.html" class="wikilink">2. Exchanges. Direct, Fanout, Topic, Headers</a> мы детально разобрали работу обменников и выяснили, как брокер распределяет входящие сообщения. Теперь пришло время исследовать конечную точку маршрута данных внутри брокера — <strong>Очереди (Queues)</strong>, а также архитектурный клей, связывающий их с обменниками — <strong>Привязки (Bindings)</strong>.</p>
+<p>Очередь в RabbitMQ — это не просто абстрактный кольцевой буфер <code>FIFO</code> в оперативной памяти. Это полноценная физическая сущность операционной системы и виртуальной машины BEAM, обладающая собственным жизненным циклом, механизмами персистентности, защитой от переполнения и строгими правилами изоляции.</p>
+<hr />
 <h2 id="ocheredi-fundamentalnye-svoystva">Очереди: Фундаментальные свойства</h2>
 
-<p>Когда вы объявляете очередь в RabbitMQ, вы должны определить её жизненный цикл. Для этого используются три основных флага:</p>
+<p>При объявлении очереди через протокол AMQP разработчик обязан определить параметры ее жизненного цикла с помощью трех базовых флагов:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Lifecycle [&quot;Флаги жизненного цикла очереди&quot;]
+D[&quot;Durable (Долговечная)&lt;br&gt;Переживает перезагрузку брокера&quot;]
+E[&quot;Exclusive (Эксклюзивная)&lt;br&gt;Привязана к одному TCP Connection&quot;]
+A[&quot;Auto-delete (Автоудаляемая)&lt;br&gt;Удаляется после ухода последнего Consumer&quot;]
+end
+
+D --&gt;|&quot;Метаданные на диске&quot;| NodeRestart[&quot;Восстановление после рестарта&quot;]
+E --&gt;|&quot;Закрылся сокет&quot;| AutoDrop1[&quot;Мгновенное удаление буфера&quot;]
+A --&gt;|&quot;0 активных подписчиков&quot;| AutoDrop2[&quot;Автоматическая очистка&quot;]
+
+classDef flag fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef action fill:#312e81,stroke:#818cf8,stroke-width:1px,color:#f8fafc;
+
+class D,E,A flag;
+class NodeRestart,AutoDrop1,AutoDrop2 action;
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>Durable (Долговечная):</strong> Метаданные очереди сохраняются на диск. Если сервер RabbitMQ перезагрузится, очередь будет восстановлена. <br />
-<em>Важно:</em> Durable очередь <strong>не гарантирует</strong>, что сами сообщения переживут рестарт. Для этого сообщения должны публиковаться с флагом <code>DeliveryMode = 2 (Persistent)</code>.</li>
-<li><strong>Exclusive (Эксклюзивная):</strong> Очередь привязана к конкретному физическому TCP-соединению (<code>amqp.Connection</code>). Как только соединение закрывается (штатно или из-за обрыва сети), очередь <strong>немедленно удаляется</strong>, даже если в ней были сообщения. Идеально подходит для паттерна Request-Reply (RPC), где клиенту нужна временная очередь для получения ответа.</li>
-<li><strong>Auto-delete (Автоматически удаляемая):</strong> Очередь удаляется автоматически, когда от неё отключается <em>последний</em> Consumer (потребитель). Если к ней никто никогда не подключался, она будет жить бесконечно.</li>
+<li><strong>Durable (Долговечная):</strong> Метаданные очереди (ее имя, конфигурация и аргументы) записываются на постоянный накопитель (диск). Если процесс RabbitMQ будет принудительно перезапущен или сервер перезагрузится по питанию, брокер восстановит саму структуру очереди.<blockquote>
+<p>[!IMPORTANT]<br />
+Объявление очереди как <code>Durable = true</code> <strong>не гарантирует</strong>, что находившиеся в ней сообщения сохранятся после аварии! Сами сообщения сохранятся лишь в том случае, если отправитель опубликовал их в режиме <code>DeliveryMode = 2 (Persistent)</code>. Долговечная очередь с эфемерными сообщениями после рестарта поднимется абсолютно пустой.</p>
+</blockquote>
+</li>
+<li><strong>Exclusive (Эксклюзивная):</strong> Очередь создается для обслуживания ровно одного конкретного физического TCP-соединения (<code>amqp.Connection</code>). Никакие другие соединения или сервисы не имеют права читать из нее или объявлять ее. В момент, когда клиент закрывает сокет (штатно или при обрыве сети), эксклюзивная очередь <strong>немедленно удаляется</strong>, а все накопленные в ней сообщения уничтожаются.<br />
+   - <em>Типичный сценарий:</em> Паттерн <strong>RPC (Request-Reply)</strong>, где вызывающему клиенту нужен временный персональный «почтовый ящик» для приема одного ответа.</li>
+<li><strong>Auto-delete (Автоматически удаляемая):</strong> Очередь существует до тех пор, пока у нее есть хотя бы один активный потребитель. Как только от нее отключается <em>последний</em> Consumer (потребитель), брокер автоматически стирает очередь из памяти.<br />
+   - <em>Важный нюанс:</em> Если очередь была создана с флагом <code>Auto-delete</code>, но к ней еще ни разу никто не подключился в роли Consumer, брокер не станет ее удалять — она будет терпеливо ждать своего первого клиента.</li>
 </ol>
+<hr />
 <h2 id="pod-kapotom-kak-ochered-rabotaet-s-zhelezom">Под капотом: Как очередь работает с железом</h2>
 
-<p>Чтобы писать производительный код, вы должны понимать, как RabbitMQ управляет очередями на уровне ОС.</p>
+<p>Разработчику на Go, привыкшему к миллионам легковесных горутин, критически важно осознавать физические ограничения внутреннего рантайма RabbitMQ.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Процессы Erlang и бутылочное горлышко</span>
+    <span class="callout-title">Под капотом: Процессы Erlang и бутылочное горлышко одного ядра CPU</span>
   </div>
   <div class="callout-body">
-    <p>В классической архитектуре RabbitMQ <strong>одна очередь = один процесс (актор) Erlang</strong>. <br />
-Процессы Erlang легковесны, но они исполняются строго последовательно. Это означает, что <strong>одна очередь ограничена пропускной способностью одного ядра CPU</strong>. <br />
-Если вы генерируете 100 000 сообщений в секунду и пытаетесь пропихнуть их через одну очередь, RabbitMQ упрется в полку по одному ядру, а остальные 63 ядра вашего сервера будут простаивать. <br />
-<strong>Решение:</strong> Для экстремального throughput необходимо шардировать данные — создавать несколько очередей (например, через Hash Exchange плагин или вручную на уровне приложения) и поднимать консьюмеры для каждой.</p>
+    <p>В классической архитектуре RabbitMQ <strong>одна очередь = один процесс (актор) Erlang</strong>.</p>
+<p>Процессы виртуальной машины BEAM изолированы и предельно легковесны, однако каждый отдельный процесс внутри себя строго однопоточен. Это означает, что <strong>пропускная способность одной классической очереди физически упирается в лимит одного ядра CPU</strong>.</p>
+<p>Если ваш сервис генерирует $100\,000$ RPS и пытается протолкнуть их через единственную монолитную очередь, ядро процессора, на котором крутится процесс этой очереди, будет загружено на 100%. При этом остальные 63 ядра мощного сервера будут бездействовать, а в очереди начнет расти колоссальный лаг (Backlog).</p>
+<p><strong>Инженерные решения для масштабирования:</strong><br />
+1. <strong>Шардирование очередей:</strong> Разделение одного логического потока на $N$ физических очередей (<code>orders.0</code>, <code>orders.1</code>, ... <code>orders.N</code>) с распределением ключей через Consistent Hash Exchange.<br />
+2. <strong>Использование Quorum Queues:</strong> Современный механизм распределения нагрузки.</p>
   </div>
 </div>
 
 <h3 id="mekhanizm-paging-sbros-na-disk">Механизм Paging (Сброс на диск)</h3>
+<p>RabbitMQ по умолчанию удерживает входящие сообщения в оперативной памяти (RAM) для достижения минимальных задержек (субмиллисекундная Latency). Однако память физически ограничена. </p>
+<p>В конфигурации брокера задействован предохранитель <strong><code>vm_memory_high_watermark</code></strong> (по умолчанию 40% от доступной физической оперативной памяти хоста).</p>
 
-<p>RabbitMQ хранит сообщения в оперативной памяти для максимальной скорости. Но память не бесконечна. В RabbitMQ есть параметр <code>vm_memory_high_watermark</code> (по умолчанию 40% от RAM сервера). </p>
-<p>Если RabbitMQ видит, что память заканчивается (например, консьюмеры упали, а паблишеры продолжают слать данные), он начинает процесс <strong>Paging</strong>. Он берет сообщения из памяти и агрессивно сбрасывает их на диск, чтобы освободить RAM. <br />
-В этот момент производительность очереди деградирует в десятки раз, так как брокер начинает тратить ресурсы на тяжелый дисковый I/O.</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Pub as &quot;Publishers&quot;
+participant RAM as &quot;RabbitMQ RAM Cache&quot;
+participant Disk as &quot;Disk Storage&quot;
+participant Sub as &quot;Consumers (Замедлились/Упали)&quot;
+
+Pub-&gt;&gt;RAM: Высокий входящий поток (100k msg/s)
+Note over RAM: Память растет: 20% -&gt; 30% -&gt; 40% (Watermark!)
+RAM--&gt;&gt;Disk: Срабатывает Paging (Аварийный сброс буферов на диск)
+Note over RAM,Disk: Пропускная способность падает в 20-50 раз (I/O Bottleneck)
+Pub--xRAM: Flow Control! Брокер блокирует сокеты продюсеров
+  </pre>
+</div>
+
+
+<p>Если консьюмеры зависли или отстают, а продюсеры продолжают накачивать систему данными, объем занятой памяти достигает порогового значения <code>vm_memory_high_watermark</code>. В этот момент брокер запускает аварийную процедуру <strong>Paging</strong>:<br />
+1. Процесс очереди блокирует прием новых сообщений в RAM и начинает массово сбрасывать находящиеся в памяти сообщения на диск.<br />
+2. Производительность очереди катастрофически деградирует (в десятки раз), так как процессор переключается на тяжелый дисковый I/O.<br />
+3. Срабатывает механизм <strong>Flow Control</strong>: брокер перестает вычитывать данные из входящих TCP-сокетов издателей, принудительно заставляя их блокироваться на системном вызове <code>write()</code>.</p>
+<hr />
 <h2 id="evolyutsiya-ocheredey-classic-vs-quorum">Эволюция очередей: Classic vs Quorum</h2>
 
-<p>В современном RabbitMQ (начиная с версии 3.8+) существует жесткое разделение типов очередей:</p>
-<ol>
-<li><strong>Classic Queues:</strong> Стандартные очереди. Раньше для отказоустойчивости (High Availability) их делали зеркалируемыми (Classic Mirrored Queues). Сейчас этот подход <strong>официально признан устаревшим (deprecated)</strong> из-за проблем с split-brain и медленной синхронизацией.</li>
-<li><strong>Quorum Queues:</strong> Современный стандарт для надежных систем. Они построены на алгоритме консенсуса <strong>Raft</strong>. Данные реплицируются на несколько узлов кластера. Очередь доступна, пока живо большинство узлов (кворум). Они требуют больше дискового пространства и I/O (так как пишут всё в Write-Ahead Log), но гарантируют сохранность данных без сюрпризов.</li>
-</ol>
+<p>За последние годы внутренняя архитектура хранения очередей в RabbitMQ претерпела революционные изменения.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2228,47 +2298,75 @@
   </div>
   <pre class="mermaid">
 graph TD
-subgraph Classic Queue
-CQ1[&quot;Node 1&lt;br&gt;Master Process&quot;] --&gt;|deprecated mirror| CQ2[&quot;Node 2&lt;br&gt;Slave Process&quot;]
+subgraph Classic Mirrored [&quot;1. Classic Mirrored Queues (DEPRECATED)&quot;]
+direction TB
+CM_M[&quot;Master Node&quot;] --&gt;|&quot;Асинхронная / полусинхронная репликация&quot;| CM_S1[&quot;Mirror Node 1&quot;]
+CM_M --&gt;|&quot;Уязвимость к Split-Brain&quot;| CM_S2[&quot;Mirror Node 2&quot;]
 end
 
-subgraph Quorum Queue - Raft Consensus
-QQ1[&quot;Node 1&lt;br&gt;Leader&quot;] --&gt;|Append Entries| QQ2[&quot;Node 2&lt;br&gt;Follower&quot;]
-QQ1 --&gt;|Append Entries| QQ3[&quot;Node 3&lt;br&gt;Follower&quot;]
+subgraph Quorum Raft [&quot;2. Quorum Queues (Современный промышленный стандарт)&quot;]
+direction TB
+QQ_L[&quot;Raft Leader&quot;] --&gt;|&quot;AppendEntries (WAL)&quot;| QQ_F1[&quot;Raft Follower 1&quot;]
+QQ_L --&gt;|&quot;AppendEntries (WAL)&quot;| QQ_F2[&quot;Raft Follower 2&quot;]
+QQ_F1 -.-&gt;|&quot;Кворум 2 из 3 подтвержден&quot;| QQ_L
 end
+
+classDef dep fill:#450a0a,stroke:#f87171,stroke-width:2px,color:#fecaca;
+classDef modern fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+
+class CM_M,CM_S1,CM_S2 dep;
+class QQ_L,QQ_F1,QQ_F2 modern;
   </pre>
 </div>
 
 
+<ol>
+<li><strong>Classic Queues:</strong> Стандартные легковесные очереди. В старых версиях брокера для обеспечения отказоустойчивости (High Availability) применялся механизм зеркалирования (<strong>Classic Mirrored Queues</strong> с префиксом <code>ha-mode</code>). Сегодня зеркалирование классических очередей <strong>официально признано устаревшим (deprecated)</strong>: оно страдало от рассинхронизации при сетевых разделениях (Split-Brain) и создавало разрушительные блокировки при вводе нового узла в кластер.</li>
+<li><strong>Quorum Queues:</strong> Современный золотой стандарт надежности (появились в RabbitMQ 3.8+). Они спроектированы на основе математически строгого алгоритма консенсуса <strong>Raft</strong>:<br />
+   - Данные реплицируются между нечетным числом узлов (3, 5 или 7).<br />
+   - Запись считается успешной, только когда большинство узлов подтвердило фиксацию операции в упреждающем журнале транзакций (<strong>Write-Ahead Log, WAL</strong>).<br />
+   - Quorum Queues требуют больше дисковых операций и процессорных ресурсов, но гарантируют защиту от потери данных даже при внезапной гибели лидера кластера.</li>
+<li><strong>RabbitMQ Streams:</strong> Добавленный в RabbitMQ 3.9+ тип хранилища, вдохновленный Kafka. Это немодифицируемый append-only лог с возможностью повторного вычитывания по оффсетам и пропускной способностью в миллионы сообщений в секунду.</li>
+</ol>
+<hr />
 <h2 id="upravlenie-povedeniem-queue-arguments">Управление поведением (Queue Arguments)</h2>
 
-<p>При создании очереди (<code>QueueDeclare</code>) вы можете передать словарь аргументов (<code>x-arguments</code>). Это мощнейший инструмент настройки:</p>
+<p>При объявлении очереди через метод <code>ch.QueueDeclare(...)</code> клиент может передать ассоциативный массив расширенных настроек — <strong><code>x-arguments</code></strong> (<code>amqp.Table</code> в Go). Это один из самых гибких механизмов управления брокером:</p>
 <ul>
-<li><code>x-message-ttl</code>: Время жизни сообщения (в миллисекундах). Если сообщение пролежало в очереди дольше, оно помечается как "мертвое".</li>
-<li><code>x-max-length</code> и <code>x-max-length-bytes</code>: Ограничение размера очереди. Полезно для защиты от Out-Of-Memory. Если лимит превышен, старые сообщения вытесняются (drop) или уходят в DLX.</li>
-<li><code>x-dead-letter-exchange</code> (DLX): Куда отправить сообщение, если оно было отвергнуто (Nack), истек TTL или очередь переполнена. Подробнее мы разберем это в статье <a href="7-dead-letter-exchanges.html" class="wikilink">7. Dead letter exchanges</a>.</li>
-<li><code>x-queue-type</code>: Указывает тип очереди (<code>classic</code>, <code>quorum</code>, <code>stream</code>).</li>
+<li><strong><code>x-message-ttl</code> (Time-To-Live):</strong> Время жизни сообщения в миллисекундах. Если сообщение не было вычитано воркером за отведенное время, брокер удаляет его либо перемещает в DLX.</li>
+<li><strong><code>x-max-length</code> и <code>x-max-length-bytes</code>:</strong> Максимальное количество сообщений или суммарный объем данных в байтах. Жесткий барьер для предотвращения утечек памяти.</li>
+<li><strong><code>x-overflow</code>:</strong> Поведение очереди при достижении максимального лимита (<code>x-max-length</code>):</li>
+<li><code>drop-head</code> (по умолчанию) — удаляет самое старое сообщение из головы очереди.</li>
+<li><code>reject-publish</code> — брокер отклоняет новое сообщение от продюсера (возвращает <code>Basic.Nack</code>).</li>
+<li><strong><code>x-dead-letter-exchange</code> (DLX):</strong> Имя обменника, в который автоматически направляются бракованные, просроченные или отвергнутые сообщения (детально разберем в лекции <a href="7-dead-letter-exchanges.html" class="wikilink">7. Dead letter exchanges</a>).</li>
+<li><strong><code>x-queue-type</code>:</strong> Указывает физический движок очереди (<code>classic</code>, <code>quorum</code> или <code>stream</code>).</li>
 </ul>
+<hr />
 <h2 id="bindings-svyazuyushchee-zveno">Bindings: Связующее звено</h2>
 
-<p><strong>Binding (Привязка)</strong> — это запись в таблице маршрутизации (в Mnesia DB), которая говорит обменнику: <em>"Если сообщение имеет такой-то Routing Key, отправь его в такую-то очередь"</em>.</p>
-<p>Ключевые свойства биндингов:<br />
-1. Вы можете привязать одну очередь к <strong>нескольким</strong> обменникам.<br />
-2. Вы можете привязать одну очередь к одному обменнику <strong>несколько раз</strong> с разными Binding Keys (например, ловить и <code>error</code>, и <code>critical</code>).<br />
-3. Биндинг сам по себе не потребляет памяти (кроме пары байт в таблице маршрутизации).</p>
+<p><strong>Binding (Привязка)</strong> — это конфигурационная запись в оперативной таблице маршрутизации брокера (внутренняя база данных <strong>Mnesia</strong>), связывающая конкретный Exchange с конкретной Queue по заданному правилу.</p>
+<h3 id="klyuchevye-svoystva-bindingov">Ключевые свойства биндингов:</h3>
+<ol>
+<li><strong>Многие-ко-многим:</strong> Одна очередь может быть связана сразу с несколькими независимыми обменниками. И наоборот — один обменник может направлять данные в сотни очередей.</li>
+<li><strong>Множественные ключи:</strong> Одну и ту же пару Exchange-Queue можно соединить несколькими биндингами с разными шаблонами (например, привязать очередь <code>critical_alerts</code> к Topic Exchange по ключу <code>alert.critical</code> и отдельно по ключу <code>alert.fatal</code>).</li>
+<li><strong>Минимальный оверхед:</strong> Сам по себе биндинг не создает очередей сообщений и потребляет всего несколько байт в оперативной памяти Erlang.</li>
+</ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Порядок декларации</span>
+    <span class="callout-title">Ловушка / Gotcha: Порядок декларации топологии</span>
   </div>
   <div class="callout-body">
-    <p>Если вы отправите сообщение в Exchange до того, как к нему через Binding будет привязана Queue, сообщение <strong>исчезнет навсегда</strong>. Брокер просто дропнет его (сработает unroutable message behavior). Всегда декларируйте топологию (Exchange -&gt; Queue -&gt; Bind) до начала публикации!</p>
+    <p>Если продюсер отправит сообщение в Exchange до того, как очередь будет объявлена и привязана к нему через Binding, сообщение <strong>будет безвозвратно утеряно</strong>.</p>
+<p>Брокер рассматривает такое сообщение как «нераспределяемое» (Unroutable Message) и мгновенно уничтожает его.<br />
+<strong>Инженерный стандарт:</strong> В микросервисной архитектуре продюсер и консьюмер должны объявлять необходимую топологию (Exchange, Queue, Binding) идемпотентно при старте до начала любого обмена сообщениями.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="praktika-na-go-deklaratsiya-i-nastroyka">Практика на Go: Декларация и настройка</h2>
 
-<p>Рассмотрим production-ready код создания инфраструктуры с использованием типов и аргументов:</p>
+<p>Ниже приведен production-ready пример конфигурации топологии на Go с созданием надежной <strong>Quorum Queue</strong>, политикой отбрасывания при переполнении и Dead Lettering.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2281,8 +2379,12 @@ end
   <pre class="language-go"><code class="language-go">package main
 
 import (
+    &quot;context&quot;
     &quot;fmt&quot;
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    &quot;log&quot;
+    &quot;time&quot;
+
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
 // DeclareInfrastructure создает Exchange, Quorum очередь и связывает их
@@ -2291,9 +2393,10 @@ func DeclareInfrastructure(ch *amqp.Channel) error {
         exchangeName = &quot;orders.topic&quot;
         queueName    = &quot;orders_processing&quot;
         routingKey   = &quot;order.created.#&quot;
+        dlxName      = &quot;orders.dlx&quot;
     )
 
-    // 1. Декларируем Exchange
+    // 1. Декларируем целевой Exchange
     err := ch.ExchangeDeclare(
         exchangeName,
         amqp.ExchangeTopic,
@@ -2307,23 +2410,24 @@ func DeclareInfrastructure(ch *amqp.Channel) error {
         return fmt.Errorf(&quot;failed to declare exchange: %w&quot;, err)
     }
 
-    // 2. Настраиваем аргументы для очереди
+    // 2. Настраиваем расширенные аргументы очереди (x-arguments)
     args := amqp.Table{
-        &quot;x-queue-type&quot;:             &quot;quorum&quot;, // Используем надежные Quorum Queues
-        &quot;x-dead-letter-exchange&quot;:   &quot;orders.dlx&quot;, // Отправляем брак в DLX
-        &quot;x-message-ttl&quot;:            int32(86400000), // Сообщение живет 24 часа (в мс)
-        &quot;x-max-length&quot;:             int32(10000), // Максимум 10k сообщений (защита от переполнения)
-        &quot;x-overflow&quot;:               &quot;reject-publish&quot;, // Если переполнена - реджектить паблишера
+        &quot;x-queue-type&quot;:           &quot;quorum&quot;,         // Используем Quorum Queues на базе Raft
+        &quot;x-dead-letter-exchange&quot;: dlxName,          // Перенаправление брака в Dead Letter Exchange
+        &quot;x-message-ttl&quot;:          int32(86400000),  // TTL сообщения: 24 часа (в миллисекундах)
+        &quot;x-max-length&quot;:           int32(10000),     // Буфер не более 10 000 сообщений
+        &quot;x-overflow&quot;:             &quot;reject-publish&quot;, // При переполнении реджектить публикацию
     }
 
     // 3. Декларируем очередь
+    // Внимание: для Quorum Queues флаг durable ОБЯЗАН быть true!
     q, err := ch.QueueDeclare(
         queueName,
-        true,  // durable - обязательно true для Quorum
+        true,  // durable
         false, // auto-delete
         false, // exclusive
         false, // no-wait
-        args,  // передаем настроенную таблицу аргументов
+        args,  // таблица аргументов
     )
     if err != nil {
         return fmt.Errorf(&quot;failed to declare queue: %w&quot;, err)
@@ -2341,7 +2445,47 @@ func DeclareInfrastructure(ch *amqp.Channel) error {
         return fmt.Errorf(&quot;failed to bind queue: %w&quot;, err)
     }
 
+    log.Printf(&quot;Инфраструктура готова: %s -&gt; [%s] -&gt; %s (Quorum)&quot;, exchangeName, routingKey, q.Name)
     return nil
+}
+
+func main() {
+    conn, err := amqp.Dial(&quot;amqp://guest:guest@localhost:5672/&quot;)
+    if err != nil {
+        log.Fatalf(&quot;Ошибка подключения: %v&quot;, err)
+    }
+    defer conn.Close()
+
+    ch, err := conn.Channel()
+    if err != nil {
+        log.Fatalf(&quot;Ошибка открытия канала: %v&quot;, err)
+    }
+    defer ch.Close()
+
+    if err := DeclareInfrastructure(ch); err != nil {
+        log.Fatalf(&quot;Сбой инициализации: %v&quot;, err)
+    }
+
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    // Публикация тестового заказа
+    err = ch.PublishWithContext(ctx,
+        &quot;orders.topic&quot;,
+        &quot;order.created.retail&quot;,
+        false,
+        false,
+        amqp.Publishing{
+            DeliveryMode: amqp.Persistent, // Persistent = 2
+            ContentType:  &quot;application/json&quot;,
+            Body:         []byte(`{&quot;order_id&quot;: 9901, &quot;item&quot;: &quot;server&quot;, &quot;qty&quot;: 2}`),
+            Timestamp:    time.Now().UTC(),
+        },
+    )
+    if err != nil {
+        log.Fatalf(&quot;Ошибка публикации: %v&quot;, err)
+    }
+    log.Println(&quot;Заказ успешно опубликован в Quorum-очередь!&quot;)
 }
 </code></pre>
 </div>
@@ -2349,24 +2493,28 @@ func DeclareInfrastructure(ch *amqp.Channel) error {
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Конфликт параметров очереди</span>
   </div>
   <div class="callout-body">
     <p><strong>Вопрос:</strong> Что произойдет, если два разных микросервиса попытаются задекларировать одну и ту же очередь <code>my_queue</code>, но с разными параметрами (например, один с <code>Durable=true</code>, а другой с <code>Durable=false</code>)?<br />
-<strong>Ответ:</strong> RabbitMQ выдаст канальную ошибку <code>PRECONDITION_FAILED - inequivalent arg</code> и закроет канал (<code>amqp.Channel</code>), через который поступил некорректный запрос. Брокер не позволяет изменять параметры существующей очереди на лету. Очередь нужно либо удалить и создать заново, либо использовать политику (Policies) кластера для переопределения поведения.</p>
+<strong>Ответ:</strong> RabbitMQ прервет операцию канальной ошибкой:<br />
+<code>PRECONDITION_FAILED - inequivalent arg</code><br />
+Брокер принудительно закроет текущий <code>amqp.Channel</code>. RabbitMQ рассматривает декларацию очереди как неизменяемый контракт (Immutable Schema). Чтобы изменить параметры существующей очереди, ее необходимо предварительно удалить (<code>ch.QueueDelete</code>) либо настраивать динамические параметры через Server Policies.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Очередь</strong> — это физический буфер (Erlang-процесс), производительность которого ограничена одним ядром CPU.</li>
-<li>Для временных задач используйте <code>Exclusive</code> или <code>Auto-delete</code> очереди. Для надежного хранения — <code>Durable</code>.</li>
-<li>Забудьте про Classic Mirrored Queues в новых проектах. Стандарт индустрии для высокой доступности — <strong>Quorum Queues</strong>.</li>
-<li>Ограничивайте очереди с помощью <code>x-max-length</code> и <code>x-message-ttl</code>, чтобы защитить брокер от падения по памяти (OOM) и жесткого дискового Paging'а.</li>
-<li><strong>Bindings</strong> — это клей, без которого сообщения из Exchange просто улетят в /dev/null.</li>
+<li><strong>Жизненный цикл очереди</strong> определяется тремя базовыми параметрами: <code>Durable</code> (сохранность структуры при рестарте брокера), <code>Exclusive</code> (привязка к одному TCP-соединению) и <code>Auto-delete</code> (очистка после отключения последнего подписчика).</li>
+<li><strong>Ограничение ядра CPU:</strong> Классическая очередь обрабатывается ровно одним процессом Erlang. Предел throughput одной очереди — это пропускная способность одного ядра CPU.</li>
+<li><strong>Paging и память:</strong> Превышение <code>vm_memory_high_watermark</code> заставляет брокер сбрасывать данные из RAM на диск, катастрофически обрушая производительность. Защищайте систему с помощью <code>x-max-length</code> и <code>x-overflow</code>.</li>
+<li><strong>Quorum Queues — современный стандарт:</strong> Для mission-critical систем всегда используйте Quorum Queues на базе консенсуса Raft вместо устаревших зеркалированных Classic Mirrored Queues.</li>
+<li><strong>Идемпотентная инициализация:</strong> Объявляйте топологию (Exchanges, Queues, Bindings) до начала публикации, чтобы избежать потери данных.</li>
 </ol>
-<p>Теперь мы умеем маршрутизировать и хранить сообщения. Но как брокер узнает, что наш сервис на Go успешно обработал задачу и сообщение можно удалять из памяти? И что делать, если горутина упала с паникой во время обработки? Об этом мы подробно поговорим в следующей статье: <a href="4-acknowledgements-i-delivery-guarantees.html" class="wikilink">4. Acknowledgements и delivery guarantees</a>.</p>
+<p>Очереди настроены, сообщения поступают и распределяются. Но как брокер узнает, что наш Go-воркер успешно завершил обработку задачи и сообщение можно удалить из памяти? Что произойдет, если горутина завершится паникой или сервис упадет по OOM прямо во время расчета? </p>
+<p>В следующей статье <a href="4-acknowledgements-i-delivery-guarantees.html" class="wikilink">4. Acknowledgements и delivery guarantees</a> мы детально исследуем семантику подтверждений <code>Ack</code>, <code>Nack</code>, <code>Reject</code> и гарантии надежности доставки.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2394,7 +2542,7 @@ func DeclareInfrastructure(ch *amqp.Channel) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#ocheredi-fundamentalnye-svoystva">Очереди: Фундаментальные свойства</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-kak-ochered-rabotaet-s-zhelezom">Под капотом: Как очередь работает с железом</a></li><li class="toc-item toc-h3"><a href="#mekhanizm-paging-sbros-na-disk">Механизм Paging (Сброс на диск)</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-ocheredey-classic-vs-quorum">Эволюция очередей: Classic vs Quorum</a></li><li class="toc-item toc-h2"><a href="#upravlenie-povedeniem-queue-arguments">Управление поведением (Queue Arguments)</a></li><li class="toc-item toc-h2"><a href="#bindings-svyazuyushchee-zveno">Bindings: Связующее звено</a></li><li class="toc-item toc-h2"><a href="#praktika-na-go-deklaratsiya-i-nastroyka">Практика на Go: Декларация и настройка</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#ocheredi-fundamentalnye-svoystva">Очереди: Фундаментальные свойства</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-kak-ochered-rabotaet-s-zhelezom">Под капотом: Как очередь работает с железом</a></li><li class="toc-item toc-h3"><a href="#mekhanizm-paging-sbros-na-disk">Механизм Paging (Сброс на диск)</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-ocheredey-classic-vs-quorum">Эволюция очередей: Classic vs Quorum</a></li><li class="toc-item toc-h2"><a href="#upravlenie-povedeniem-queue-arguments">Управление поведением (Queue Arguments)</a></li><li class="toc-item toc-h2"><a href="#bindings-svyazuyushchee-zveno">Bindings: Связующее звено</a></li><li class="toc-item toc-h3"><a href="#klyuchevye-svoystva-bindingov">Ключевые свойства биндингов:</a></li><li class="toc-item toc-h2"><a href="#praktika-na-go-deklaratsiya-i-nastroyka">Практика на Go: Декларация и настройка</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

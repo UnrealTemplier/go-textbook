@@ -2168,36 +2168,45 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Exchanges. Direct, Fanout, Topic, Headers</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="1-rabbitmq-arkhitektura-i-kontseptsii.html" class="wikilink">1. RabbitMQ. Архитектура и концепции</a> мы выяснили, что в RabbitMQ сообщения никогда не попадают напрямую в очередь. Они всегда публикуются в <strong>Exchange</strong> (Обменник). Именно обменник решает, что делать с сообщением дальше: отбросить его, положить в одну очередь или размножить на несколько.</p>
-<p>Этот процесс называется <strong>Маршрутизацией (Routing)</strong>. RabbitMQ предоставляет четыре стандартных типа обменников, которые покрывают 99% архитектурных паттернов. Выбор правильного типа критически влияет на производительность и потребление ресурсов (CPU/Memory) кластером.</p>
+            <p>В предыдущей статье <a href="1-rabbitmq-arkhitektura-i-kontseptsii.html" class="wikilink">1. RabbitMQ. Архитектура и концепции</a> мы выяснили фундаментальный закон архитектуры AMQP: в RabbitMQ отправитель никогда не помещает сообщение напрямую в очередь. Поток данных всегда направляется в <strong>Exchange</strong> (Обменник). </p>
+<p>Если провести аналогию с классической почтовой службой, то Exchange — это автоматизированный распределительный логистический хаб. Отправитель наклеивает на конверт почтовый индекс или ярлык категории (<strong>Routing Key</strong>), а хаб, сверяясь со своей маршрутной картой (<strong>Bindings</strong>), мгновенно решает: отправить посылку в один конкретный почтомат, размножить ее копии по десяткам филиалов или сразу отправить в шредер, если адресат не существует.</p>
+<p>Выбор правильного типа обменника напрямую определяет вычислительную сложность маршрутизации, нагрузку на процессорные ядра (CPU) и расход оперативной памяти брокера.</p>
+<hr />
 <h2 id="mekhanika-marshrutizatsii">Механика маршрутизации</h2>
 
-<p>Когда вы публикуете сообщение, вы всегда указываете два параметра:<br />
-1. Имя обменника.<br />
-2. <strong>Routing Key (Ключ маршрутизации)</strong> — строка, которая служит "адресом" или "тегом" сообщения.</p>
-<p>Когда мы привязываем очередь к обменнику (создаем <strong>Binding</strong>), мы указываем <strong>Binding Key</strong>. Обменник берет <em>Routing Key</em> пришедшего сообщения, сравнивает его с <em>Binding Key</em> всех привязанных очередей и принимает решение о доставке.</p>
+<p>Процесс маршрутизации опирается на взаимодействие трех сущностей:</p>
+<ol>
+<li><strong>Exchange Name:</strong> Имя обменника, принимающего входящие фреймы публикации.</li>
+<li><strong>Routing Key (Ключ маршрутизации):</strong> Строка-метка, прикрепляемая отправителем к сообщению при вызове <code>ch.Publish(...)</code>. Она служит логическим адресом или тегом полезной нагрузки (например, <code>orders.eu.created</code> или <code>image.resize</code>).</li>
+<li><strong>Binding Key (Ключ привязки):</strong> Шаблон или критерий отбора, задаваемый при связывании конкретной очереди с данным обменником.</li>
+</ol>
+<p>Когда брокер принимает фрейм <code>Basic.Publish</code>, обменник сопоставляет <code>Routing Key</code> с <code>Binding Key</code> всех очередей, подключенных к нему в данный момент, и направляет ссылки на сообщение во все совпавшие очереди.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Erlang и копирование сообщений</span>
+    <span class="callout-title">Под капотом: Erlang, ссылочная прозрачность и Zero-Copy в BEAM</span>
   </div>
   <div class="callout-body">
-    <p>RabbitMQ написан на Erlang. Когда обменник решает, что сообщение нужно положить в 10 разных очередей, <strong>он не копирует payload (тело) сообщения 10 раз</strong>. <br />
-В памяти создается только одна копия тела сообщения, а в процессы (горутины мира Erlang), обслуживающие эти 10 очередей, передаются только ссылки (указатели) на это сообщение. Это колоссально экономит оперативную память при массовых рассылках.</p>
+    <p>Что происходит в памяти сервера, когда обменник решает продублировать сообщение в 10 или 100 разных очередей?</p>
+<p>Начинающие инженеры часто опасаются, что брокер создаст 100 физических копий полезной нагрузки в RAM, вызвав взрывной рост нагрузки на сборщик мусора. В RabbitMQ это не так:<br />
+- В виртуальной машине <strong>BEAM</strong> бинарные данные размером больше 64 байт аллоцируются в глобальной разделяемой куче (Refc Binaries).<br />
+- Процесс обменника создает <strong>ровно один экземпляр тела сообщения в памяти</strong>. <br />
+- Очередям (каждая из которых является независимым Erlang-процессом) передаются лишь крошечные указатели (ссылки со счетчиком ссылок — reference counter) на исходный буфер.</p>
+<p>Память освобождается только тогда, когда последний потребитель во всех 100 очередях подтвердит обработку (<code>Basic.Ack</code>) либо когда истечет срок жизни сообщения (TTL).</p>
   </div>
 </div>
 
 <hr />
 <h2 id="1-direct-exchange-pryamoy-obmennik">1. Direct Exchange (Прямой обменник)</h2>
 
-<p><strong>Алгоритм:</strong> Сообщение попадает в очередь, если её <code>Binding Key</code> <strong>в точности совпадает</strong> с <code>Routing Key</code> сообщения.</p>
+<p><strong>Алгоритм работы:</strong> Обменник направляет сообщение в очередь только в том случае, если ее <code>Binding Key</code> <strong>байт-в-байт совпадает</strong> с <code>Routing Key</code> сообщения.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2212,34 +2221,72 @@
   </div>
   <pre class="mermaid">
 graph LR
-P[&quot;Producer&quot;] --&gt;|RK=pdf| Ex[&quot;Direct Exchange&quot;]
-Ex --&gt;|&quot;BK=pdf&quot;| Q1[&quot;Queue PDF Workers&quot;]
-Ex --&gt;|&quot;BK=image&quot;| Q2[&quot;Queue Image Workers&quot;]
-Ex --&gt;|&quot;BK=pdf&quot;| Q3[&quot;Queue Audit PDF&quot;]
+subgraph Publisher [&quot;Отправитель&quot;]
+P[&quot;Producer&quot;]
+end
 
-classDef ex fill:#f9f,stroke:#333,stroke-width:2px;
-class Ex ex;
+subgraph DirectEx [&quot;Direct Exchange: &#x27;tasks.direct&#x27;&quot;]
+direction TB
+RouteLookup[&quot;O(1) Hash Map Lookup&lt;br&gt;(Mnesia / ETS)&quot;]
+end
+
+subgraph Queues [&quot;Очереди&quot;]
+Q1[&quot;Queue PDF Workers&lt;br&gt;(Binding: &#x27;pdf&#x27;)&quot;]
+Q2[&quot;Queue Image Workers&lt;br&gt;(Binding: &#x27;image&#x27;)&quot;]
+Q3[&quot;Queue Audit PDF&lt;br&gt;(Binding: &#x27;pdf&#x27;)&quot;]
+end
+
+P --&gt;|&quot;Routing Key = &#x27;pdf&#x27;&quot;| RouteLookup
+RouteLookup --&gt;|&quot;Точное совпадение&quot;| Q1
+RouteLookup -.-&gt;|&quot;Не совпадает&quot;| Q2
+RouteLookup --&gt;|&quot;Точное совпадение&quot;| Q3
+
+classDef pub fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef ex fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+classDef q fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+classDef skip fill:#1e293b,stroke:#64748b,stroke-dasharray: 5 5,color:#94a3b8;
+
+class P pub;
+class RouteLookup ex;
+class Q1,Q3 q;
+class Q2 skip;
   </pre>
 </div>
 
 
 <p><em>На схеме сообщение с <code>Routing Key = pdf</code> попадет и в <code>Queue PDF Workers</code>, и в <code>Queue Audit PDF</code>, так как обе очереди имеют точное совпадение ключа привязки, а <code>Queue Image Workers</code> будет проигнорирована.</em></p>
-<p><strong>Особенности производительности (Mechanical Sympathy):</strong><br />
-Это <strong>очень быстрый</strong> обменник. Поиск подходящих очередей под капотом реализован через O(1) hash-map lookup в таблице маршрутизации Mnesia (внутренняя распределенная БД RabbitMQ). Нет никаких сложных вычислений регулярных выражений.</p>
+<h3 id="osobennosti-proizvoditelnosti-mechanical-sympathy">Особенности производительности (Mechanical Sympathy)</h3>
+<p>Direct Exchange — один из самых быстрых инструментов маршрутизации в RabbitMQ. Поиск целевых очередей под капотом реализован через хэш-таблицу $O(1)$ во внутренней оперативной памяти Erlang (таблицы <strong>ETS</strong> — <em>Erlang Term Storage</em>). Вычисление адресата сводится к мгновенному поиску строки по хэшу без разбора префиксов и регулярных выражений.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Дефолтный обменник</span>
+    <span class="callout-title">Ловушка / Gotcha: Дефолтный обменник (Default Exchange)</span>
   </div>
   <div class="callout-body">
-    <p>В RabbitMQ существует предопределенный Direct Exchange без имени (пустая строка <code>""</code>). При создании любой новой очереди RabbitMQ автоматически привязывает её к этому безымянному обменнику с Binding Key, равным имени этой очереди.<br />
-Именно поэтому новички часто думают, что публикуют "напрямую в очередь", указывая <code>ch.Publish("", "my_queue", ...)</code>. На самом деле они используют неявный Direct Exchange. В production-коде так делать не рекомендуется — всегда объявляйте свои обменники явно.</p>
+    <p>В RabbitMQ по умолчанию сконфигурирован безымянный Direct Exchange (обозначается пустой строкой <code>""</code>). </p>
+<p>При создании абсолютно любой очереди брокер неявно и автоматически привязывает ее к этому дефолтному обменнику с <code>Binding Key</code>, равным <strong>имени созданной очереди</strong>.</p>
+<p>Именно поэтому в обучающих примерах часто встречается код вроде:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">ch.Publish(&quot;&quot;, &quot;my_queue&quot;, false, false, amqp.Publishing{...})
+</code></pre>
+</div>
+
+<p>Разработчику кажется, будто он отправляет данные «напрямую в очередь» через <code>ch.Publish("", "my_queue", ...)</code>. На самом деле сообщение проходит через невидимый Default Direct Exchange. В промышленных микросервисах полагаться на дефолтный обменник не рекомендуется: это разрушает гибкость топологии и лишает систему возможности динамически подключать аудит или репликацию без изменения кода продюсера.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="2-fanout-exchange-shirokoveshchatelnyy-obmennik">2. Fanout Exchange (Широковещательный обменник)</h2>
 
-<p><strong>Алгоритм:</strong> Игнорирует <code>Routing Key</code> полностью. Просто отправляет копию (ссылку) сообщения <strong>во все</strong> привязанные к нему очереди.</p>
+<p><strong>Алгоритм работы:</strong> Полностью игнорирует <code>Routing Key</code>. Каждое поступившее сообщение безусловно дублируется (через ссылки в памяти) <strong>во все очереди</strong>, привязанные к данному обменнику.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2254,24 +2301,118 @@ class Ex ex;
   </div>
   <pre class="mermaid">
 graph LR
-P[&quot;Producer&quot;] --&gt;|RK=any| Ex[&quot;Fanout Exchange&quot;]
-Ex --&gt;|ignore key| Q1[&quot;Queue Cache Invalidation&quot;]
-Ex --&gt;|ignore key| Q2[&quot;Queue WebSocket Push&quot;]
-Ex --&gt;|ignore key| Q3[&quot;Queue Analytics&quot;]
+subgraph Publisher [&quot;Издатель события&quot;]
+P[&quot;User Service&lt;br&gt;(Event: ProfileUpdated)&quot;]
+end
+
+subgraph FanoutEx [&quot;Fanout Exchange: &#x27;user.events&#x27;&quot;]
+Distributor[&quot;Широковещательный дистрибьютор&lt;br&gt;(Игнорирует Routing Key)&quot;]
+end
+
+subgraph Subscribers [&quot;Подписчики (Pub/Sub)&quot;]
+Q1[&quot;Queue: cache_invalidator&lt;br&gt;(Сброс Redis)&quot;]
+Q2[&quot;Queue: ws_push&lt;br&gt;(Уведомление браузера)&quot;]
+Q3[&quot;Queue: analytics_dwh&lt;br&gt;(Запись в ClickHouse)&quot;]
+end
+
+P --&gt;|&quot;Routing Key = &#x27;&#x27; (любой)&quot;| Distributor
+Distributor ==&gt; Q1
+Distributor ==&gt; Q2
+Distributor ==&gt; Q3
+
+classDef pub fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef ex fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+classDef q fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+
+class P pub;
+class Distributor ex;
+class Q1,Q2,Q3 q;
   </pre>
 </div>
 
 
-<p><strong>Когда использовать:</strong><br />
-Идеально для паттерна Pub/Sub (Издатель/Подписчик). Например, сервис профилей пользователей обновил аватарку. Он кидает сообщение в Fanout Exchange, а дальше оно разлетается во все сервисы, которым это интересно: кэш сбрасывается, фронтенду пушится апдейт по сокету, аналитика записывает событие.</p>
-<p><strong>Производительность:</strong><br />
-Это <strong>самый быстрый</strong> тип обменника в RabbitMQ. Ему вообще не нужно тратить такты процессора на вычисление совпадений ключей. O(1) операция прохода по списку привязанных очередей.</p>
+<h3 id="kogda-primenyat">Когда применять</h3>
+<p>Идеальный выбор для архитектурного паттерна <strong>Publish/Subscribe (Издатель / Подписчики)</strong>. Классический пример: сервис профилей обновляет данные пользователя. Он публикует одно событие в Fanout Exchange, а далее оно параллельно разлетается по независимым потребителям:<br />
+1. Сервис кэширования инвалидирует ключи в Redis.<br />
+2. Сервис веб-сокетов отправляет пуш на мобильное устройство клиента.<br />
+3. Сервис аналитики перекладывает событие в ClickHouse.</p>
+<h3 id="proizvoditelnost">Производительность</h3>
+<p>Это <strong>абсолютный лидер по скорости</strong> среди всех обменников RabbitMQ. Процессу Erlang вообще не требуется выполнять строковых сравнений или вычислять хэш-функции. Сложность операции — $O(N)$, где $N$ — число очередей, подключенных к обменнику: брокер просто проходит по связанному списку подписчиков и инкрементирует счетчики ссылок на бинарный буфер.</p>
+<hr />
 <h2 id="3-topic-exchange-tematicheskiy-obmennik">3. Topic Exchange (Тематический обменник)</h2>
 
-<p><strong>Алгоритм:</strong> Маршрутизирует сообщения на основе совпадения <code>Routing Key</code> с <code>Binding Key</code>, используя шаблоны с подстановочными знаками (wildcards). Ключи должны состоять из слов, разделенных точками (например, <code>user.created.eu</code>).</p>
-<p>Доступно два спецсимвола:<br />
-* <code>*</code> (звездочка) — заменяет ровно <strong>одно</strong> слово.<br />
-* <code>#</code> (решетка) — заменяет <strong>ноль или больше</strong> слов.</p>
+<p><strong>Алгоритм работы:</strong> Маршрутизирует сообщения на основе сопоставления <code>Routing Key</code> со специальными строковыми шаблонами очередей (<code>Binding Key</code>), поддерживающими групповые подстановочные знаки (<em>wildcards</em>).</p>
+<p>Ключи маршрутизации обязаны состоять из отдельных слов, разделенных точками (длина ключа ограничена спецификацией AMQP до 255 байт). Например: <code>user.created.eu</code> или <code>telemetry.eu.sensor_12.temperature</code>.</p>
+<p>В шаблонах привязки (<code>Binding Key</code>) допускается использование двух специальных метасимволов:<br />
+- <code>*</code> (звездочка) — заменяет ровно <strong>одно слово</strong> между точками.<br />
+- <code>#</code> (решетка) — заменяет <strong>ноль, одно или произвольное количество слов</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph TopicEx [&quot;Topic Exchange: &#x27;system.logs&#x27;&quot;]
+TrieLookup[&quot;Префиксное дерево (Trie)&lt;br&gt;Маршрутизация по шаблонам&quot;]
+end
+
+P1[&quot;Producer: log.error.db&quot;] --&gt; TopicEx
+P2[&quot;Producer: log.info.web&quot;] --&gt; TopicEx
+P3[&quot;Producer: log.warning.cache.redis&quot;] --&gt; TopicEx
+
+TopicEx --&gt;|&quot;Binding: &#x27;log.error.*&#x27;&quot;| Q_DB[&quot;Queue: Critical DB Errors&lt;br&gt;(Поймает только log.error.db)&quot;]
+TopicEx --&gt;|&quot;Binding: &#x27;log.*.web&#x27;&quot;| Q_Web[&quot;Queue: Web Logs&lt;br&gt;(Поймает только log.info.web)&quot;]
+TopicEx --&gt;|&quot;Binding: &#x27;log.#&#x27;&quot;| Q_All[&quot;Queue: Central Elastic Log&lt;br&gt;(Поймает абсолютно все логи)&quot;]
+
+classDef pub fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef ex fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+classDef q fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+
+class P1,P2,P3 pub;
+class TrieLookup ex;
+class Q_DB,Q_Web,Q_All q;
+  </pre>
+</div>
+
+
+<h3 id="razbor-primerov-shablonov">Разбор примеров шаблонов:</h3>
+<ul>
+<li>Шаблон <code>log.error.*</code>:</li>
+<li>Совпадет с <code>log.error.db</code> и <code>log.error.auth</code>.</li>
+<li><strong>НЕ совпадет</strong> с <code>log.error</code> (не хватает одного слова в конце).</li>
+<li><strong>НЕ совпадет</strong> с <code>log.error.db.primary</code> (слишком много слов).</li>
+<li>Шаблон <code>log.#</code>:</li>
+<li>Совпадет с <code>log.error.db</code>, <code>log.info</code>, <code>log.warning.cache.redis</code> и даже с одиночным словом <code>log</code>.</li>
+</ul>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Префиксное дерево (Trie) и накладные расходы на CPU</span>
+  </div>
+  <div class="callout-body">
+    <p>В отличие от Direct Exchange, где достаточно хэш-таблицы, для Topic Exchange брокер компилирует все активные правила привязок в иерархическую структуру данных — <strong>Trie (префиксное дерево)</strong>.</p>
+<p>При поступлении каждого фрейма публикации планировщик Erlang выполняет поиск пути в дереве шаблонов. <br />
+- Чем длиннее цепочки слов в ключах (например, 10 уровней вложенности) и чем больше символов <code>#</code> используется в биндингах, тем больше узлов дерева вынужден обойти алгоритм.<br />
+- Это приводит к дополнительным тактам процессора и повышает задержку доставки (Latency).</p>
+<p><em>Рекомендация по System Design:</em> Проектируйте структуру топиков компактной — не более 3–4 семантических уровней (например, <code>&lt;домен&gt;.&lt;сущность&gt;.&lt;действие&gt;</code>: <code>billing.invoice.paid</code>).</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="4-headers-exchange-obmennik-po-zagolovkam">4. Headers Exchange (Обменник по заголовкам)</h2>
+
+<p><strong>Алгоритм работы:</strong> Полностью игнорирует значение <code>Routing Key</code>. Вместо этого логика маршрутизации анализирует словарь метаданных (<code>Headers</code> в свойствах фрейма <code>Header Frame</code>), прикрепленный к сообщению.</p>
+<p>При связывании очереди с Headers Exchange указывается набор пар «ключ-значение», а также специальный системный заголовок <strong><code>x-match</code></strong>:<br />
+- <strong><code>x-match: all</code> (по умолчанию):</strong> Сообщение попадает в очередь только тогда, когда в его заголовках присутствуют <strong>все</strong> указанные в привязке ключи с совпадающими значениями (логическое <code>AND</code>).<br />
+- <strong><code>x-match: any</code>:</strong> Сообщению достаточно иметь совпадение хотя бы по <strong>одному</strong> заголовку из таблицы привязки (логическое <code>OR</code>).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2286,55 +2427,58 @@ Ex --&gt;|ignore key| Q3[&quot;Queue Analytics&quot;]
   </div>
   <pre class="mermaid">
 graph TD
-P[&quot;Producer&quot;] --&gt; Ex[&quot;Topic Exchange&quot;]
-Ex --&gt;|&quot;rk=log.error.db&quot;| Q1[&quot;Queue DB Errors&quot;]
-Ex --&gt;|&quot;rk=log.info.web&quot;| Q2[&quot;Queue All Logs&quot;]
+subgraph Publisher [&quot;Публикация с Headers&quot;]
+P[&quot;Producer&lt;br&gt;Headers: {format: &#x27;pdf&#x27;, type: &#x27;report&#x27;}&quot;]
+end
 
-Q1 -.-&gt;|&quot;Binding: log.error.*&quot;| Ex
-Q2 -.-&gt;|&quot;Binding: log.#&quot;| Ex
+subgraph HeadersEx [&quot;Headers Exchange: &#x27;docs.headers&#x27;&quot;]
+HeaderMatcher[&quot;Анализатор таблиц аргументов&lt;br&gt;(Проверка x-match)&quot;]
+end
+
+subgraph Queues [&quot;Очереди&quot;]
+Q1[&quot;Queue: PDF Reports&lt;br&gt;Binding: {format: &#x27;pdf&#x27;, type: &#x27;report&#x27;, x-match: &#x27;all&#x27;}&quot;]
+Q2[&quot;Queue: Any PDF&lt;br&gt;Binding: {format: &#x27;pdf&#x27;, x-match: &#x27;any&#x27;}&quot;]
+Q3[&quot;Queue: Invoices&lt;br&gt;Binding: {type: &#x27;invoice&#x27;, x-match: &#x27;all&#x27;}&quot;]
+end
+
+P --&gt; HeaderMatcher
+HeaderMatcher --&gt;|&quot;Совпали все (all)&quot;| Q1
+HeaderMatcher --&gt;|&quot;Совпал format (any)&quot;| Q2
+HeaderMatcher -.-&gt;|&quot;Не совпал type&quot;| Q3
+
+classDef pub fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef ex fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#f8fafc;
+classDef q fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+classDef skip fill:#1e293b,stroke:#64748b,stroke-dasharray: 5 5,color:#94a3b8;
+
+class P pub;
+class HeaderMatcher ex;
+class Q1,Q2 q;
+class Q3 skip;
   </pre>
 </div>
 
 
-<p>Примеры:<br />
-* <code>log.error.*</code> поймает <code>log.error.db</code> и <code>log.error.auth</code>, но <strong>не</strong> поймает <code>log.error</code> (не хватает одного слова).<br />
-* <code>log.#</code> поймает <code>log.error.db</code>, <code>log.info</code>, и просто <code>log</code>.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Trie (Префиксное дерево)</span>
-  </div>
-  <div class="callout-body">
-    <p>Из-за наличия wildcards, RabbitMQ не может использовать простой hash-map для поиска. Для Topic Exchanges таблица маршрутизации компилируется в структуру данных <strong>Trie</strong> (Префиксное дерево). <br />
-При публикации сообщения RabbitMQ выполняет обход этого дерева. Это означает, что Topic Exchange потребляет больше CPU, чем Direct. Чем больше уровней (точек) в вашем ключе и чем больше <code>#</code> в биндингах, тем дольше длится вычисление маршрута. Старайтесь не делать ключи длиннее 3-5 сегментов.</p>
-  </div>
-</div>
-
-<h2 id="4-headers-exchange-obmennik-po-zagolovkam">4. Headers Exchange (Обменник по заголовкам)</h2>
-
-<p><strong>Алгоритм:</strong> Игнорирует <code>Routing Key</code> (как Fanout), но вместо этого смотрит на словарь <code>Headers</code> (метаданные), прикрепленный к сообщению. Привязка очереди также содержит словарь заголовков и специальный аргумент <code>x-match</code>.</p>
-<ul>
-<li><code>x-match: all</code> — сообщение попадет в очередь, если совпадут <strong>все</strong> заголовки.</li>
-<li><code>x-match: any</code> — сообщение попадет в очередь, если совпадет <strong>хотя бы один</strong> заголовок.</li>
-</ul>
-<p><strong>Производительность:</strong><br />
-Это <strong>самый медленный</strong> обменник. Парсинг заголовков (которые являются динамическими структурами AMQP) обходится очень дорого с точки зрения аллокаций памяти и тактов CPU.</p>
+<h3 id="osobennosti-proizvoditelnosti">Особенности производительности</h3>
+<p>Headers Exchange — <strong>наименее производительный</strong> тип обменника в экосистеме RabbitMQ. <br />
+Парсинг динамических бинарных структур AMQP <code>table</code> (словари произвольных типов, строк, чисел и массивов) требует постоянных аллокаций памяти и глубокого сканирования структур данных в Erlang.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Когда выбирать Headers Exchange?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В каких случаях вы выберете Headers Exchange вместо Topic Exchange?<br />
-<strong>Ответ:</strong> На практике Headers Exchange используется крайне редко из-за деградации производительности. Единственный валидный кейс — когда критериев маршрутизации слишком много (больше 10-15) и они опциональны, из-за чего закодировать их в одну строку <code>Routing Key</code> с точками для Topic Exchange становится невозможно или слишком запутанно. Во всех остальных случаях Topic предпочтительнее.</p>
+    <p><strong>Вопрос:</strong> В каких сценариях оправдано применение Headers Exchange вместо классического Topic Exchange?<br />
+<strong>Ответ:</strong> В реальном продакшене Headers Exchange применяется крайне редко. Единственный валидный архитектурный кейс — когда критериев фильтрации слишком много (десятки ортогональных атрибутов: регион, тип клиента, версия API, формат шифрования), и закодировать их комбинацию в одну плоскую строку <code>Routing Key</code> становится невозможно из-за ограничений формата или комбинаторного взрыва длины ключей. <br />
+Во всех остальных 99% случаев используется Topic Exchange как существенно более быстрый и простой в отладке.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="realizatsiya-na-go-idiomatic-go">Реализация на Go (Idiomatic Go)</h2>
 
-<p>Посмотрим, как правильно декларировать обменники и биндинги с использованием <code>amqp091-go</code>.<br />
-Хорошей практикой является декларация инфраструктуры при старте сервиса, чтобы гарантировать, что сообщения не улетят "в пустоту", если консьюмер еще не запустился.</p>
+<p>Ниже представлен канонический пример настройки топологии RabbitMQ на Go с использованием драйвера <code>amqp091-go</code>.</p>
+<p>Архитектурная рекомендация: инициализацию обменников, очередей и привязок должен выполнять сервис при старте (идемпотентно). Если продюсер отправит сообщение до того, как консьюмер объявит очередь и свяжет ее с обменником, сообщение будет безвозвратно отброшено!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2347,73 +2491,163 @@ Q2 -.-&gt;|&quot;Binding: log.#&quot;| Ex
   <pre class="language-go"><code class="language-go">package main
 
 import (
+    &quot;context&quot;
     &quot;fmt&quot;
     &quot;log&quot;
+    &quot;time&quot;
 
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
+// setupInfrastructure объявляет топологию: Topic Exchange, очередь и привязку по маске
 func setupInfrastructure(ch *amqp.Channel) error {
     const (
         exchangeName = &quot;events.topic&quot;
         queueName    = &quot;audit_logs&quot;
-        bindingKey   = &quot;user.#&quot; // Ловим все события пользователей
+        bindingKey   = &quot;user.#&quot; // Отлавливаем любые события жизненного цикла пользователя
     )
 
-    // 1. Декларируем Topic Exchange
-    // Важно: Durable = true (переживет рестарт брокера)
+    // 1. Объявляем Topic Exchange
+    // Durable = true гарантирует, что метаданные обменника сохранятся при перезапуске брокера
     err := ch.ExchangeDeclare(
         exchangeName, // name
         &quot;topic&quot;,      // kind (direct, fanout, topic, headers)
         true,         // durable
-        false,        // auto-delete (удалить когда нет биндингов)
-        false,        // internal (только для других обменников)
+        false,        // auto-delete (удалять, когда отключены все очереди)
+        false,        // internal (true запрещает прямую публикацию клиентам)
         false,        // no-wait
         nil,          // args
     )
     if err != nil {
-        return fmt.Errorf(&quot;exchange declare: %w&quot;, err)
+        return fmt.Errorf(&quot;ошибка ExchangeDeclare: %w&quot;, err)
     }
 
-    // 2. Декларируем очередь
+    // 2. Объявляем устойчивую (Durable) очередь
     q, err := ch.QueueDeclare(
         queueName,
         true,  // durable
-        false, // delete when unused
-        false, // exclusive (только для этого connection)
+        false, // auto-delete (удалять, если отключился последний consumer)
+        false, // exclusive (очередь доступна только текущему TCP-соединению)
         false, // no-wait
-        nil,   // args (например x-message-ttl)
+        nil,   // args (например, x-message-ttl, x-max-length)
     )
     if err != nil {
-        return fmt.Errorf(&quot;queue declare: %w&quot;, err)
+        return fmt.Errorf(&quot;ошибка QueueDeclare: %w&quot;, err)
     }
 
     // 3. Создаем Binding между Exchange и Queue
     err = ch.QueueBind(
-        q.Name,
-        bindingKey,
-        exchangeName,
-        false, // no-wait
-        nil,   // args
+        q.Name,       // имя очереди
+        bindingKey,   // routing pattern
+        exchangeName, // имя обменника
+        false,        // no-wait
+        nil,          // args
     )
     if err != nil {
-        return fmt.Errorf(&quot;queue bind: %w&quot;, err)
+        return fmt.Errorf(&quot;ошибка QueueBind: %w&quot;, err)
     }
 
+    log.Printf(&quot;Топология успешно инициализирована: Exchange [%s] -&gt; Binding [%s] -&gt; Queue [%s]&quot;,
+        exchangeName, bindingKey, q.Name)
     return nil
+}
+
+func main() {
+    conn, err := amqp.Dial(&quot;amqp://guest:guest@localhost:5672/&quot;)
+    if err != nil {
+        log.Fatalf(&quot;Подключение не удалось: %v&quot;, err)
+    }
+    defer conn.Close()
+
+    ch, err := conn.Channel()
+    if err != nil {
+        log.Fatalf(&quot;Ошибка открытия канала: %v&quot;, err)
+    }
+    defer ch.Close()
+
+    if err := setupInfrastructure(ch); err != nil {
+        log.Fatalf(&quot;Сбой настройки топологии: %v&quot;, err)
+    }
+
+    // Пример публикации в Topic Exchange
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    routingKey := &quot;user.profile.updated&quot;
+    payload := []byte(`{&quot;user_id&quot;: 42, &quot;status&quot;: &quot;active&quot;}`)
+
+    err = ch.PublishWithContext(ctx,
+        &quot;events.topic&quot;, // exchange
+        routingKey,     // routing key
+        false,          // mandatory
+        false,          // immediate
+        amqp.Publishing{
+            DeliveryMode: amqp.Persistent,
+            ContentType:  &quot;application/json&quot;,
+            Body:         payload,
+            Timestamp:    time.Now().UTC(),
+        },
+    )
+    if err != nil {
+        log.Fatalf(&quot;Ошибка публикации: %v&quot;, err)
+    }
+
+    log.Printf(&quot;Сообщение опубликовано с ключом [%s]&quot;, routingKey)
 }
 </code></pre>
 </div>
 
+<hr />
+<h2 id="sravnitelnaya-tablitsa-obmennikov">Сравнительная таблица обменников</h2>
+
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Тип Exchange</th>
+<th>Алгоритм сопоставления</th>
+<th style="text-align: center;">Вычислительная сложность</th>
+<th>Типичный сценарий использования</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Direct</strong></td>
+<td>Точное равенство (<code>Routing Key == Binding Key</code>)</td>
+<td style="text-align: center;">$O(1)$ хэш-таблица</td>
+<td>Точечная отправка воркерам конкретных задач, RPC</td>
+</tr>
+<tr>
+<td><strong>Fanout</strong></td>
+<td>Игнорирует ключи, транслирует всем</td>
+<td style="text-align: center;">$O(N)$ проход по списку</td>
+<td>Event-Driven архитектуры, Pub/Sub, инвалидация кэшей</td>
+</tr>
+<tr>
+<td><strong>Topic</strong></td>
+<td>Шаблоны с масками <code>*</code> (1 слово) и <code>#</code> (0+ слов)</td>
+<td style="text-align: center;">$O(\log M)$ обход префиксного дерева (Trie)</td>
+<td>Доменные события с иерархией (<code>geo.service.action</code>)</td>
+</tr>
+<tr>
+<td><strong>Headers</strong></td>
+<td>Сопоставление словаря заголовков (<code>x-match: all/any</code>)</td>
+<td style="text-align: center;">$O(K \cdot M)$ глубокое сканирование структур</td>
+<td>Редкие сценарии с десятками ортогональных метаданных</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
 <h2 id="itogi">Итоги</h2>
 
 <ol>
-<li><strong>Direct</strong> — Быстрый, для точного совпадения (RPC, конкретные задачи).</li>
-<li><strong>Fanout</strong> — Самый быстрый, для массовой рассылки копий всем желающим (Pub/Sub).</li>
-<li><strong>Topic</strong> — Умный (использует Trie под капотом), для сложной иерархической маршрутизации с wildcards <code>*</code> и <code>#</code>. Самый популярный в микросервисах.</li>
-<li><strong>Headers</strong> — Медленный, маршрутизация по метаданным. Использовать только в крайнем случае.</li>
+<li><strong>Exchange — диспетчер, а не хранилище:</strong> Он никогда не хранит сообщения на диске. Неприкаянные сообщения немедленно уничтожаются, если у них нет подходящих привязок (<code>Bindings</code>).</li>
+<li><strong>BEAM оптимизирует дублирование:</strong> При доставке сообщения в десятки очередей полезная нагрузка не копируется многократно в RAM — очереди получают ссылки на общий буфер в куче Erlang.</li>
+<li><strong>Direct</strong> быстр и прост благодаря поиску по хэш-таблице ETS. Помните о неявном безымянном Default Exchange.</li>
+<li><strong>Fanout</strong> — максимальная пропускная способность для широковещательных рассылок.</li>
+<li><strong>Topic</strong> — стандарт де-факто для микросервисной коммуникации; следите за глубиной вложенности топиков, чтобы не перегружать процессор поиском по Trie.</li>
+<li><strong>Headers</strong> — используйте с осторожностью из-за высокой вычислительной стоимости разбора динамических заголовков.</li>
 </ol>
-<p>Теперь, когда мы научились распределять сообщения по нужным направлениям, пора углубиться в то, как и где они хранятся перед обработкой. В следующей статье мы разберем параметры буферов и связей: <a href="3-queues-i-bindings.html" class="wikilink">3. Queues и bindings</a>.</p>
+<p>Разобравшись с логикой маршрутизации, пора исследовать место, где сообщения физически оседают в ожидании воркеров. В следующей лекции <a href="3-queues-i-bindings.html" class="wikilink">3. Queues и bindings</a> мы подробно изучим анатомию очередей, флаги долговечности, эксклюзивности, автоудаления и тонкости работы с аргументами <code>x-arguments</code>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2441,7 +2675,7 @@ func setupInfrastructure(ch *amqp.Channel) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mekhanika-marshrutizatsii">Механика маршрутизации</a></li><li class="toc-item toc-h2"><a href="#1-direct-exchange-pryamoy-obmennik">1. Direct Exchange (Прямой обменник)</a></li><li class="toc-item toc-h2"><a href="#2-fanout-exchange-shirokoveshchatelnyy-obmennik">2. Fanout Exchange (Широковещательный обменник)</a></li><li class="toc-item toc-h2"><a href="#3-topic-exchange-tematicheskiy-obmennik">3. Topic Exchange (Тематический обменник)</a></li><li class="toc-item toc-h2"><a href="#4-headers-exchange-obmennik-po-zagolovkam">4. Headers Exchange (Обменник по заголовкам)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-na-go-idiomatic-go">Реализация на Go (Idiomatic Go)</a></li><li class="toc-item toc-h2"><a href="#itogi">Итоги</a></li>
+    <li class="toc-item toc-h2"><a href="#mekhanika-marshrutizatsii">Механика маршрутизации</a></li><li class="toc-item toc-h2"><a href="#1-direct-exchange-pryamoy-obmennik">1. Direct Exchange (Прямой обменник)</a></li><li class="toc-item toc-h3"><a href="#osobennosti-proizvoditelnosti-mechanical-sympathy">Особенности производительности (Mechanical Sympathy)</a></li><li class="toc-item toc-h2"><a href="#2-fanout-exchange-shirokoveshchatelnyy-obmennik">2. Fanout Exchange (Широковещательный обменник)</a></li><li class="toc-item toc-h3"><a href="#kogda-primenyat">Когда применять</a></li><li class="toc-item toc-h3"><a href="#proizvoditelnost">Производительность</a></li><li class="toc-item toc-h2"><a href="#3-topic-exchange-tematicheskiy-obmennik">3. Topic Exchange (Тематический обменник)</a></li><li class="toc-item toc-h3"><a href="#razbor-primerov-shablonov">Разбор примеров шаблонов:</a></li><li class="toc-item toc-h2"><a href="#4-headers-exchange-obmennik-po-zagolovkam">4. Headers Exchange (Обменник по заголовкам)</a></li><li class="toc-item toc-h3"><a href="#osobennosti-proizvoditelnosti">Особенности производительности</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-na-go-idiomatic-go">Реализация на Go (Idiomatic Go)</a></li><li class="toc-item toc-h2"><a href="#sravnitelnaya-tablitsa-obmennikov">Сравнительная таблица обменников</a></li><li class="toc-item toc-h2"><a href="#itogi">Итоги</a></li>
   </ul>
 </aside>
 
