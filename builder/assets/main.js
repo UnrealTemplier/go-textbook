@@ -38,6 +38,44 @@
   }
 
   // -------------------------------------------------------------------------
+  // Вспомогательные функции центрирования сайдбара
+  // -------------------------------------------------------------------------
+  function centerElementInContainer(container, element, smooth) {
+    if (!container || !element) return;
+
+    const containerRect = container.getBoundingClientRect();
+    const elementRect = element.getBoundingClientRect();
+
+    if (containerRect.height === 0 || elementRect.height === 0) return;
+
+    const currentScrollTop = container.scrollTop;
+    const elementTopInContent = (elementRect.top - containerRect.top) + currentScrollTop;
+    const targetScrollTop = elementTopInContent + (elementRect.height / 2) - (container.clientHeight / 2);
+
+    container.scrollTo({
+      top: Math.max(0, Math.round(targetScrollTop)),
+      behavior: smooth ? 'smooth' : 'auto'
+    });
+  }
+
+  function centerActiveLecture(smooth = false) {
+    const container = document.getElementById('sidebar-content');
+    if (!container) return;
+
+    const activeItem = container.querySelector('.nav-item.active');
+    if (activeItem) {
+      let parentDetails = activeItem.closest('details');
+      while (parentDetails) {
+        if (!parentDetails.hasAttribute('open')) {
+          parentDetails.setAttribute('open', '');
+        }
+        parentDetails = parentDetails.parentElement ? parentDetails.parentElement.closest('details') : null;
+      }
+      centerElementInContainer(container, activeItem, smooth);
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 2. Управление шириной сайдбара (drag-to-resize)
   // -------------------------------------------------------------------------
   function initSidebarResize() {
@@ -78,6 +116,7 @@
         document.body.style.cursor = '';
         document.body.style.userSelect = '';
         localStorage.setItem(STORAGE_KEY, parseInt(sidebar.style.width, 10));
+        centerActiveLecture(false);
       }
     });
   }
@@ -115,6 +154,9 @@
           sub.style.display = '';
           sub.removeAttribute('open');
         });
+        setTimeout(function () {
+          centerActiveLecture(true);
+        }, 30);
         return;
       }
 
@@ -308,7 +350,12 @@
 
     toggleBtn.addEventListener('click', function (e) {
       e.stopPropagation();
-      sidebar.classList.toggle('open');
+      const isOpen = sidebar.classList.toggle('open');
+      if (isOpen) {
+        setTimeout(function () {
+          centerActiveLecture(false);
+        }, 150);
+      }
     });
 
     document.addEventListener('click', function (e) {
@@ -405,12 +452,75 @@
   }
 
   // -------------------------------------------------------------------------
+  // 9. Автоцентрирование сайдбара (активная лекция и заголовок модуля)
+  // -------------------------------------------------------------------------
+  function initSidebarCentering() {
+    const container = document.getElementById('sidebar-content');
+    if (!container) return;
+
+    let userHasScrolled = false;
+    container.addEventListener('wheel', function () {
+      userHasScrolled = true;
+    }, { passive: true });
+    container.addEventListener('touchmove', function () {
+      userHasScrolled = true;
+    }, { passive: true });
+
+    // 1. Всегда центрируем сайдбар на текущей выбранной лекции при открытии страницы
+    centerActiveLecture(false);
+
+    requestAnimationFrame(function () {
+      if (!userHasScrolled) {
+        centerActiveLecture(false);
+      }
+    });
+
+    setTimeout(function () {
+      if (!userHasScrolled) {
+        centerActiveLecture(false);
+      }
+    }, 120);
+
+    window.addEventListener('pageshow', function () {
+      centerActiveLecture(false);
+    });
+
+    // 2. Если модуль свёрнут кликом по заголовку — центрируем сайдбар на заголовке модуля
+    container.addEventListener('click', function (e) {
+      const summary = e.target.closest('.nav-module-title, .nav-submodule-title');
+      if (!summary) return;
+
+      const details = summary.closest('details');
+      if (!details) return;
+
+      const wasOpen = details.hasAttribute('open');
+
+      requestAnimationFrame(function () {
+        setTimeout(function () {
+          const isNowOpen = details.hasAttribute('open');
+          if (wasOpen && !isNowOpen) {
+            // Модуль свёрнут кликом по заголовку — центрируем сайдбар на заголовке модуля
+            centerElementInContainer(container, summary, true);
+          } else if (!wasOpen && isNowOpen) {
+            // Если модуль был развернут и в нем находится активная лекция — центрируем на ней
+            const activeItem = details.querySelector('.nav-item.active');
+            if (activeItem) {
+              centerElementInContainer(container, activeItem, true);
+            }
+          }
+        }, 15);
+      });
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Запуск при загрузке DOM
   // -------------------------------------------------------------------------
   document.addEventListener('DOMContentLoaded', function () {
     initMermaid();
     initSidebarResize();
     initSidebarFilter();
+    initSidebarCentering();
     initScrollProgress();
     initMobileMenu();
     initGlobalSearch();
