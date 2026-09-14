@@ -197,7 +197,11 @@
         });
         submodules.forEach(sub => {
           sub.style.display = '';
-          sub.removeAttribute('open');
+          if (!sub.classList.contains('active-submodule')) {
+            sub.removeAttribute('open');
+          } else {
+            sub.setAttribute('open', '');
+          }
         });
         setTimeout(function () {
           centerActiveLecture(true);
@@ -629,26 +633,49 @@
           return;
         }
 
-        // Вычисляем целевой скролл
-        const activeItem = details.querySelector('.nav-item.active');
+        // Вычисляем целевой элемент для центрирования
         const containerRect = container.getBoundingClientRect();
+        let targetElement = null;
 
-        let targetScrollTop;
+        const activeItem = details.querySelector('.nav-item.active');
         if (activeItem) {
-          // Если внутри находится активная лекция — центрируемся на ней
-          const itemRect = activeItem.getBoundingClientRect();
-          const itemTopInContent = (itemRect.top - containerRect.top) + container.scrollTop;
-          const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
-          const desired = itemTopInContent + (itemRect.height / 2) - (container.clientHeight / 2);
-          targetScrollTop = Math.max(0, Math.min(maxScroll, Math.round(desired)));
-        } else {
-          // Иначе центрируемся на заголовке развернутого модуля
-          const summaryRect = summary.getBoundingClientRect();
-          const summaryTopInContent = (summaryRect.top - containerRect.top) + container.scrollTop;
-          const desired = summaryTopInContent + (summaryRect.height / 2) - (container.clientHeight / 2);
-          const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
-          targetScrollTop = Math.max(0, Math.min(maxScroll, Math.round(desired)));
+          // Проверяем, видна ли активная лекция (открыты ли все родительские details до details)
+          let isItemVisible = true;
+          let p = activeItem.parentElement ? activeItem.parentElement.closest('details') : null;
+          let closedSub = null;
+          while (p && p !== details) {
+            if (!p.hasAttribute('open')) {
+              isItemVisible = false;
+              closedSub = p;
+              break;
+            }
+            p = p.parentElement ? p.parentElement.closest('details') : null;
+          }
+
+          if (isItemVisible) {
+            // Если лекция открыта и видна — центрируемся на ней
+            targetElement = activeItem;
+          } else if (closedSub) {
+            // Если подраздел с лекцией свёрнут — центрируемся на заголовке этого подраздела!
+            targetElement = closedSub.querySelector('.nav-submodule-title') || closedSub;
+          }
         }
+
+        if (!targetElement) {
+          // Проверяем, может в развернутом блоке есть активный подраздел
+          const activeSub = details.querySelector('.nav-submodule.active-submodule');
+          if (activeSub) {
+            targetElement = activeSub.querySelector('.nav-submodule-title') || activeSub;
+          } else {
+            targetElement = summary;
+          }
+        }
+
+        const targetRect = targetElement.getBoundingClientRect();
+        const targetTopInContent = (targetRect.top - containerRect.top) + container.scrollTop;
+        const desired = targetTopInContent + (targetRect.height / 2) - (container.clientHeight / 2);
+        const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+        const targetScrollTop = Math.max(0, Math.min(maxScroll, Math.round(desired)));
 
         // Плавно скроллим контейнер синхронно с разворачиванием
         smoothScroll(container, targetScrollTop, ANIMATION_DURATION);

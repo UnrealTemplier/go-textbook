@@ -62,8 +62,9 @@ def render_sidebar(
                 is_sub_active = True
 
             sub_open = "open" if is_sub_active else ""
-            html_parts.append(f'<details class="nav-submodule" {sub_open}>')
-            html_parts.append(f'<summary class="nav-submodule-title">{html.escape(sub_name)}</summary>')
+            active_sub_class = " active-submodule" if is_sub_active else ""
+            html_parts.append(f'<details class="nav-submodule{active_sub_class}" {sub_open}>')
+            html_parts.append(f'<summary class="nav-submodule-title"><span class="sub-chevron"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg></span><span class="sub-text">{html.escape(sub_name)}</span></summary>')
             html_parts.append('<ul class="nav-articles-list sub-list">')
             for art in sub["articles"]:
                 href = rel_root + art.rel_output_path
