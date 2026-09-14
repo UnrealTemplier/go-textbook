@@ -2168,7 +2168,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">22. RBAC в БД</h1>
@@ -2177,18 +2177,25 @@
           <div class="article-markdown">
             <h2 id="vvedenie">Введение</h2>
 
-<p>Контроль доступа к данным — фундамент безопасности бэкенда. В современной архитектуре микросервисов на Go каждый сервис подключается к базе данных под собственной учётной записью, и крайне важно, чтобы скомпрометированный сервис не мог прочитать или изменить данные, выходящие за пределы его ответственности. <strong>RBAC (Role-Based Access Control)</strong> в базах данных решает именно эту задачу: вы определяете роли, назначаете им привилегии, а затем предоставляете эти роли пользователям или другим ролям.</p>
-<p>В отличие от простого разделения «администратор / обычный пользователь», RBAC позволяет моделировать тонкие политики: сервис заказов может читать таблицу <code>users</code>, но не изменять её; сервис аналитики — читать реплику, но не трогать мастер; миграции выполняются под отдельной elevated ролью. Всё это снижает радиус поражения при утечке креденшелов и помогает соответствовать стандартам безопасности.</p>
-<p>Для Go-разработчика глубокое понимание RBAC на уровне базы данных необходимо для правильного проектирования конфигураций подключения, безопасного выполнения миграций и интеграции с системами аутентификации.</p>
+<p>В реальном мире никому не придет в голову выдать мастер-ключ от всех сейфов банка каждому стажеру или водителю инкассаторской машины. Инженерный допуск строго разграничен: кассир имеет доступ к операционной кассе, кладовщик — к инвентарному складу, а доступ к главному хранилищу требует совместного присутствия двух старших офицеров. В архитектуре программного обеспечения этот фундаментальный принцип разделения полномочий называется <strong>управлением доступом на основе ролей (Role-Based Access Control, RBAC)</strong>.</p>
+<p>В микросервисной архитектуре на Go десятки независимых сервисов взаимодействуют с общей реляционной СУБД. Подключение всех микросервисов под единой учетной записью с широкими правами — это колоссальный архитектурный просчет. Если злоумышленник находит уязвимость типа SQL-инъекции (<a href="21-sql-injection.html" class="wikilink">21. SQL Injection</a>) в сервисе формирования чеков или компрометирует его токены в Kubernetes, он автоматически получает доступ ко всей корпоративной базе данных: финансовым транзакциям, персональным данным клиентов и системным каталогам.</p>
+<p>RBAC превращает базу данных в многосекционную герметичную конструкцию с отсеками (Bulkhead Pattern). Если один сервис скомпрометирован, радиус поражения (<strong>blast radius</strong>) строго ограничен рамками его роли: сервис заказов может читать и обновлять таблицу <code>orders</code>, но физически не имеет прав на чтение хэшей паролей в таблице <code>users</code>; сервис аналитики читает исключительно реплику базы данных в режиме read-only; а опасные операции изменения структуры таблиц (DDL) разрешены только специализированной роли <code>migrator</code>, запускаемой изолированно в пайплайне CI/CD.</p>
+<p>В этой главе мы разберем:<br />
+- Как устроена ролевая модель RBAC и механизмы наследования привилегий.<br />
+- Внутреннее устройство подсистемы прав PostgreSQL (<code>pg_catalog</code>, списки контроля доступа <code>relacl</code>, фазы планировщика <code>setrefs.c</code>).<br />
+- Механику фильтрации строк на уровне ядра СУБД с помощью Row-Level Security (RLS).<br />
+- Безопасную интеграцию с Go: паттерны разделения пулов <code>ROPool</code> / <code>RWPool</code>, проведение миграций и динамическое переключение ролей.<br />
+- Цену безопасности на аппаратном уровне (Mechanical Sympathy): кэширование ACL и накладные расходы предикатов RLS.</p>
+<hr />
 <h2 id="model-rbac-roli-privilegii-i-nasledovanie">Модель RBAC: роли, привилегии и наследование</h2>
 
-<p>Классический RBAC состоит из трёх сущностей:</p>
-<ul>
-<li><strong>Пользователь (User / Role)</strong> — учётная запись, под которой клиент подключается к базе. В PostgreSQL и многих других СУБД пользователи и роли — это одно и то же (<code>CREATE ROLE</code>).</li>
-<li><strong>Роль (Role)</strong> — именованный набор привилегий, который может быть назначен пользователю или другой роли.</li>
-<li><strong>Привилегия (Privilege)</strong> — разрешение выполнять определённое действие над объектом базы данных (таблицей, схемой, функцией, sequence). Примеры: <code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>EXECUTE</code>, <code>USAGE</code>.</li>
-</ul>
-<p>Наследование ролей делает систему гибкой: роль <code>readonly</code> даёт <code>SELECT</code> на все таблицы схемы, роль <code>app_user</code> наследует <code>readonly</code> плюс получает <code>INSERT</code> и <code>UPDATE</code> на определённые таблицы. Иерархия может быть многоуровневой.</p>
+<p>Классическая модель RBAC в реляционных базах данных строится на трех базовых концепциях:</p>
+<ol>
+<li><strong>Пользователь / Субъект (User / Role):</strong> Учетная запись, под которой клиентское приложение или DBA устанавливает TCP-соединение с сервером СУБД. В современных версиях PostgreSQL понятия «пользователь» и «группа» унифицированы: любая учетная запись создается единой командой <code>CREATE ROLE</code>, а флаг <code>WITH LOGIN</code> определяет, разрешено ли под ней аутентифицироваться.</li>
+<li><strong>Роль (Role):</strong> Именованный контейнер привилегий. Роли можно объединять в иерархические деревья, назначая одни роли другим.</li>
+<li><strong>Привилегия (Privilege):</strong> Атомарное право на выполнение конкретной операции над объектом базы данных (таблицей, представлением, схемой, функцией или генератором последовательностей <code>SEQUENCE</code>). Ключевые привилегии: <code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>EXECUTE</code>, <code>USAGE</code>.</li>
+</ol>
+<p>Механизм наследования ролей (<code>INHERIT</code>) позволяет строить элегантные, масштабируемые графы прав: базовая роль <code>readonly</code> получает права <code>SELECT</code> на схемы, роль <code>readwrite</code> наследует <code>readonly</code> и добавляет права модификации данных, а конечные сервисные аккаунты наследуют нужный уровень доступа.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2208,15 +2215,24 @@ AppOwner --&gt; AppReadWrite[&quot;app_readwrite&lt;br&gt;чтение и зап
 AppOwner --&gt; AppReadOnly[&quot;app_readonly&lt;br&gt;только чтение&quot;]
 AppReadWrite --&gt; SvcOrders[&quot;svc_orders&lt;br&gt;сервис заказов&quot;]
 AppReadOnly --&gt; SvcAnalytics[&quot;svc_analytics&lt;br&gt;сервис аналитики&quot;]
+
+classDef admin fill:#1e293b,stroke:#f43f5e,stroke-width:1px,color:#f8fafc;
+classDef role fill:#1e293b,stroke:#818cf8,stroke-width:1px,color:#f8fafc;
+classDef svc fill:#0f172a,stroke:#34d399,stroke-width:1px,color:#f8fafc;
+class Admin admin;
+class AppOwner,AppReadWrite,AppReadOnly role;
+class SvcOrders,SvcAnalytics svc;
   </pre>
 </div>
 
 
+<hr />
 <h2 id="rbac-v-postgresql-sintaksis-i-podkapotnaya-rabota">RBAC в PostgreSQL: синтаксис и подкапотная работа</h2>
 
-<p>PostgreSQL обладает одной из самых развитых реализаций RBAC среди реляционных СУБД. Понимание внутренностей помогает избегать ошибок и писать эффективный код.</p>
+<p>PostgreSQL обладает одной из самых мощных и гибких реализаций ролевого доступа в индустрии.</p>
 <h3 id="sozdanie-roley-i-predostavlenie-privilegiy">Создание ролей и предоставление привилегий</h3>
 
+<p>Настроим эталонную иерархию прав для производственной базы данных:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2226,31 +2242,45 @@ AppReadOnly --&gt; SvcAnalytics[&quot;svc_analytics&lt;br&gt;сервис ана
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-sql"><code class="language-sql">-- Создаём роли (без логина)
+  <pre class="language-sql"><code class="language-sql">-- 1. Создаем абстрактные роли без права прямого логина (группы)
 CREATE ROLE readonly;
 CREATE ROLE readwrite;
-CREATE ROLE app_owner WITH LOGIN PASSWORD '...' INHERIT;
+CREATE ROLE app_owner WITH LOGIN PASSWORD 'strong_owner_password' INHERIT;
 
--- Назначаем привилегии
+-- 2. Базовые права для чтения
 GRANT CONNECT ON DATABASE mydb TO readonly;
 GRANT USAGE ON SCHEMA public TO readonly;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+
+-- КРИТИЧЕСКИ ВАЖНО: Права по умолчанию для будущих таблиц миграций!
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO readonly;
 
--- readwrite наследует readonly и получает права на запись
+-- 3. Роль записи наследует чтение и получает права DML
 GRANT readonly TO readwrite;
 GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO readwrite;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT INSERT, UPDATE, DELETE ON TABLES TO readwrite;
 
--- Пользовательский сервисный аккаунт
-CREATE ROLE svc_orders WITH LOGIN PASSWORD '...' INHERIT;
+-- 4. Сервисный аккаунт приложения
+CREATE ROLE svc_orders WITH LOGIN PASSWORD 'service_secret' INHERIT;
 GRANT readwrite TO svc_orders;
 </code></pre>
 </div>
 
-<p>Ключевой момент: <code>ALTER DEFAULT PRIVILEGES</code> определяет права для таблиц, создаваемых в будущем. Без этого после новой миграции сервис потеряет доступ, что приведёт к падению продакшена.</p>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">ALTER DEFAULT PRIVILEGES — спасение от аварий в проде</span>
+  </div>
+  <div class="callout-body">
+    <p>Команда <code>GRANT ... ON ALL TABLES</code> действует <strong>только на таблицы, уже существующие на момент выполнения команды</strong>! </p>
+<p>Если ночью пайплайн накатит миграцию с новой таблицей <code>payments</code>, сервисный пользователь <code>svc_orders</code> мгновенно получит ошибку <code>permission denied for table payments</code>, уронив продакшен. </p>
+<p>Команда <code>ALTER DEFAULT PRIVILEGES</code> закладывает правила автоматического назначения прав на все объекты, которые будут созданы в схеме в будущем.</p>
+  </div>
+</div>
+
 <h3 id="row-level-security-rls">Row-Level Security (RLS)</h3>
 
-<p>Для максимальной изоляции можно использовать RLS — политики, ограничивающие видимость строк на основе выражения. Например, сервис <code>tenant_A</code> видит только строки, где <code>tenant_id = 'A'</code>:</p>
+<p>Для максимальной изоляции можно использовать RLS — политики, ограничивающие видимость строк на основе логического выражения. Например, сервис арендатора <code>tenant_A</code> должен видеть исключительно строки, где <code>tenant_id = 'A'</code>:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2260,7 +2290,10 @@ GRANT readwrite TO svc_orders;
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-sql"><code class="language-sql">ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+  <pre class="language-sql"><code class="language-sql">-- Активируем политику RLS для таблицы документов
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+-- Создаем предикат изоляции строк
 CREATE POLICY tenant_isolation ON documents
     FOR ALL
     TO app_user
@@ -2268,19 +2301,7 @@ CREATE POLICY tenant_isolation ON documents
 </code></pre>
 </div>
 
-<p>Приложение устанавливает контекст: <code>SET app.tenant_id = 'A';</code> — и дальше B-Tree сканирует только подходящие строки. RLS добавляет дополнительный фильтр в фазу планирования запроса, аналогично неявному <code>WHERE</code>, но с гарантией, что даже прямой <code>SELECT * FROM documents</code> не вернёт чужие данные.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>В PostgreSQL привилегии хранятся в системном каталоге <code>pg_catalog</code>: таблицы <code>pg_authid</code> (роли), <code>pg_auth_members</code> (членство в ролях), <code>pg_class</code> (объекты), <code>pg_attribute</code> (колонки), а также <code>pg_database</code>, <code>pg_namespace</code>. Каждая строка в <code>pg_class</code> имеет массив прав доступа <code>relacl</code>. При запросе исполнитель проверяет наличие у роли соответствующих привилегий, обходя цепочку наследования. RLS реализован через дополнительные условия, вставляемые в план запроса на этапе <code>setrefs.c</code> и проверяемые при каждом чтении строки. Эти проверки выполняются для каждой строки, что может оказать влияние на производительность (см. Mechanical Sympathy ниже).</p>
-  </div>
-</div>
-
-<h3 id="roli-i-privilegii-dlya-funktsiy-i-rasshireniy">Роли и привилегии для функций и расширений</h3>
-
+<p>Перед выполнением запросов клиентское Go-приложение задает локальный параметр сессии:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2290,26 +2311,63 @@ CREATE POLICY tenant_isolation ON documents
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-sql"><code class="language-sql">-- Разрешить выполнение функции
+  <pre class="language-sql"><code class="language-sql">SET app.tenant_id = 'A';
+</code></pre>
+</div>
+
+<p>При выполнении любого запроса ядро СУБД прозрачно внедряет условие проверки в дерево плана запроса. Это работает аналогично неявному предикату <code>WHERE</code>, но с абсолютной гарантией: даже если небрежно написанный код выполнит прямой <code>SELECT * FROM documents</code>, планировщик вернет исключительно строки арендатора <code>'A'</code>, физически исключая утечку чужих данных!</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Где хранятся права и как работает setrefs.c</span>
+  </div>
+  <div class="callout-body">
+    <p>Вся информация о ролях и привилегиях PostgreSQL детерминированно хранится в системном каталоге <code>pg_catalog</code>:<br />
+- <code>pg_authid</code> — роли, хэши паролей и системные атрибуты (<code>rolsuper</code>, <code>rolcanlogin</code>).<br />
+- <code>pg_auth_members</code> — ребра графа наследования ролей (членство ролей в других ролях).<br />
+- <code>pg_class</code> — описание таблиц, индексов и представлений. Колонка <code>relacl</code> хранит массив структур прав доступа (Access Control List, ACL).<br />
+- <code>pg_attribute</code> — права на уровне отдельных колонок.<br />
+- <code>pg_database</code> и <code>pg_namespace</code> — права на базы данных и пространства имен (схемы).</p>
+<p>Когда планировщик строит план выполнения запроса, модуль <code>setrefs.c</code> инспектирует ACL-массивы. Если на таблице включен RLS, планировщик трансформирует исходное дерево запроса, внедряя предикат политики <code>USING</code> как неявный узел фильтрации <code>Qual</code> над узлом сканирования (<code>Seq Scan</code> или <code>Index Scan</code>). Проверка выполняется аппаратно на уровне итератора кортежей строк.</p>
+  </div>
+</div>
+
+<h3 id="roli-i-privilegii-dlya-funktsiy-i-rasshireniy">Роли и привилегии для функций и расширений</h3>
+
+<p>Нередко приложению требуется вызывать специализированные хранимые процедуры или генерировать автоинкрементные ключи:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">-- Разрешить выполнение функции расчета скидки
 GRANT EXECUTE ON FUNCTION calculate_discount TO readwrite;
--- Доступ к последовательностям для SERIAL
+
+-- Доступ к генераторам последовательностей для SERIAL / IDENTITY колонок
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO readwrite;
--- Использование расширений (например, pgcrypto)
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO readwrite;
+
+-- Использование расширений (например, pgcrypto для хэширования)
 GRANT USAGE ON SCHEMA extensions TO app_user;
 </code></pre>
 </div>
 
+<hr />
 <h2 id="go-i-upravlenie-rbac">Go и управление RBAC</h2>
 
-<p>При инициализации приложения на Go вы подключаетесь к базе, используя одного из системных пользователей. Важно разделять роли:</p>
-<ul>
-<li><strong>Миграции</strong> выполняются под специальной учётной записью <code>migrator</code>, которая владеет схемой или имеет право <code>CREATE TABLE</code>, но не используется в рантайме. Инструменты типа <code>golang-migrate</code> или <code>goose</code> запускаются с отдельной строкой подключения.</li>
-<li><strong>Рантайм</strong> — сервисная роль с минимально необходимыми правами (<code>svc_orders</code>). Это предотвращает случайный <code>DROP TABLE</code> из-за бага.</li>
-<li><strong>Аналитика / чтение реплик</strong> — ещё одна роль, только <code>SELECT</code>, возможно, с лимитами на длительность запроса.</li>
-</ul>
+<p>Инженерная дисциплина в Go требует строгого разделения учетных записей по функциональным назначениям:</p>
+<ol>
+<li><strong>Роль миграций (<code>migrator</code>):</strong> Обладает правами DDL (<code>CREATE</code>, <code>ALTER</code>, <code>DROP</code>). Используется исключительно инструментами миграций (<code>golang-migrate</code>, <code>goose</code>) в момент деплоя.</li>
+<li><strong>Сервисная роль рантайма (<code>svc_orders</code>):</strong> Обладает только DML-правами (<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>) на нужные таблицы.</li>
+<li><strong>Роль аналитики (<code>svc_analytics</code>):</strong> Строго <code>SELECT</code>, часто подключается к выделенной читающей реплике с агрессивными таймаутами выполнения запросов <code>statement_timeout</code>.</li>
+</ol>
 <h3 id="dinamicheskaya-smena-roli-v-go">Динамическая смена роли в Go</h3>
 
-<p>Используя <code>database/sql</code> или <code>pgx</code>, можно после подключения выполнить <code>SET ROLE</code>:</p>
+<p>Некоторые архитектуры используют временное переключение роли внутри открытой сессии с помощью команды <code>SET ROLE</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2319,19 +2377,35 @@ GRANT USAGE ON SCHEMA extensions TO app_user;
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func initDB(ctx context.Context) (*sql.DB, error) {
-    db, err := sql.Open(&quot;pgx&quot;, &quot;postgres://migrator:...@host/db&quot;)
-    if err != nil { return nil, err }
-    // Понижаем привилегии до роли сервиса
-    if _, err := db.ExecContext(ctx, &quot;SET ROLE svc_orders&quot;); err != nil {
-        return nil, fmt.Errorf(&quot;set role: %w&quot;, err)
+  <pre class="language-go"><code class="language-go">package database
+
+import (
+    &quot;context&quot;
+    &quot;database/sql&quot;
+    &quot;fmt&quot;
+
+    _ &quot;github.com/jackc/pgx/v5/stdlib&quot;
+)
+
+func initDB(ctx context.Context) (*sql.DB, error) {
+    db, err := sql.Open(&quot;pgx&quot;, &quot;postgres://migrator:secret@host:5432/mydb?sslmode=require&quot;)
+    if err != nil {
+        return nil, err
     }
+
+    // Понижаем привилегии сессии до сервисной роли
+    if _, err := db.ExecContext(ctx, &quot;SET ROLE svc_orders&quot;); err != nil {
+        db.Close()
+        return nil, fmt.Errorf(&quot;set role failed: %w&quot;, err)
+    }
+
     return db, nil
 }
 </code></pre>
 </div>
 
-<p>Однако более надёжно сразу подключаться под целевой ролью, без промежуточного <code>migrator</code>, чтобы избежать периода с избыточными правами. В <code>pgxpool</code> это делается через параметры:</p>
+<p>Однако в пулах соединений (<code>database/sql</code>, <code>pgxpool</code>) использование динамического <code>SET ROLE</code> — опасный антипаттерн! Если соединение возвращается в пул без очистки роли (<code>RESET ROLE</code>), следующая горутина случайно унаследует чужой контекст безопасности.</p>
+<p>Золотое правило: <strong>подключайтесь сразу под целевой сервисной ролью</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2341,13 +2415,17 @@ GRANT USAGE ON SCHEMA extensions TO app_user;
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">config, _ := pgxpool.ParseConfig(&quot;postgres://svc_orders:password@host/db?sslmode=require&quot;)
-pool, _ := pgxpool.NewWithConfig(ctx, config)
+  <pre class="language-go"><code class="language-go">config, err := pgxpool.ParseConfig(&quot;postgres://svc_orders:password@host/db?sslmode=require&quot;)
+if err != nil {
+    return nil, err
+}
+pool, err := pgxpool.NewWithConfig(ctx, config)
 </code></pre>
 </div>
 
 <h3 id="migratsii-iz-go">Миграции из Go</h3>
 
+<p>Запуск миграций выполняется под отдельной строкой подключения с правами владельца схемы:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2357,27 +2435,43 @@ pool, _ := pgxpool.NewWithConfig(ctx, config)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// запуск миграций под отдельными креденшелами
+  <pre class="language-go"><code class="language-go">package migrations
+
+import (
+    &quot;errors&quot;
+    &quot;log&quot;
+
+    &quot;github.com/golang-migrate/migrate/v4&quot;
+    _ &quot;github.com/golang-migrate/migrate/v4/database/postgres&quot;
+    _ &quot;github.com/golang-migrate/migrate/v4/source/file&quot;
+)
+
+// запуск миграций под отдельными креденшелами
 func runMigrations(migrationsURL string) error {
     m, err := migrate.New(&quot;file://migrations&quot;, migrationsURL)
-    if err != nil { return err }
-    if err := m.Up(); err != nil &amp;&amp; err != migrate.ErrNoChange {
+    if err != nil {
+        return err
+    }
+    defer m.Close()
+
+    if err := m.Up(); err != nil &amp;&amp; !errors.Is(err, migrate.ErrNoChange) {
         return err
     }
     return nil
 }
 
-// main
-migratorDSN := &quot;postgres://migrator:...@host/db?sslmode=require&quot;
-if err := runMigrations(migratorDSN); err != nil {
-    log.Fatal(err)
+func ApplyMigrations() {
+    migratorDSN := &quot;postgres://migrator:super_secret@host:5432/db?sslmode=require&quot;
+    if err := runMigrations(migratorDSN); err != nil {
+        log.Fatalf(&quot;Migration failed: %v&quot;, err)
+    }
 }
 </code></pre>
 </div>
 
 <h3 id="pgxpool-i-neskolko-pulov-dlya-raznykh-privilegiy">pgxpool и несколько пулов для разных привилегий</h3>
 
-<p>Если сервис изредка нуждается в повышенных правах (например, для периодических задач архивирования), разумно создать отдельный пул с более высокими привилегиями и использовать его только для этих операций, не смешивая с основным трафиком.</p>
+<p>Если бэкенд сочетает регулярные операции пользователей с фоновыми задачами архивирования или аналитики, правильный архитектурный шаблон — разделение пулов соединений:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2387,38 +2481,94 @@ if err := runMigrations(migratorDSN); err != nil {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type DB struct {
-    ROPool *pgxpool.Pool // readonly
-    RWPool *pgxpool.Pool // readwrite
+  <pre class="language-go"><code class="language-go">package repository
+
+import &quot;github.com/jackc/pgx/v5/pgxpool&quot;
+
+type DB struct {
+    ROPool *pgxpool.Pool // readonly (подключение svc_analytics к реплике)
+    RWPool *pgxpool.Pool // readwrite (подключение svc_orders к мастеру)
 }
 </code></pre>
 </div>
 
+<p>Это исключает взаимное влияние нагрузок и гарантирует соблюдение прав доступа на сетевом уровне пулов (<a href="2-connection-pool.html" class="wikilink">2. Connection pool</a>).</p>
+<hr />
 <h2 id="mechanical-sympathy-tsena-proverok-prav">Mechanical Sympathy: цена проверок прав</h2>
 
-<p>Каждый запрос в PostgreSQL проходит этап проверки привилегий. Для простых запросов это занимает микросекунды и сводится к поиску в хеш-таблице кэша прав (<code>ACL</code>). Однако при использовании RLS с большим количеством политик или сложными условиями проверка может стать значимой.</p>
+<p>С точки зрения кремния и архитектуры СУБД, RBAC и политики доступа не являются бесплатными:</p>
 <ul>
-<li><strong>Кэш ACL</strong>: PostgreSQL кэширует привилегии в локальной памяти бэкенда, инвалидируя кэш при <code>GRANT</code>/<code>REVOKE</code>. Поэтому частые изменения прав в рантайме нежелательны.</li>
-<li><strong>RLS</strong>: Условие политики добавляется в план запроса и выполняется для каждой отфильтрованной строки. Если выражение содержит подзапросы или <code>current_setting</code>, оно вызывается многократно. В Go-сервисе, генерирующем тысячи запросов в секунду, рост CPU может быть заметен. Рекомендуется делать условия максимально простыми и использовать индексы, соответствующие политике (например, индекс на <code>tenant_id</code>).</li>
-<li><strong>Соединения и роли</strong>: При старте нового соединения PostgreSQL выполняет аутентификацию и загружает членство в ролях. При использовании пулов соединений (<a href="2-connection-pool.html" class="wikilink">2. Connection pool</a>) этот overhead амортизируется, но при частом переключении контекста <code>SET ROLE</code> происходит повторная проверка прав.</li>
+<li><strong>Кэш списков контроля доступа (ACL Cache):</strong> Серверный бэкенд PostgreSQL не обращается к дисковым таблицам <code>pg_catalog</code> на каждый SQL-запрос. При первом обращении права компилируются в оптимизированную хэш-таблицу в локальной памяти процесса backend'а. Вызовы команд <code>GRANT</code> или <code>REVOKE</code> вызывают отправку широковещательного сигнала инвалидации кэша (<code>Shared Invalidation Message</code>), заставляя все бэкенды перечитывать каталоги. Поэтому частая смена прав в рантайме недопустима.</li>
+<li><strong>Накладные расходы Row-Level Security (RLS):</strong> Условие политики RLS физически вычисляется для <strong>каждой просматриваемой строки</strong>. Если предикат политики содержит тяжелый вызов <code>current_setting('app.tenant_id')</code> или подзапросы, это создает заметную нагрузку на CPU. Чтобы минимизировать деградацию, обязательно создавайте индекс по колонке селектора (например, <code>CREATE INDEX idx_docs_tenant ON documents(tenant_id)</code>), чтобы планировщик применял RLS на этапе <code>Index Scan</code>, отсекая 99% строк без чтения табличных страниц в память!</li>
+<li><strong>Аутентификация при старте соединения:</strong> Разрешение членства в ролях и проверка пароля (SCRAM-SHA-256) требуют нескольких тысяч тактов CPU. Повторное использование TCP-сокетов через пулы соединений (<code>pgxpool</code>) полностью амортизирует эти расходы.</li>
 </ul>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Утечка привилегий через функции SECURITY DEFINER</span>
   </div>
   <div class="callout-body">
-    <p><strong>Утечка привилегий через <code>SECURITY DEFINER</code> функции.</strong> Функция, созданная с <code>SECURITY DEFINER</code>, выполняется с правами владельца, а не вызывающего. Это удобно для инкапсуляции привилегированных действий (например, удаление старых записей), но если внутри функции есть ошибка или SQL-инъекция (<a href="21-sql-injection.html" class="wikilink">21. SQL Injection</a>), злоумышленник получит привилегии владельца функции. Всегда тщательно валидируйте параметры внутри <code>SECURITY DEFINER</code> функций и минимизируйте их использование.</p>
+    <p>По умолчанию функции в PostgreSQL выполняются с правами пользователя, который их вызывает (<code>SECURITY INVOKER</code>). Однако функции с флагом <code>SECURITY DEFINER</code> исполняются с правами <strong>владельца функции</strong> (часто суперпользователя!).</p>
+<p>Если внутри такой функции содержится динамический SQL или не зафиксирован путь поиска схем:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">-- ОПАСНО: злоумышленник может подменить search_path
+CREATE FUNCTION cleanup_logs() RETURNS void SECURITY DEFINER AS $$
+BEGIN
+    TRUNCATE logs; -- Какая таблица logs будет очищена?
+END;
+$$ LANGUAGE plpgsql;
+</code></pre>
+</div>
+
+<p>злоумышленник, изменив <code>SET search_path = evil_schema, public</code>, заставит функцию суперпользователя выполнить код над вредоносным объектом.</p>
+<p><strong>Правило безопасности:</strong> В функциях <code>SECURITY DEFINER</code> всегда жестко фиксируйте параметры:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">ALTER FUNCTION cleanup_logs() SET search_path = pg_catalog, public;
+</code></pre>
+</div>
+
   </div>
 </div>
 
+<hr />
 <h2 id="razgranichenie-dostupa-k-kolonkam-i-skhemam">Разграничение доступа к колонкам и схемам</h2>
 
-<p>PostgreSQL позволяет ограничивать доступ на уровне колонок через <code>GRANT SELECT (col1, col2) ON table TO role</code>. Это полезно, когда сервис должен читать публичные поля пользователя, но не видеть хеш пароля или email. Однако учтите: драйверы Go могут не поддерживать колоночные права прозрачно, при попытке <code>SELECT *</code> результат вернёт ошибку, если есть запрещённые колонки. Лучше явно перечислять столбцы в запросах.</p>
+<p>PostgreSQL позволяет ограничивать доступ с точностью до отдельных полей:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">GRANT SELECT (id, username, created_at) ON users TO public_reader;
+</code></pre>
+</div>
+
+<p>Это полезно, когда сервис должен читать публичный профиль, но не имеет права видеть колонки <code>password_hash</code> или <code>phone_number</code>. </p>
+<p>Однако учтите инженерный нюанс: если Go-сервис использует ORM или наивный запрос <code>SELECT * FROM users</code>, СУБД немедленно вернет ошибку <code>permission denied for column password_hash</code>. При использовании колоночного RBAC клиентский код обязан явно перечислять только разрешенные колонки в операторе <code>SELECT</code>.</p>
+<hr />
 <h2 id="rbac-i-cicd-avtomatizatsiya-kontrolya-prav">RBAC и CI/CD: автоматизация контроля прав</h2>
 
-<p>Храните определения ролей и привилегий в системе контроля версий как часть миграций. Каждая миграция добавляет нужные права для новых таблиц. Это гарантирует, что разворачивание свежего инстанса не потребует ручных манипуляций и что отзыв прав происходит контролируемо.</p>
-<p>Пример файла миграции:</p>
+<p>Конфигурация ролей и привилегий — это неотъемлемая часть инфраструктурного кода (Schema as Code). Права обязаны версионироваться вместе с DDL в миграциях:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2429,16 +2579,23 @@ if err := runMigrations(migratorDSN); err != nil {
     </button>
   </div>
   <pre class="language-sql"><code class="language-sql">-- +migrate Up
-CREATE TABLE orders (id SERIAL PRIMARY KEY, ...);
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    tenant_id VARCHAR(64) NOT NULL,
+    amount NUMERIC(12, 2) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Выдаем права на чтение и запись
 GRANT SELECT, INSERT, UPDATE ON orders TO readwrite;
-GRANT USAGE ON SEQUENCE orders_id_seq TO readwrite;
+GRANT USAGE, SELECT ON SEQUENCE orders_id_seq TO readwrite;
 
 -- +migrate Down
 DROP TABLE IF EXISTS orders;
 </code></pre>
 </div>
 
-<p>Использование <code>ALTER DEFAULT PRIVILEGES</code> снижает риск забыть <code>GRANT</code>, но всё равно необходимо для новых колонок с ограниченным доступом.</p>
+<hr />
 <h2 id="tipichnye-voprosy-s-sobesedovaniy">Типичные вопросы с собеседований</h2>
 
 <div class="callout callout-interview">
@@ -2447,8 +2604,12 @@ DROP TABLE IF EXISTS orders;
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> У вас есть микросервис заказов, которому нужно обновлять статус заказа в базе, и сервис аналитики, читающий все заказы. Как обеспечить минимальные привилегии и предотвратить случайную запись аналитиком?<br />
-<strong>Ответ:</strong> Создадим роли <code>orders_rw</code> с <code>SELECT, INSERT, UPDATE</code> на таблицу orders (без <code>DELETE</code>), <code>analytics_ro</code> с <code>SELECT</code>. Сервис заказов подключается как пользователь, унаследовавший <code>orders_rw</code>, аналитика — как <code>analytics_ro</code>. Также можно использовать RLS для мультитенантности или исключения конфиденциальных полей. Для дополнительной безопасности сетевые политики на уровне фаервола могут ограничить доступ аналитики только к реплике.</p>
+    <p><strong>Вопрос:</strong> У вас есть микросервис заказов, которому нужно обновлять статус заказа в базе, и сервис аналитики, читающий все заказы. Как обеспечить минимальные привилегии и предотвратить случайную запись аналитиком?</p>
+<p><strong>Ответ:</strong> <br />
+1. Создаем роль <code>orders_rw</code> с точечными правами <code>SELECT, INSERT, UPDATE</code> на таблицу <code>orders</code> (без права <code>DELETE</code>). Сервис заказов подключается под пользователем, унаследовавшим <code>orders_rw</code>.<br />
+2. Создаем роль <code>analytics_ro</code> с правом только <code>SELECT</code> на таблицу <code>orders</code>.<br />
+3. На сетевом уровне настраиваем подключение сервиса аналитики исключительно к физической читающей реплике базы данных (Read Replica), где запись физически невозможна на уровне ядра СУБД.<br />
+4. При необходимости изолировать конфиденциальные поля (номера карт) используем ограничение прав на уровне колонок (<code>GRANT SELECT (id, status, amount)...</code>).</p>
   </div>
 </div>
 
@@ -2458,15 +2619,40 @@ DROP TABLE IF EXISTS orders;
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдёт, если вы удалите роль, на которую завязаны привилегии?<br />
-<strong>Ответ:</strong> В PostgreSQL все объекты, принадлежащие роли, должны быть переданы другой роли перед удалением (<code>REASSIGN OWNED</code>). Привилегии, предоставленные удалённой роли другим объектам, останутся, но членство в ролях исчезнет, и пользователи, бывшие членами удалённой роли, потеряют соответствующие права. Поэтому лучше сначала отозвать членство, мониторить логи, и только потом удалять роль.</p>
+    <p><strong>Вопрос:</strong> Что произойдёт, если администратор попытается выполнить команду <code>DROP ROLE analyst</code>, пока за этой ролью закреплены привилегии на таблицы?</p>
+<p><strong>Ответ:</strong> СУБД PostgreSQL заблокирует удаление и вернет ошибку: <code>role "analyst" cannot be dropped because some objects depend on it</code>. Перед удалением роли необходимо переназначить владение объектами или отозвать все зависимости:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">-- Переназначаем объекты новому владельцу
+REASSIGN OWNED BY analyst TO backup_admin;
+-- Отзываем все выданные роли права
+DROP OWNED BY analyst;
+-- Теперь удаление безопасно
+DROP ROLE analyst;
+</code></pre>
+</div>
+
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>RBAC в базах данных — это не галочка для аудита, а живой, постоянно обслуживаемый уровень безопасности. Для Go-разработчика практическое владение ролями, привилегиями и row-level security означает способность проектировать сервисы, устойчивые к компрометации, с чётко очерченными границами ответственности. Интеграция с миграциями, CI/CD и observability (<a href="19-observability-bd.html" class="wikilink">19. Observability БД</a>) превращает RBAC из ручного ad-hoc процесса в автоматизированную, повторяемую практику.</p>
-<p>Завершающая статья раздела подведёт итог всему нашему путешествию по базам данных и соберёт полную картину для Senior/Lead Go-инженера: <a href="23-itogi-razdela-polnaya-kartina-raboty-s-bazami-dannyk.html" class="wikilink">23. Итоги раздела. Полная картина работы с базами данных</a>.</p>
+<p>Управление доступом на основе ролей (RBAC) в базах данных — это фундаментальный каркас безопасности, превращающий систему из монолитной уязвимой мишени в эшелонированную крепость.</p>
+<p>Для Go-разработчика понимание RBAC охватывает:<br />
+- Проектирование изолированных сервисных учетных записей с минимально достаточными правами.<br />
+- Разделение пулов соединений <code>ROPool</code> и <code>RWPool</code> для защиты транзакционного мастера от аналитических нагрузок.<br />
+- Использование Row-Level Security для гарантированной мультитенантной изоляции данных на уровне ядра СУБД.<br />
+- Автоматизацию привилегий через <code>ALTER DEFAULT PRIVILEGES</code> в миграциях CI/CD.</p>
+<p>Мы прошли огромный путь: от физического устройства дисковых страниц и структур индексов B-Tree до масштабирования, шардирования, наблюдаемости (<a href="19-observability-bd.html" class="wikilink">19. Observability БД</a>) и безопасности. </p>
+<p>В финальной статье раздела мы сведем все полученные знания в единую архитектурную панораму: <a href="23-itogi-razdela-polnaya-kartina-raboty-s-bazami-dannyk.html" class="wikilink">23. Итоги раздела. Полная картина работы с базами данных</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

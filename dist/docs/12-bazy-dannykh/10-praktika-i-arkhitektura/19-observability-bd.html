@@ -2168,7 +2168,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~20 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~35 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">19. Observability БД</h1>
@@ -2177,8 +2177,14 @@
           <div class="article-markdown">
             <h2 id="vvedenie">Введение</h2>
 
-<p>Наблюдаемость (observability) — это способность понимать внутреннее состояние системы по её внешним выходам. Если <a href="17-monitoring-baz-dannykh.html" class="wikilink">мониторинг</a> отвечает на вопрос «что болит?», показывая метрики и алерты, то observability идёт дальше: позволяет исследовать произвольные вопросы без заранее предсказанных дашбордов, особенно в распределённых системах. Для баз данных это три столпа: <strong>трассировка запросов</strong>, <strong>структурированные логи</strong> и <strong>метрики</strong>, склеенные общим контекстом.</p>
-<p>В Go-экосистеме полная наблюдаемость БД достигается интеграцией OpenTelemetry (OTel) с драйверами (<code>database/sql</code>, <code>pgx</code>, <code>go-redis</code>) и настройкой серверной части (PostgreSQL, Redis, MongoDB) на экспорт логов и статистики. Эта статья объясняет, как включить три столпа observability для баз данных, как они взаимодействуют под капотом и как не переплатить производительностью за избыточную телеметрию.</p>
+<p>В сложной инженерной системе мониторинг отвечает на простой вопрос: «Что именно сломалось прямо сейчас?». Он зажигает красные индикаторы на приборной панели, фиксирует всплески задержек и шлет тревожные алерты дежурному инженеру (<a href="17-monitoring-baz-dannykh.html" class="wikilink">17. Мониторинг баз данных</a>). Однако в мире современных распределенных микросервисов этого фундаментально недостаточно. Когда пользователь жалуется, что оформление заказа занимает 15 секунд вместо положенных 200 миллисекунд, классический мониторинг базы данных часто рапортует об идеальном здоровье: загрузка CPU — 12%, средний TPS стабилен, а средняя задержка запросов составляет комфортные 3 миллисекунды.</p>
+<p>Здесь на сцену выходит <strong>наблюдаемость (Observability)</strong> — способность исследовать и понимать внутреннее состояние сложнейшей системы на основе анализа ее внешних сигналов. Observability позволяет инженеру отвечать на произвольные, заранее не сформулированные вопросы: «Почему именно у пользователя с идентификатором <code>#94821</code> транзакция выполнялась 15 секунд? Какие именно SQL-операторы были вызваны в рамках его HTTP-запроса, сколько времени они ожидали освобождения блокировок и на какой реплике исполнялись?».</p>
+<p>Для базы данных наблюдаемость держится на трех неразрывных столпах:<br />
+1. <strong>Распределенная трассировка (Distributed Tracing)</strong> — сквозной путь транзакции от входного сетевого шлюза через горутины сервиса до конкретных строк СУБД.<br />
+2. <strong>Структурированные логи (Structured Logging)</strong> — контекстные журналы событий с общими идентификаторами операций (<code>trace_id</code>).<br />
+3. <strong>Агрегированные метрики (Metrics)</strong> — количественные временные ряды, связанные с трассировкой через механизм экземпляров (Exemplars).</p>
+<p>В этой главе мы разберем, как в экосистеме Go построить эталонный конвейер наблюдаемости для <code>database/sql</code>, <code>pgx</code> и <code>go-redis</code> на базе стандарта OpenTelemetry (OTel), изучим скрытые накладные расходы трассировки на аппаратное обеспечение (Mechanical Sympathy) и научимся связывать клиентские спаны с серверными процессами СУБД без ущерба для кэша планов запросов.</p>
+<hr />
 <h2 id="tri-stolpa-observability-v-kontekste-bd">Три столпа observability в контексте БД</h2>
 
 
@@ -2209,18 +2215,31 @@ Loki --&gt; Correlation
 </div>
 
 
-<p>Три столпа, собранные с единым <code>trace_id</code>, дают полную картину для любого запроса: какие SQL-операторы выполнялись, сколько времени заняли, какие строки были затронуты, и как это коррелирует с действиями пользователя.</p>
+<p>Три столпа, объединенные общим контекстом сквозного идентификатора <code>trace_id</code> (W3C Trace Context), формируют единую непрерывную панораму:<br />
+- <strong>Метрика</strong> фиксирует аномалию: скачок p99 latency на графике Grafana.<br />
+- Связанный с метрикой <strong>Exemplar</strong> указывает точный <code>trace_id</code> конкретного аномального запроса.<br />
+- Инженер в один клик переходит в распределенный <strong>трейс</strong> (Jaeger / Grafana Tempo), где видит водопад спанов и находит проблемный спан к базе данных длительностью 8 секунд.<br />
+- По этому же <code>trace_id</code> извлекаются <strong>структурированные логи</strong> (Loki / ELK), содержащие точный текст SQL-оператора, параметры запроса, имя клиента и текст возникшей ошибки.</p>
+<hr />
 <h2 id="trassirovka-zaprosov-k-bd">Трассировка запросов к БД</h2>
 
-<p>Трассировка — это цепочка спанов, представляющих путь запроса от HTTP-обработчика до строки базы данных. Для БД спаны содержат атрибуты: <code>db.system</code>, <code>db.name</code>, <code>db.statement</code>, <code>db.user</code>, <code>net.peer.name</code>, <code>net.transport</code>. Инструментирование позволяет автоматически создавать спаны вокруг каждого выполнения запроса.</p>
+<p>Трассировка — это направленный ациклический граф спанов (Span), представляющих отрезки времени выполнения операций. Для реляционных и NoSQL баз данных OpenTelemetry определяет семантическую спецификацию (Semantic Conventions) с обязательными атрибутами:<br />
+- <code>db.system</code> — тип СУБД (<code>postgresql</code>, <code>mysql</code>, <code>redis</code>, <code>mongodb</code>).<br />
+- <code>db.name</code> — целевая база данных.<br />
+- <code>db.statement</code> — нормализованный текст SQL-запроса или команды.<br />
+- <code>db.user</code> — имя пользователя, под которым выполнено подключение.<br />
+- <code>net.peer.name</code> — сетевой адрес или хостнейм сервера базы данных.<br />
+- <code>net.transport</code> — транспортный протокол (<code>IP.TCP</code>).</p>
+<p>Инструментирование Go-кода позволяет автоматически оборачивать каждое обращение к базе данных в отдельный дочерний спан, наследующий контекст активной горутины.</p>
 <h3 id="opentelemetry-i-go-drayvery">OpenTelemetry и Go-драйверы</h3>
 
-<p>Сообщество Go предлагает обёртки, внедряющие трассировку без изменения кода:</p>
+<p>Сообщество Go разработало высокопроизводительные библиотеки-обертки, внедряющие телеметрию в драйверы баз данных без переписывания бизнес-логики:</p>
 <ul>
-<li><strong><code>otelpgx</code></strong> — оборачивает <code>pgxpool</code> и <code>pgx.Conn</code>, перехватывая <code>Query</code>, <code>Exec</code>, <code>SendBatch</code>. Работает на основе <code>pgx.QueryTracer</code>.</li>
-<li><strong><code>otelsql</code></strong> — регистрирует обёртку для стандартного <code>database/sql</code>. Перехватывает <code>db.Prepare</code>, <code>db.QueryContext</code>, <code>db.ExecContext</code>, создавая спаны.</li>
-<li><strong><code>go-redis/extra/redisotel</code></strong> — добавляет трассировку в команды Redis.</li>
+<li><strong><code>otelpgx</code></strong> — инструментация для высокоскоростного драйвера <code>pgx</code>, его пула <code>pgxpool</code> и соединений <code>pgx.Conn</code>. Работает на базе встроенного интерфейса хуков <code>pgx.QueryTracer</code>, перехватывая события <code>Query</code>, <code>Exec</code>, <code>SendBatch</code> и <code>Prepare</code>.</li>
+<li><strong><code>otelsql</code></strong> — обертка для стандартного интерфейса <code>database/sql</code>. Перехватывает вызовы <code>db.Prepare</code>, <code>db.QueryContext</code>, <code>db.ExecContext</code>, измеряя время на сетевых вызовах драйвера.</li>
+<li><strong><code>go-redis/extra/redisotel</code></strong> — хук для клиента <code>go-redis</code>, создающий спаны для каждой исполняемой команды или пайплайна.</li>
 </ul>
+<p>Пример подключения трассировки к пулу <code>pgxpool</code> в современном Go-сервисе:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2230,40 +2249,79 @@ Loki --&gt; Correlation
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import (
+  <pre class="language-go"><code class="language-go">package database
+
+import (
+    &quot;context&quot;
+
     &quot;github.com/exaring/otelpgx&quot;
     &quot;github.com/jackc/pgx/v5/pgxpool&quot;
     &quot;go.opentelemetry.io/otel&quot;
 )
 
 func initDB(ctx context.Context) (*pgxpool.Pool, error) {
-    config, _ := pgxpool.ParseConfig(&quot;postgres://...&quot;)
+    config, err := pgxpool.ParseConfig(&quot;postgres://user:pass@localhost:5432/orders_db&quot;)
+    if err != nil {
+        return nil, err
+    }
+
+    // Внедряем OpenTelemetry Tracer в конфигурацию pgxpool
     config.ConnConfig.Tracer = otelpgx.NewTracer(
         otelpgx.WithTracerProvider(otel.GetTracerProvider()),
-        otelpgx.WithLogSQLStatement(true),
+        otelpgx.WithLogSQLStatement(true), // логировать нормализованный текст SQL
     )
+
     return pgxpool.NewWithConfig(ctx, config)
 }
 </code></pre>
 </div>
 
-<p>Под капотом <code>otelpgx</code> внедряет кастомный <code>pgx.QueryTracer</code>, который вызывает методы <code>TraceQueryStart</code> и <code>TraceQueryEnd</code>. В <code>TraceQueryStart</code> создаётся спан с атрибутами (SQL, аргументы — если разрешено), устанавливается родительский контекст из переданного <code>context.Context</code>. По завершении спана фиксируются длительность и статус.</p>
+<p>Под капотом библиотека <code>otelpgx</code> реализует интерфейс <code>pgx.QueryTracer</code>, определяющий два ключевых метода жизненного цикла: <code>TraceQueryStart</code> и <code>TraceQueryEnd</code>. <br />
+- В момент вызова <code>TraceQueryStart</code> из переданного <code>context.Context</code> извлекается родительский контекст трассировки, создается новый дочерний спан с именем операции, проставляются семантические атрибуты СУБД, а обновленный контекст связывается с выполняемой операцией.<br />
+- При завершении вызова метод <code>TraceQueryEnd</code> фиксирует финальную метку времени, вычисляет длительность выполнения, при наличии ошибки записывает статус <code>codes.Error</code> и завершает спан вызовом <code>span.End()</code>.</p>
 <h3 id="peredacha-konteksta-trassirovki-v-bd">Передача контекста трассировки в БД</h3>
 
-<p>Для соединения спанов клиента и серверных логов БД используется <strong>SQL комментарий</strong> с <code>traceparent</code>. Многие драйверы (включая pgx с настройкой) добавляют заголовок трассировки в начало SQL-запроса, например:</p>
-<pre><code>/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ SELECT * FROM users WHERE id=$1
+<p>Клиентская трассировка заканчивается на сетевом сокете вашего приложения. Но что, если мы хотим связать клиентский спан с серверным журналом PostgreSQL или утилитой <code>pganalyze</code>?</p>
+<p>Для этого используется стандарт <strong>SQLCommenter</strong> — внедрение комментариев стандарта W3C Trace Context непосредственно в текст SQL-запроса:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */ SELECT * FROM users WHERE id=$1
 </code></pre>
-<p>PostgreSQL может логировать этот запрос целиком, и <code>pganalyze</code>, <code>pgBadger</code> или собственный парсер извлекут <code>trace_id</code> для стыковки с логами приложения.</p>
+</div>
+
+<p>Сервер PostgreSQL при логировании медленных операций (<a href="18-slow-query-log.html" class="wikilink">18. Slow query log</a>) фиксирует этот комментарий целиком. Системы анализа логов (например, <code>pganalyze</code> или <code>pgBadger</code>) извлекают поле <code>traceparent</code> и сквозной <code>trace_id</code>, позволяя идеально связать серверный лог СУБД со спаном в Jaeger!</p>
+<hr />
 <h2 id="logirovanie-zaprosov-ot-slow-query-k-kazhdomu-vyzovu">Логирование запросов: от slow query к каждому вызову</h2>
 
-<p>Серверный журнал медленных запросов (<a href="18-slow-query-log.html" class="wikilink">18. Slow query log</a>) — основа диагностики проблем производительности. Однако observability требует не только медленные, но и все запросы с контекстом.</p>
+<p>Журнал медленных запросов сервера СУБД (<a href="18-slow-query-log.html" class="wikilink">18. Slow query log</a>) служит первой линией обороны. Однако для полноценной наблюдаемости этого мало: медленный запрос может быть симптомом, а причиной — сотни предшествующих ему микро-запросов.</p>
 <h3 id="postgresql-autoexplain-i-logstatement">PostgreSQL: auto_explain и log_statement</h3>
 
-<p>Расширение <code>auto_explain</code> (загружается через <code>shared_preload_libraries</code>) автоматически логирует план выполнения запросов, превысивших заданный порог <code>auto_explain.log_min_duration</code>. В сочетании с <code>log_statement = 'all'</code> и <code>log_line_prefix = '%m [%p] %q%u@%d '</code> можно получить полный журнал всех запросов с идентификатором процесса и пользователя.</p>
-<p>Для production это слишком дорого. Вместо этого используют <strong>выборочное логирование</strong> из приложения: Go-сервис сам решает, какие вызовы записывать в структурированный лог (например, при ошибке или при превышении порога). <code>pgx</code> позволяет подписаться на события через <code>pgx.Logger</code>, и можно интегрировать с <code>slog</code> / <code>zerolog</code>, добавляя <code>trace_id</code> и <code>span_id</code>.</p>
+<p>На стороне сервера PostgreSQL расширение <code>auto_explain</code> (подключаемое через параметр ядра <code>shared_preload_libraries</code>) способно автоматически логировать реальные планы выполнения запросов, время которых превысило порог <code>auto_explain.log_min_duration</code>. В сочетании с конфигурацией <code>log_statement = 'all'</code> и префиксом строки лога:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">log_line_prefix = '%m [%p] %q%u@%d '
+</code></pre>
+</div>
+
+<p>администратор получает исчерпывающий протокол каждого выполненного запроса с указанием PID процесса <code>%p</code>, имени пользователя <code>%u</code> и базы данных <code>%d</code>.</p>
+<p>Однако включение <code>log_statement = 'all'</code> на боевом высоконагруженном сервере абсолютно неприемлемо. Это порождает колоссальную дисковую нагрузку и способно быстро исчерпать IOPS. Инженерный стандарт состоит в <strong>выборочном клиентском логировании</strong>: приложение само решает, когда и что логировать, опираясь на контекст. Драйвер <code>pgx</code> позволяет подключить кастомный интерфейс <code>pgx.Logger</code>, направляя записи в системный логгер с обогащением метаданными.</p>
 <h3 id="structured-logging-v-go">Structured logging в Go</h3>
 
-<p>Современный Go использует <code>log/slog</code> с контекстными атрибутами:</p>
+<p>В современном Go де-факто стандартом является пакет <code>log/slog</code>. Он позволяет бесшовно обогащать логи идентификаторами трассировки:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2273,70 +2331,150 @@ func initDB(ctx context.Context) (*pgxpool.Pool, error) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">logger := slog.Default().With(&quot;trace_id&quot;, span.SpanContext().TraceID())
-logger.Info(&quot;db query&quot;, &quot;sql&quot;, query, &quot;duration_ms&quot;, duration)
+  <pre class="language-go"><code class="language-go">package repository
+
+import (
+    &quot;context&quot;
+    &quot;log/slog&quot;
+    &quot;time&quot;
+
+    &quot;go.opentelemetry.io/otel/trace&quot;
+)
+
+func LogDatabaseOperation(ctx context.Context, query string, duration time.Duration, err error) {
+    span := trace.SpanFromContext(ctx)
+    traceID := span.SpanContext().TraceID().String()
+    spanID := span.SpanContext().SpanID().String()
+
+    logger := slog.Default().With(
+        slog.String(&quot;trace_id&quot;, traceID),
+        slog.String(&quot;span_id&quot;, spanID),
+        slog.String(&quot;db.system&quot;, &quot;postgresql&quot;),
+    )
+
+    if err != nil {
+        logger.Error(&quot;database query failed&quot;,
+            slog.String(&quot;sql&quot;, query),
+            slog.Float64(&quot;duration_ms&quot;, float64(duration.Microseconds())/1000.0),
+            slog.String(&quot;error&quot;, err.Error()),
+        )
+        return
+    }
+
+    // Логируем медленные запросы на стороне Go-приложения
+    if duration &gt; 100*time.Millisecond {
+        logger.Warn(&quot;slow database query detected&quot;,
+            slog.String(&quot;sql&quot;, query),
+            slog.Float64(&quot;duration_ms&quot;, float64(duration.Microseconds())/1000.0),
+        )
+    }
+}
 </code></pre>
 </div>
 
-<p>При экспорте в Loki или ELK такие логи автоматически связываются с трейсами через <code>trace_id</code>. В совокупности с трассировкой вы видите: в каком спане родился данный SQL, какие параллельные запросы выполнялись, какие ошибки предшествовали.</p>
+<p>При отправке логов в Grafana Loki или ELK система автоматически индексирует метку <code>trace_id</code>, обеспечивая бесшовный переход от лога к трейсу и обратно.</p>
+<hr />
 <h2 id="metriki-kak-fundament">Метрики как фундамент</h2>
 
-<p>Метрики остаются необходимым компонентом: латенси запросов (P50/P95/P99), количество ошибок, размер пула соединений. OpenTelemetry SDK для Go может экспортировать метрики автоматически, если включён <code>otelgrpc</code>/<code>otelhttp</code>, а для БД используются соответствующие инструментации.</p>
-<p>Важно объединить метрики с трейсами через <strong>exemplars</strong> — прометеевские метрики могут содержать <code>trace_id</code> как пример, позволяя из дашборда Grafana перейти к конкретному трейсу в Jaeger.</p>
+<p>Метрики остаются наиболее экономичным и быстрым фундаментом наблюдаемости: латенси запросов (P50/P95/P99), количество ошибок, размер пула соединений. OpenTelemetry SDK для Go может экспортировать метрики автоматически, если включён <code>otelgrpc</code>/<code>otelhttp</code>, а для БД используются соответствующие инструментации.</p>
+<p>Критически важно связать агрегированные метрики с трассировкой через механизм <strong>Exemplars</strong>. Поддерживаемый в Prometheus и OpenTelemetry, Exemplar прикрепляет конкретный <code>trace_id</code> к точке на временном ряде метрики (например, к корзине гистограммы P99). Инженер, кликая на пик графика задержки в Grafana, мгновенно получает ссылку на реальный трейс именно того медленного запроса, который сформировал эту точку!</p>
+<hr />
 <h2 id="mechanical-sympathy-tsena-polnoy-nablyudaemosti">Mechanical Sympathy: цена полной наблюдаемости</h2>
 
-<p>Каждый созданный спан, каждое логирование и сбор метрик потребляют CPU, память и генерируют дополнительный сетевой трафик. Понимание этих затрат необходимо Senior-инженеру.</p>
-<ul>
-<li><strong>Создание спана:</strong> в Go аллокации неизбежны: слайс атрибутов, строка имени спана, временная метка. При 100 000 RPS к БД это может составлять значимую долю нагрузки. OpenTelemetry SDK позволяет настроить <strong>семплинг</strong>: <code>TraceIDRatioBased(0.01)</code> — трассировать только 1% запросов.</li>
-<li><strong>Экспорт спанов:</strong> <code>BatchSpanProcessor</code> накапливает спаны и отправляет их пачками, избегая <code>write</code> на каждый запрос. Настройка <code>MaxQueueSize</code>, <code>BatchTimeout</code> критична для баланса между задержкой доставки и нагрузкой.</li>
-<li><strong>Логирование каждого SQL:</strong> строки SQL и параметры — потенциально большие строки. Логирование в синхронном режиме (запись в файл/сокет) может добавить задержку, если используется блокирующий вызов <code>write</code>. Используйте асинхронные логгеры (zerolog с буферизацией).</li>
-<li><strong>Серверная трассировка БД:</strong> в PostgreSQL расширение <code>pg_stat_statements</code> агрегирует статистику, а не логирует всё. Но <code>pg_query_state</code> (для активных запросов) может потреблять разделяемую память. Включение <code>log_statement=all</code> в продакшене опасно — оно убьёт производительность диска (постоянная запись WAL логов) и процессор (форматирование строк). Поэтому observability на стороне сервера БД часто ограничивается агрегированными метриками и трейсами от клиента.</li>
-</ul>
+<p>Никакая телеметрия не дается бесплатно. Каждый созданный спан, каждый вызов форматирования строки лога и сбор гистограмм потребляют такты процессора, аллоцируют память и создают сетевой трафик.</p>
+<p>Взглянем на цену полной наблюдаемости через призму архитектуры машины (Mechanical Sympathy):</p>
+<ol>
+<li><strong>Аллокации спанов в памяти:</strong> Создание спана в Go требует динамического выделения структур: слайс атрибутов <code>[]attribute.KeyValue</code>, буфер имени спана, временные метки. При 100 000 RPS к СУБД непрерывная генерация спанов создаст гигантское давление на Garbage Collector. Решение — <strong>вероятностное семплирование (Sampling)</strong>:<br />
+<code>go
+   // Трассировать только 1% штатных запросов
+   sampler := trace.ParentBased(trace.TraceIDRatioBased(0.01))</code></li>
+<li><strong>Пакетная передача (Batching):</strong> Использование <code>BatchSpanProcessor</code> вместо синхронного <code>SimpleSpanProcessor</code>. Он аккумулирует спаны во внутреннем кольцевом буфере памяти и сбрасывает их в OTLP-коллектор пачками по расписанию (<code>BatchTimeout</code>, <code>MaxQueueSize</code>), минимизируя системные вызовы сокетов <code>write()</code> и переключения контекста ядра ОС.</li>
+<li><strong>Асинхронность логов:</strong> Синхронная запись логов в файл или сокет — фатальная ошибка. Если диск или демон сбора логов зависнет, блокирующий системный вызов <code>write()</code> остановит горутину и заблокирует рабочий поток рантайма. Логирование обязано быть неблокирующим (через ring buffer или буферизованные логгеры вроде <code>zerolog</code>).</li>
+<li><strong>Серверные лимиты СУБД:</strong> В PostgreSQL модуль <code>pg_stat_statements</code> агрегирует статистику в разделяемой хэш-таблице без дискового ввода-вывода. Однако расширения вроде <code>pg_query_state</code> потребляют разделяемую память. А включение <code>log_statement=all</code> на проде опасно и способно физически парализовать дисковую подсистему постоянной записью текстовых журналов и вызвать OOM. Поэтому серверная наблюдаемость обязана быть агрегированной.</li>
+</ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Prepared Statements и SQL-комментарии</span>
   </div>
   <div class="callout-body">
-    <p>Добавление <code>traceparent</code> в SQL-комментарий ломает кэширование планов запросов (prepared statements) в PostgreSQL, потому что каждый запрос теперь уникален по тексту. Решение — использовать <code>pgx</code> с <code>QueryTracer</code>, который не модифицирует SQL, а передаёт контекст через отдельный механизм (например, через параметр <code>application_name</code> или кастомную GUC, но это сложно). Лучше оставить трассировку только на клиенте, без внедрения в сам SQL, если это не критично для серверной корреляции.</p>
+    <p>Добавление заголовка <code>traceparent</code> непосредственно в текст SQL-запроса через комментарий:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">/* traceparent='...' */ SELECT * FROM users WHERE id = $1;
+</code></pre>
+</div>
+
+<p>несет смертельную опасность для PostgreSQL!</p>
+<p>Сервер СУБД строит хэш от буквального текста SQL-запроса для кэширования планов подготовленных выражений (Prepared Statements). Поскольку значение <code>traceparent</code> уникально для каждого HTTP-запроса, СУБД воспринимает каждый входящий SQL как совершенно новый уникальный запрос! Это приводит к полной инвалидации кэша планов, постоянному повторному парсингу и взрывному росту потребления разделяемой памяти.</p>
+<p><strong>Решение:</strong> Если вы используете prepared statements, откажитесь от модификации текста SQL. Ограничьтесь клиентской трассировкой либо передавайте контекст через легкие параметры сессии (например, <code>SET LOCAL application_name = ...</code>), если это действительно необходимо.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="integratsiya-s-infrastrukturoy">Интеграция с инфраструктурой</h2>
 
-<p>Экосистема observability для БД включает:</p>
+<p>Комплексный контур наблюдаемости баз данных объединяет следующие компоненты инфраструктуры:</p>
 <ul>
-<li><strong>Сбор метрик:</strong> <code>postgres_exporter</code>, <code>redis_exporter</code> отправляют в Prometheus.</li>
-<li><strong>Трассировка:</strong> OpenTelemetry Collector принимает спаны от Go-сервисов и редиректит в Jaeger или Grafana Tempo.</li>
-<li><strong>Логи:</strong> Promtail / Filebeat собирает структурированные логи Go-сервисов и самой БД (через <code>log_destination = csvlog</code> с разбором <code>log_line_prefix</code>) и отправляет в Loki / ELK.</li>
-<li><strong>Дашборды:</strong> Grafana соединяет все источники. Пример: дашборд "Observability DB" показывает корреляцию метрик TPS, латенси, ошибок, и при клике на аномалию открывает трейс с детализацией SQL-спанов.</li>
+<li><strong>Сбор метрик:</strong> СУБД-экспортеры <code>postgres_exporter</code>, <code>redis_exporter</code> собирают статистику ядра и передают ее в Prometheus или VictoriaMetrics.</li>
+<li><strong>Трассировка:</strong> Агенты OpenTelemetry Collector принимают спаны от Go-сервисов по протоколу gRPC/OTLP и маршрутизируют их в Jaeger или Grafana Tempo.</li>
+<li><strong>Логи:</strong> Агенты сбора (Promtail / Vector / Filebeat) агрегируют структурированные JSON-логи Go-сервисов и журналы самой СУБД (через <code>log_destination = csvlog</code> с автоматическим парсингом <code>log_line_prefix</code>) и направляют их в Loki или Elasticsearch/ELK.</li>
+<li><strong>Визуализация:</strong> Дашборд Grafana объединяет все три потока телеметрии на едином экране: от графика TPS и латенси до просмотра трейса и поиска контекстных логов.</li>
 </ul>
-<p>Для Go-разработчика важно настроить <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> в среде выполнения и обеспечить, чтобы контекст распространения передавался от HTTP-запроса до драйвера БД без разрывов (через <code>context.Context</code>).</p>
+<p>Для Go-разработчика ключевая задача в инфраструктуре — настроить переменную окружения <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> и гарантировать непрерывную передачу <code>context.Context</code> через всю цепочку вызовов от входящего сетевого сокета до драйвера хранилища.</p>
+<hr />
 <h2 id="prakticheskie-rekomendatsii-pri-vnedrenii">Практические рекомендации при внедрении</h2>
 
 <ol>
-<li><strong>Начните с метрик</strong> — они дешёвые и дают базовую картину. Добавьте <code>pg_stat_statements</code> и Prometheus exporter.</li>
-<li><strong>Включите трассировку с низким семплингом</strong> (1%), чтобы не уронить прод. Используйте <code>otelsql</code> или <code>otelpgx</code>.</li>
-<li><strong>Логируйте только ошибки и медленные запросы</strong> на уровне приложения, добавляя <code>trace_id</code>. Не включайте <code>log_statement=all</code> на сервере.</li>
-<li><strong>Маскируйте чувствительные данные</strong>: в атрибутах спана заменяйте значения параметров на <code>?</code> с помощью <code>WithLogSQLStatement(false)</code> или собственного фильтра.</li>
-<li><strong>Объединяйте трейсы и логи через <code>trace_id</code></strong> — это даёт суперсилу при дебаге.</li>
+<li><strong>Начните с метрик</strong> — они предельно дешевы по ресурсам и дают немедленное понимание базового состояния системы. Подключите <code>pg_stat_statements</code> и Prometheus exporter.</li>
+<li><strong>Включите трассировку с низким семплингом</strong> (например, <code>TraceIDRatioBased(0.01)</code> — 1% трафика). Используйте проверенные обертки <code>otelsql</code> или <code>otelpgx</code>.</li>
+<li><strong>Логируйте только ошибки и медленные запросы</strong> на уровне приложения, обязательно обогащая их контекстом <code>trace_id</code>. Категорически избегайте <code>log_statement = 'all'</code> на сервере.</li>
+<li><strong>Маскируйте чувствительные данные</strong>: персональные данные пользователей (PII), токены и пароли ни в коем случае не должны попадать в спаны и логи. В библиотеках трассировки используйте опцию маскирования параметров <code>WithLogSQLStatement(false)</code> или внедряйте кастомные фильтры санитайзинга.</li>
+<li><strong>Объединяйте трейсы и логи через <code>trace_id</code></strong> — наличие общего сквозного идентификатора сокращает среднее время расследования инцидента (MTTR) с нескольких часов до пары минут.</li>
 </ol>
+<hr />
+<h2 id="lovushki-i-voprosy-s-sobesedovaniy">Ловушки и вопросы с собеседований</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как вы отладите ситуацию, когда пользователи жалуются на медленные ответы API, а метрики PostgreSQL показывают среднюю задержку 5 мс и никаких алертов?<br />
-<strong>Ответ:</strong><br />
-Включу трассировку для проблемного эндпоинта с увеличенным семплингом. В трейсе увижу цепочку спанов: возможно, не один долгий запрос, а много последовательных быстрых запросов в цикле (N+1 проблема). Метрики среднего этого не показывают, а трейс покажет. Затем, используя <code>trace_id</code>, найду логи и проверю, какие именно запросы выполнялись. Скорее всего, причина в отсутствии batch-запроса или JOIN'а, из-за чего горутины проводят время в ожидании сети и парсинге, а сама БД быстро отвечает на каждый отдельный запрос.</p>
+    <p><strong>Вопрос:</strong> Пользователи жалуются на медленную загрузку страниц профиля (отклик 3–4 секунды). При этом мониторинг PostgreSQL показывает, что средняя задержка выполнения запросов составляет 2 мс, нагрузка на CPU базы не превышает 15%, а алерты производительности молчат. Как вы будете расследовать эту проблему?</p>
+<p><strong>Ответ:</strong> Это классическая иллюстрация разрыва между мониторингом и наблюдаемостью:<br />
+1. Средняя задержка базы в 2 мс скрывает проблему множественных вызовов (проблема N+1). Сервис может выполнять 1 000 быстрых запросов последовательно в цикле, каждый из которых занимает 2 мс. Для базы данных каждый запрос тривиален, но суммарно клиент ждет 2–3 секунды из-за накладных расходов сетевых round-trips.<br />
+2. Для расследования я открою распределенный трейс проблемного HTTP-запроса в Jaeger/Tempo. На графе водопада спанов будет наглядно видна длинная «лесенка» из сотен мелких последовательных спанов <code>db.statement</code>.<br />
+3. По <code>trace_id</code> найду связанные логи сервиса, чтобы понять, какой именно цикл в Go-коде порождает эти запросы.<br />
+4. Решение: переписать обращение к БД на пакетную выборку (<code>WHERE id IN (...)</code>) или объединить данные через <code>JOIN</code>, сократив количество сетевых вызовов с 1 000 до одного.</p>
   </div>
 </div>
 
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha</span>
+  </div>
+  <div class="callout-body">
+    <ul>
+<li><strong>Утечка PII в атрибуты спанов:</strong> По умолчанию сохранение параметров запроса может отправить в систему трассировки хэши паролей, номера кредитных карт или паспортные данные. Всегда отключайте логирование значений аргументов в продакшене.</li>
+<li><strong>Разрыв контекста в горутинах:</strong> В Go частая ошибка — запуск фоновой горутины с передачей пустого <code>context.Background()</code> вместо родительского контекста запроса. В результате спаны фоновой обработки БД отрываются от общего трейса пользователя, и трассировка становится фрагментированной.</li>
+</ul>
+  </div>
+</div>
+
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Observability баз данных — это не роскошь, а необходимость в распределённом Go-бэкенде. С помощью OpenTelemetry и структурированного логирования мы превращаем чёрный ящик SQL-запросов в понятную, трассируемую систему, где каждый запрос может быть отслежен от пользователя до дискового ввода-вывода. Ключ к успеху — разумный баланс между полнотой телеметрии и производительностью, достигаемый семплингом, асинхронностью и маскированием данных.</p>
-<p>В следующей статье мы перейдём к не менее важному аспекту — защите баз данных от угроз, включая SQL-инъекции и управление доступом: <a href="20-bezopasnost-bd.html" class="wikilink">20. Безопасность БД</a>.</p>
+<p>Observability баз данных — это не просто дань инженерной моде, а краеугольный камень надежности современного распределенного бэкенда. Объединяя распределенную трассировку OpenTelemetry, структурированные логи <code>log/slog</code> и метрики пулов соединений, мы превращаем черный ящик базы данных в прозрачный, математически предсказуемый механизм.</p>
+<p>Мы научились измерять, логировать и оптимизировать поведение баз данных. Однако идеальная производительность бесполезна, если база данных уязвима для атак и утечек. В следующей главе мы переходим к фундаментальным принципам защиты данных: <a href="20-bezopasnost-bd.html" class="wikilink">20. Безопасность БД</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2364,7 +2502,7 @@ logger.Info(&quot;db query&quot;, &quot;sql&quot;, query, &quot;duration_ms&quot
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vvedenie">Введение</a></li><li class="toc-item toc-h2"><a href="#tri-stolpa-observability-v-kontekste-bd">Три столпа observability в контексте БД</a></li><li class="toc-item toc-h2"><a href="#trassirovka-zaprosov-k-bd">Трассировка запросов к БД</a></li><li class="toc-item toc-h3"><a href="#opentelemetry-i-go-drayvery">OpenTelemetry и Go-драйверы</a></li><li class="toc-item toc-h3"><a href="#peredacha-konteksta-trassirovki-v-bd">Передача контекста трассировки в БД</a></li><li class="toc-item toc-h2"><a href="#logirovanie-zaprosov-ot-slow-query-k-kazhdomu-vyzovu">Логирование запросов: от slow query к каждому вызову</a></li><li class="toc-item toc-h3"><a href="#postgresql-autoexplain-i-logstatement">PostgreSQL: autoexplain и logstatement</a></li><li class="toc-item toc-h3"><a href="#structured-logging-v-go">Structured logging в Go</a></li><li class="toc-item toc-h2"><a href="#metriki-kak-fundament">Метрики как фундамент</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-polnoy-nablyudaemosti">Mechanical Sympathy: цена полной наблюдаемости</a></li><li class="toc-item toc-h2"><a href="#integratsiya-s-infrastrukturoy">Интеграция с инфраструктурой</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-rekomendatsii-pri-vnedrenii">Практические рекомендации при внедрении</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#vvedenie">Введение</a></li><li class="toc-item toc-h2"><a href="#tri-stolpa-observability-v-kontekste-bd">Три столпа observability в контексте БД</a></li><li class="toc-item toc-h2"><a href="#trassirovka-zaprosov-k-bd">Трассировка запросов к БД</a></li><li class="toc-item toc-h3"><a href="#opentelemetry-i-go-drayvery">OpenTelemetry и Go-драйверы</a></li><li class="toc-item toc-h3"><a href="#peredacha-konteksta-trassirovki-v-bd">Передача контекста трассировки в БД</a></li><li class="toc-item toc-h2"><a href="#logirovanie-zaprosov-ot-slow-query-k-kazhdomu-vyzovu">Логирование запросов: от slow query к каждому вызову</a></li><li class="toc-item toc-h3"><a href="#postgresql-autoexplain-i-logstatement">PostgreSQL: autoexplain и logstatement</a></li><li class="toc-item toc-h3"><a href="#structured-logging-v-go">Structured logging в Go</a></li><li class="toc-item toc-h2"><a href="#metriki-kak-fundament">Метрики как фундамент</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-polnoy-nablyudaemosti">Mechanical Sympathy: цена полной наблюдаемости</a></li><li class="toc-item toc-h2"><a href="#integratsiya-s-infrastrukturoy">Интеграция с инфраструктурой</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-rekomendatsii-pri-vnedrenii">Практические рекомендации при внедрении</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-voprosy-s-sobesedovaniy">Ловушки и вопросы с собеседований</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

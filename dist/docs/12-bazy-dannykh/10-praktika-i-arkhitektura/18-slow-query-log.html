@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~36 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">18. Slow query log</h1>
           </header>
@@ -2177,35 +2177,98 @@
           <div class="article-markdown">
             <h2 id="slow-query-log-vyyavlenie-i-analiz-medlennykh-zaprosov-v-bd">🐢 Slow Query Log: выявление и анализ медленных запросов в БД</h2>
 
-<p><strong>Slow Query Log (лог медленных запросов)</strong> — это механизм регистрации запросов, выполнение которых заняло больше заданного порогового времени. Это один из основных инструментов диагностики производительности баз данных, позволяющий выявлять проблемные SQL-операторы, требующие оптимизации.</p>
+<p>В механике существует старое мудрое правило: «Машина ломается не там, где шумит, а там, где трение переходит в перегрев». Когда высоконагруженная база данных начинает захлебываться, а среднее время ответа приложения растет, неопытный инженер бросается изучать общую загрузку процессора или наращивать память. Но общие метрики коварны: один-единственный кривой SQL-запрос, выполняющийся раз в секунду и сканирующий 50 миллионов строк в памяти, способен незаметно вытеснить из кэша все рабочие таблицы и поставить дисковую подсистему на колени.</p>
+<p><strong>Slow Query Log (журнал медленных запросов)</strong> — это штатный бортовой самописец СУБД, регистрирующий все операции, время выполнения которых превысило заранее установленный временной порог (threshold). Это фундаментальный хирургический инструмент инженера и DBA, позволяющий отделить тысячи быстрых штатных транзакций от редких «тяжеловесов», отравляющих работу всей системы.</p>
+<p>В этой главе мы подробно разберем механику работы журналов медленных запросов в MySQL, PostgreSQL, MS SQL и Oracle, изучим влияние сбора логов на дисковую подсистему (Mechanical Sympathy) и покажем, как Go-разработчикам эффективно связывать медленные запросы со своим кодом.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Execution[&quot;Исполнение SQL-запроса&quot;]
+Client[&quot;Go Service / Driver&quot;] --&gt;|&quot;SQL Query&quot;| Engine[&quot;Ядро СУБД (Executor)&quot;]
+TimerStart[&quot;Фиксация времени начала t0&quot;] --&gt; Engine
+Engine --&gt; TimerEnd[&quot;Завершение t1: Duration = t1 - t0&quot;]
+end
+
+subgraph Decision[&quot;Фильтр порога (Threshold Engine)&quot;]
+TimerEnd --&gt; Check{&quot;Duration &gt;= threshold\nИЛИ no_index?&quot;}
+Check --&quot;Нет&quot;--&gt; Fast[&quot;Быстрый возврат клиенту\n(Без записи в журнал)&quot;]
+Check --&quot;Да&quot;--&gt; Format[&quot;Сбор контекста:\nUser, Host, Lock time, Rows examined&quot;]
+end
+
+subgraph Storage[&quot;Хранение и Анализ&quot;]
+Format --&gt; Target{&quot;log_output&quot;}
+Target --&gt;|&quot;FILE (Рекомендуется)&quot;| LogFile[(&quot;Файл лога на диске\n(/var/log/slow.log)&quot;)]
+Target --&gt;|&quot;TABLE (Антипаттерн)&quot;| SlowTable[(&quot;mysql.slow_log\n(Блокировки метаданных)&quot;)]
+Target --&gt;|&quot;Shared Memory&quot;| StatStatements[(&quot;pg_stat_statements\n(In-Memory Hash Table)&quot;)]
+
+LogFile --&gt; Analyzer[&quot;Пакетный анализ:\npt-query-digest / mysqldumpslow&quot;]
+StatStatements --&gt; PromExporter[&quot;Prometheus / Grafana&quot;]
+end
+
+classDef exec fill:#1e293b,stroke:#38bdf8,stroke-width:1px,color:#f8fafc;
+classDef dec fill:#0f172a,stroke:#f59e0b,stroke-width:1px,color:#f8fafc;
+classDef store fill:#1e293b,stroke:#818cf8,stroke-width:1px,color:#f8fafc;
+class Execution,Client,Engine,TimerStart,TimerEnd exec;
+class Decision,Check,Fast,Format dec;
+class Storage,Target,LogFile,SlowTable,StatStatements,Analyzer,PromExporter store;
+  </pre>
+</div>
+
+
 <hr />
 <h3 id="zachem-nuzhen-slow-query-log">📌 Зачем нужен Slow Query Log?</h3>
 
+<p>Логирование медленных запросов выполняет пять важнейших стратегических задач:</p>
 <ol>
-<li><strong>Выявление узких мест</strong> — находит запросы, которые потребляют больше всего ресурсов и времени.</li>
-<li><strong>Оптимизация производительности</strong> — помогает определить, какие запросы нужно оптимизировать (добавить индексы, переписать SQL).</li>
-<li><strong>Мониторинг и анализ</strong> — позволяет отслеживать изменения производительности со временем.</li>
-<li><strong>Планирование масштабирования</strong> — показывает нагрузку на БД, помогает принимать решения о масштабировании.</li>
-<li><strong>Соответствие SLA</strong> — помогает гарантировать, что время отклика системы соответствует требованиям бизнеса.</li>
+<li><strong>Выявление узких мест</strong> — находит запросы, которые потребляют больше всего ресурсов и времени (CPU, disk IO, lock wait time).</li>
+<li><strong>Оптимизация производительности</strong> — помогает определить, какие запросы нужно оптимизировать (добавить индексы, переписать SQL, применить денормализацию).</li>
+<li><strong>Мониторинг и анализ</strong> — позволяет отслеживать изменения производительности со временем при росте объема данных.</li>
+<li><strong>Планирование масштабирования</strong> — показывает реальную нагрузку на БД, помогает принимать взвешенные решения о шардировании, партиционировании или переходе на чтение с реплик.</li>
+<li><strong>Соответствие SLA</strong> — помогает гарантировать, что время отклика системы соответствует строгим требованиям бизнеса и соглашениям об уровне сервиса.</li>
 </ol>
 <hr />
 <h3 id="kak-rabotaet-slow-query-log">⚙️ Как работает Slow Query Log</h3>
 
+<p>Механизм логирования встроен непосредственно в цикл выполнения команд движка СУБД:</p>
 <ol>
-<li><strong>Пороговое время (threshold)</strong> — запросы, выполняющиеся дольше этого времени, записываются в лог.</li>
-<li><strong>Запись в лог</strong> — информация о запросе: текст SQL, время выполнения, пользователь, база данных, время начала, количество возвращенных строк и т.д.</li>
+<li><strong>Пороговое время (threshold)</strong> — запросы, выполняющиеся дольше этого времени, записываются в лог. Порог задается в миллисекундах или секундах (например, <code>0.1</code> с или <code>100ms</code>).</li>
+<li><strong>Запись в лог</strong> — в лог сохраняется исчерпывающая метаинформация о запросе: точный текст SQL-оператора, время выполнения (<code>Query_time</code>), время удержания блокировок (<code>Lock_time</code>), имя пользователя и хост, имя базы данных, метка времени начала, количество возвращенных строк (<code>Rows_sent</code>) и количество просканированных строк (<code>Rows_examined</code>).</li>
 <li><strong>Хранение логов</strong> — в файле, таблице (в MySQL) или системном каталоге (в PostgreSQL).</li>
 </ol>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Rows Sent vs Rows Examined</span>
+  </div>
+  <div class="callout-body">
+    <p>Главный маркер катастрофы в логе медленных запросов — гигантский разрыв между <code>Rows_sent</code> и <code>Rows_examined</code>. </p>
+<p>Если запрос вернул клиенту 5 строк (<code>Rows_sent: 5</code>), но для этого движку пришлось просканировать 2 000 000 строк таблицы (<code>Rows_examined: 2000000</code>), это классический <code>Full Table Scan</code>. Вся таблица была поднята с диска в ОЗУ только для того, чтобы отбросить 99.999% данных. Это явный кандидат на создание индекса (<a href="../04-indeksy-i-proizvoditelnost/10-plan-vypolneniya-zaprosa-explain.html" class="wikilink">10. План выполнения запроса. EXPLAIN</a>).</p>
+  </div>
+</div>
+
 <hr />
 <h3 id="nastroyka-i-ispolzovanie-v-raznykh-subd">🛠️ Настройка и использование в разных СУБД</h3>
 
+<p>Каждая промышленная СУБД обладает собственной спецификой и архитектурными компромиссами при регистрации медленных операций.</p>
 <h4 id="1-mysql-mariadb">**1. MySQL / MariaDB**</h4>
 
+<p>В экосистеме MySQL журнал медленных запросов исторически является основным средством профилирования.</p>
 <p><strong>Ключевые параметры:</strong><br />
 - <code>slow_query_log</code> — включить/выключить логирование (<code>ON</code>/<code>OFF</code>).<br />
-- <code>long_query_time</code> — пороговое время в секундах (может быть с дробной частью, например, 0.1).<br />
-- <code>log_queries_not_using_indexes</code> — записывать запросы, не использующие индексы, даже если они быстрее порога.<br />
-- <code>slow_query_log_file</code> — путь к файлу лога.<br />
+- <code>long_query_time</code> — пороговое время в секундах (может быть с дробной частью, например, 0.1 для отлова запросов длиннее 100 мс).<br />
+- <code>log_queries_not_using_indexes</code> — записывать запросы, не использующие индексы, даже если они быстрее порога (позволяет поймать скрытые table scan на маленьких таблицах до того, как они вырастут).<br />
+- <code>slow_query_log_file</code> — абсолютный путь к файлу лога на файловой системе.<br />
 - <code>log_output</code> — куда писать: <code>FILE</code>, <code>TABLE</code> (в таблицу <code>mysql.slow_log</code>) или <code>NONE</code>.</p>
 <p><strong>Пример настройки:</strong></p>
 
@@ -2223,9 +2286,20 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 </code></pre>
 </div>
 
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: log_output = TABLE</span>
+  </div>
+  <div class="callout-body">
+    <p>Никогда не используйте параметр <code>log_output = 'TABLE'</code> на высоконагруженном продакшене! </p>
+<p>Запись в таблицу <code>mysql.slow_log</code> использует стандартные механизмы транзакционного движка. Если база начинает деградировать и генерировать сотни медленных запросов в секунду, каждый поток пытается заблокировать таблицу <code>mysql.slow_log</code> для вставки записи. Возникает каскадный коллапс блокировок (<code>lock contention</code>), и сам логгер добивает упавшую базу данных. Всегда направляйте лог в файл (<code>log_output = 'FILE'</code>), где запись выполняется через последовательный буферизованный системный вызов <code>write()</code>.</p>
+  </div>
+</div>
+
 <p><strong>Инструменты анализа:</strong><br />
-- <code>mysqldumpslow</code> — утилита для агрегации и суммирования медленных запросов (показывает похожие запросы, их количество, общее время).<br />
-- <code>pt-query-digest</code> (Percona Toolkit) — мощный инструмент для детального анализа логов, построения отчетов, выявления трендов.</p>
+- <code>mysqldumpslow</code> — утилита для агрегации и суммирования медленных запросов (показывает похожие запросы, их количество, общее время, заменяя числа и строки абстрактными <code>N</code> и <code>'S'</code>).<br />
+- <code>pt-query-digest</code> (Percona Toolkit) — промышленный золотой стандарт анализа: строит сводный отчет по закону Парето (ранжирует запросы по суммарному времени потребления ресурсов), выявляет тренды и распределения.</p>
 <p><strong>Пример использования mysqldumpslow:</strong></p>
 
 <div class="code-block" data-lang="bash">
@@ -2242,15 +2316,16 @@ SET GLOBAL log_queries_not_using_indexes = 'ON';
 
 <p>(Показывает топ запросов по времени выполнения.)</p>
 <p><strong>Рекомендации:</strong><br />
-- Включать на продакшене, но с аккуратным порогом (например, 1-2 секунды).<br />
+- Включать на продакшене, но с аккуратным порогом (например, 1-2 секунды, постепенно снижая до 0.2–0.5 с по мере оптимизации).<br />
 - Анализировать регулярно, особенно после изменений в данных или схеме.<br />
-- Для высоконагруженных систем: можно использовать семплирование (логировать только часть запросов).</p>
+- Для высоконагруженных систем: можно использовать семплирование (логировать только часть запросов) через <code>log_slow_rate_limit</code> (в Percona Server).</p>
 <hr />
 <h4 id="2-postgresql">**2. PostgreSQL**</h4>
 
+<p>Философия PostgreSQL отдает предпочтение модульности и минимальному влиянию на дисковый ввод-вывод.</p>
 <p><strong>Ключевые параметры:</strong><br />
-- <code>log_min_duration_statement</code> — минимальное время выполнения в миллисекундах, при котором запрос попадает в лог.<br />
-- <code>log_line_prefix</code> — формат строки лога (можно добавить информацию о запросе).<br />
+- <code>log_min_duration_statement</code> — минимальное время выполнения в миллисекундах, при котором запрос попадает в лог (значение <code>1000</code> логирует запросы от 1 с, <code>250</code> — от 250 мс, <code>-1</code> выключает логирование, <code>0</code> логирует вообще все запросы).<br />
+- <code>log_line_prefix</code> — формат строки лога (можно добавить информацию о запросе: идентификатор процесса <code>%p</code>, имя пользователя <code>%u</code>, имя базы <code>%d</code>, метку времени <code>%m</code>, идентификатор транзакции <code>%x</code>).<br />
 - <code>log_statement</code> — можно логировать все запросы (<code>all</code>), но это создает большую нагрузку.</p>
 <p><strong>Пример настройки:</strong></p>
 
@@ -2268,8 +2343,8 @@ SELECT pg_reload_conf();
 </div>
 
 <p><strong>Расширения:</strong><br />
-- <code>pg_stat_statements</code> — собирает статистику по всем выполненным запросам: количество вызовов, общее время, строки, планирование и выполнение. Это более современный и эффективный способ анализа, чем логи.<br />
-- <code>auto_explain</code> — автоматически записывает планы выполнения запросов, занимающих больше заданного времени.</p>
+- <code>pg_stat_statements</code> — собирает статистику по всем выполненным запросам: количество вызовов, общее время, строки, планирование и выполнение. Это более современный и эффективный способ анализа, чем логи, так как он накапливает данные в оперативной памяти без дисковых операций.<br />
+- <code>auto_explain</code> — расширение, автоматически записывающее в журнал реальные планы выполнения (<code>EXPLAIN</code>) запросов, превысивших заданный порог <code>auto_explain.log_min_duration</code>.</p>
 <p><strong>Пример использования pg_stat_statements:</strong></p>
 
 <div class="code-block" data-lang="sql">
@@ -2290,14 +2365,15 @@ LIMIT 10;
 <p>(Показывает топ-10 запросов по общему времени выполнения.)</p>
 <p><strong>Рекомендации:</strong><br />
 - Использовать <code>pg_stat_statements</code> для постоянного мониторинга.<br />
-- Настройка <code>log_min_duration_statement</code> полезна для разового анализа, но создает нагрузку на диск.</p>
+- Настройка <code>log_min_duration_statement</code> полезна для разового анализа, но создает нагрузку на диск при слишком низком пороге.</p>
 <hr />
 <h4 id="3-microsoft-sql-server">**3. Microsoft SQL Server**</h4>
 
+<p>В MS SQL Server исторические профайлеры уступили место легковесным событийным движкам.</p>
 <p><strong>Инструменты:</strong><br />
-- <strong>Extended Events (XEvents)</strong> — современный механизм для отслеживания событий, включая длительные запросы. Можно настроить сессию для перехвата запросов с длительностью больше порога.<br />
-- <strong>Query Store</strong> — встроенный функционал для сбора статистики по запросам, планам выполнения и ресурсам. Позволяет видеть историю запросов и их производительности.<br />
-- <strong>SQL Trace / SQL Server Profiler</strong> — устаревшие, но все еще используемые инструменты для трассировки запросов.</p>
+- <strong>Extended Events (XEvents)</strong> — современный высокопроизводительный механизм ядра для отслеживания системных событий, включая длительные запросы. Работает с микроскопическими накладными расходами памяти. Можно настроить сессию для перехвата запросов с длительностью больше порога.<br />
+- <strong>Query Store</strong> — встроенный функционал для автоматического сбора статистики по запросам, планам выполнения и ресурсам. Позволяет видеть историю запросов и их производительности прямо в SQL Server Management Studio (SSMS), а также фиксировать стабильные планы («plan pinning»).<br />
+- <strong>SQL Trace / SQL Server Profiler</strong> — устаревшие, но все еще используемые инструменты для трассировки запросов, создающие заметную нагрузку на сервер.</p>
 <p><strong>Пример настройки Extended Events:</strong></p>
 
 <div class="code-block" data-lang="sql">
@@ -2320,14 +2396,15 @@ ALTER EVENT SESSION [LongRunningQueries] ON SERVER STATE = START;
 
 <p><strong>Рекомендации:</strong><br />
 - Использовать Query Store для постоянного мониторинга.<br />
-- Extended Events — для детального анализа и отладки.</p>
+- Extended Events — для детального анализа и отладки конкретных инцидентов.</p>
 <hr />
 <h4 id="4-oracle-database">**4. Oracle Database**</h4>
 
+<p>В СУБД Oracle профилирование тесно интегрировано с системным представлением сессий.</p>
 <p><strong>Инструменты:</strong><br />
-- <strong>AWR (Automatic Workload Repository)</strong> — собирает статистику по работе БД, включая SQL-запросы.<br />
-- <strong>ASH (Active Session History)</strong> — история активных сессий, позволяет видеть, какие запросы выполнялись в конкретные моменты времени.<br />
-- <strong>SQL Trace / TKPROF</strong> — трассировка SQL-запросов с последующим форматированием отчета.</p>
+- <strong>AWR (Automatic Workload Repository)</strong> — собирает статистику по работе БД, включая снимки производительности SQL-запросов каждые 60 минут.<br />
+- <strong>ASH (Active Session History)</strong> — поминутная история активных сессий, опрашивающая память каждую секунду. Позволяет видеть, какие запросы выполнялись в конкретные моменты времени в прошлом без включения тяжелых логов.<br />
+- <strong>SQL Trace / TKPROF</strong> — классическая трассировка SQL-запросов на уровне отдельного процесса сессии с последующим форматированием сырого файла трассировки консольной утилитой <code>tkprof</code>.</p>
 <p><strong>Пример включения трассировки для сессии:</strong></p>
 
 <div class="code-block" data-lang="sql">
@@ -2351,18 +2428,19 @@ EXEC DBMS_SESSION.SESSION_TRACE_ENABLE(waits =&gt; TRUE, binds =&gt; TRUE);
 <hr />
 <h3 id="analiz-logov-i-instrumenty">📊 Анализ логов и инструменты</h3>
 
+<p>Сырой лог медленных запросов на миллион строк бесполезен для человека. Для извлечения пользы применяются специализированные конвейеры:</p>
 <ol>
 <li>
 <p><strong>Сбор и агрегация:</strong><br />
-   - Утилиты вроде <code>mysqldumpslow</code>, <code>pt-query-digest</code>.<br />
-   - Системы мониторинга: Prometheus + Grafana, Zabbix, Nagios (с плагинами).<br />
-   - Облачные решения: AWS RDS Performance Insights, Google Cloud SQL Insights.</p>
+   - Консольные утилиты: <code>mysqldumpslow</code>, <code>pt-query-digest</code> (позволяют сгруппировать миллионы записей в 10–20 уникальных шаблонов).<br />
+   - Системы мониторинга: Prometheus + Grafana, Zabbix, Nagios (с плагинами анализа логов).<br />
+   - Облачные решения: AWS RDS Performance Insights, Google Cloud SQL Insights (автоматически визуализируют нагрузку на CPU в разрезе конкретных SQL-запросов и ожиданий <code>Wait Events</code>).</p>
 </li>
 <li>
 <p><strong>Выявление проблем:</strong><br />
-   - Запросы с высоким временем выполнения.<br />
-   - Запросы с высоким количеством сканируемых строк (full table scan).<br />
-   - Запросы с неэффективными планами выполнения (отсутствие индексов, неоптимальные join).</p>
+   - Запросы с высоким временем выполнения (Latency outliers).<br />
+   - Запросы с высоким количеством сканируемых строк (full table scan, дефицит индексов).<br />
+   - Запросы с неэффективными планами выполнения (отсутствие индексов, неоптимальные join, Hash Join вместо Index Scan).</p>
 </li>
 <li>
 <p><strong>Анализ планов выполнения:</strong><br />
@@ -2371,42 +2449,51 @@ EXEC DBMS_SESSION.SESSION_TRACE_ENABLE(waits =&gt; TRUE, binds =&gt; TRUE);
 </li>
 <li>
 <p><strong>Действия после анализа:</strong><br />
-   - Добавление/изменение индексов.<br />
-   - Переписывание SQL (избегать подзапросов, использовать правильные join).<br />
-   - Обновление статистики таблиц (ANALYZE, UPDATE STATISTICS).<br />
-   - Изменение конфигурации БД (например, увеличение буферов).</p>
+   - Добавление/изменение индексов (покрывающие индексы, B-Tree, GIN).<br />
+   - Переписывание SQL (избегать подзапросов, использовать правильные join, заменять <code>SELECT *</code> на конкретные колонки).<br />
+   - Обновление статистики таблиц (<code>ANALYZE</code>, <code>UPDATE STATISTICS</code>), чтобы оптимизатор не ошибался в кардинальности.<br />
+   - Изменение конфигурации БД (например, увеличение буферов <code>shared_buffers</code> или <code>innodb_buffer_pool_size</code>).</p>
 </li>
 </ol>
 <hr />
 <h3 id="luchshie-praktiki-raboty-s-slow-query-log">📈 Лучшие практики работы с Slow Query Log</h3>
 
+<p>Для того чтобы журнал медленных запросов приносил пользу, а не превращался в кладбище терабайтов дискового пространства, придерживайтесь проверенных инженерных правил:</p>
 <ol>
-<li><strong>Регулярный анализ</strong> — настроить еженедельный или ежедневный просмотр логов.</li>
-<li><strong>Автоматизация</strong> — использовать скрипты для агрегации отчетов и отправки по email/в мессенджеры.</li>
-<li><strong>Тестирование изменений</strong> — после оптимизации запроса проверять его производительность на тестовых данных.</li>
-<li><strong>Мониторинг в реальном времени</strong> — интеграция с системами мониторинга для алертинга при появлении медленных запросов.</li>
-<li><strong>Документирование</strong> — вести журнал оптимизаций и их результатов.</li>
+<li><strong>Регулярный анализ</strong> — настроить еженедельный или ежедневный просмотр логов командой разработки.</li>
+<li><strong>Автоматизация</strong> — использовать CI/CD скрипты для генерации регулярных отчетов <code>pt-query-digest</code> и отправки сводки топ-10 запросов по email или в корпоративный мессенджер.</li>
+<li><strong>Тестирование изменений</strong> — после оптимизации запроса проверять его производительность на реалистичном тестовом стенде с боевым объемом данных.</li>
+<li><strong>Мониторинг в реальном времени</strong> — интеграция с системами мониторинга для алертинга при появлении медленных запросов, выбивающихся за критический порог (например, запросы дольше 10 секунд).</li>
+<li><strong>Документирование</strong> — вести журнал оптимизаций и их результатов (какой индекс был добавлен и насколько снизился <code>Rows_examined</code>).</li>
 <li><strong>Баланс между детализацией и нагрузкой</strong> — не включать логирование всех запросов на высоконагруженных системах, использовать семплирование.</li>
+<li><strong>Использование sqlcommenter (Связь с Go):</strong> Внедряйте в SQL-запросы метаданные о вызвающей горутине и эндпоинте в виде комментариев:<br />
+<code>go
+   // Go: добавление контекста для Slow Query Log
+   query := fmt.Sprintf("SELECT id, name FROM users WHERE tenant_id = $1 /* handler=%s, trace_id=%s */", 
+       handlerName, traceID)</code><br />
+   Когда запрос попадет в Slow Query Log, DBA или инженер мгновенно увидит имя HTTP-хэндлера и <code>TraceID</code>, не гадая, какой из 50 микросервисов сгенерировал этот SQL.</li>
 </ol>
 <hr />
 <h3 id="svyaz-s-drugimi-temami-arkhitektury-bd">🔗 Связь с другими темами архитектуры БД</h3>
 
+<p>Slow Query Log не существует в вакууме — он связан со всеми слоями архитектуры данных:</p>
 <ul>
-<li><strong>Индексы</strong> — многие медленные запросы решаются добавлением правильных индексов.</li>
-<li><strong>Репликация и шардирование</strong> — если запросы медленные из-за объема данных, возможно, пора подумать о масштабировании.</li>
-<li><strong>Кэширование</strong> — некоторые запросы можно кэшировать на уровне приложения или БД.</li>
-<li><strong>Транзакции и блокировки</strong> — медленные запросы могут быть вызваны блокировками, что требует анализа конкурентного доступа.</li>
+<li><strong>Индексы</strong> — многие медленные запросы решаются добавлением правильных индексов (<a href="../04-indeksy-i-proizvoditelnost/10-plan-vypolneniya-zaprosa-explain.html" class="wikilink">10. План выполнения запроса. EXPLAIN</a>).</li>
+<li><strong>Репликация и шардирование</strong> — если запросы медленные из-за объема данных, возможно, пора подумать о масштабировании (<a href="13-highload-bazy-dannykh.html" class="wikilink">13. Highload базы данных</a>, <a href="14-hot-partition-i-skew.html" class="wikilink">14. Hot partition и skew</a>).</li>
+<li><strong>Кэширование</strong> — некоторые запросы можно кэшировать на уровне приложения или БД (<a href="7-keshirovanie-poverkh-bd.html" class="wikilink">7. Кэширование поверх БД</a>).</li>
+<li><strong>Транзакции и блокировки</strong> — медленные запросы могут быть вызваны блокировками, что требует анализа конкурентного доступа (<a href="8-cqrs-i-bazy-dannykh.html" class="wikilink">8. CQRS и базы данных</a>).</li>
 </ul>
 <hr />
 <h3 id="primer-bystroy-nastroyki-v-mysql">💡 Пример быстрой настройки в MySQL</h3>
 
+<p>Пошаговый сценарий оптимизации на реальном стенде:</p>
 <ol>
 <li>Включить лог:<br />
 <code>sql
    SET GLOBAL slow_query_log = 'ON';
    SET GLOBAL long_query_time = 1;
    SET GLOBAL log_queries_not_using_indexes = 'ON';</code></li>
-<li>Выполнить типичные запросы на продакшене (или нагрузочное тестирование).</li>
+<li>Выполнить типичные запросы на продакшене (или запустить нагрузочное тестирование).</li>
 <li>Проанализировать лог:<br />
 <code>bash
    mysqldumpslow -s t /var/log/mysql/mysql-slow.log | head -20</code></li>
@@ -2414,7 +2501,41 @@ EXEC DBMS_SESSION.SESSION_TRACE_ENABLE(waits =&gt; TRUE, binds =&gt; TRUE);
 <li>Оптимизировать: добавить индексы, переписать запросы, обновить статистику.</li>
 </ol>
 <hr />
+<h2 id="lovushki-i-voprosy-s-sobesedovaniy">Ловушки и вопросы с собеседований</h2>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Мы настроили <code>long_query_time = 1</code> в MySQL, но сервис работает невыносимо медленно. При этом файл Slow Query Log абсолютно пуст! Как такое возможно?</p>
+<p><strong>Ответ:</strong> Это классическая ловушка «множества быстрых запросов» (Death by a thousand cuts):<br />
+1. <strong>Проблема N+1:</strong> Приложение выполняет 10 000 микро-запросов по 200 микросекунд каждый в цикле (например, загрузка связанных сущностей в ORM). Ни один из них не превышает порог 1 секунды, поэтому лог пуст, но суммарно страница грузится 2 секунды из-за сетевых задержек.<br />
+2. <strong>Блокировки строк на клиенте:</strong> Запрос может быстро выполниться на сервере БД, но приложение тратит время на десериализацию или долго удерживает открытую транзакцию.<br />
+3. <strong>Неверный порог:</strong> Порог в 1 секунду слишком велик для современного веба. Запрос, длящийся 800 мс — катастрофа для SLA, но он невидим для лога с порогом в 1 с.<br />
+4. <strong>Инструмент решения:</strong> Использовать <code>pg_stat_statements</code> или <code>pt-query-digest</code> с более агрессивным порогом (например, 50 мс), либо смотреть на суммарный показатель <code>total_exec_time</code> (частота вызовов $\times$ среднее время), а не на максимальное время отдельного вызова.</p>
+  </div>
+</div>
+
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha</span>
+  </div>
+  <div class="callout-body">
+    <ul>
+<li><strong>Слишком низкий порог на продакшене:</strong> Установка <code>long_query_time = 0</code> (логировать все) на сервере с 20 000 QPS мгновенно забьет диск терабайтами логов за считанные часы и вызовет остановку базы из-за дискового переполнения (Disk Full).</li>
+<li><strong>Отсутствие ротации логов (logrotate):</strong> Если медленный лог не ротируется, он вырастает до десятков гигабайт. Попытка открыть или распарсить такой файл утилитой <code>mysqldumpslow</code> приведет к нехватке памяти на хосте мониторинга.</li>
+</ul>
+  </div>
+</div>
+
+<hr />
+<h2 id="itog">Итог</h2>
+
 <p>Slow Query Log — это первый и важнейший шаг в оптимизации производительности базы данных. Его правильная настройка и регулярный анализ позволяют значительно улучшить отклик системы и предотвратить проблемы до того, как они станут критическими.</p>
+<p>В следующей лекции мы объединим метрики, логи и трассировку в единую стройную систему: <a href="19-observability-bd.html" class="wikilink">19. Observability БД</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2442,7 +2563,7 @@ EXEC DBMS_SESSION.SESSION_TRACE_ENABLE(waits =&gt; TRUE, binds =&gt; TRUE);
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#slow-query-log-vyyavlenie-i-analiz-medlennykh-zaprosov-v-bd">🐢 Slow Query Log: выявление и анализ медленных запросов в БД</a></li><li class="toc-item toc-h3"><a href="#zachem-nuzhen-slow-query-log">📌 Зачем нужен Slow Query Log?</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-slow-query-log">⚙️ Как работает Slow Query Log</a></li><li class="toc-item toc-h3"><a href="#nastroyka-i-ispolzovanie-v-raznykh-subd">🛠️ Настройка и использование в разных СУБД</a></li><li class="toc-item toc-h4"><a href="#1-mysql-mariadb">1. MySQL / MariaDB</a></li><li class="toc-item toc-h4"><a href="#2-postgresql">2. PostgreSQL</a></li><li class="toc-item toc-h4"><a href="#3-microsoft-sql-server">3. Microsoft SQL Server</a></li><li class="toc-item toc-h4"><a href="#4-oracle-database">4. Oracle Database</a></li><li class="toc-item toc-h3"><a href="#analiz-logov-i-instrumenty">📊 Анализ логов и инструменты</a></li><li class="toc-item toc-h3"><a href="#luchshie-praktiki-raboty-s-slow-query-log">📈 Лучшие практики работы с Slow Query Log</a></li><li class="toc-item toc-h3"><a href="#svyaz-s-drugimi-temami-arkhitektury-bd">🔗 Связь с другими темами архитектуры БД</a></li><li class="toc-item toc-h3"><a href="#primer-bystroy-nastroyki-v-mysql">💡 Пример быстрой настройки в MySQL</a></li>
+    <li class="toc-item toc-h2"><a href="#slow-query-log-vyyavlenie-i-analiz-medlennykh-zaprosov-v-bd">🐢 Slow Query Log: выявление и анализ медленных запросов в БД</a></li><li class="toc-item toc-h3"><a href="#zachem-nuzhen-slow-query-log">📌 Зачем нужен Slow Query Log?</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-slow-query-log">⚙️ Как работает Slow Query Log</a></li><li class="toc-item toc-h3"><a href="#nastroyka-i-ispolzovanie-v-raznykh-subd">🛠️ Настройка и использование в разных СУБД</a></li><li class="toc-item toc-h4"><a href="#1-mysql-mariadb">1. MySQL / MariaDB</a></li><li class="toc-item toc-h4"><a href="#2-postgresql">2. PostgreSQL</a></li><li class="toc-item toc-h4"><a href="#3-microsoft-sql-server">3. Microsoft SQL Server</a></li><li class="toc-item toc-h4"><a href="#4-oracle-database">4. Oracle Database</a></li><li class="toc-item toc-h3"><a href="#analiz-logov-i-instrumenty">📊 Анализ логов и инструменты</a></li><li class="toc-item toc-h3"><a href="#luchshie-praktiki-raboty-s-slow-query-log">📈 Лучшие практики работы с Slow Query Log</a></li><li class="toc-item toc-h3"><a href="#svyaz-s-drugimi-temami-arkhitektury-bd">🔗 Связь с другими темами архитектуры БД</a></li><li class="toc-item toc-h3"><a href="#primer-bystroy-nastroyki-v-mysql">💡 Пример быстрой настройки в MySQL</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-voprosy-s-sobesedovaniy">Ловушки и вопросы с собеседований</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

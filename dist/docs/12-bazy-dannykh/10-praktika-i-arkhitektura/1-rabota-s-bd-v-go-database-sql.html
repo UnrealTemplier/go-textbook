@@ -2168,14 +2168,15 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Работа с БД в Go. database_sql</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie-pochemu-databasesql-eto-fundament">Введение: Почему database/sql — это фундамент</h2>
+            <h1>Работа с БД в Go: архитектура database/sql, жизненный цикл соединений и Mechanical Sympathy</h1>
+<h2 id="vvedenie-pochemu-databasesql-eto-fundament">Введение: Почему database/sql — это фундамент</h2>
 
 <p>Пакет <code>database/sql</code> — это не просто обертка над драйверами баз данных. Это продуманная до мелочей абстракция, которая предоставляет унифицированный интерфейс для работы с реляционными СУБД, скрывая за собой сложную механику управления соединениями, пуллинга, транзакций и обработки ошибок.</p>
 <p>Для бэкенд-инженера уровня Senior/Lead понимание того, как работает <code>database/sql</code> «под капотом», критически важно. Не зная внутренней механики, легко допустить утечку соединений, создать скрытый бутылнек в конкурентном коде или неправильно настроить таймауты, что в продакшене выльется в <code>connection pool exhausted</code> и падение сервиса под нагрузкой.</p>
@@ -2195,6 +2196,7 @@
   </div>
 </div>
 
+<hr />
 <h2 id="arkhitektura-interfeysy-i-realizatsiya">Архитектура: Интерфейсы и реализация</h2>
 
 <p>Ключевой принцип работы пакета — разделение ответственности. Ваша бизнес-логика работает с высокоуровневыми типами <code>*sql.DB</code>, <code>*sql.Tx</code>, <code>*sql.Rows</code>, в то время как драйвер работает с низкоуровневыми примитивами.</p>
@@ -2217,6 +2219,10 @@ DB --&gt; Runtime[&quot;sql/driver Interfaces&quot;]
 Runtime --&gt; Driver[&quot;Драйвер (pgx / mysql)&quot;]
 Driver --&gt; Net[&quot;Network / Syscalls&quot;]
 Net --&gt; DBServer[&quot;PostgreSQL / MySQL&quot;]
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef pool fill:#312e81,stroke:#6366f1,color:#ffffff;
+class DB pool;
   </pre>
 </div>
 
@@ -2265,20 +2271,29 @@ func handler(w http.ResponseWriter, r *http.Request) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import (
+  <pre class="language-go"><code class="language-go">package main
+
+import (
     &quot;database/sql&quot;
+    &quot;log&quot;
+    &quot;time&quot;
+
     _ &quot;github.com/jackc/pgx/v5/stdlib&quot; // Side-effect import для регистрации драйвера
 )
 
-// При старте приложения
-db, err := sql.Open(&quot;pgx&quot;, &quot;postgres://user:pass@localhost:5432/dbname&quot;)
-if err != nil {
-    log.Fatal(err)
+func main() {
+    // При старте приложения
+    db, err := sql.Open(&quot;pgx&quot;, &quot;postgres://user:pass@localhost:5432/dbname&quot;)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    // Настройка пула ОБЯЗАТЕЛЬНА для продакшена
+    db.SetMaxOpenConns(25)
+    db.SetMaxIdleConns(5)
+    db.SetConnMaxLifetime(5 * time.Minute)
 }
-// Настройка пула ОБЯЗАТЕЛЬНА для продакшена
-db.SetMaxOpenConns(25)
-db.SetMaxIdleConns(5)
-db.SetConnMaxLifetime(5 * time.Minute)
 </code></pre>
 </div>
 
@@ -2293,6 +2308,7 @@ db.SetConnMaxLifetime(5 * time.Minute)
   </div>
 </div>
 
+<hr />
 <h2 id="vnutrennee-ustroystvo-pula-soedineniy">Внутреннее устройство пула соединений</h2>
 
 <p>Понимание механики пула — это ключ к настройке производительности. Пул в <code>database/sql</code> — это сложная структура, управляющая состоянием множества горутин и сетевых соединений.</p>
@@ -2333,18 +2349,23 @@ db.SetConnMaxLifetime(5 * time.Minute)
   </div>
   <pre class="mermaid">
 flowchart TD
-Start[&quot;Запрос: QueryContext&quot;] --&gt; CheckIdle{&quot;Есть idle\nсоединения?&quot;}
-CheckIdle -- Да --&gt; MarkInUse[&quot;Пометить InUse&quot;]
-CheckIdle -- Нет --&gt; CheckLimit{&quot;Open &lt; MaxOpen?&quot;}
-CheckLimit -- Да --&gt; CreateNew[&quot;Создать новое (dial)&quot;]
-CheckLimit -- Нет --&gt; WaitPool[&quot;Блокировка: ожидание в пуле&quot;]
+Start[&quot;Запрос: QueryContext&quot;] --&gt; CheckIdle{&quot;Есть idle соединения?&quot;}
+CheckIdle -- &quot;Да&quot; --&gt; MarkInUse[&quot;Пометить InUse&quot;]
+CheckIdle -- &quot;Нет&quot; --&gt; CheckLimit{&quot;Open &lt; MaxOpen?&quot;}
+CheckLimit -- &quot;Да&quot; --&gt; CreateNew[&quot;Создать новое (dial)&quot;]
+CheckLimit -- &quot;Нет&quot; --&gt; WaitPool[&quot;Блокировка: ожидание в пуле&quot;]
 CreateNew --&gt; MarkInUse
 WaitPool --&gt; MarkInUse
 MarkInUse --&gt; DriverExec[&quot;Вызов driver.Conn.Query&quot;]
+
+classDef default fill:#1e293b,stroke:#334155,color:#f8fafc;
+classDef wait fill:#312e81,stroke:#6366f1,color:#ffffff;
+class WaitPool wait;
   </pre>
 </div>
 
 
+<hr />
 <h2 id="zhiznennyy-tsikl-zaprosa-ot-koda-do-syscall">Жизненный цикл запроса: От кода до Syscall</h2>
 
 <p>Разберем путь данных при выполнении простого <code>SELECT</code>. Это важно для понимания задержек (latency) и накладных расходов.</p>
@@ -2438,6 +2459,7 @@ if err := rows.Err(); err != nil {
   </div>
 </div>
 
+<hr />
 <h2 id="tranzaktsii-upravlenie-sostoyaniem">Транзакции: Управление состоянием</h2>
 
 <p>Транзакция в <code>database/sql</code> привязывается к <strong>одному конкретному физическому соединению</strong> на все время своей жизни.</p>
@@ -2491,6 +2513,7 @@ err = tx.Commit() // Фиксация изменений
   </div>
 </div>
 
+<hr />
 <h2 id="prepared-statements-pereispolzovanie-planov">Prepared Statements: Переиспользование планов</h2>
 
 <p>Подготовленные выражения (<code>Prepare</code>) полезны для безопасности (защита от SQL Injection) и производительности (БД парсит и планирует запрос один раз).</p>
@@ -2526,6 +2549,7 @@ err = stmt.QueryRowContext(ctx, 123).Scan(&amp;name)
   </div>
 </div>
 
+<hr />
 <h2 id="obrabotka-oshibok-idiomaticheskiy-podkhod">Обработка ошибок: Идиоматический подход</h2>
 
 <p>В Go ошибки — это значения. В контексте БД важно различать типы ошибок.</p>
@@ -2538,10 +2562,25 @@ err = stmt.QueryRowContext(ctx, 123).Scan(&amp;name)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import (
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;database/sql&quot;
     &quot;errors&quot;
+    &quot;fmt&quot;
+
     &quot;github.com/jackc/pgx/v5/pgconn&quot;
 )
+
+var (
+    ErrUserNotFound = errors.New(&quot;пользователь не найден&quot;)
+    ErrDuplicate    = errors.New(&quot;дубликат записи&quot;)
+)
+
+type User struct {
+    Name string
+}
 
 func GetUser(ctx context.Context, db *sql.DB, id int) (*User, error) {
     var u User
@@ -2578,6 +2617,7 @@ func GetUser(ctx context.Context, db *sql.DB, id int) (*User, error) {
   </div>
 </div>
 
+<hr />
 <h2 id="proizvoditelnost-tyuning-i-mechanical-sympathy">Производительность: Тюнинг и Mechanical Sympathy</h2>
 
 <h3 id="nastroyka-pula-tuning">Настройка пула (Tuning)</h3>
@@ -2593,8 +2633,8 @@ func GetUser(ctx context.Context, db *sql.DB, id int) (*User, error) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">// Пример для сервиса с умеренной нагрузкой
-db.SetMaxOpenConns(50)       // Максимум одновременных соединений с БД
-db.SetMaxIdleConns(10)       // Сколько держать &quot;теплыми&quot; в простое
+db.SetMaxOpenConns(50)                  // Максимум одновременных соединений с БД
+db.SetMaxIdleConns(10)                  // Сколько держать &quot;теплыми&quot; в простое
 db.SetConnMaxLifetime(30 * time.Minute) // Чтобы убивать старые коннекты (важно для балансировщиков)
 db.SetConnMaxIdleTime(10 * time.Minute) // Как долго держать idle соединение
 </code></pre>
@@ -2617,6 +2657,7 @@ db.SetConnMaxIdleTime(10 * time.Minute) // Как долго держать idle
 2.  Буферы для чтения из сети.<br />
 3.  Объекты строк при сканировании.</p>
 <p><strong>Совет:</strong> Используйте <code>rows.ColumnTypes()</code> для предсказуемого выделения памяти под сканирование, если вы знаете схему заранее и работаете в очень высоконагруженном контуре (хотя обычно это излишняя оптимизация).</p>
+<hr />
 <h2 id="sravnenie-databasesql-vs-orm-gorm-sqlc">Сравнение: database/sql vs ORM (GORM, sqlc)</h2>
 
 <div class="table-container"><table>
@@ -2666,6 +2707,7 @@ db.SetConnMaxIdleTime(10 * time.Minute) // Как долго держать idle
   </div>
 </div>
 
+<hr />
 <h2 id="cheklist-gotovnost-k-prodakshenu">Чеклист: Готовность к продакшену</h2>
 
 <ol>
@@ -2677,6 +2719,7 @@ db.SetConnMaxIdleTime(10 * time.Minute) // Как долго держать idle
 <li>[ ] Таймауты настроены и на уровне приложения (<code>context</code>), и на уровне драйвера/БД, если нужно.</li>
 <li>[ ] Используются подготовленные выражения для часто повторяющихся запросов.</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Пакет <code>database/sql</code> предоставляет мощный и гибкий инструмент, но он требует уважения к своей механике. Понимание того, как управляются соединения, как контекст прерывает выполнение и как происходят аллокации памяти, отличает разработчика, который просто "пишет запросы", от инженера, способного построить надежную и масштабируемую систему хранения данных.</p>
