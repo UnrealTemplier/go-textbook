@@ -2168,7 +2168,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Индексы в MySQL</h1>
@@ -2177,28 +2177,27 @@
           <div class="article-markdown">
             <h2 id="indeksy-v-mysql-b-derevya-page-splits-i-pokryvayushchie-vyborki">Индексы в MySQL: B+ Деревья, Page Splits и покрывающие выборки</h2>
 
-<p>В прошлой статье <a href="2-innodb-storage-engine.html" class="wikilink">2. InnoDB storage engine</a> мы разобрались, что InnoDB оперирует страницами памяти по 16 KB и старается максимально использовать Buffer Pool (RAM) для минимизации дорогих дисковых операций ввода-вывода (I/O). </p>
-<p>Но как найти нужную строку среди миллиардов записей, не сканируя терабайты данных? Здесь на сцену выходят индексы. Для инженера понимание индексов — это не просто знание синтаксиса <code>CREATE INDEX</code>. Это понимание того, как физически располагаются байты на диске и почему порядок колонок в составном индексе может ускорить запрос в 1000 раз или не дать вообще никакого эффекта.</p>
-<h3 id="struktura-dannykh-pochemu-btree">Структура данных: Почему B+Tree?</h3>
+<p>В предыдущей главе <a href="2-innodb-storage-engine.html" class="wikilink">2. InnoDB storage engine</a> мы детально разобрали, как движок InnoDB организует хранение данных блоками фиксированного размера по 16 КБ и как подсистема Buffer Pool в оперативной памяти сглаживает колоссальную разницу в скорости между кремнием CPU и постоянными накопителями.</p>
+<p>Однако каким образом сервер отыскивает единичную запись среди сотен миллионов строк за доли миллисекунды, не считывая при этом гигабайты файлов с диска?<br />
+Здесь на сцену выходят <strong>Индексы</strong>. Для профессионального инженера понимание индексов — это не заучивание синтаксической конструкции <code>CREATE INDEX</code>. Это ясное видение того, как физически раскладываются байты по страницам накопителя, почему случайный первичный ключ способен разорвать страницы таблицы в клочья и почему порядок объявления колонок в составном ключе определяет судьбу производительности вашего сервиса.</p>
+<hr />
+<h3 id="struktura-dannykh-pochemu-imenno-btree">Структура данных: Почему именно B+Tree?</h3>
 
-<p>InnoDB (как и большинство реляционных БД) использует структуру данных <strong>B+Tree</strong> (B+ дерево). </p>
+<p>В подавляющем большинстве реляционных СУБД (и в InnoDB в частности) стандартом де-факто является модифицированное сбалансированное дерево поиска — <strong>B+Tree (B+ дерево)</strong>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Отличие B-Tree от B+Tree</span>
+    <span class="callout-title">Под капотом: В чем фундаментальное отличие B-Tree от B+Tree?</span>
   </div>
   <div class="callout-body">
-    <p>В классическом B-Tree (B-дереве) данные могут храниться в любом узле дерева, включая корень и промежуточные ветви.<br />
-В <strong>B+Tree</strong> данные хранятся <strong>только в листовых узлах (Leaf Nodes)</strong>. Промежуточные узлы (Non-leaf / Branch nodes) содержат только значения ключей и указатели для маршрутизации. Кроме того, все листовые узлы связаны между собой двусвязным списком (Double-linked list).</p>
+    <p>В классическом сбалансированном дереве Рудольфа Байера (B-Tree) пользовательские данные строк могут размещаться в абсолютно любом узле иерархии — в корне, промежуточных ветвях и листьях.<br />
+В структуре <strong>B+Tree</strong> действует железное разделение обязанностей:<br />
+1. <strong>Промежуточные узлы (Branch / Non-leaf nodes):</strong> Содержат <em>исключительно</em> ключи маршрутизации и указатели на дочерние страницы. Они не содержат пользовательских данных!<br />
+2. <strong>Листовые узлы (Leaf nodes):</strong> Размещаются строго на самом нижнем уровне и хранят фактические строки.<br />
+3. <strong>Двусвязный список листьев (Double-linked list):</strong> Все листовые страницы на физическом уровне сшиты между собой прямыми и обратными указателями в единую непрерывную ленту.</p>
   </div>
 </div>
 
-<p>Почему это важно для Mechanical Sympathy?<br />
-Размер страницы в InnoDB жестко фиксирован — 16 KB. Если мы храним в промежуточных узлах только ключи маршрутизации (например, <code>BIGINT</code> ID = 8 байт + указатель на страницу = 6 байт), то в одну страницу 16 KB поместится более 1000 указателей. <br />
-Это дает <strong>огромный коэффициент ветвления (Branching Factor)</strong>. </p>
-<p>Дерево глубиной всего в 3 уровня может адресовать: <code>1000 * 1000 * 1000 = 1 миллиард</code> строк! <br />
-Чтобы найти одну строку из миллиарда, нужно прочитать всего 3 страницы (3 * 16 KB). Причем корневая страница и промежуточные ветви почти всегда закэшированы в оперативной памяти (в Buffer Pool). Итого: поиск по миллиардной таблице часто требует всего <strong>одного физического чтения с диска</strong> (Random I/O) для загрузки листовой страницы.</p>
-<p>Связанный список на уровне листьев решает проблему сканирования диапазонов (<code>RANGE</code> запросы). Если вам нужно сделать <code>SELECT ... WHERE id BETWEEN 100 AND 200</code>, движок спускается по дереву к ID 100, а затем просто идет вправо по указателям связанного списка, читая страницы последовательно (Sequential I/O), пока не дойдет до 200.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2213,50 +2212,80 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Root[&quot;Корневой узел - Page 1&lt;br&gt;Ключи: 100, 200, 300&quot;]
-Branch1[&quot;Промежуточный - Page 2&lt;br&gt;Ключи: 100-199&quot;]
-Branch2[&quot;Промежуточный - Page 3&lt;br&gt;Ключи: 200-299&quot;]
-Leaf1[&quot;Листовой узел - Page 4&lt;br&gt;Строки: 100, 101, 102...&quot;]
-Leaf2[&quot;Листовой узел - Page 5&lt;br&gt;Строки: 200, 201, 202...&quot;]
+subgraph BPlusTreeStructure [&quot;Сбалансированное дерево B+Tree в InnoDB&quot;]
+direction TB
+Root[&quot;Корневой узел — Page 1 (16KB) &lt;br&gt; Маршрутные ключи: [ 100 | 200 | 300 ]&quot;]
+
+Branch1[&quot;Промежуточный узел — Page 2 &lt;br&gt; Ключи: [ 100 .. 199 ]&quot;]
+Branch2[&quot;Промежуточный узел — Page 3 &lt;br&gt; Ключи: [ 200 .. 299 ]&quot;]
+
+Leaf1[&quot;Листовой узел — Page 4 (16KB) &lt;br&gt; Строки: 100, 101, 102 ...&quot;]
+Leaf2[&quot;Листовой узел — Page 5 (16KB) &lt;br&gt; Строки: 200, 201, 202 ...&quot;]
 
 Root --&gt;|Указатель| Branch1
 Root --&gt;|Указатель| Branch2
 Branch1 --&gt;|Указатель| Leaf1
 Branch2 --&gt;|Указатель| Leaf2
 
-Leaf1 &lt;-.-&gt;|&quot;Двусвязный список&lt;br&gt;для RANGE сканирования&quot;| Leaf2
+Leaf1 &lt;-.-&gt;|&quot;Двусвязный список &lt;br&gt; для RANGE-сканирования&quot;| Leaf2
+end
   </pre>
 </div>
 
 
+<h3 id="v-chem-triumf-btree-s-tochki-zreniya-mechanical-sympathy">В чем триумф B+Tree с точки зрения Mechanical Sympathy?</h3>
+<p>Размер страницы в InnoDB строго равен 16 КБ (16 384 байта).<br />
+Поскольку в промежуточных узлах не хранятся тела строк, одна маршрутная запись состоит лишь из ключа (например, <code>BIGINT</code> = 8 байт) и физического указателя на дочернюю страницу (6 байт). С учетом служебного заголовка в одну 16-килобайтную страницу помещается <strong>более 1 000 дочерних указателей</strong>!</p>
+<p>Это обеспечивает колоссальный <strong>коэффициент ветвления (Branching Factor)</strong>:<br />
+Дерево глубиной всего в 3 уровня может адресовать: <code>1000 * 1000 * 1000 = 1 миллиард</code> строк! <br />
+Чтобы найти одну строку из миллиарда, нужно прочитать всего 3 страницы (3 * 16 KB).<br />
+При этом корневая страница и большинство ветвей постоянно прогреты в оперативной памяти Buffer Pool. Для извлечения произвольной строки из миллиардной таблицы базе требуется совершить всего <strong>одно физическое чтение с SSD (Random I/O)</strong> — загрузить целевую листовую страницу!</p>
+<p>Наличие двусвязного списка между листьями решает проблему интервальных выборок (<code>RANGE</code>-запросы). Когда ваше Go-приложение выполняет <code>SELECT ... WHERE id BETWEEN 100 AND 200</code>, движок спускается по ветвям к ключу 100, а затем просто шагает вправо по цепочке листьев, считывая 16 КБ страницы последовательным чтением (<strong>Sequential I/O</strong>), пока не встретит ключ 200.</p>
 <hr />
 <h2 id="1-klasternyy-indeks-clustered-index">1. Кластерный индекс (Clustered Index)</h2>
 
-<p>В InnoDB <strong>таблица — это и есть индекс</strong>. Это называется кластерным индексом, и он строится вокруг Первичного Ключа (Primary Key).</p>
-<p>В листовых страницах кластерного индекса хранятся не просто какие-то указатели, а <strong>полные данные строк</strong> (все остальные колонки таблицы). Физически на диске (в файле <code>.ibd</code>) данные отсортированы в порядке возрастания первичного ключа.</p>
+<p>Как мы уже подчеркивали, в подсистеме InnoDB <strong>таблица — это и есть индекс</strong>. Кластерный индекс всегда организуется вокруг Первичного Ключа (<strong>Primary Key</strong>).</p>
+<p>В листовых страницах кластерного B+ дерева физически размещаются <strong>абсолютно все колонки строки</strong> (<code>id</code>, <code>name</code>, <code>email</code>, <code>created_at</code>). Данные на диске в файле <code>.ibd</code> упорядочены строго в порядке возрастания первичного ключа.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Отсутствие Primary Key</span>
   </div>
   <div class="callout-body">
-    <p>Если вы создаете таблицу без <code>PRIMARY KEY</code> и без <code>UNIQUE NOT NULL</code> ключей, InnoDB молча сгенерирует скрытый 6-байтовый <code>ROW_ID</code> и построит кластерный индекс по нему. Проблема в том, что этот скрытый счетчик — глобальный ресурс с общим мьютексом (mutex) для всей БД. Конкурентная вставка в такие таблицы убьет производительность базы данных из-за contention (борьбы за блокировку). <strong>Всегда явно задавайте Primary Key.</strong></p>
+    <p>Если разработчик создает таблицу без объявления <code>PRIMARY KEY</code> и без уникального <code>UNIQUE NOT NULL</code> индекса, InnoDB не откажется работать. Он молча сгенерирует скрытую 6-байтовую колонку <strong><code>ROW_ID</code></strong> и построит кластерное дерево вокруг нее.<br />
+В чем смертельная ловушка?<br />
+Этот скрытый счетчик <code>ROW_ID</code> является <strong>единым глобальным ресурсом СУБД с общим мьютексом (Global Mutex)</strong> для <em>всех</em> бесключевых таблиц инстанса! При параллельной вставке из сотен горутин потоки намертво заблокируют друг друга в борьбе за этот мьютекс (Mutex Contention).<br />
+<strong>Инженерный стандарт:</strong> Любая реляционная таблица в InnoDB обязана иметь явно объявленный первичный ключ.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="2-vtorichnye-indeksy-secondary-indexes">2. Вторичные индексы (Secondary Indexes)</h2>
 
-<p>Любой индекс, который не является кластерным (например, индекс по <code>email</code> или составной индекс по <code>last_name, first_name</code>), называется вторичным.</p>
-<p><strong>Критическое отличие:</strong> Листовые узлы вторичного индекса содержат не полные данные строки, а только само проиндексированное значение (например, <code>test@email.com</code>) и <strong>значение Первичного Ключа (Primary Key)</strong> для этой строки.</p>
-<h3 id="tsena-dvoynogo-prokhoda-bookmark-lookup">Цена двойного прохода (Bookmark Lookup)</h3>
+<p>Любой индекс таблицы, не являющийся первичным (например, индекс по столбцу <code>email</code> или составной индекс по <code>(last_name, first_name)</code>), классифицируется как <strong>вторичный индекс (Secondary Index)</strong>.</p>
+<p><strong>Фундаментальное отличие вторичного индекса:</strong><br />
+Листовые узлы вторичного индекса содержат не тело строки, а исключительно само проиндексированное значение ключа и <strong>значение Primary Key</strong> соответствующей строки.</p>
+<h3 id="tsena-dvoynogo-prokhoda-mekhanika-bookmark-lookup">Цена двойного прохода: Механика Bookmark Lookup</h3>
 
-<p>Если вы делаете запрос:<br />
-<code>SELECT age, phone FROM users WHERE email = 'test@email.com'</code></p>
-<p>MySQL выполнит следующие шаги:<br />
-1. Пройдет по B+Tree вторичного индекса <code>idx_email</code>, чтобы найти <code>test@email.com</code>.<br />
-2. В листовом узле найдет Primary Key (например, <code>ID = 42</code>).<br />
-3. <strong>Bookmark Lookup</strong>: С этим <code>ID = 42</code> пойдет в B+Tree кластерного индекса, пройдет его от корня до листа, чтобы извлечь полные данные строки (<code>age</code> и <code>phone</code>).</p>
+<p>Представьте, что вы отправляете запрос:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">SELECT age, phone FROM users WHERE email = 'test@email.com';
+</code></pre>
+</div>
+
+<p>Если по колонке <code>email</code> создан вторичный индекс <code>idx_email</code>, MySQL выполняет двухфазную процедуру:</p>
+<ol>
+<li><strong>Фаза 1:</strong> Спускается по B+ дереву вторичного индекса <code>idx_email</code>, находит узел со значением <code>'test@email.com'</code> и считывает ассоциированный первичный ключ (например, <code>ID = 42</code>).</li>
+<li><strong>Фаза 2 (Bookmark Lookup):</strong> Сервер берет значение <code>ID = 42</code> и с ним идет в B+ дерево кластерного индекса, спускаясь от корня к листу, чтобы извлечь полные данные строки (<code>age</code> и <code>phone</code>).</li>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2271,10 +2300,10 @@ Leaf1 &lt;-.-&gt;|&quot;Двусвязный список&lt;br&gt;для RANGE 
   </div>
   <pre class="mermaid">
 flowchart LR
-Query[&quot;SELECT ... WHERE email&quot;] --&gt;|Шаг 1| SecIdx[&quot;Вторичный индекс&lt;br&gt;Поиск &#x27;test-at-email.com&#x27;&quot;]
-SecIdx --&gt;|Найден| PKValue[&quot;Primary Key&lt;br&gt;ID: 42&quot;]
-PKValue --&gt;|Шаг 2 - Bookmark Lookup| ClustIdx[&quot;Кластерный индекс&lt;br&gt;Спуск по дереву ID&quot;]
-ClustIdx --&gt;|Найден| Result[&quot;Полная строка&lt;br&gt;ID: 42, age: 30, phone: ...&quot;]
+Query[&quot;SELECT age, phone FROM users &lt;br&gt; WHERE email = &#x27;test@email.com&#x27;&quot;] --&gt;|Шаг 1| SecIdx[&quot;Вторичный индекс idx_email &lt;br&gt; (Спуск за &#x27;test@email.com&#x27;)&quot;]
+SecIdx --&gt;|Найден ключ| PKVal[&quot;Primary Key: ID = 42&quot;]
+PKVal --&gt;|Шаг 2: Bookmark Lookup| ClustIdx[&quot;Кластерный индекс &lt;br&gt; (Спуск по первичному ключу ID)&quot;]
+ClustIdx --&gt;|Извлечение данных| Result[&quot;Полный кортеж: &lt;br&gt; age: 30, phone: &#x27;+12345&#x27;&quot;]
   </pre>
 </div>
 
@@ -2285,8 +2314,8 @@ ClustIdx --&gt;|Найден| Result[&quot;Полная строка&lt;br&gt;ID
     <span class="callout-title">Собеседование: Покрывающий индекс (Covering Index)</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как оптимизировать предыдущий запрос, чтобы избежать второго прохода по кластерному дереву?<br />
-<strong>Ответ:</strong> Использовать <strong>Покрывающий индекс</strong>. <br />
+    <p><strong>Вопрос:</strong> Как модифицировать индексы, чтобы полностью устранить второй проход по кластерному дереву (Bookmark Lookup) в запросе <code>SELECT age, phone FROM users WHERE email = ?</code>?<br />
+<strong>Ответ:</strong> Использовать <strong>Покрывающий индекс (Covering Index)</strong>.<br />
 Если изменить индекс на <code>INDEX(email, age, phone)</code>, то вторичный индекс будет содержать в своих листьях все данные, необходимые для ответа на <code>SELECT age, phone</code>. Движок найдет email, сразу возьмет <code>age</code> и <code>phone</code> из этого же узла и вернет результат. Это называется <strong>Index-Only Scan</strong> (в <code>EXPLAIN</code> будет написано <code>Using index</code>). Это один из самых мощных способов оптимизации <code>SELECT</code> запросов.<br />
 Именно поэтому <code>SELECT *</code> — это антипаттерн. Он почти всегда убивает возможность использовать покрывающий индекс, заставляя БД делать тяжелый Bookmark Lookup.</p>
   </div>
@@ -2295,8 +2324,8 @@ ClustIdx --&gt;|Найден| Result[&quot;Полная строка&lt;br&gt;ID
 <hr />
 <h2 id="3-problema-uuid-v4-kak-primary-key-page-splits">3. Проблема UUID v4 как Primary Key (Page Splits)</h2>
 
-<p>Это классический вопрос для позиций Middle+/Senior, где проверяется понимание структур на диске.</p>
-<p>В микросервисной архитектуре на Go часто возникает желание использовать UUID в качестве Primary Key, чтобы генерировать ID на стороне клиента и избегать централизованного счетчика.</p>
+<p>Это классический вопрос для позиций уровня Senior, где проверяется понимание структур на диске.</p>
+<p>В распределенной архитектуре на Go часто возникает желание использовать UUID в качестве Primary Key, чтобы генерировать ID на стороне клиента и избегать централизованного счетчика.</p>
 <p>Обычный UUID v4 генерируется случайно (Random). B+Tree кластерного индекса требует, чтобы данные вставлялись в <strong>упорядоченном</strong> виде.<br />
 Если мы используем автоинкрементный <code>BIGINT</code> (Sequential), новые строки всегда дописываются в конец последней страницы (Append-only). Когда страница 16 KB заполняется, InnoDB просто создает новую. Это сверхбыстро.</p>
 <p><strong>Что происходит при вставке случайного UUID v4:</strong><br />
@@ -2307,11 +2336,13 @@ ClustIdx --&gt;|Найден| Result[&quot;Полная строка&lt;br&gt;ID
 5. Берет половину строк из старой страницы и переносит (копирует) их в новую страницу.<br />
 6. Вставляет новую строку.<br />
 7. Обновляет все указатели в родительских (branch) узлах и перестраивает двусвязный список.</p>
-<p><strong>Последствия:</strong><br />
-* Огромное количество случайных чтений и записей (Write Amplification).<br />
-* Сильная фрагментация данных на диске (страницы заполнены только наполовину, что снижает эффективность кэша Buffer Pool).</p>
-<h3 id="reshenie-na-go-time-ordered-id">Решение на Go: Time-ordered ID</h3>
-<p>Вместо случайного <code>uuid</code> (UUIDv4) используйте сортируемые по времени идентификаторы: <strong>ULID</strong>, <strong>UUID v7</strong> (официально добавлен в спецификацию) или системы вроде Twitter Snowflake. Они содержат временную метку (timestamp) в старших битах, поэтому лексикографически всегда возрастают, сохраняя последовательную вставку (Append-only) для B+Tree, но при этом гарантируют уникальность в распределенных системах.</p>
+<p><strong>Системные последствия:</strong><br />
+* <strong>Колоссальный Write Amplification:</strong> Ради вставки 100 байтов случайного UUID движок переписывает десятки килобайтов памяти и диска.<br />
+* <strong>Катастрофическая фрагментация:</strong> После массовых расколов страницы оказываются заполненными лишь на 50–60%. База раздувается в два раза, а эффективность кэша Buffer Pool падает вдвое, так как ценная RAM расходуется на хранение полупустых блоков!</p>
+<h3 id="arkhitekturnoe-reshenie-v-go-monotonnye-time-ordered-id">Архитектурное решение в Go: Монотонные Time-ordered ID</h3>
+
+<p>Если бизнес-логика требует генерации уникальных идентификаторов на стороне сервиса Go, применяйте упорядоченные по времени ключи: <strong>ULID</strong> или современный стандарт <strong>UUIDv7</strong>.</p>
+<p>В таких идентификаторах старшие 48 бит отданы под метку времени UNIX с миллисекундной точностью, а младшие биты заполняются криптографической или монотонной энтропией. В результате ключи лексикографически строго возрастают, гарантируя чистое последовательное добавление страниц без расколов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2321,21 +2352,23 @@ ClustIdx --&gt;|Найден| Result[&quot;Полная строка&lt;br&gt;ID
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Идиоматичный подход для генерации ID в Go для баз данных на InnoDB
-package main
+  <pre class="language-go"><code class="language-go">package main
 
 import (
     &quot;fmt&quot;
     &quot;math/rand&quot;
     &quot;time&quot;
 
-    &quot;[github.com/oklog/ulid/v2](https://github.com/oklog/ulid/v2)&quot;
+    &quot;github.com/oklog/ulid/v2&quot;
 )
 
+// GenerateDBEntityID создает монотонно возрастающий идентификатор для InnoDB
 func GenerateDBEntityID() string {
+    // Создаем источник монотонной энтропии
     entropy := ulid.Monotonic(rand.New(rand.NewSource(time.Now().UnixNano())), 0)
-    // Первые 48 бит — время, остальные 80 бит — монотонная энтропия.
-    // Идеально сортируется в B+Tree, предотвращая Page Splits.
+
+    // Старшие 48 бит — временная метка, младшие 80 бит — энтропия.
+    // Ключи идеально упорядочены во времени, предотвращая Page Splits в B+Tree!
     id := ulid.MustNew(ulid.Timestamp(time.Now()), entropy)
     return id.String()
 }
@@ -2343,44 +2376,44 @@ func GenerateDBEntityID() string {
 </div>
 
 <hr />
-<h2 id="4-sostavnye-indeksy-i-pravilo-levogo-prefiksa">4. Составные индексы и Правило левого префикса</h2>
+<h2 id="4-sostavnye-indeksy-i-pravilo-levogo-prefiksa-left-most-prefix-rule">4. Составные индексы и Правило левого префикса (Left-Most Prefix Rule)</h2>
 
-<p>Индекс можно создать по нескольким колонкам одновременно: <code>INDEX(a, b, c)</code>.<br />
-Внутри B+Tree данные сортируются сначала по колонке <code>a</code>, при равенстве <code>a</code> — по колонке <code>b</code>, и при равенстве <code>a</code> и <code>b</code> — по <code>c</code>.</p>
-<p>Из этого вытекает фундаментальное <strong>Правило левого префикса (Left-most prefix rule)</strong>: БД может использовать индекс только в том случае, если в запросе используются колонки индекса начиная слева направо без пропусков.</p>
+<p>Составной индекс строится сразу по нескольким атрибутам: <code>INDEX(a, b, c)</code>.<br />
+Внутри листовых страниц B+ дерева значения упорядочиваются по строгой лексикографической иерархии: сначала по столбцу <code>a</code>, при совпадении <code>a</code> — по столбцу <code>b</code>, а при равенстве <code>a</code> и <code>b</code> — по столбцу <code>c</code>.</p>
+<p>Отсюда вытекает фундаментальный закон оптимизатора: <strong>Правило левого префикса (Left-most prefix rule)</strong>. База данных способна применить B+Tree индекс только в том случае, если предикаты фильтрации покрывают колонки индекса <strong>строго слева направо без единого пропуска</strong>!</p>
 <div class="table-container"><table>
 <thead>
 <tr>
 <th style="text-align: left;">Запрос</th>
-<th style="text-align: left;">Используется ли <code>INDEX(a, b, c)</code>?</th>
-<th style="text-align: left;">Почему?</th>
+<th style="text-align: center;">Задействован ли <code>INDEX(a, b, c)</code>?</th>
+<th style="text-align: left;">Механическое объяснение планировщика</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td style="text-align: left;"><code>WHERE a = 1</code></td>
-<td style="text-align: left;">Да (полностью)</td>
-<td style="text-align: left;">Левый префикс соблюден.</td>
+<td style="text-align: center;"><strong>Да (полностью)</strong></td>
+<td style="text-align: left;">Левый префикс <code>a</code> соблюден идеально.</td>
 </tr>
 <tr>
 <td style="text-align: left;"><code>WHERE a = 1 AND b = 2</code></td>
-<td style="text-align: left;">Да (полностью)</td>
-<td style="text-align: left;">Префикс соблюден.</td>
+<td style="text-align: center;"><strong>Да (полностью)</strong></td>
+<td style="text-align: left;">Префикс <code>(a, b)</code> соблюден без разрывов.</td>
 </tr>
 <tr>
 <td style="text-align: left;"><code>WHERE a = 1 AND c = 3</code></td>
-<td style="text-align: left;">Частично</td>
-<td style="text-align: left;">Индекс используется для <code>a</code>, поиск по <code>c</code> игнорирует индекс (происходит фильтрация на лету).</td>
+<td style="text-align: center;"><strong>Частично</strong></td>
+<td style="text-align: left;">Индекс используется для поиска <code>a = 1</code>. Поиск по <code>c</code> требует фильтрации (пропущен столбец <code>b</code>).</td>
 </tr>
 <tr>
 <td style="text-align: left;"><code>WHERE b = 2 AND c = 3</code></td>
-<td style="text-align: left;"><strong>НЕТ</strong> (Full Scan)</td>
-<td style="text-align: left;">Нарушен левый префикс (нет <code>a</code>). Данные внутри индекса не отсортированы по <code>b</code> глобально.</td>
+<td style="text-align: center;"><strong>НЕТ (Full Scan)</strong></td>
+<td style="text-align: left;">Левый префикс нарушен (нет <code>a</code>). Глобально данные по <code>b</code> не отсортированы!</td>
 </tr>
 <tr>
 <td style="text-align: left;"><code>WHERE a &gt; 5 AND b = 2</code></td>
-<td style="text-align: left;">Частично</td>
-<td style="text-align: left;">Индекс используется для диапазона <code>a &gt; 5</code>. После применения оператора диапазона (<code>&gt;</code>, <code>&lt;</code>, <code>BETWEEN</code>), индекс для последующих колонок (<code>b</code>) использовать невозможно.</td>
+<td style="text-align: center;"><strong>Частично</strong></td>
+<td style="text-align: left;">Индекс используется для интервала <code>a &gt; 5</code>. После оператора диапазона (<code>&gt;</code>, <code>&lt;</code>, <code>BETWEEN</code>) использовать индекс для последующей колонки <code>b</code> математически невозможно.</td>
 </tr>
 </tbody>
 </table></div>
@@ -2390,20 +2423,23 @@ func GenerateDBEntityID() string {
     <span class="callout-title">Под капотом: Index Condition Pushdown (ICP)</span>
   </div>
   <div class="callout-body">
-    <p>Начиная с MySQL 5.6 (и в актуальных версиях), для запроса <code>WHERE a = 1 AND c = 3</code> применяется оптимизация ICP. Вторичный индекс все равно не может быстро перепрыгнуть к <code>c = 3</code>, но Storage Engine проверяет условие <code>c = 3</code> прямо на уровне прохода по вторичному индексу, <em>до</em> того как делать тяжелый Bookmark Lookup в кластерный индекс. Это радикально снижает количество случайных чтений диска.</p>
+    <p>Начиная с версии MySQL 5.6, для запросов с частичным префиксом (например, <code>WHERE a = 1 AND c = 3</code>) активируется оптимизация <strong>Index Condition Pushdown (ICP)</strong>.<br />
+Раньше движок извлекал по индексу все строки с <code>a = 1</code>, для каждой делал тяжелый Bookmark Lookup в кластерное дерево, поднимал всю строку с диска и лишь на уровне ядра отбрасывал строки с <code>c != 3</code>.<br />
+При включенном ICP ядро "проталкивает" предикат <code>c = 3</code> непосредственно в Storage Engine: InnoDB инспектирует значение <code>c</code> прямо в листовом узле вторичного индекса и выполняет Bookmark Lookup <strong>только для тех строк, где условие истинно</strong>, сокращая Random I/O в сотни раз!</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume-dlya-inzhenera">Резюме для инженера</h2>
 
 <ol>
-<li><strong>InnoDB</strong> — это B+Tree. Данные кластерного индекса лежат в листовых узлах.</li>
-<li>Вторичные индексы хранят значения проиндексированных колонок + Primary Key. Извлечение остальных данных требует второго прохода (Bookmark Lookup).</li>
-<li><strong>Покрывающий индекс (Covering Index)</strong> позволяет вернуть данные прямо из вторичного индекса, минуя кластерный.</li>
-<li><strong>Primary Key должен быть последовательным.</strong> Случайные строки (UUIDv4) вызывают фрагментацию и Page Splits. Используйте ULID или UUIDv7.</li>
-<li>При использовании составных индексов жестко соблюдайте <strong>Правило левого префикса</strong>.</li>
+<li><strong>B+Tree — плоское и широкое:</strong> Коэффициент ветвления свыше 1 000 позволяет адресовать миллиард строк при глубине всего в 3 страницы (минимум операций Random I/O).</li>
+<li><strong>Кластерный каркас:</strong> Таблица упорядочена по <code>PRIMARY KEY</code>. Вторичные индексы хранят только ключ и Primary Key, требуя Bookmark Lookup для извлечения остальных атрибутов.</li>
+<li><strong>Покрывающий индекс (Covering Index):</strong> Устраняет Bookmark Lookup, отдавая результат запроса прямо из вторичного дерева (<code>Using index</code>).</li>
+<li><strong>Опасность случайных UUID:</strong> UUIDv4 взрывает страницы таблицы через Page Splits. Используйте монотонные во времени идентификаторы (ULID, UUIDv7).</li>
+<li><strong>Закон левого префикса:</strong> Составной индекс <code>(a, b, c)</code> бесполезен для выборок без участия старшей колонки <code>a</code>.</li>
 </ol>
-<p>Понимание структур данных на диске и алгоритмов блокировок — это то, что позволяет инженеру предсказывать поведение базы под высокой нагрузкой. Теперь, когда мы знаем, как данные хранятся и ищутся, самое время разобраться, как MySQL обеспечивает консистентность этих данных при конкурентном доступе из сотен горутин: переходим к <a href="4-tranzaktsii-v-mysql.html" class="wikilink">4. Транзакции в MySQL</a>.</p>
+<p>Поняв, как данные с феноменальной скоростью отыскиваются на диске с помощью B+ деревьев, мы подошли к самому сложному и захватывающему аспекту высоконагруженного бэкенда: как обеспечить согласованность и изоляцию этих записей при одновременной атаке тысячами конкурентных горутин. О блокировках, уровнях изоляции и MVCC в MySQL — в следующей лекции: <a href="4-tranzaktsii-v-mysql.html" class="wikilink">4. Транзакции в MySQL</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2431,7 +2467,7 @@ func GenerateDBEntityID() string {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#indeksy-v-mysql-b-derevya-page-splits-i-pokryvayushchie-vyborki">Индексы в MySQL: B+ Деревья, Page Splits и покрывающие выборки</a></li><li class="toc-item toc-h3"><a href="#struktura-dannykh-pochemu-btree">Структура данных: Почему B+Tree?</a></li><li class="toc-item toc-h2"><a href="#1-klasternyy-indeks-clustered-index">1. Кластерный индекс (Clustered Index)</a></li><li class="toc-item toc-h2"><a href="#2-vtorichnye-indeksy-secondary-indexes">2. Вторичные индексы (Secondary Indexes)</a></li><li class="toc-item toc-h3"><a href="#tsena-dvoynogo-prokhoda-bookmark-lookup">Цена двойного прохода (Bookmark Lookup)</a></li><li class="toc-item toc-h2"><a href="#3-problema-uuid-v4-kak-primary-key-page-splits">3. Проблема UUID v4 как Primary Key (Page Splits)</a></li><li class="toc-item toc-h3"><a href="#reshenie-na-go-time-ordered-id">Решение на Go: Time-ordered ID</a></li><li class="toc-item toc-h2"><a href="#4-sostavnye-indeksy-i-pravilo-levogo-prefiksa">4. Составные индексы и Правило левого префикса</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#indeksy-v-mysql-b-derevya-page-splits-i-pokryvayushchie-vyborki">Индексы в MySQL: B+ Деревья, Page Splits и покрывающие выборки</a></li><li class="toc-item toc-h3"><a href="#struktura-dannykh-pochemu-imenno-btree">Структура данных: Почему именно B+Tree?</a></li><li class="toc-item toc-h3"><a href="#v-chem-triumf-btree-s-tochki-zreniya-mechanical-sympathy">В чем триумф B+Tree с точки зрения Mechanical Sympathy?</a></li><li class="toc-item toc-h2"><a href="#1-klasternyy-indeks-clustered-index">1. Кластерный индекс (Clustered Index)</a></li><li class="toc-item toc-h2"><a href="#2-vtorichnye-indeksy-secondary-indexes">2. Вторичные индексы (Secondary Indexes)</a></li><li class="toc-item toc-h3"><a href="#tsena-dvoynogo-prokhoda-mekhanika-bookmark-lookup">Цена двойного прохода: Механика Bookmark Lookup</a></li><li class="toc-item toc-h2"><a href="#3-problema-uuid-v4-kak-primary-key-page-splits">3. Проблема UUID v4 как Primary Key (Page Splits)</a></li><li class="toc-item toc-h3"><a href="#arkhitekturnoe-reshenie-v-go-monotonnye-time-ordered-id">Архитектурное решение в Go: Монотонные Time-ordered ID</a></li><li class="toc-item toc-h2"><a href="#4-sostavnye-indeksy-i-pravilo-levogo-prefiksa-left-most-prefix-rule">4. Составные индексы и Правило левого префикса (Left-Most Prefix Rule)</a></li><li class="toc-item toc-h2"><a href="#rezyume-dlya-inzhenera">Резюме для инженера</a></li>
   </ul>
 </aside>
 

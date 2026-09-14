@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~12 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Percona Server</h1>
           </header>
@@ -2177,59 +2177,113 @@
           <div class="article-markdown">
             <h2 id="percona-server-dlya-mysql-tyuning-pod-enterprise-nagruzki">Percona Server для MySQL: Тюнинг под Enterprise-нагрузки</h2>
 
-<p>Когда стандартного дистрибутива MySQL (Community Edition) становится недостаточно для высоконагруженных систем, а переходить на проприетарную Enterprise-версию от Oracle не позволяют бюджеты или убеждения, на сцену выходит <strong>Percona Server</strong>.</p>
-<p>Percona Server — это форк MySQL "с открытым исходным кодом, который полностью совместим (drop-in replacement), но включает в себя патчи и оптимизации, которые Oracle обычно оставляет для платных версий или вообще не включает в основную ветку. Для бэкенд-инженера на Go это означает, что вы можете просто поменять Docker-образ базы, не меняя ни строчки кода, и получить существенный прирост в производительности и наблюдаемости (Observability).</p>
+<p>Когда стандартного дистрибутива MySQL (Community Edition) перестает хватать для обслуживания требовательных высоконагруженных систем, а переход на проприетарную Enterprise-версию от корпорации Oracle блокируется бюджетами или строгими требованиями к Open Source лицензированию, в архитектурной практике на сцену выходит <strong>Percona Server for MySQL</strong>.</p>
+<p>Percona Server — это полноценный, бескомпромиссный форк с открытым исходным кодом, спроектированный как <strong>Drop-in replacement</strong> (прямая бесшовная замена) для оригинального MySQL. Это означает, что вы можете заменить Docker-образ или системный пакет <code>mysqld</code> на аналогичный от Percona, не переписывая ни единой строчки прикладного кода на Go, сохранив 100% бинарную и протокольную совместимость, но мгновенно получив колоссальный прирост в пропускной способности, стабильности задержек (Latency) и глубине наблюдаемости (<strong>Observability</strong>).</p>
 <hr />
 <h2 id="1-thread-pool-reshenie-problemy-tysyach-soedineniy">1. Thread Pool: Решение проблемы тысяч соединений</h2>
 
-<p>Как мы помним из <a href="1-arkhitektura-mysql.html" class="wikilink">1. Архитектура MySQL</a>, стандартный MySQL использует модель "один поток на соединение". Если ваше Go-приложение в пике создает 5000 горутин, каждая из которых берет коннект из пула, MySQL начинает задыхаться от переключения контекста (Context Switching) в ядре ОС.</p>
-<p>Percona включает в себя <strong>Thread Pool Plugin</strong>, который в Oracle MySQL доступен только в платной Enterprise версии.</p>
+<p>Как мы выяснили при анализе <a href="1-arkhitektura-mysql.html" class="wikilink">1. Архитектура MySQL</a>, классический MySQL по умолчанию реализует модель «один поток операционной системы на одно клиентское соединение» (Thread-per-Connection). </p>
+<p>Если ваш масштабируемый Go-бэкенд под наплывом сотен тысяч пользователей разворачивает сотни экземпляров сервиса, каждый из которых держит пул соединений <code>database/sql</code>, суммарное число открытых TCP-сокетов к СУБД может легко перевалить за 5 000 – 10 000. В этот момент операционная система Linux сталкивается с физическим кошмаром планировщика:<br />
+- Тысячи потоков непрерывно борются за доступ к ядрам CPU.<br />
+- Каждое переключение контекста (Context Switch) обходится в 1–2 микросекунды, но главное — оно вымывает процессорные кэши L1d/L1i и буфер ассоциативной трансляции страниц (TLB).<br />
+- Наступает разрушительный эффект <strong>Thrashing (пробуксовка)</strong>: процессорные ядра тратят 70–80% своего времени не на выполнение полезных инструкций SQL, а на переключение контекстов и ожидание синхронизации в планировщике ядра Linux.</p>
+<p>Для решения этой фундаментальной проблемы Percona бесплатно включает в свой дистрибутив <strong>Thread Pool Plugin</strong> (который в дистрибутиве от Oracle доступен исключительно в дорогостоящей коммерческой редакции Enterprise Edition).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Clients [&quot;Go-микросервисы (Тысячи горутин)&quot;]
+C1[&quot;TCP Conn 1&quot;]
+C2[&quot;TCP Conn 2&quot;]
+C3[&quot;TCP Conn 3&quot;]
+CN[&quot;TCP Conn 10000&quot;]
+end
+
+subgraph PerconaTP [&quot;Percona Thread Pool Engine&quot;]
+Queue[&quot;Приоритетная очередь входящих запросов&lt;br&gt;(Work Queue)&quot;]
+
+subgraph Groups [&quot;Thread Groups (привязаны к ядрам CPU)&quot;]
+TG1[&quot;Group 1 (Core 0-3)&lt;br&gt;Фиксированный пул потоков&quot;]
+TG2[&quot;Group 2 (Core 4-7)&lt;br&gt;Фиксированный пул потоков&quot;]
+end
+end
+
+subgraph Hardware [&quot;Физические ядра CPU&quot;]
+CPU1[&quot;Cores: 100% полезного исполнения SQL&lt;br&gt;0% оверхеда на переключение 10K потоков&quot;]
+end
+
+Clients --&gt; Queue
+Queue --&gt; TG1
+Queue --&gt; TG2
+TG1 --&gt; Hardware
+TG2 --&gt; Hardware
+
+style Clients fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style PerconaTP fill:#0f172a,stroke:#818cf8,stroke-width:2px
+style Hardware fill:#0f172a,stroke:#34d399,stroke-width:2px
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Как работает Thread Pool</span>
   </div>
   <div class="callout-body">
-    <p>Вместо того чтобы создавать новый поток ОС для каждого запроса, Percona выделяет фиксированное количество групп потоков (Thread Groups). Запросы от клиентов попадают в очередь. Свободный поток из группы берет запрос из очереди, выполняет его и возвращается за следующим.<br />
-Это очень похоже на работу планировщика Go (G-M-P), где небольшое количество системных тредов (M) обслуживает огромное количество горутин (G). Это предотвращает <strong>Thrashing</strong> — ситуацию, когда CPU тратит больше времени на управление потоками, чем на выполнение SQL-запросов.</p>
+    <p>Вместо порождения неконтролируемого числа тредов Percona инициализирует фиксированное количество групп потоков (<strong>Thread Groups</strong>), число которых обычно приравнивается к количеству физических ядер сервера (например, 32 или 64). </p>
+<p>Входящие запросы от клиентов попадают в компактную очередь задач. Свободный рабочий поток группы забирает SQL-запрос, быстро выполняет его в движке и немедленно возвращается в пул за следующим.  </p>
+<p>Механистически эта модель поразительно похожа на планировщик самого Go (<strong>модель G-M-P</strong>): небольшое число системных потоков ядра ($M$) эффективно обслуживает гигантский поток задач ($G$) без разрушительного расхода памяти и деградации L1-кэшей.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="2-xtradb-prokachannyy-innodb">2. XtraDB: Прокачанный InnoDB</h2>
 
-<p>Исторически Percona поставлялась с собственным движком <strong>XtraDB</strong>, который является глубоко модифицированным InnoDB. В современных версиях (8.0+) различия в коде сократились, но Percona по-прежнему включает критические патчи для работы с диском и памятью:</p>
+<p>Исторически Percona завоевала мир благодаря собственному оптимизированному движку хранения — <strong>XtraDB</strong>, который являлся форком InnoDB с сотнями низкоуровневых улучшений. В современных ветках MySQL 8.0 разработчики объединили лучшие наработки, однако Percona Server по-прежнему содержит глубокие патчи ядра InnoDB:</p>
 <ul>
-<li><strong>Улучшенный Buffer Pool Scalability:</strong> В стандартном MySQL работа с Buffer Pool часто упирается в глобальные мьютексы. Percona оптимизирует механизмы очистки страниц (LRU flushing), позволяя лучше утилизировать современные многоядерные процессоры и быстрые NVMe-диски.</li>
-<li><strong>Doublewrite Buffer Tuning:</strong> Percona позволяет выносить Doublewrite Buffer в отдельные файлы или даже отключать его на файловых системах, поддерживающих атомарную запись (например, на некоторых специфичных SSD или ZFS), что радикально снижает Write Amplification.</li>
+<li><strong>Масштабируемость Buffer Pool (LRU Scalability):</strong> В классическом MySQL при высокой частоте чтения и записи страницы памяти конкурируют за глобальные мьютексы списков LRU. Percona разбивает операции сброса страниц (Page Flushing) на независимые алгоритмы, снижая влияние блокировок при работе на 64–128 ядерных серверах с быстрыми накопителями NVMe.</li>
+<li><strong>Doublewrite Buffer Tuning:</strong> Буфер двойной записи жизненно необходим для защиты от частичной записи страниц (Torn Pages). Percona позволяет гибко разделять файлы Doublewrite Buffer по независимым накопителям или полностью отключать его на современных корпоративных хранилищах и файловых системах с атомарной записью (например, на ZFS или SSD с O_DIRECT поддержкой атомарных 16KB блоков), что кардинально уменьшает избыточную дисковую запись (Write Amplification).</li>
+<li><strong>Многопоточный Purge:</strong> Фоновые процессы очистки старых записей Undo Log (Purge Threads) в Percona более агрессивно возвращают свободное пространство, не допуская деградации производительности в моменты пиковых апдейтов.</li>
 </ul>
 <hr />
 <h2 id="3-nablyudaemost-advanced-observability">3. Наблюдаемость (Advanced Observability)</h2>
 
-<p>Это, пожалуй, главная причина, по которой Senior-инженеры выбирают Percona. Стандартный MySQL довольно скуп на подробности о том, <em>почему</em> конкретный запрос тормозит.</p>
-<h3 id="rasshirennyy-slow-query-log">Расширенный Slow Query Log</h3>
-<p>В Percona Slow Query Log содержит гораздо больше метрик:<br />
-* Время ожидания блокировок (Lock time).<br />
-* Количество прочитанных и измененных строк.<br />
-* Время, проведенное в очередях Thread Pool.<br />
-* <strong>Query Plan:</strong> Percona может логировать план выполнения (EXPLAIN) прямо в лог медленных запросов.</p>
-<h3 id="instrumentariy-percona-toolkit">Инструментарий Percona Toolkit</h3>
-<p>Это набор CLI-утилит (многие написаны на Perl и Go), которые стали стандартом индустрии:<br />
-* <code>pt-online-schema-change</code>: Позволяет делать <code>ALTER TABLE</code> на огромных таблицах без блокировки на чтение и запись. Она создает временную таблицу, вешает триггеры и копирует данные пачками.<br />
-* <code>pt-query-digest</code>: Анализирует логи и выдает отчет о самых "дорогих" запросах.<br />
-* <code>pt-kill</code>: Автоматически убивает запросы, которые выполняются слишком долго или потребляют слишком много памяти, защищая базу от падения.</p>
+<p>Главная причина признания Percona среди опытных инженеров и SRE — исключительный уровень наблюдаемости. Оригинальный MySQL славится своей скрытностью: когда в продакшене внезапно растет p99 latency, стандартные логи редко отвечают на вопрос, <em>почему именно</em> тормозит конкретный запрос.</p>
+<h3 id="rasshirennyy-slow-query-log-extended-slow-log">Расширенный Slow Query Log (Extended Slow Log)</h3>
+<p>В Percona журнал медленных запросов превращен в полноценный профилировщик. Он фиксирует исчерпывающую низкоуровневую диагностику:<br />
+* <strong>Время ожидания блокировок (Lock time):</strong> Детализация по блокировкам строк InnoDB и метаданных таблиц (MDL).<br />
+* <strong>Количество прочитанных и измененных строк:</strong> Точное соотношение <code>Rows_examined</code> к <code>Rows_sent</code>. Если запрос прочитал 1 000 000 строк, чтобы отдать 1 — это мгновенный сигнал отсутствия индекса.<br />
+* <strong>Время в очередях Thread Pool:</strong> Сколько микросекунд запрос простоял в ожидании свободного потока.<br />
+* <strong>Встроенный Query Plan:</strong> Percona умеет автоматически записывать снимок плана выполнения (<code>EXPLAIN</code>) прямо в лог медленного запроса, избавляя инженера от необходимости воспроизводить запрос вручную.</p>
+<h3 id="instrumentariy-percona-toolkit-zolotoy-standart-industrii">Инструментарий Percona Toolkit: Золотой стандарт индустрии</h3>
+<p>Вместе с сервером поставляется признанный во всем мире набор CLI-утилит:<br />
+* <strong><code>pt-online-schema-change</code>:</strong> Легендарная утилита, позволяющая выполнять миграции схемы данных (<code>ALTER TABLE</code>) на таблицах объемом в сотни гигабайт без блокировки чтения и записи. Она создает пустую теневую копию таблицы, накладывает триггеры на изменения (<code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>), пачками (chunks) копирует исторические данные и затем в микросекундной атомарной операции <code>RENAME TABLE</code> подменяет исходную таблицу.<br />
+* <strong><code>pt-query-digest</code>:</strong> Мощный агрегатор логов. Анализирует терабайтные журналы Slow Log или сетевые дампы пакетов MySQL, группирует запросы по структурным отпечаткам (Fingerprints) и формирует сводный рейтинг запросов по общему времени утилизации ресурсов базы.<br />
+* <strong><code>pt-kill</code>:</strong> Автономный сторожевой таймер. Отслеживает и принудительно прерывает аномально долгие запросы, которые повисли на локах или исчерпывают системную память, защищая весь кластер от каскадного отказа.</p>
 <hr />
 <h2 id="4-bezopasnost-i-enterprise-fichi-besplatno">4. Безопасность и Enterprise-фичи (Бесплатно)</h2>
 
-<p>Percona включает функции, за которые Oracle просит тысячи долларов:<br />
-* <strong>Audit Log Plugin:</strong> Полный лог того, кто, когда и какой запрос выполнил (необходимо для соблюдения стандартов PCI DSS или HIPAA).<br />
-* <strong>Data Masking:</strong> Позволяет маскировать персональные данные (PII) в результатах запросов "на лету".<br />
-* <strong>External Authentication:</strong> Интеграция с LDAP или Active Directory для управления доступами.</p>
+<p>В то время как в экосистеме Oracle Enterprise многие средства аудита и защиты требуют покупки дорогих коммерческих подписок, Percona Server предоставляет их в открытом доступе:</p>
+<ul>
+<li><strong>Audit Log Plugin:</strong> Исчерпывающее протоколирование действий пользователей: кто, когда, с какого IP-адреса и какой конкретно SQL-запрос отправил. Этот функционал является обязательным требованием для прохождения строгого регуляторного аудита по стандартам PCI DSS, SOC 2 и HIPAA.</li>
+<li><strong>Data Masking:</strong> Динамическая маскировка конфиденциальной информации (PII — персональные данные клиентов, номера кредитных карт, паспортные данные) «на лету» при выполнении запросов непривилегированными пользователями или аналитиками.</li>
+<li><strong>External Authentication:</strong> Бесшовная интеграция аутентификации с корпоративными службами каталогов LDAP, Active Directory и Kerberos.</li>
+</ul>
 <hr />
 <h2 id="5-vzaimodeystvie-s-go-metriki-i-pmm">5. Взаимодействие с Go: Метрики и PMM</h2>
 
-<p>Если вы используете Percona Server, идиоматично будет подключить <strong>PMM (Percona Monitoring and Management)</strong>. Это готовый стек (Prometheus + Grafana + ClickHouse), который визуализирует всё происходящее в БД.</p>
-<p>Для Go-разработчика это дает возможность сопоставлять графики из вашего приложения с графиками БД:</p>
+<p>В современной архитектуре микросервисов на Go критически важно уметь коррелировать поведение прикладного кода с внутренним состоянием базы данных. Для этих целей экосистема Percona предлагает стек <strong>PMM (Percona Monitoring and Management)</strong> — готовое решение на базе Prometheus, Grafana и ClickHouse.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2244,36 +2298,48 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-GoApp[&quot;Go App&lt;br&gt;Prometheus Metrics&quot;] --&gt; Prometheus[&quot;Prometheus&lt;br&gt;Time Series&quot;]
-Percona[&quot;Percona Server&lt;br&gt;Exporter&quot;] --&gt; Prometheus
-Prometheus --&gt; Grafana[&quot;Grafana Dashboards&quot;]
+GoApp[&quot;Go Microservice&lt;br&gt;(database/sql metrics)&quot;] --&gt; Prometheus[&quot;Prometheus Server&lt;br&gt;(Time-Series Storage)&quot;]
+Percona[&quot;Percona Server&lt;br&gt;(mysqld_exporter + PMM Client)&quot;] --&gt; Prometheus
+Prometheus --&gt; Grafana[&quot;Grafana Unified Dashboard&quot;]
 
-subgraph Analysis [&quot;Корреляция&quot;]
-Grafana --&gt;|&quot;Видно всплеск&lt;br&gt;Response Time&quot;| Match[&quot;Стык: всплеск&lt;br&gt;InnoDB Row Lock Wait&quot;]
+subgraph Analysis [&quot;Архитектурный анализ инцидента&quot;]
+Grafana --&gt;|&quot;Всплеск p99 HTTP latency&quot;| Match[&quot;Корреляция:&lt;br&gt;Пик ожидания InnoDB Row Lock Waits&lt;br&gt;в очереди Thread Pool&quot;]
 end
+
+style GoApp fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style Percona fill:#0f172a,stroke:#818cf8,stroke-width:2px
+style Grafana fill:#0f172a,stroke:#f59e0b,stroke-width:2px
   </pre>
 </div>
 
 
+<p>Благодаря экспортеру метрик Percona в PMM, Go-инженер может на одном экране сопоставить:<br />
+1. Задержки вызовов <code>db.QueryContext</code> в Go-приложении.<br />
+2. Рост количества ожидающих горутин в пуле <code>database/sql</code>.<br />
+3. Точное количество блокировок строк InnoDB (<code>Innodb_row_lock_current_waits</code>), ожидание мьютексов и загрузку очередей Thread Pool на стороне СУБД.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование: Когда предлагать Percona?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы уперлись в производительность MySQL на 64-ядерном сервере. Что делать?<br />
-<strong>Ответ:</strong> Помимо тюнинга индексов и запросов, стоит рассмотреть переход на Percona Server. Его Thread Pool позволит эффективнее утилизировать ядра при большом количестве соединений, а расширенные метрики Slow Log помогут найти узкое место в блокировках InnoDB, которые не видны в стандартном MySQL.</p>
+    <p><strong>Вопрос:</strong> Сервис на Go вырос, трафик увеличился в 10 раз. Мы развернули базу на мощном 64-ядерном сервере, но под пиковой нагрузкой производительность не растет, а графики показывают скачки CPU User/System Time из-за тысяч горутин. Что предложить на архитектурном комитете?</p>
+<p><strong>Ответ:</strong> Первым делом стоит рассмотреть бесшовный переход на <strong>Percona Server for MySQL</strong>. <br />
+1. Его <strong>Thread Pool</strong> кардинально снизит оверхед от Context Switching и стабилизирует работу с тысячами одновременных подключений.<br />
+2. Активация <strong>Extended Slow Log</strong> с автоматическим сбором планов исполнения (<code>EXPLAIN</code>) позволит моментально выявить запросы, вызывающие деградацию и блокировки строк.<br />
+3. Всё это достигается в формате <strong>Drop-in replacement</strong> без риска поломать совместимость с кодом и без необходимости закупки коммерческих лицензий.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Percona Server — это MySQL "на стероидах". <br />
-1. <strong>Thread Pool</strong> спасает от оверхеда большого количества коннектов из Go-приложения.<br />
-2. <strong>XtraDB</strong> выжимает максимум из NVMe и многоядерных систем.<br />
-3. <strong>Toolkit и PMM</strong> дают инженеру "рентгеновское зрение" для отладки производительности.<br />
-4. Это <strong>Drop-in replacement</strong>: вы просто меняете бинарник, и всё продолжает работать.</p>
-<p>Percona — отличный выбор для традиционных реляционных задач. Но что если нам нужно хранить данные не просто надежно, а обеспечивать их доступность в разных дата-центрах с гарантией автоматического переключения при отказе? Для этого существует другой важнейший форк, который мы разберем далее: <a href="8-mariadb.html" class="wikilink">8. MariaDB</a>.</p>
+<p>Percona Server — это эталон того, каким должен быть промышленный реляционный сервер:<br />
+1. <strong>Thread Pool</strong> ликвидирует узкое горлышко модели «один поток на соединение» и спасает сервер от паралича планировщика при тысячах конкурентных подключений из Go.<br />
+2. <strong>XtraDB и патчи InnoDB</strong> обеспечивают максимальную утилизацию многоядерных CPU и быстрых NVMe-накопителей, оптимизируя циклы сброса буферного пула.<br />
+3. <strong>Percona Toolkit и PMM</strong> вооружают инженера первоклассными инструментами диагностики (<code>pt-online-schema-change</code>, <code>pt-query-digest</code>), исключая гадание на кофейной гуще при авариях.<br />
+4. Это <strong>Drop-in replacement</strong>: стопроцентная бинарная совместимость с протоколом MySQL гарантирует безболезненный переход без переписывания прикладного кода.</p>
+<p>Percona Server великолепен, когда вам требуется максимальная отдача от одного узла или классической репликации. Но что делать, если вам необходим полностью мультимастерный синхронный кластер без единой точки отказа, либо вы ищете независимый форк с собственным вектором развития движков хранения? Для этого существует другой великий наследник империи MySQL, созданный ее первоначальным автором: <a href="8-mariadb.html" class="wikilink">8. MariaDB</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2301,7 +2367,7 @@ end
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#percona-server-dlya-mysql-tyuning-pod-enterprise-nagruzki">Percona Server для MySQL: Тюнинг под Enterprise-нагрузки</a></li><li class="toc-item toc-h2"><a href="#1-thread-pool-reshenie-problemy-tysyach-soedineniy">1. Thread Pool: Решение проблемы тысяч соединений</a></li><li class="toc-item toc-h2"><a href="#2-xtradb-prokachannyy-innodb">2. XtraDB: Прокачанный InnoDB</a></li><li class="toc-item toc-h2"><a href="#3-nablyudaemost-advanced-observability">3. Наблюдаемость (Advanced Observability)</a></li><li class="toc-item toc-h3"><a href="#rasshirennyy-slow-query-log">Расширенный Slow Query Log</a></li><li class="toc-item toc-h3"><a href="#instrumentariy-percona-toolkit">Инструментарий Percona Toolkit</a></li><li class="toc-item toc-h2"><a href="#4-bezopasnost-i-enterprise-fichi-besplatno">4. Безопасность и Enterprise-фичи (Бесплатно)</a></li><li class="toc-item toc-h2"><a href="#5-vzaimodeystvie-s-go-metriki-i-pmm">5. Взаимодействие с Go: Метрики и PMM</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#percona-server-dlya-mysql-tyuning-pod-enterprise-nagruzki">Percona Server для MySQL: Тюнинг под Enterprise-нагрузки</a></li><li class="toc-item toc-h2"><a href="#1-thread-pool-reshenie-problemy-tysyach-soedineniy">1. Thread Pool: Решение проблемы тысяч соединений</a></li><li class="toc-item toc-h2"><a href="#2-xtradb-prokachannyy-innodb">2. XtraDB: Прокачанный InnoDB</a></li><li class="toc-item toc-h2"><a href="#3-nablyudaemost-advanced-observability">3. Наблюдаемость (Advanced Observability)</a></li><li class="toc-item toc-h3"><a href="#rasshirennyy-slow-query-log-extended-slow-log">Расширенный Slow Query Log (Extended Slow Log)</a></li><li class="toc-item toc-h3"><a href="#instrumentariy-percona-toolkit-zolotoy-standart-industrii">Инструментарий Percona Toolkit: Золотой стандарт индустрии</a></li><li class="toc-item toc-h2"><a href="#4-bezopasnost-i-enterprise-fichi-besplatno">4. Безопасность и Enterprise-фичи (Бесплатно)</a></li><li class="toc-item toc-h2"><a href="#5-vzaimodeystvie-s-go-metriki-i-pmm">5. Взаимодействие с Go: Метрики и PMM</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

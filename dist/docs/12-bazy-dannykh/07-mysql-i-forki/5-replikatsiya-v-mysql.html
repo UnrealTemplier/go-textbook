@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Репликация в MySQL</h1>
           </header>
@@ -2177,40 +2177,55 @@
           <div class="article-markdown">
             <h2 id="preodolevaya-predely-odnogo-servera">Преодолевая пределы одного сервера</h2>
 
-<p>В прошлой статье <a href="4-tranzaktsii-v-mysql.html" class="wikilink">4. Транзакции в MySQL</a> мы увидели, как InnoDB гарантирует ACID на одном узле. Однако в реальном высоконагруженном проекте один сервер базы данных (Master) быстро становится узким местом. У него есть предел по CPU, оперативной памяти (Buffer Pool) и IOPS диска. Более того, единичный сервер — это Single Point of Failure (SPOF). Если сгорит материнская плата, весь проект ляжет.</p>
-<p>Для решения этих проблем базы данных используют <strong>Репликацию (Replication)</strong> — процесс копирования данных с одного узла на другие. В мире MySQL репликация исторически является краеугольным камнем архитектуры и де-факто стандартом масштабирования операций чтения (Read Scaling).</p>
+<p>В предыдущей главе (<a href="4-tranzaktsii-v-mysql.html" class="wikilink">4. Транзакции в MySQL</a>) мы детально исследовали, как движок InnoDB гарантирует свойства ACID и управляет сложнейшими блокировками на уровне одного физического узла. Однако в реальной жизни любой одиночный сервер базы данных — даже вооруженный десятками терабайт NVMe и терабайтами RAM в Buffer Pool — быстро упирается в непреложные законы физики: лимиты тактовой частоты CPU, пропускную способность шины памяти и потолок дисковых IOPS.</p>
+<p>Хуже того, одиночный сервер — это классическая единичная точка отказа (<strong>SPOF — Single Point of Failure</strong>). Сгоревшая материнская плата, обесточенная серверная стойка или авария в стойке ЦОД способны мгновенно парализовать весь бизнес. </p>
+<p>Для преодоления аппаратных ограничений и построения надежных высоконагруженных систем применяется <strong>Репликация (Replication)</strong> — механизм непрерывного, детерминированного копирования потока изменений с основного узла (<strong>Master / Source</strong>) на один или несколько подчиненных серверов (<strong>Replica / Replica Nodes</strong>). В экосистеме MySQL репликация исторически является фундаментальным фундаментом масштабирования операций чтения (Read Scaling), создания резервных копий и обеспечения катастрофоустойчивости (Disaster Recovery).</p>
+<hr />
 <h2 id="binarnyy-log-binlog-istochnik-istiny">Бинарный лог (Binlog): Источник истины</h2>
 
-<p>Прежде чем говорить о сети, нужно понять, <em>что</em> именно передается по сети.</p>
+<p>Прежде чем данные полетят по сетевому кабелю между дата-центрами, нам нужно ответить на фундаментальный вопрос: <em>в каком именно виде изменения фиксируются на диске для передачи?</em></p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование: Redo Log против Binlog</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Зачем MySQL два лога? Почему нельзя реплицировать данные через Redo Log (WAL)?<br />
-<strong>Ответ:</strong> Это вопрос на понимание архитектуры из <a href="1-arkhitektura-mysql.html" class="wikilink">1. Архитектура MySQL</a>. <br />
-* <strong>Redo Log</strong> принадлежит подсистеме хранения InnoDB. Он содержит физические изменения страниц памяти (offset 1024, write bytes 0xFA...). Он нужен только для Crash Recovery конкретного инстанса.<br />
-* <strong>Binlog (Binary Log)</strong> принадлежит уровню Server Layer. Это логический лог изменения данных. Он ничего не знает про страницы по 16 KB. Он нужен для репликации и восстановления данных на определенный момент времени (Point-in-Time Recovery).</p>
+    <p><strong>Вопрос:</strong> Зачем в архитектуре MySQL существуют сразу два независимых транзакционных лога? Почему нельзя реплицировать данные напрямую через привычный Redo Log (WAL), как это делают некоторые другие СУБД?</p>
+<p><strong>Ответ:</strong> Это классический вопрос на глубокое понимание слоистой архитектуры MySQL, разобранной нами в <a href="1-arkhitektura-mysql.html" class="wikilink">1. Архитектура MySQL</a>:<br />
+* <strong>Redo Log</strong> принадлежит исключительно подсистеме хранения (<strong>Storage Engine</strong>, например, InnoDB). Он содержит физические дельты страниц памяти (байт со смещением <code>offset 1024</code> перезаписать байтом <code>0xFA</code>...). Он привязан к конкретному формату страниц (16 KB) и служит строго одной цели: мгновенному восстановлению после аппаратного сбоя (<strong>Crash Recovery</strong>) конкретного локального инстанса.<br />
+* <strong>Binlog (Binary Log)</strong> принадлежит верхнему уровню сервера (<strong>Server Layer / SQL Layer</strong>). Это логический журнал, не зависящий от конкретного движка хранения (он с одинаковым успехом логирует операции и для InnoDB, и для MyISAM, и для Memory). Binlog описывает изменения данных на уровне SQL-команд или строковых образов. Он необходим для репликации между версиями и узлами, а также для восстановления на произвольный момент времени (<strong>Point-in-Time Recovery</strong>).</p>
   </div>
 </div>
 
-<p>Чтобы репликация работала, на мастере должен быть включен <code>log_bin</code>. Все транзакции, изменяющие данные (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>ALTER</code>), после успешного коммита записываются в этот бинарный лог.</p>
-<h3 id="formaty-binloga">Форматы Binlog'а</h3>
-<ol>
-<li><strong>Statement-Based Replication (SBL):</strong> В лог пишется сам SQL-запрос (например, <code>UPDATE users SET status = 1 WHERE age &gt; 18</code>). <br />
-   * <em>Плюс:</em> Лог очень компактный (меньше I/O и сетевого трафика).<br />
-   * <em>Минус:</em> Недетерминированность. Если запрос содержит функции вроде <code>NOW()</code> или <code>RAND()</code>, на мастере и реплике получатся разные данные.</li>
-<li><strong>Row-Based Replication (RBL):</strong> В лог пишется фактическое изменение каждой строки (образ строки до и после). <br />
-   * <em>Плюс:</em> 100% гарантия консистентности (Data Consistency).<br />
-   * <em>Минус:</em> Write Amplification. Если ваш запрос обновил 100 000 строк, в лог запишутся 100 000 физических изменений, раздувая его размер.</li>
-<li><strong>Mixed:</strong> MySQL сама решает, когда использовать Statement, а когда безопасно переключиться на Row (например, при вызове <code>UUID()</code>).</li>
-</ol>
-<p><em>Начиная с MySQL 5.7.7, дефолтным и рекомендуемым форматом является </em><em>Row-Based (ROW)</em>**.</p>
-<hr />
-<h2 id="arkhitektura-i-potoki-replikatsii-pod-kapotom">Архитектура и потоки репликации: Под капотом</h2>
+<p>Чтобы активировать репликацию, на мастере должен быть включен флаг <code>log_bin</code>. Любая транзакция, модифицирующая данные (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>ALTER</code>), в момент коммита атомарно регистрируется в файлах бинарного журнала.</p>
+<h3 id="formaty-binlog-evolyutsiya-i-kompromissy">Форматы Binlog: Эволюция и компромиссы</h3>
 
-<p>Классическая репликация MySQL работает по модели <strong>Push/Pull</strong> и задействует три основных потока (threads).</p>
+<ol>
+<li><strong>Statement-Based Replication (SBR):</strong><br />
+   В лог записывается исходный текст выполненного SQL-запроса (например: <code>UPDATE users SET status = 1 WHERE age &gt; 18</code>).<br />
+   * <em>Плюс:</em> Предельная компактность лога. Сетевой трафик и дисковые операции минимальны: даже если запрос обновил миллион строк, в лог пишется одна короткая строчка.<br />
+   * <em>Минус:</em> Проблема недетерминированности. Если SQL-запрос содержит недетерминированные функции вроде <code>NOW()</code>, <code>UUID()</code>, <code>RAND()</code> или подзапросы без строгого <code>ORDER BY</code>, то результат выполнения на мастере и реплике неизбежно разойдется. В данных возникнет тихий, катастрофический рассинхрон.</li>
+<li><strong>Row-Based Replication (RBR):</strong><br />
+   В лог записывается не SQL-запрос, а физические образы затронутых строк (Before-Image и After-Image).<br />
+   * <em>Плюс:</em> 100% математическая гарантия идентичности данных между репликами. Никакие системные функции или условия гонки не могут вызвать рассинхрон.<br />
+   * <em>Минус:</em> Рост объема лога (Write Amplification). Если один запрос обновил 500 000 записей, в Binlog будет записано 500 000 полных образов строк, что создаст всплеск нагрузки на сеть и дисковый ввод-вывод.</li>
+<li><strong>Mixed (Смешанный режим):</strong><br />
+   MySQL по умолчанию использует Statement-формат, но если парсер встречает недетерминированную конструкцию (вызовы функций <code>UUID()</code>, использование триггеров или временных таблиц), он автоматически переключает текущую запись в Row-формат.</li>
+</ol>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Стандарт современного продакшена</span>
+  </div>
+  <div class="callout-body">
+    <p>Начиная с версии MySQL 5.7.7, дефолтным, безальтернативным и промышленным стандартом является <strong>Row-Based Replication (ROW)</strong>. В связке с параметром <code>binlog_row_image=minimal</code> MySQL пишет в After-Image только реально измененные колонки, что существенно сокращает избыточность логов без потери надежности.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="arkhitektura-i-potoki-replikatsii-mekhanika-pod-kapotom">Архитектура и потоки репликации: Механика под капотом</h2>
+
+<p>Классическая репликация MySQL опирается на модель <strong>Publish/Subscribe (Push/Pull)</strong> и реализуется согласованной работой трех системных потоков операционной системы:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2225,67 +2240,176 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-subgraph Master [&quot;Master Node&quot;]
-Binlog[&quot;Binlog&lt;br&gt;Файл на диске&quot;]
-DumpThread[&quot;Binlog Dump Thread&quot;]
-Binlog --&gt;|&quot;Чтение&quot;| DumpThread
+subgraph Master [&quot;Master Node (Source)&quot;]
+Binlog[&quot;Binlog&lt;br&gt;(Файл на диске)&quot;]
+DumpThread[&quot;Binlog Dump Thread&lt;br&gt;(Ядерный поток OS)&quot;]
+Binlog --&gt;|&quot;Чтение событий&quot;| DumpThread
 end
 
-subgraph Replica [&quot;Replica Node&quot;]
-IOThread[&quot;IO Thread&quot;]
-RelayLog[&quot;Relay Log&lt;br&gt;Файл на диске&quot;]
-SQLThread[&quot;SQL Thread&lt;br&gt;Coordinator + Workers&quot;]
-Data[&quot;InnoDB Data&quot;]
+subgraph Replica [&quot;Replica Node (Target)&quot;]
+IOThread[&quot;IO Thread (Receiver)&quot;]
+RelayLog[&quot;Relay Log&lt;br&gt;(Файл на диске)&quot;]
+SQLThread[&quot;Applier Coordinator&lt;br&gt;(SQL Thread)&quot;]
+Workers[&quot;Worker Threads&lt;br&gt;(MTS / Parallel Applier)&quot;]
+Data[&quot;InnoDB Buffer Pool &amp; Data&quot;]
 
-IOThread --&gt;|&quot;Запись&quot;| RelayLog
-RelayLog --&gt;|&quot;Чтение&quot;| SQLThread
-SQLThread --&gt;|&quot;Выполнение транзакций&quot;| Data
+IOThread --&gt;|&quot;Последовательная запись&quot;| RelayLog
+RelayLog --&gt;|&quot;Чтение событий&quot;| SQLThread
+SQLThread --&gt;|&quot;Диспетчеризация&quot;| Workers
+Workers --&gt;|&quot;Параллельное исполнение&quot;| Data
 end
 
-DumpThread --&gt;|&quot;Передача по TCP&quot;| IOThread
+DumpThread --&gt;|&quot;Передача по TCP-сокету&quot;| IOThread
+
+style Master fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style Replica fill:#0f172a,stroke:#34d399,stroke-width:2px
+style Binlog fill:#1e293b,stroke:#818cf8,stroke-width:1px
+style RelayLog fill:#1e293b,stroke:#818cf8,stroke-width:1px
+style Data fill:#1e293b,stroke:#f87171,stroke-width:1px
   </pre>
 </div>
 
 
 <ol>
-<li><strong>Binlog Dump Thread (Master):</strong> Когда реплика подключается к мастеру, на мастере создается этот поток. Он читает локальный Binlog и отправляет его по сети. Если реплика отстала, поток читает старые файлы логов; если реплика догнала мастера, поток засыпает в ожидании новых событий.</li>
-<li><strong>IO Thread (Replica):</strong> Этот поток на реплике принимает байты по TCP от мастера и пишет их в свой локальный лог, который называется <strong>Relay Log (Ретрансляционный лог)</strong>. Это чистая последовательная запись на диск (Sequential I/O), поэтому этот этап обычно очень быстрый.</li>
-<li><strong>SQL Thread (Replica):</strong> Этот поток читает Relay Log, парсит события (Row-изменения) и применяет их к локальному движку InnoDB. </li>
+<li><strong>Binlog Dump Thread (на стороне Master):</strong><br />
+   Когда реплика устанавливает сетевое соединение с мастером, процесс <code>mysqld</code> на мастере выделяет для нее персональный поток операционной системы. Этот поток открывает файлы Binlog, читает бинарные события и пересылает их по TCP-соединению. Если реплика отстает от мастера, поток непрерывно читает старые архивы логов; если реплика догнала мастер, поток переходит в спящий режим ожидания (wait) на системном условном мьютексе и мгновенно просыпается при записи новых данных в Binlog.</li>
+<li><strong>IO Thread / Receiver Thread (на стороне Replica):</strong><br />
+   Фоновый поток реплики принимает сетевые пакеты от мастера через TCP-сокет и сохраняет их в промежуточные локальные файлы — <strong>Relay Log (Журнал ретрансляции)</strong>. Это быстрая операция последовательной записи на накопитель (Sequential Disk Append), поэтому задержка на этапе приема сетевых пакетов обычно составляет доли миллисекунды.</li>
+<li><strong>SQL Thread / Applier Thread (на стороне Replica):</strong><br />
+   Этот поток последовательно читает записи из Relay Log, декодирует изменения строк и вызывает функции подсистемы хранения InnoDB, повторяя транзакции в локальных страницах данных.</li>
 </ol>
 <hr />
-<h2 id="problema-otstavaniya-replication-lag-i-mts">Проблема отставания (Replication Lag) и MTS</h2>
+<h2 id="problema-otstavaniya-replication-lag-i-mnogopotochnyy-applier-mts">Проблема отставания (Replication Lag) и многопоточный Applier (MTS)</h2>
 
-<p>Исторически <strong>SQL Thread</strong> был однопоточным. </p>
+<p>Исторически ахиллесовой пятой репликации MySQL был тот факт, что <strong>SQL Thread на реплике работал в один-единственный поток</strong>.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Бутылочное горлышко реплики</span>
   </div>
   <div class="callout-body">
-    <p>Представьте: на мастере 100 конкурентных соединений (горутин) одновременно делают тяжелые <code>UPDATE</code>. Мастер справляется за счет многоядерности.<br />
-Эти 100 транзакций пишутся в Binlog, прилетают на реплику, и... единственный SQL Thread пытается применить их по очереди, одну за другой. <br />
-Результат: Реплика начинает безбожно отставать от мастера (<code>Seconds_Behind_Master</code> в метриках улетает в космос).</p>
+    <p>Представьте типичную картину под нагрузкой: на мощном мастере работают 128 ядер CPU и сотни конкурентных горутин сервиса. Они параллельно изменяют данные в разных таблицах. Мастер справляется за счет параллелизма транзакций.  </p>
+<p>Но когда этот непрерывный шторм транзакций попадает в Relay Log на реплику, одинокий SQL Thread пытается применить их <strong>строго по очереди, друг за другом</strong>.  </p>
+<p>Результат: реплика начинает стремительно отставать от мастера. Метрика <code>Seconds_Behind_Master</code> улетает в космос (минуты или часы), запросы на чтение выдают безнадежно устаревшую информацию, а при внезапной смерти мастера переключение на реплику грозит потерей свежих данных!</p>
   </div>
 </div>
 
-<p>Как решается эта проблема Mechanical Sympathy? Через <strong>MTS (Multi-Threaded Slave)</strong>.<br />
-Начиная с MySQL 5.7, SQL Thread был разделен на Coordinator-поток и пул Worker-потоков (настраивается через <code>slave_parallel_workers</code>). </p>
-<p>Но как параллельно применять транзакции и не сломать данные (ведь порядок важен)? MySQL использует алгоритм <strong>Logical Clock</strong>. Если группа транзакций успешно закоммитилась на мастере <em>в одно и то же время</em> (Group Commit) и они не пересеклись по блокировкам строк, значит, их абсолютно безопасно выполнять параллельно и на реплике. Координатор читает Relay Log и раскидывает независимые транзакции по воркерам.</p>
-<hr />
-<h2 id="rezhimy-sinkhronizatsii-trade-offs">Режимы синхронизации: Trade-offs</h2>
+<h3 id="spasenie-cherez-mechanical-sympathy-mts-i-logical-clock">Спасение через Mechanical Sympathy: MTS и Logical Clock</h3>
 
-<h3 id="1-asynchronous-replication-po-umolchaniyu">1. Asynchronous Replication (По умолчанию)</h3>
-<p>Когда клиент на Go делает <code>COMMIT</code> на мастере, мастер пишет в Binlog, возвращает <code>OK</code> клиенту и только потом (в фоне) отправляет данные на реплику.<br />
-* <strong>Плюсы:</strong> Максимальная производительность. Мастер не ждет реплику.<br />
-* <strong>Минусы:</strong> Возможна потеря данных. Если мастер сгорел через миллисекунду после <code>OK</code>, а Binlog Dump Thread не успел отправить пакет по сети, данные закоммичены для пользователя, но навсегда потеряны.</p>
+<p>Чтобы устранить этот фундаментальный дисбаланс, в современных версиях MySQL появился механизм <strong>Multi-Threaded Slave / Multi-Threaded Applier (MTS)</strong>:<br />
+- В MySQL 5.7+ и MySQL 8.0 одиночный SQL Thread трансформировался в <strong>Coordinator-поток</strong>, управляющий пулом воркеров (<code>slave_parallel_workers</code> в 5.7 или <code>replica_parallel_workers</code> в 8.0).</p>
+<p>Но как параллельно исполнять зависимые транзакции на реплике и не нарушить хронологический порядок? Если транзакция 1 создала пользователя, а транзакция 2 сразу же списала с него деньги, воркеры не имеют права поменять их местами!</p>
+<p>MySQL элегантно решает эту задачу с помощью алгоритма <strong>Logical Clock</strong> и механизма <strong>Group Commit</strong>:<br />
+1. На мастере транзакции группируются перед сбросом в Redo Log и Binlog. <br />
+2. Если группа транзакций смогла одновременно закоммититься на мастере без взаимных блокировок, это служит математическим доказательством того, что <strong>эти транзакции не пересекаются по строкам</strong>.<br />
+3. В заголовок каждой транзакции в Binlog записываются два логических счетчика: <code>sequence_number</code> (номер транзакции) и <code>last_committed</code> (номер коммита, с которым она не конфликтовала).<br />
+4. Координатор на реплике видит: все транзакции с одинаковым <code>last_committed</code> полностью независимы! Он мгновенно распределяет их по свободным Worker-потокам, достигая десятков тысяч транзакций в секунду на реплике.</p>
+<hr />
+<h2 id="rezhimy-sinkhronizatsii-arkhitekturnye-trade-offs">Режимы синхронизации: Архитектурные Trade-offs</h2>
+
+<p>В распределенных системах мы неизбежно сталкиваемся с компромиссом между скоростью отклика (Latency) и надежностью хранения (Durability).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant App as Go Application
+participant Master as Master Node
+participant Replica as Replica Node
+
+rect rgb(30, 41, 59)
+note right of App: Асинхронная репликация (Async)
+App-&gt;&gt;Master: 1. COMMIT Transaction
+Master-&gt;&gt;Master: 2. Write Engine &amp; Binlog
+Master--&gt;&gt;App: 3. OK (Транзакция зафиксирована)
+Master-)Replica: 4. Отправка Binlog по сети (в фоне)
+end
+
+rect rgb(15, 23, 42)
+note right of App: Полусинхронная репликация (Semi-Sync AFTER_SYNC)
+App-&gt;&gt;Master: 1. COMMIT Transaction
+Master-&gt;&gt;Master: 2. Write Binlog &amp; Flush Redo Log (Prepare)
+Master-&gt;&gt;Replica: 3. Отправка пакета Binlog по сети
+Replica-&gt;&gt;Replica: 4. Запись в Relay Log (fsync)
+Replica--&gt;&gt;Master: 5. ACK (Подтверждение записи)
+Master-&gt;&gt;Master: 6. Commit в движке InnoDB
+Master--&gt;&gt;App: 7. OK (Ответ клиенту)
+end
+  </pre>
+</div>
+
+
+<h3 id="1-asynchronous-replication-asinkhronnaya-po-umolchaniyu">1. Asynchronous Replication (Асинхронная, по умолчанию)</h3>
+<p>Мастер фиксирует транзакцию в движке и в локальном Binlog, немедленно возвращает <code>OK</code> клиенту и лишь затем в фоновом режиме пересылает события на реплику.<br />
+* <strong>Плюсы:</strong> Минимальная сетевая задержка. Скорость коммита на мастере абсолютно не зависит от задержек сети до реплик.<br />
+* <strong>Минусы:</strong> Риск потери данных при аварии (<strong>Data Loss</strong>). Если мастер сгорел через 1 миллисекунду после отправки ответа клиенту, а пакеты Binlog еще не покинули сетевой буфер, данные навсегда потеряны для мира.</p>
 <h3 id="2-semi-synchronous-replication-polusinkhronnaya">2. Semi-Synchronous Replication (Полусинхронная)</h3>
-<p>Мастер пишет транзакцию в Binlog, отправляет её реплике и <strong>ждет (блокирует поток клиента)</strong>, пока IO Thread реплики не пришлет ACK (подтверждение, что данные записаны в Relay Log на диск реплики). После получения ACK, мастер возвращает <code>OK</code> клиенту.<br />
-* <strong>Плюсы:</strong> Строгая гарантия, что хотя бы одна реплика имеет копию транзакции в случае смерти мастера.<br />
-* <strong>Минусы:</strong> Задержка ответа клиенту увеличивается на сетевой Round-Trip Time (RTT) до реплики плюс время <code>fsync</code> Relay Log'а. Требует отличной сети между ДЦ.</p>
-<hr />
-<h2 id="inzheneriya-na-go-read-after-write-consistency">Инженерия на Go: Read-After-Write Consistency</h2>
+<p>Мастер ждет, пока хотя бы одна подключенная полусинхронная реплика не примет пакет данных и не запишет его в свой Relay Log.<br />
+* <strong>Плюсы:</strong> Нулевая потеря данных (<strong>RPO = 0</strong>). При падении мастера гарантируется, что хотя бы на одной реплике есть точная копия всех подтвержденных клиенту транзакций.<br />
+* <strong>Минусы:</strong> Задержка ответа клиенту на запись возрастает ровно на сетевой Round-Trip Time (RTT) до реплики плюс время вызова <code>fsync</code> Relay Log на стороне реплики.</p>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Эволюция Semi-Sync: AFTER_COMMIT против AFTER_SYNC</span>
+  </div>
+  <div class="callout-body">
+    <p>В старых версиях MySQL использовался режим <code>AFTER_COMMIT</code> (мастер сначала коммитил транзакцию в InnoDB, а затем ждал ACK реплики). Это приводило к аномалии: параллельные клиенты на мастере уже видели новые данные, но если мастер падал до прихода ACK, происходил failover на реплику, где этих данных не было!<br />
+В современном MySQL стандартом является режим <code>rpl_semi_sync_master_wait_point = AFTER_SYNC</code>: мастер записывает Binlog, отправляет его реплике, получает подтверждение (ACK) и <strong>только после этого</strong> открывает видимость данных в InnoDB и возвращает <code>OK</code> пользователю. Это полностью устраняет фантомные подтверждения.</p>
+  </div>
+</div>
 
-<p>Добавление репликации в систему радикально усложняет код бэкенда. Основная проблема — разделение чтения и записи (Read/Write Split). Всю запись мы направляем на Master, а чтение (чтобы разгрузить мастера) балансируем между Репликами.</p>
+<hr />
+<h2 id="gtid-globalnye-identifikatory-tranzaktsiy">GTID: Глобальные идентификаторы транзакций</h2>
+
+<p>Исторически репликация в MySQL настраивалась по координатам файлов: <code>MASTER_LOG_FILE='mysql-bin.000142', MASTER_LOG_POS=48201</code>. Это было кошмаром системных инженеров: при падении мастера было крайне сложно понять, на какой именно позиции в разных файлах остановились подчиненные реплики, чтобы переключить их на нового лидера.</p>
+<p>Начиная с MySQL 5.6+, де-факто стандартом стал <strong>GTID (Global Transaction Identifier)</strong>.<br />
+Каждая закоммиченная транзакция получает уникальный на весь мир идентификатор вида:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">3E11FA47-71CA-11E1-9E33-C80AA9429562:23
+</code></pre>
+</div>
+
+<p>(UUID инстанса мастера, породившего транзакцию, и монотонно возрастающий номер транзакции).</p>
+<p>Благодаря GTID репликация настраивается буквально одной командой:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">CHANGE REPLICATION SOURCE TO 
+    SOURCE_HOST='master-host', 
+    SOURCE_AUTO_POSITION=1;
+</code></pre>
+</div>
+
+<p>Реплика сама сообщает мастеру список уже выполненных ею GTID-диапазонов (<code>Retrieved_Gtid_Set</code>), а мастер автоматически отсылает ей недостающие транзакции. Автоматический Failover (например, через Orchestrator или Patroni-подобные утилиты) с GTID стал простым и надежным.</p>
+<hr />
+<h2 id="inzheneriya-na-go-pattern-readwrite-split-i-read-after-write">Инженерия на Go: Паттерн Read/Write Split и Read-After-Write</h2>
+
+<p>В архитектуре Go-микросервисов масштабирование чтения реализуется разделением потоков запросов (<strong>Read/Write Splitting</strong>): все модифицирующие операции (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>) уходят на Master, а тяжелые выборки (<code>SELECT</code>) балансируются по пулу реплик.</p>
+<p>Однако асинхронная природа репликаций создает классическую проблему консистентности:</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2293,17 +2417,19 @@ DumpThread --&gt;|&quot;Передача по TCP&quot;| IOThread
   </div>
   <div class="callout-body">
     <ol>
-<li>Пользователь обновляет свой профиль (запрос уходит на Master).</li>
-<li>Go-приложение возвращает HTTP 200 OK.</li>
-<li>Фронтенд делает редирект и запрашивает страницу профиля.</li>
-<li>Go-приложение делает <code>SELECT</code> из Реплики.</li>
-<li>Из-за асинхронной природы репликации данные еще не долетели (lag 50ms).</li>
-<li>Пользователь видит свои СТАРЫЕ данные и в панике кликает "Сохранить" еще раз.</li>
+<li>Пользователь обновляет свой аватар или пароль в личном кабинете. HTTP POST-запрос уходит на Master.</li>
+<li>Бэкенд на Go возвращает статус <code>200 OK</code>.</li>
+<li>Браузер тут же делает редирект на страницу профиля и запрашивает актуальные данные через HTTP GET.</li>
+<li>Go-сервис отправляет <code>SELECT</code> в ближайшую случайную реплику.</li>
+<li>Из-за сетевой задержки реплика отстает от мастера всего на 30 миллисекунд — новые данные еще не доехали в Relay Log!</li>
+<li>Пользователь видит свой СТАРЫЙ профиль и в недоумении начинает засыпать поддержку жалобами.</li>
 </ol>
   </div>
 </div>
 
-<p>В идиоматичном Go мы решаем это на уровне архитектуры репозитория. Мы создаем обертку, содержащую два пула соединений: один для записи, другой для чтения.</p>
+<h3 id="idiomatichnyy-pul-s-marshrutizatsiey-zaprosov-v-go">Идиоматичный пул с маршрутизацией запросов в Go</h3>
+
+<p>Для решения этой проблемы в бэкенд закладывают абстракцию кластера и применяют паттерн <strong>"Sticky Master" (Липкий мастер)</strong>: если пользователь недавно внес изменения, его запросы на чтение временно (в течение 2–3 секунд) принудительно направляются на Master.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2319,41 +2445,71 @@ import (
     &quot;context&quot;
     &quot;database/sql&quot;
     &quot;fmt&quot;
+    &quot;sync/atomic&quot;
+    &quot;time&quot;
 )
 
-// DBCluster инкапсулирует логику маршрутизации запросов
+// DBCluster инкапсулирует мастер и пул доступных реплик для прозрачной маршрутизации.
 type DBCluster struct {
     Master   *sql.DB
     Replicas []*sql.DB
+    counter  uint64
 }
 
-// MasterConn возвращает пул для записи
+// NewDBCluster инициализирует отказоустойчивый кластерный клиент.
+func NewDBCluster(master *sql.DB, replicas []*sql.DB) *DBCluster {
+    return &amp;DBCluster{
+        Master:   master,
+        Replicas: replicas,
+    }
+}
+
+// WriteDB возвращает пул соединений к Master-узлу для модифицирующих операций.
 func (c *DBCluster) WriteDB() *sql.DB {
     return c.Master
 }
 
-// ReadDB использует Round-Robin или Random для выбора реплики
+// ReadDB возвращает соединение к реплике по алгоритму Round-Robin.
+// Если реплики недоступны, прозрачно деградирует (fallback) до чтения с Master.
 func (c *DBCluster) ReadDB() *sql.DB {
-    // Для простоты примера берем первую (в реальности нужен балансировщик)
-    if len(c.Replicas) &gt; 0 {
-        return c.Replicas[0]
+    if len(c.Replicas) == 0 {
+        return c.Master
     }
-    // Fallback на мастера, если реплик нет
-    return c.Master
+    idx := atomic.AddUint64(&amp;c.counter, 1) % uint64(len(c.Replicas))
+    return c.Replicas[idx]
+}
+
+// QueryWithAffinity решает проблему Read-After-Write Consistency:
+// если с момента последней записи пользователя прошло меньше stickyDuration,
+// запрос на чтение принудительно направляется на Master.
+func (c *DBCluster) QueryWithAffinity(
+    ctx context.Context, 
+    lastWriteTime time.Time, 
+    stickyDuration time.Duration, 
+    query string, 
+    args ...any,
+) (*sql.Rows, error) {
+    db := c.ReadDB()
+    if time.Since(lastWriteTime) &lt; stickyDuration {
+        // &quot;Липкий мастер&quot; гарантирует, что пользователь увидит свои собственные свежие изменения
+        db = c.WriteDB()
+    }
+    return db.QueryContext(ctx, query, args...)
 }
 </code></pre>
 </div>
 
-<p>Чтобы решить проблему Read-After-Write, бэкендеры часто используют паттерн <strong>"Sticky Master" (Липкий мастер)</strong>. Если пользователь только что сделал <code>UPDATE</code>, мы кладем в его сессию (или JWT токен, или Redis кэш) флаг с timestamp'ом. При последующих <code>SELECT</code> запросах в течение ближайших 2-3 секунд мы принудительно маршрутизируем его чтения на Master (<code>WriteDB()</code>), игнорируя реплики.</p>
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li>Репликация в MySQL исторически строится вокруг <strong>Binlog'а</strong>.</li>
-<li>По умолчанию используется <strong>асинхронная</strong> передача: это быстро, но грозит потерей последних транзакций при крахе мастера. Полусинхронный режим решает эту проблему ценой сетевой задержки (RTT).</li>
-<li><strong>Отставание реплики (Replication Lag)</strong> — неизбежное зло. В современных версиях MySQL оно минимизируется за счет параллельного применения логов (MTS - Multi-Threaded Slave).</li>
-<li>Разработчик на Go должен явно управлять маршрутизацией запросов (Master для Write, Replica для Read) и обрабатывать аномалии консистентности (Read-After-Write) на уровне архитектуры приложения.</li>
+<li><strong>Binlog (Server Layer)</strong> — фундамент репликации в MySQL. Для продакшена обязателен формат <strong>Row-Based Replication (ROW)</strong> в сочетании с глобальными идентификаторами транзакций (<strong>GTID</strong>).</li>
+<li>Репликация приводится в движение тремя системными потоками: <strong>Binlog Dump Thread</strong> (на мастере) отправляет байты по TCP, <strong>IO Thread</strong> (на реплике) сохраняет их в <strong>Relay Log</strong>, а <strong>SQL Thread</strong> накладывает изменения на локальный движок.</li>
+<li>Отставание реплик (<strong>Replication Lag</strong>) минимизируется многопоточным применением транзакций (<strong>MTS</strong>), где алгоритм <strong>Logical Clock</strong> безопасно распараллеливает независимые группы коммитов.</li>
+<li>Выбор между <strong>Asynchronous</strong> и <strong>Semi-Synchronous (AFTER_SYNC)</strong> репликацией — это фундаментальный архитектурный выбор между максимальным RPS и гарантией нулевой потери данных (RPO = 0).</li>
+<li>Приложение на Go должно осознанно управлять разделением соединений на Master и Replicas и предотвращать аномалии <strong>Read-After-Write</strong> с помощью паттернов вроде Sticky Master или передачи GTID-метки в заголовках.</li>
 </ol>
-<p>MySQL — прекрасная и проверенная временем система, но у нее есть сильный конкурент в мире Open Source. Чтобы стать полноценным System Architect'ом, нужно понимать сильные и слабые стороны обоих гигантов. В следующей статье мы проведем хардкорное сравнение их подкапотных механизмов: <a href="6-otlichiya-mysql-i-postgresql.html" class="wikilink">6. Отличия MySQL и PostgreSQL</a>.</p>
+<p>Теперь, когда мы досконально изучили устройство транзакций, блокировок и репликации в MySQL, самое время сопоставить эти знания с другим титаном мира Open Source — PostgreSQL. В следующей лекции мы проведем глубокое архитектурное вскрытие и сравним их внутренние механизмы: <a href="6-otlichiya-mysql-i-postgresql.html" class="wikilink">6. Отличия MySQL и PostgreSQL</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2381,7 +2537,7 @@ func (c *DBCluster) ReadDB() *sql.DB {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#preodolevaya-predely-odnogo-servera">Преодолевая пределы одного сервера</a></li><li class="toc-item toc-h2"><a href="#binarnyy-log-binlog-istochnik-istiny">Бинарный лог (Binlog): Источник истины</a></li><li class="toc-item toc-h3"><a href="#formaty-binloga">Форматы Binlog&#x27;а</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-i-potoki-replikatsii-pod-kapotom">Архитектура и потоки репликации: Под капотом</a></li><li class="toc-item toc-h2"><a href="#problema-otstavaniya-replication-lag-i-mts">Проблема отставания (Replication Lag) и MTS</a></li><li class="toc-item toc-h2"><a href="#rezhimy-sinkhronizatsii-trade-offs">Режимы синхронизации: Trade-offs</a></li><li class="toc-item toc-h3"><a href="#1-asynchronous-replication-po-umolchaniyu">1. Asynchronous Replication (По умолчанию)</a></li><li class="toc-item toc-h3"><a href="#2-semi-synchronous-replication-polusinkhronnaya">2. Semi-Synchronous Replication (Полусинхронная)</a></li><li class="toc-item toc-h2"><a href="#inzheneriya-na-go-read-after-write-consistency">Инженерия на Go: Read-After-Write Consistency</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#preodolevaya-predely-odnogo-servera">Преодолевая пределы одного сервера</a></li><li class="toc-item toc-h2"><a href="#binarnyy-log-binlog-istochnik-istiny">Бинарный лог (Binlog): Источник истины</a></li><li class="toc-item toc-h3"><a href="#formaty-binlog-evolyutsiya-i-kompromissy">Форматы Binlog: Эволюция и компромиссы</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-i-potoki-replikatsii-mekhanika-pod-kapotom">Архитектура и потоки репликации: Механика под капотом</a></li><li class="toc-item toc-h2"><a href="#problema-otstavaniya-replication-lag-i-mnogopotochnyy-applier-mts">Проблема отставания (Replication Lag) и многопоточный Applier (MTS)</a></li><li class="toc-item toc-h3"><a href="#spasenie-cherez-mechanical-sympathy-mts-i-logical-clock">Спасение через Mechanical Sympathy: MTS и Logical Clock</a></li><li class="toc-item toc-h2"><a href="#rezhimy-sinkhronizatsii-arkhitekturnye-trade-offs">Режимы синхронизации: Архитектурные Trade-offs</a></li><li class="toc-item toc-h3"><a href="#1-asynchronous-replication-asinkhronnaya-po-umolchaniyu">1. Asynchronous Replication (Асинхронная, по умолчанию)</a></li><li class="toc-item toc-h3"><a href="#2-semi-synchronous-replication-polusinkhronnaya">2. Semi-Synchronous Replication (Полусинхронная)</a></li><li class="toc-item toc-h2"><a href="#gtid-globalnye-identifikatory-tranzaktsiy">GTID: Глобальные идентификаторы транзакций</a></li><li class="toc-item toc-h2"><a href="#inzheneriya-na-go-pattern-readwrite-split-i-read-after-write">Инженерия на Go: Паттерн Read/Write Split и Read-After-Write</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-pul-s-marshrutizatsiey-zaprosov-v-go">Идиоматичный пул с маршрутизацией запросов в Go</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

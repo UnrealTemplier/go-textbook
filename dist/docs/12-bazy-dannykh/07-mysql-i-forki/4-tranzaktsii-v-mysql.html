@@ -2168,62 +2168,106 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~37 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Транзакции в MySQL</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы разобрали, как InnoDB хранит страницы в памяти (<a href="2-innodb-storage-engine.html" class="wikilink">2. InnoDB storage engine</a>) и как ускоряет поиск с помощью B+ деревьев (<a href="3-indeksy-v-mysql.html" class="wikilink">3. Индексы в MySQL</a>). Но базы данных редко работают в однопоточном режиме. В реальном мире ваш Go-бэкенд открывает сотни соединений к СУБД, и тысячи горутин пытаются одновременно читать и изменять одни и те же строки.</p>
-<p>Чтобы этот хаос не привел к разрушению данных, существуют <strong>Транзакции</strong>. Транзакция переводит базу из одного консистентного состояния в другое. Если что-то идет не так — всё откатывается. </p>
-<p>Сегодня мы разберем, как транзакции работают в MySQL (InnoDB), почему дефолтное поведение MySQL отличается от стандартов и почему слепая вера в уровни изоляции может положить ваш production.</p>
-<h2 id="acid-fundament-tranzaktsiy">ACID: Фундамент транзакций</h2>
+            <p>В предыдущих статьях мы подробно разобрали, как движок InnoDB организует страницы в оперативной памяти и сбрасывает их на накопитель (<a href="2-innodb-storage-engine.html" class="wikilink">2. InnoDB storage engine</a>), а также как ускоряет поиск с помощью сбалансированных B+ деревьев (<a href="3-indeksy-v-mysql.html" class="wikilink">3. Индексы в MySQL</a>). Но в реальных инженерных системах базы данных практически никогда не работают в вакууме или в однопоточном режиме. </p>
+<p>Ваш типовой Go-сервис держит пул из десятков или сотен открытых TCP-соединений к СУБД. Тысячи легковесных горутин каждую секунду одновременно обращаются к таблицам: списывают средства со счетов, бронируют остатки товаров на складе, переводят статусы заказов и читают аналитику. Без надежных правил этот параллельный поток неминуемо превратит хранилище в хаос — с отрицательными балансами, потерянными обновлениями и «фантомными» записями.</p>
+<p>Чтобы предотвратить подобное разрушение, существует фундаментальная математическая и инженерная абстракция — <strong>Транзакция</strong>. Транзакция переводит состояние базы данных из одного строго непротиворечивого состояния в другое, гарантируя, что любая цепочка операций завершится либо триумфальным успехом, либо бесследным откатом. </p>
+<p>В этой главе мы с инженерной дотошностью разберем, как транзакции реализованы в недрах MySQL и подсистемы InnoDB: почему дефолтное поведение MySQL расходится со стандартами ANSI SQL, как работают хитроумные блокировки диапазонов (Next-Key Locks) и почему слепая вера в уровни изоляции может поставить на колени высоконагруженный production.</p>
+<hr />
+<h2 id="acid-fundament-i-anatomiya-tranzaktsiy">ACID: Фундамент и анатомия транзакций</h2>
 
-<p>Любая надежная СУБД обещает выполнение четырех свойств ACID:</p>
+<p>Каждая промышленная реляционная СУБД обещает разработчику соблюдение знаменитого акронима <strong>ACID</strong>. Давайте заглянем под капот и посмотрим, какими именно физическими структурами InnoDB гарантирует каждое из этих четырех качеств:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph ACID[&quot;Гарантии ACID в движке InnoDB&quot;]
+A[&quot;&lt;b&gt;Atomicity (Атомарность)&lt;/b&gt;&lt;br&gt;Undo Log (Rollback Segment)&quot;]
+C[&quot;&lt;b&gt;Consistency (Консистентность)&lt;/b&gt;&lt;br&gt;B-Tree Constraints, F-Keys, Двойная запись&quot;]
+I[&quot;&lt;b&gt;Isolation (Изоляция)&lt;/b&gt;&lt;br&gt;MVCC (Read View) + Lock Manager (Row/Gap Locks)&quot;]
+D[&quot;&lt;b&gt;Durability (Долговечность)&lt;/b&gt;&lt;br&gt;Redo Log (WAL) + fsync + Doublewrite Buffer&quot;]
+end
+
+style ACID fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style A fill:#1e293b,stroke:#818cf8,stroke-width:1px
+style C fill:#1e293b,stroke:#34d399,stroke-width:1px
+style I fill:#1e293b,stroke:#fbbf24,stroke-width:1px
+style D fill:#1e293b,stroke:#f87171,stroke-width:1px
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>Atomicity (Атомарность):</strong> «Всё или ничего». Если вы списываете деньги с одного счета и зачисляете на другой, обе операции либо выполнятся, либо откатятся. В InnoDB за это отвечает <strong>Undo Log</strong> (лог отката), хранящий старые версии строк.</li>
-<li><strong>Consistency (Консистентность):</strong> Транзакция не может нарушить правила БД (внешние ключи, уникальные индексы). Если уникальный индекс <code>idx_email</code> нарушен, вся транзакция отклоняется.</li>
-<li><strong>Isolation (Изоляция):</strong> Параллельные транзакции не должны влиять друг на друга. За это отвечают механизмы <strong>Блокировок (Locking)</strong> и <strong>MVCC (Multi-Version Concurrency Control)</strong>. Это самая сложная и настраиваемая часть.</li>
-<li><strong>Durability (Долговечность):</strong> Если клиент получил <code>COMMIT</code>, данные не пропадут даже при отключении электричества. За это отвечает <strong>Redo Log (WAL)</strong> и системные вызовы <code>fsync</code> к ОС.</li>
+<li><strong>Atomicity (Атомарность):</strong> Принцип «всё или ничего». Если при переводе средств мы успешно уменьшили баланс одного клиента, но операция начисления второму упала с ошибкой (например, из-за превышения лимита или сбоя сети), система обязана полностью аннулировать списание.<br />
+   В InnoDB за атомарность отвечает <strong>Undo Log</strong> (сегменты отката). Прежде чем модифицировать любую страницу в буферном пуле, движок сохраняет дельту исходного состояния строки в Undo-страницы. Если транзакция завершается аварией или явной командой <code>ROLLBACK</code>, InnoDB последовательно применяет цепочку отката, возвращая строки к первозданному виду.</li>
+<li><strong>Consistency (Консистентность):</strong> Транзакция обязана переводить базу данных только между валидными состояниями, удовлетворяющими всем явным ограничениям схемы данных (первичные ключи, уникальные индексы, внешние ключи <code>FOREIGN KEY</code>, <code>CHECK</code>-констрейнты), а также внутренней целостности самого движка (корректность указателей B+ дерева). Если бизнес-правило или ограничение уникальности <code>idx_email</code> нарушено, вся транзакция прерывается и откатывается.</li>
+<li><strong>Isolation (Изоляция):</strong> Параллельно исполняемые транзакции не должны деструктивно вмешиваться в работу друг друга. Идеальная изоляция создает для каждой транзакции иллюзию того, что она является единственным клиентом во всей базе данных.<br />
+   Это самая дорогая с точки зрения задержек характеристика. Для ее обеспечения InnoDB балансирует между двумя ключевыми механизмами: <strong>MVCC (Multi-Version Concurrency Control)</strong> для неблокирующего чтения и <strong>Locking (Менеджер блокировок)</strong> для модификаций.</li>
+<li><strong>Durability (Долговечность):</strong> Как только клиент получил подтверждение <code>COMMIT</code>, изменения считаются вечными. Ни внезапное исчезновение питания, ни падение ядра операционной системы, ни краш процесса <code>mysqld</code> не имеют права стереть зафиксированные данные.<br />
+   В InnoDB долговечность гарантируется <strong>Redo Log</strong> (журналом упреждающей записи WAL) и периодическими системными вызовами <code>fsync</code> к дисковой подсистеме операционной системы.</li>
 </ol>
 <hr />
 <h2 id="urovni-izolyatsii-balans-mezhdu-proizvoditelnostyu-i-anomaliyami">Уровни изоляции: Баланс между производительностью и аномалиями</h2>
 
-<p>Стандарт SQL-92 определяет четыре уровня изоляции. В MySQL (InnoDB) они реализованы со своими нюансами.</p>
+<p>Стандарт ANSI SQL-92 определил четыре классических уровня изоляции транзакций, ранжированных по степени защиты от феноменов параллельного доступа (грязное чтение, неповторяющееся чтение, фантомы). Однако реализация этих уровней в MySQL InnoDB имеет уникальные особенности, отличающие ее от большинства других СУБД.</p>
 <h3 id="1-read-uncommitted-ru">1. Read Uncommitted (RU)</h3>
-<p>Транзакция видит не закоммиченные изменения других транзакций. <br />
-* <strong>Аномалия:</strong> <em>Dirty Read (Грязное чтение)</em>. Вы прочитали баланс клиента (1000), который другая транзакция только что обновила, но еще не закоммитила. Затем та транзакция упала и откатилась (Rollback). Вы работаете с фантомными деньгами, которых никогда не существовало.<br />
-* <strong>Применение:</strong> Практически никогда не используется на практике.</p>
+<p>Самый слабый уровень изоляции. Транзакция способна наблюдать изменения, внесенные параллельными транзакциями, которые еще не были закоммичены.<br />
+* <strong>Аномалия:</strong> <em>Dirty Read (Грязное чтение)</em>. Представьте, что транзакция А перевела баланс счета на 1 000 000 рублей, но еще не зафиксировала результат. Транзакция Б читает этот баланс и одобряет выдачу кредита. Сразу после этого транзакция А ловит ошибку и откатывается (<code>ROLLBACK</code>). Транзакция Б оперировала деньгами, которых в действительности никогда не существовало на диске.<br />
+* <strong>Применение:</strong> В серьезной бэкенд-разработке практически не используется, за исключением крайне специфических сценариев грубого приближенного подсчета статистики, где погрешность не играет никакой роли, а блокировки недопустимы.</p>
 <h3 id="2-read-committed-rc">2. Read Committed (RC)</h3>
-<p>Транзакция видит только закоммиченные данные. Грязного чтения нет.<br />
-* <strong>Как работает в InnoDB:</strong> При каждом отдельном <code>SELECT</code>-запросе внутри транзакции InnoDB создает новый <strong>Read View</strong> (снимок видимости). Он смотрит в Undo Log и отфильтровывает строки, <code>DB_TRX_ID</code> которых принадлежит еще не завершенным транзакциям.<br />
-* <strong>Аномалия:</strong> <em>Non-repeatable Read (Неповторяющееся чтение)</em>. Вы делаете <code>SELECT</code> баланса (100). Затем другая транзакция делает <code>UPDATE</code> баланса на 50 и коммитит. Вы делаете тот же <code>SELECT</code> в своей транзакции и получаете 50. Данные изменились прямо в процессе вашей работы.<br />
-* <strong>Интересный факт:</strong> Это уровень изоляции по умолчанию в PostgreSQL и Oracle.</p>
+<p>Транзакция видит только строго зафиксированные (закоммиченные) данные. Грязное чтение здесь математически исключено.<br />
+* <strong>Как работает в InnoDB:</strong> Для каждого отдельного <code>SELECT</code>-запроса внутри одной транзакции движок InnoDB генерирует свежий <strong>Read View</strong> (снимок видимости). Он обращается к системным полям строк (<code>DB_TRX_ID</code>, <code>DB_ROLL_PTR</code>) и к Undo Log, динамически отфильтровывая записи, созданные или измененные транзакциями, которые еще активны в этот конкретный момент времени.<br />
+* <strong>Аномалия:</strong> <em>Non-repeatable Read (Неповторяющееся чтение)</em>. Выполняя <code>SELECT balance FROM accounts WHERE id = 42</code>, вы получаете 100 рублей. Через мгновение параллельная транзакция списывает со счета 50 рублей и фиксирует <code>COMMIT</code>. Повторный <code>SELECT</code> в рамках вашей первой транзакции внезапно вернет 50 рублей. Данные изменились прямо посреди выполнения вашего бизнес-сценария.<br />
+* <strong>Интересный факт:</strong> Это стандартный уровень изоляции по умолчанию в PostgreSQL, Oracle и Microsoft SQL Server.</p>
 <h3 id="3-repeatable-read-rr-po-umolchaniyu-v-mysql">3. Repeatable Read (RR) — По умолчанию в MySQL</h3>
-<p>Транзакция видит мир таким, каким он был на момент её старта (или на момент первого <code>SELECT</code>).<br />
-* <strong>Как работает в InnoDB:</strong> <strong>Read View</strong> создается <em>один раз</em> при первом чтении и сохраняется до конца транзакции. Все последующие <code>SELECT</code> используют этот же снимок, читая старые версии строк из Undo Log. Вы всегда будете получать один и тот же результат.</p>
+<p>Транзакция изолирована от внешнего мира и наблюдает снимок базы данных строго в том состоянии, в котором он находился на момент старта (точнее, на момент выполнения самого первого оператора <code>SELECT</code> в транзакции).<br />
+* <strong>Как работает в InnoDB:</strong> <strong>Read View</strong> создается <em>ровно один раз</em> при первом чтении и сохраняется неизменным вплоть до завершения транзакции (<code>COMMIT</code> или <code>ROLLBACK</code>). Все последующие запросы <code>SELECT</code> обращаются к этому же неизменному снимку, воссоздавая старые версии строк из Undo Log. Сколько бы раз вы ни читали одну и ту же запись, результат останется гарантированно идентичным.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование: Фантомное чтение и магия InnoDB</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Стандарт SQL-92 гласит, что на уровне Repeatable Read возможно <em>Phantom Read (Фантомное чтение)</em> — когда вы делаете <code>SELECT ... WHERE age &gt; 18</code>, получаете 10 строк, затем кто-то вставляет 11-ю строку, и повторный <code>SELECT</code> вернет 11 строк. Происходит ли это в MySQL?<br />
-<strong>Ответ:</strong> <strong>НЕТ.</strong> InnoDB защищает от фантомных чтений на уровне Repeatable Read. Для обычных <code>SELECT</code> это делается через MVCC (новая строка игнорируется, так как ее ID транзакции больше, чем в нашем Read View). Для блокирующих чтений (<code>SELECT ... FOR UPDATE</code>) это делается с помощью <strong>Next-Key Locks</strong>.</p>
+    <p><strong>Вопрос:</strong> Стандарт ANSI SQL-92 прямо гласит, что уровень изоляции Repeatable Read допускает возникновение <em>Phantom Read (Фантомного чтения)</em> — когда при выполнении <code>SELECT ... WHERE age &gt; 18</code> транзакция получает 10 строк, параллельная транзакция вставляет 11-ю запись с <code>age = 25</code> и коммитит, а повторный запрос вернет уже 11 строк. Происходит ли это в MySQL?</p>
+<p><strong>Ответ:</strong> <strong>НЕТ.</strong> В движке InnoDB на уровне Repeatable Read фантомное чтение предотвращено полностью:<br />
+1. Для обычных, неблокирующих запросов (<code>Consistent Nonlocking Reads</code>) защита достигается за счет <strong>MVCC</strong>: созданный в начале Read View просто игнорирует строки с системным идентификатором <code>DB_TRX_ID</code>, превышающим порог видимости снимка.<br />
+2. Для блокирующих запросов (<code>SELECT ... FOR UPDATE</code>, <code>SELECT ... FOR SHARE</code>, <code>UPDATE</code>, <code>DELETE</code>) защита обеспечивается блокировками диапазонов — <strong>Next-Key Locks</strong>, которые физически запрещают параллельным транзакциям вставлять новые строки в промежутки между существующими записями индекса.</p>
   </div>
 </div>
 
 <h3 id="4-serializable">4. Serializable</h3>
-<p>Самый строгий уровень. Транзакции выполняются так, как будто они идут строго последовательно, одна за другой. <br />
-В InnoDB это достигается тем, что СУБД неявно превращает <em>все</em> обычные <code>SELECT</code> в <code>SELECT ... FOR SHARE</code>, вешая разделяемые блокировки (Shared Locks) на все прочитанные строки и диапазоны.<br />
-* <strong>Применение:</strong> Крайне редко. Убивает конкурентность и превращает базу в узкое горлышко.</p>
+<p>Абсолютная степень изоляции. Поведение параллельных транзакций эквивалентно их строго последовательному, однопоточному выполнению.<br />
+* <strong>Как работает в InnoDB:</strong> Если выключен режим <code>autocommit</code>, InnoDB неявно конвертирует абсолютно все простые запросы <code>SELECT</code> в блокирующие конструкции <code>SELECT ... FOR SHARE</code>. Это развешивает разделяемые блокировки (Shared Locks) на все сканируемые строки и диапазоны.<br />
+* <strong>Применение:</strong> Используется крайне редко. Полностью ликвидирует выгоды конкурентного многоядерного исполнения, превращая базу данных в гигантское узкое горлышко и порождая лавины таймаутов на блокировках.</p>
 <hr />
 <h2 id="pod-kapotom-blokirovki-i-next-key-locks">Под капотом: Блокировки и Next-Key Locks</h2>
 
-<p>Чтобы понять, почему MySQL в режиме Repeatable Read не допускает фантомов, нужно заглянуть на уровень структуры B+ дерева.</p>
-<p>Когда вы делаете <code>SELECT * FROM users WHERE id BETWEEN 10 AND 20 FOR UPDATE</code>, InnoDB блокирует не только существующие строки (Record Locks). Она также блокирует <strong>пустоты (Gaps)</strong> между индексами, чтобы никто не смог вставить туда новые данные.<br />
-Комбинация блокировки самой строки и промежутка перед ней называется <strong>Next-Key Lock</strong>.</p>
+<p>Чтобы до конца осознать, почему MySQL на уровне Repeatable Read столь непримирим к фантомам, нам необходимо заглянуть в менеджер блокировок InnoDB и структуру листьев B+ дерева.</p>
+<p>В реляционных базах данных блокировки разделяются по намерениям:<br />
+- <strong>Shared Locks (S-блокировки):</strong> Блокировки на чтение. Позволяют нескольким транзакциям одновременно читать одну строку, но блокируют любую запись.<br />
+- <strong>Exclusive Locks (X-блокировки):</strong> Блокировки на запись. Запрещают другим транзакциям и чтение (блокирующее), и изменение строки.<br />
+- <strong>Intention Locks (IS / IX):</strong> Намерения на уровне всей таблицы. Прежде чем повесить строчную блокировку S или X, транзакция обязана получить флаг намерения (IS или IX) на таблицу. Это избавляет движок от необходимости полного обхода миллионов строк таблицы при выполнении команд вроде <code>LOCK TABLES users WRITE</code> — достаточно проверить наличие флагов на уровне таблицы.</p>
+<p>Но самое интересное происходит при поиске по индексам. Когда транзакция выполняет запрос вида <code>SELECT * FROM users WHERE id BETWEEN 10 AND 20 FOR UPDATE</code>, движок не может ограничиться блокировкой лишь существующих строк (Record Locks). Ведь если строка с <code>id = 12</code> сейчас отсутствует, параллельный поток запросто вставит ее в дерево, и транзакция получит фантом!</p>
+<p>Для решения этой задачи InnoDB реализует три типа блокировок индекса:<br />
+1. <strong>Record Lock:</strong> Блокировка конкретной записи в индексном листе B+ дерева.<br />
+2. <strong>Gap Lock (Блокировка зазора/пустоты):</strong> Блокировка интервала между существующими записями индекса, либо интервала перед первой / после последней записи (<code>supremum</code>). Задача Gap Lock — одна: запретить вставку (<code>INSERT</code>) новых строк в этот интервал другими транзакциями. При этом два разных потока могут держать конфликтующие Gap Locks на один и тот же интервал — они блокируют только вставки, но не чтение друг друга.<br />
+3. <strong>Next-Key Lock:</strong> Комбинация блокировки самой записи (Record Lock) и зазора строго <em>перед</em> ней (Gap Lock). Например, если в индексе присутствуют значения 10, 15 и 22, то Next-Key блокировка для значения 15 накрывает полуинтервал <code>(10, 15]</code>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2243,7 +2287,7 @@ Node10[&quot;Index: 10&quot;]
 Node15[&quot;Index: 15&quot;]
 Node22[&quot;Index: 22&quot;]
 
-Node7 -.-&gt;|&quot;Gap Lock&lt;br&gt;Вставка 8,9 запрещена&quot;| Node10
+Node7 -.-&gt;|&quot;Gap Lock&lt;br&gt;Вставка 8, 9 запрещена&quot;| Node10
 Node10 -.-&gt;|&quot;Gap Lock&lt;br&gt;Вставка 11-14 запрещена&quot;| Node15
 Node15 -.-&gt;|&quot;Gap Lock&lt;br&gt;Вставка 16-21 запрещена&quot;| Node22
 
@@ -2259,17 +2303,23 @@ style Node15 fill:#f96,stroke:#333,stroke-width:2px
     <span class="callout-title">Ловушка / Gotcha: Deadlocks из-за Gap Locks</span>
   </div>
   <div class="callout-body">
-    <p>Это архитектурная боль MySQL по умолчанию. Gap блокировки в Repeatable Read — главная причина взаимных блокировок (Deadlocks) в высоконагруженных системах. <br />
-Если две транзакции одновременно попытаются заблокировать пересекающиеся «пустоты» перед вставкой, они могут заблокировать друг друга.<br />
-<strong>Решение Senior-уровня:</strong> Многие крупные компании (включая GitHub, Shopify и Booking) намеренно переводят MySQL на уровень <strong>Read Committed</strong> (<code>SET GLOBAL tx_isolation = 'READ-COMMITTED'</code>). На этом уровне InnoDB <strong>отключает Gap Locks</strong> для большинства операций, оставляя только блокировки конкретных строк (Row Locks). Это радикально снижает вероятность дедлоков за счет того, что мы миримся с возможными фантомами (которые в реальной бизнес-логике редко являются проблемой, если мы используем оптимистичные блокировки).</p>
+    <p>Блокировки зазоров (Gap Locks) в режиме Repeatable Read — это классическая «мина замедленного действия» для высоконагруженных систем. </p>
+<p>Предположим, две горутины одновременно выполняют проверку наличия уникального промокода или бронируют место:<br />
+1. Транзакция 1 делает <code>SELECT ... WHERE code = 'PROMO10' FOR UPDATE</code>. Записи нет — вешается Gap Lock на интервал <code>('PREV', 'NEXT')</code>.<br />
+2. Транзакция 2 делает точно такой же запрос на параллельный отсутствующий код в этом же диапазоне — и тоже успешно получает совместимый Gap Lock!<br />
+3. Транзакция 1 пытается сделать <code>INSERT INTO promo VALUES ('PROMO10')</code> — она засыпает, ожидая освобождения Gap Lock транзакции 2.<br />
+4. Транзакция 2 пытается вставить свое значение в этот же зазор — и обе транзакции оказываются во взаимной блокировке (<strong>Deadlock</strong>)!</p>
+<p>Встроенный детектор взаимных блокировок (<code>innodb_deadlock_detect=ON</code>) мгновенно построит граф ожидания (<em>Wait-For Graph</em>), выберет жертву (обычно транзакцию с наименьшим числом модифицированных строк в Undo Log), сделает ей принудительный откат и вернет ошибку <code>Error 1213: Deadlock found when trying to get lock</code>.</p>
+<p><strong>Решение Senior-уровня:</strong> Инженерные команды гигантов масштаба GitHub, Uber, Shopify и Booking.com стандартно переводят свои базы данных MySQL на уровень изоляции <strong>Read Committed</strong> (<code>SET GLOBAL transaction_isolation = 'READ-COMMITTED'</code>). На этом уровне InnoDB полностью отключает использование Gap Locks для операций поиска и блокировок строк (оставляя их исключительно для валидации внешних ключей и проверки дубликатов). Это практически сводит на нет вероятность случайных дедлоков на пустых диапазонах, а возможные риски неповторяющегося чтения закрываются прикладными оптимистичными блокировками (через поле <code>version</code>).</p>
   </div>
 </div>
 
 <hr />
-<h2 id="idiomatichnyy-go-upravlenie-tranzaktsiyami">Идиоматичный Go: Управление транзакциями</h2>
+<h2 id="idiomatichnyy-go-upravlenie-tranzaktsiyami-v-databasesql">Идиоматичный Go: Управление транзакциями в `database/sql`</h2>
 
-<p>В Go пакет <code>database/sql</code> предоставляет отличные абстракции для работы с транзакциями, но требует дисциплины. Пул соединений в Go устроен так, что транзакция жестко привязывается к одному конкретному соединению (TCP-сокету).</p>
-<p>Если вы забудете сделать <code>Commit</code> или <code>Rollback</code>, это соединение останется «висеть» в пуле в зависшем состоянии транзакции. Следующая горутина, которая возьмет этот коннект, получит непредсказуемое поведение или ошибку таймаута на локах БД.</p>
+<p>В стандартной библиотеке Go пакет <code>database/sql</code> предоставляет лаконичный и выразительный API для работы с транзакциями, однако за кажущейся простотой скрывается критически важная деталь реализации: <strong>привязка к соединению</strong>.</p>
+<p>Когда вы вызываете метод <code>db.Begin()</code> или <code>db.BeginTx()</code>, менеджер соединений извлекает один физический TCP-сокет из пула и монопольно закрепляет его за объектом <code>*sql.Tx</code>. Все запросы в рамках транзакции будут направляться строго через этот сокет. Если разработчик допускает ошибку — например, забывает обработать ветку с <code>return err</code> до вызова <code>Commit()</code> или <code>Rollback()</code> — сокет навсегда зависает в занятом состоянии. Пул соединений исчерпывается за считанные минуты, и весь бэкенд перестает отвечать на запросы.</p>
+<p>Посмотрим на эталонную реализацию транзакционной операции с явным контролем контекста и уровня изоляции:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2287,10 +2337,12 @@ import (
     &quot;fmt&quot;
 )
 
+// UpdateOrderStatus атомарно обновляет статус заказа с явным контролем изоляции.
 func UpdateOrderStatus(ctx context.Context, db *sql.DB, orderID int, newStatus string) error {
-    // Явно указываем уровень изоляции, если он отличается от глобального в MySQL
+    // 1. Явно определяем параметры транзакции.
+    // Настоятельно рекомендуется задавать LevelReadCommitted, чтобы минимизировать Gap Locks в MySQL.
     opts := &amp;sql.TxOptions{
-        Isolation: sql.LevelReadCommitted, // Спасаемся от Gap Locks
+        Isolation: sql.LevelReadCommitted,
         ReadOnly:  false,
     }
 
@@ -2299,26 +2351,34 @@ func UpdateOrderStatus(ctx context.Context, db *sql.DB, orderID int, newStatus s
         return fmt.Errorf(&quot;begin tx: %w&quot;, err)
     }
 
-    // КРИТИЧЕСКОЕ ПРАВИЛО: Всегда делаем defer tx.Rollback()
-    // Если транзакция будет успешно закоммичена ниже, tx.Rollback()
-    // безопасно вернет ошибку sql.ErrTxDone, которую defer проигнорирует.
-    // Это гарантирует освобождение соединения при паниках или ранних return.
-    defer tx.Rollback()
+    // 2. ЗОЛОТОЕ ПРАВИЛО GO: Всегда регистрируем отложенный Rollback!
+    // Если транзакция будет успешно зафиксирована через tx.Commit(),
+    // последующий вызов tx.Rollback() в defer вернет безопасную ошибку sql.ErrTxDone,
+    // которую драйвер молча проигнорирует.
+    // Но если функция завершится по panic, раннему return err или отмене контекста,
+    // defer гарантированно пошлет команду отката в СУБД и вернет TCP-сокет обратно в пул.
+    defer func() {
+        _ = tx.Rollback()
+    }()
 
-    // Используем ExecContext с переданным ctx. 
-    // Если клиент отвалится (timeout/cancel), Go пошлет сигнал отмены в БД
+    // 3. Используем строго контекстные методы ExecContext / QueryContext.
+    // Если клиент разорвет соединение (timeout / client abort), Go передаст сигнал
+    // отмены в драйвер, который прервет выполнение долгого запроса на стороне MySQL.
     res, err := tx.ExecContext(ctx, &quot;UPDATE orders SET status = ? WHERE id = ?&quot;, newStatus, orderID)
     if err != nil {
         return fmt.Errorf(&quot;update status: %w&quot;, err)
     }
 
-    affected, _ := res.RowsAffected()
+    affected, err := res.RowsAffected()
+    if err != nil {
+        return fmt.Errorf(&quot;get rows affected: %w&quot;, err)
+    }
     if affected == 0 {
         return fmt.Errorf(&quot;order %d not found&quot;, orderID)
     }
 
-    // Если мы дошли сюда, фиксируем изменения.
-    // Это вызовет fsync(Redo Log) на стороне MySQL.
+    // 4. Фиксируем изменения.
+    // На стороне MySQL это запускает двухфазную фиксацию (2PC): запись в Binlog и fsync Redo Log.
     if err := tx.Commit(); err != nil {
         return fmt.Errorf(&quot;commit tx: %w&quot;, err)
     }
@@ -2334,19 +2394,36 @@ func UpdateOrderStatus(ctx context.Context, db *sql.DB, orderID int, newStatus s
     <span class="callout-title">Под капотом: Что происходит при `tx.Begin()`?</span>
   </div>
   <div class="callout-body">
-    <p>Драйвер <code>go-sql-driver/mysql</code> берет свободное соединение из пула. Если <code>TxOptions</code> требует специфичного уровня изоляции, драйвер отправляет команду <code>SET TRANSACTION ISOLATION LEVEL ...</code>. Затем он отправляет команду <code>START TRANSACTION</code>. С этого момента данный тред MySQL (вспоминаем Thread-per-Connection из <a href="1-arkhitektura-mysql.html" class="wikilink">1. Архитектура MySQL</a>) привязан к вашей горутине, пока вы не вызовете <code>Commit</code> или <code>Rollback</code>.</p>
+    <p>Драйвер <code>go-sql-driver/mysql</code> берет свободное соединение из пула. Если <code>TxOptions</code> требует специфичного уровня изоляции, отличного от глобального конфига сервера, драйвер предварительно отправляет команду:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">SET TRANSACTION ISOLATION LEVEL ...; -- например, SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+</code></pre>
+</div>
+
+<p>Вслед за этим отправляется сетевой пакет с командой <code>START TRANSACTION</code>. <br />
+С этой секунды поток операционной системы внутри процесса <code>mysqld</code> (вспоминаем архитектуру Thread-per-Connection из <a href="1-arkhitektura-mysql.html" class="wikilink">1. Архитектура MySQL</a>) привязан к вашей горутине, а его состояние переводится в транзакционный режим. Освободить его сможет только явный пакет <code>COMMIT</code> или <code>ROLLBACK</code>.</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li>Транзакции обеспечивают <strong>ACID</strong>, где InnoDB блистает своими механизмами Redo Log (Durability) и Undo Log (Atomicity).</li>
-<li>MySQL по умолчанию использует уровень <strong>Repeatable Read</strong>, который, в отличие от стандарта, защищает еще и от фантомных чтений.</li>
-<li>Защита от фантомов достигается дорогими <strong>Next-Key Locks (Gap + Row lock)</strong>, что часто приводит к дедлокам при высокой конкурентности. Снижение изоляции до <strong>Read Committed</strong> — классический паттерн оптимизации бэкенда.</li>
-<li>В Go всегда используйте <code>defer tx.Rollback()</code> для защиты пула соединений от "осиротевших" транзакций.</li>
+<li><strong>ACID в InnoDB</strong> опирается на две фундаментальные журнальные структуры: <strong>Undo Log</strong> гарантирует атомарность (<code>ROLLBACK</code>) и обеспечивает версионирование строк (MVCC), а <strong>Redo Log</strong> (WAL) гарантирует долговечность данных после перезагрузок или сбоев оборудования.</li>
+<li><strong>Repeatable Read</strong> — уровень изоляции по умолчанию в MySQL. В отличие от стандарта ANSI SQL, реализация InnoDB на этом уровне полностью исключает фантомные чтения как для снимков MVCC, так и для блокирующих выборок.</li>
+<li>Защита от фантомов в блокирующих запросах достигается через <strong>Next-Key Locks (Record Lock + Gap Lock)</strong>. Блокировка пустых диапазонов между ключами является главным источником дедлоков в конкурентных средах. Переход на <strong>Read Committed</strong> — общепринятая инженерная практика оптимизации OLTP-нагрузок в MySQL.</li>
+<li>В коде на Go транзакция неразрывно привязана к одному физическому сетевому сокету из пула <code>database/sql</code>. Шаблон с <code>defer tx.Rollback()</code> обязателен к применению для предотвращения утечек соединений и блокировок в базе данных.</li>
 </ol>
-<p>Когда данные консистентны в рамках одного сервера, возникает новая проблема. Сервер может сгореть, или на него может обрушиться трафик, с которым один инстанс не справится. Нам нужно масштабироваться. В следующей статье мы разберем, как MySQL передает свои закоммиченные транзакции на другие узлы: <a href="5-replikatsiya-v-mysql.html" class="wikilink">5. Репликация в MySQL</a>.</p>
+<p>Мы научились управлять транзакциями и блокировками в пределах одного инстанса СУБД. Однако в промышленной архитектуре любой одиночный сервер представляет собой единую точку отказа (SPOF) и физический потолок производительности. Чтобы обеспечить отказоустойчивость и распределение нагрузки на чтение, нам необходимо организовать согласованную передачу данных между узлами. </p>
+<p>В следующей лекции мы детально изучим сердце масштабирования MySQL — <a href="5-replikatsiya-v-mysql.html" class="wikilink">5. Репликация в MySQL</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2374,7 +2451,7 @@ func UpdateOrderStatus(ctx context.Context, db *sql.DB, orderID int, newStatus s
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#acid-fundament-tranzaktsiy">ACID: Фундамент транзакций</a></li><li class="toc-item toc-h2"><a href="#urovni-izolyatsii-balans-mezhdu-proizvoditelnostyu-i-anomaliyami">Уровни изоляции: Баланс между производительностью и аномалиями</a></li><li class="toc-item toc-h3"><a href="#1-read-uncommitted-ru">1. Read Uncommitted (RU)</a></li><li class="toc-item toc-h3"><a href="#2-read-committed-rc">2. Read Committed (RC)</a></li><li class="toc-item toc-h3"><a href="#3-repeatable-read-rr-po-umolchaniyu-v-mysql">3. Repeatable Read (RR) — По умолчанию в MySQL</a></li><li class="toc-item toc-h3"><a href="#4-serializable">4. Serializable</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-blokirovki-i-next-key-locks">Под капотом: Блокировки и Next-Key Locks</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-upravlenie-tranzaktsiyami">Идиоматичный Go: Управление транзакциями</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#acid-fundament-i-anatomiya-tranzaktsiy">ACID: Фундамент и анатомия транзакций</a></li><li class="toc-item toc-h2"><a href="#urovni-izolyatsii-balans-mezhdu-proizvoditelnostyu-i-anomaliyami">Уровни изоляции: Баланс между производительностью и аномалиями</a></li><li class="toc-item toc-h3"><a href="#1-read-uncommitted-ru">1. Read Uncommitted (RU)</a></li><li class="toc-item toc-h3"><a href="#2-read-committed-rc">2. Read Committed (RC)</a></li><li class="toc-item toc-h3"><a href="#3-repeatable-read-rr-po-umolchaniyu-v-mysql">3. Repeatable Read (RR) — По умолчанию в MySQL</a></li><li class="toc-item toc-h3"><a href="#4-serializable">4. Serializable</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-blokirovki-i-next-key-locks">Под капотом: Блокировки и Next-Key Locks</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-upravlenie-tranzaktsiyami-v-databasesql">Идиоматичный Go: Управление транзакциями в database/sql</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 
