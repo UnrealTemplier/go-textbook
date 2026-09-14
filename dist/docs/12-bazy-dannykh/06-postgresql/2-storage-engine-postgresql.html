@@ -2168,41 +2168,66 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~20 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~35 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Storage engine PostgreSQL</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Если в вашем Go-коде данные живут в оперативной памяти в виде аккуратно выровненных структур, массивов и слайсов, управляемых Garbage Collector-ом, то база данных — это сложнейшая система управления байтами на жестком диске. </p>
-<p>В отличие от MySQL, где исторически был зоопарк подключаемых движков (MyISAM, Memory и доминирующий ныне <code>InnoDB</code>), PostgreSQL изначально проектировался вокруг единого, монолитного и невероятно надежного механизма хранения — <strong>Heap</strong> (Куча). Начиная с 12-й версии, в Postgres появилось API <code>tableam</code> (Table Access Method), позволяющее разрабатывать альтернативные движки (например, <code>zheap</code> для решения проблем с раздуванием таблиц), но стандартом де-факто и основой для 99% инсталляций остается классический Heap.</p>
-<p>Понимание того, как PostgreSQL укладывает байты на SSD, критически важно для бэкенд-разработчика. Это объясняет, почему порядок колонок в миграциях влияет на размер базы, почему <code>SELECT *</code> убивает производительность и как индексы на самом деле находят нужную строку.</p>
-<h2 id="anatomiya-faylov-ot-bazy-k-gigabaytam">Анатомия файлов: От базы к гигабайтам</h2>
+            <p>Если в вашем приложении на Go данные размещаются в оперативной памяти в виде компактных, выровненных по машинному слову структур (<code>struct</code>), массивов и срезов (<code>slice</code>), а управление их временем жизни берет на себя автоматический сборщик мусора (Go GC), то в реляционной СУБД ситуация выглядит принципиально иначе. База данных — это специализированная операционная система внутри операционной системы, чья главная задача — предельно надежно, экономно и предсказуемо упаковывать байты на постоянные блочные накопители (NVMe SSD).</p>
+<p>В отличие от MySQL, где исторически существовала экосистема сменных подключаемых движков (MyISAM, Memory и ставший стандартом де-факто <code>InnoDB</code>), PostgreSQL изначально проектировался вокруг монолитного, кристально надежного механизма хранения — <strong>Heap (Куча)</strong>. Начиная с версии PostgreSQL 12, в ядре появился унифицированный интерфейс <code>tableam</code> (Table Access Method), открывший путь к созданию альтернативных движков (таких как <code>zheap</code> для борьбы с раздуванием таблиц при обновлениях), однако классический <strong>Append-Only Heap</strong> остается стандартом де-факто для 99% промышленных инсталляций.</p>
+<p>Понимание того, как PostgreSQL раскладывает байты на накопителе, наделяет инженера механическим сочувствием к машине: вы начнете физически видеть, почему порядок объявления колонок в миграциях экономит гигабайты памяти, почему слепой <code>SELECT *</code> разрушает кэш ввода-вывода и как индексы за один шаг находят нужный кортеж на диске.</p>
+<hr />
+<h2 id="anatomiya-faylov-ot-bazy-dannykh-k-gigabaytnym-segmentam">Анатомия файлов: От базы данных к гигабайтным сегментам</h2>
 
-<p>Если вы зайдете на сервер с PostgreSQL и откроете директорию с данными (обычно <code>/var/lib/postgresql/data/base/</code>), вы не увидите там файлов с названиями ваших таблиц. Вы увидите директории, названные числами, внутри которых лежат файлы, также названные числами.</p>
-<p>В PostgreSQL всё есть <strong>Relation</strong> (Отношение) — таблица, индекс, материализованное представление. Каждому Relation присваивается уникальный идентификатор — <strong>OID</strong> (Object Identifier) или <strong>RelFileNode</strong>.</p>
-<p>Каждая таблица хранится в виде отдельного файла, имя которого равно её OID.<br />
-Но операционные системы (особенно исторически) плохо работали с файлами гигантских размеров. Поэтому Postgres жестко нарезает файлы таблиц на сегменты ровно по <strong>1 ГБ</strong>.</p>
-<p>Если таблица с OID <code>16384</code> вырастает больше гигабайта, Postgres создает файл <code>16384.1</code>, затем <code>16384.2</code> и так далее. </p>
+<p>Если вы заглянете внутрь каталога данных PostgreSQL (обычно <code>/var/lib/postgresql/data/base/</code>), вы не обнаружите там привычных файлов с человеческими именами <code>users.db</code> или <code>orders.dat</code>. Перед вами предстанет лес директорий и файлов с числовыми именами:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># Типичная структура директории base/
+$ ls -l /var/lib/postgresql/data/base/16384/
+-rw------- 1 postgres postgres 1073741824 Sep 14 10:00 16390
+-rw------- 1 postgres postgres 1073741824 Sep 14 10:15 16390.1
+-rw------- 1 postgres postgres  524288000 Sep 14 10:30 16390.2
+-rw------- 1 postgres postgres      24576 Sep 14 10:30 16390_fsm
+-rw------- 1 postgres postgres       8192 Sep 14 10:30 16390_vm
+</code></pre>
+</div>
+
+<p>В реляционной теории и исходном коде PostgreSQL все сущности обобщаются понятием <strong>Relation (Отношение)</strong> — обычная таблица, индекс B-Tree, последовательность (<code>SEQUENCE</code>) или материализованное представление (<code>MATERIALIZED VIEW</code>). Каждому отношению при создании назначается уникальный системный идентификатор — <strong>OID (Object Identifier)</strong> или физический дескриптор <strong>RelFileNode</strong>.</p>
+<p>Каждая таблица хранится в виде набора бинарных файлов, базовое имя которых совпадает с ее OID (например, <code>16384</code>). <br />
+Однако операционные системы и утилиты резервного копирования исторически испытывали трудности при манипуляциях с монолитными файлами терабайтных размеров. Поэтому движок PostgreSQL жестко нарезает данные таблиц на сегменты фиксированного размера — ровно по <strong>1 ГБ</strong> (1 073 741 824 байта):</p>
+<ul>
+<li>Когда таблица с OID <code>16384</code> превышает объем в 1 ГБ, создается сегмент <code>16384.1</code>.</li>
+<li>Когда заполняется и он — открывается <code>16384.2</code>, <code>16384.3</code> и так далее.</li>
+<li>Рядом располагаются вспомогательные файлы: карта свободного пространства (<code>_fsm</code>, Free Space Map) и карта видимости (<code>_vm</code>, Visibility Map, необходимая для оптимизации Index-Only Scan и VACUUM).</li>
+</ul>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Mechanical Sympathy</span>
+    <span class="callout-title">Под капотом: Mechanical Sympathy и размер в 1 ГБ</span>
   </div>
   <div class="callout-body">
-    <p>Почему именно 1 ГБ? Это компромисс между количеством файловых дескрипторов и удобством работы ОС. Файлы по 1 ГБ легко копировать, бэкапить, они не вызывают проблем с лимитами файловых систем, а системный вызов <code>fsync()</code>, гарантирующий сброс данных на диск при записи в <a href="../05-tranzaktsii-i-vnutrennosti/8-wal-write-ahead-log.html" class="wikilink">8. WAL. Write Ahead Log</a>, работает предсказуемо и не блокирует I/O подсистему намертво, как это могло бы быть с монолитным файлом на 500 ГБ.</p>
+    <p>Почему именно 1 ГБ? Это выверенный инженерный компромисс между расходом системных дескрипторов файлов (<code>ulimit -n</code>) и предсказуемостью работы файловой системы Linux. Сегменты по 1 ГБ элементарно перемещать, архивировать и восстанавливать. Главное же преимущество — системный вызов <code>fsync()</code>, гарантирующий физический сброс страниц памяти на диск при работе журнала предзаписи (<a href="../05-tranzaktsii-i-vnutrennosti/8-wal-write-ahead-log.html" class="wikilink">8. WAL. Write Ahead Log</a>), отрабатывает плавно и не вызывает катастрофических пауз дисковой подсистемы (I/O freezes), которые неизбежно возникали бы при попытке сбросить метаданные одного монолитного файла на 500 ГБ.</p>
   </div>
 </div>
 
 <hr />
-<h2 id="stranitsa-page-bazovaya-edinitsa-vvoda-vyvoda">Страница (Page): Базовая единица ввода-вывода</h2>
+<h2 id="stranitsa-page-nedelimyy-kvant-vvoda-vyvoda">Страница (Page): Неделимый квант ввода-вывода</h2>
 
-<p>Сегмент на 1 ГБ — это лишь контейнер. Внутри него файл строго разбит на блоки фиксированного размера — <strong>Страницы (Pages)</strong>. По умолчанию размер страницы в PostgreSQL равен <strong>8 КБ</strong>.</p>
-<p>Это важнейшее правило: <strong>PostgreSQL никогда не читает и не пишет на диск отдельные строки</strong>. Минимальная единица обмена данными между RAM и диском — 8 КБ. Если вам нужно прочитать 1 байт из таблицы, база прочитает 8192 байта в разделяемую память (<code>shared_buffers</code>, о которой мы говорили в <a href="1-arkhitektura-postgresql.html" class="wikilink">1. Архитектура PostgreSQL</a>).</p>
-<h3 id="ustroystvo-stranitsy-page-layout">Устройство страницы (Page Layout)</h3>
+<p>Гигабайтный сегмент — это лишь внешняя оболочка. Физически любой файл таблицы в PostgreSQL строго нарезан на блоки фиксированного размера — <strong>Страницы (Pages, или Blocks)</strong>. По умолчанию размер страницы равен <strong>8 КБ (8192 байта)</strong>.</p>
+<p>Запомните фундаментальный закон: <strong>PostgreSQL никогда не читает и не записывает на диск отдельные строки или колонки</strong>. Минимальной и неделимой единицей обмена между дисковым накопителем и оперативной памятью всегда является страница размером 8 КБ. </p>
+<p>Если в вашем запросе <code>SELECT email FROM users WHERE id = 1</code> требуется прочитать единственную строку длиной в 30 байт, движок загрузит с SSD в разделяемую память (<code>shared_buffers</code>, разобранную в <a href="1-arkhitektura-postgresql.html" class="wikilink">1. Архитектура PostgreSQL</a>) целиком всю 8-килобайтную страницу, содержащую эту запись.</p>
+<h3 id="vnutrennee-ustroystvo-8-kilobaytnoy-stranitsy-page-layout">Внутреннее устройство 8-килобайтной страницы (Page Layout)</h3>
 
-<p>Структура 8-килобайтной страницы гениальна в своей простоте и эффективности. Она устроена так, чтобы минимизировать фрагментацию и быстро находить данные переменной длины.</p>
+<p>Структура страницы базы данных — это шедевр низкоуровневой системной инженерии. Она спроектирована по принципу <strong>двунаправленного роста (slotted page)</strong>, что позволяет эффективно хранить строки переменной длины и исключает внутреннюю фрагментацию.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2217,19 +2242,19 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph &quot;Страница PostgreSQL - 8 КБ&quot;
+subgraph Page8KB [&quot;Страница PostgreSQL — ровно 8192 байта (8 КБ)&quot;]
 direction TB
-PH[&quot;1. PageHeaderData &lt;br&gt; Метаданные, LSN - 24 байта&quot;]
-LP[&quot;2. Line Pointers &lt;br&gt; Массив указателей - 4 байта каждый&quot;]
-FS[&quot;3. Free Space &lt;br&gt; Свободное пространство - дыра&quot;]
-T3[&quot;4. Tuple 3 &lt;br&gt; Данные строки 3&quot;]
-T2[&quot;4. Tuple 2 &lt;br&gt; Данные строки 2&quot;]
-T1[&quot;4. Tuple 1 &lt;br&gt; Данные строки 1&quot;]
-SP[&quot;5. Special Space &lt;br&gt; Спец. данные - опционально&quot;]
+PH[&quot;1. PageHeaderData &lt;br&gt; Метаданные страницы, LSN — 24 байта&quot;]
+LP[&quot;2. Line Pointers (Указатели строк itemId) &lt;br&gt; Массив itemIdData [offset, flags, length] — 4 байта каждый &lt;br&gt; ⬇️ Растет сверху вниз&quot;]
+FS[&quot;3. Free Space (Свободное пространство) &lt;br&gt; Непрерывное окно для новых указателей и кортежей&quot;]
+T3[&quot;4. Tuple 3 (Данные кортежа 3)&quot;]
+T2[&quot;4. Tuple 2 (Данные кортежа 2)&quot;]
+T1[&quot;4. Tuple 1 (Данные кортежа 1) &lt;br&gt; ⬆️ Растет снизу вверх от конца страницы&quot;]
+SP[&quot;5. Special Space (Специальная область) &lt;br&gt; Служебные ссылки (для B-Tree страниц) — опционально&quot;]
 
 PH --&gt; LP
 LP --&gt; FS
-FS -.-&gt;|&quot;Рост записей&quot;| T3
+FS -.-&gt;|&quot;встречное заполнение&quot;| T3
 T3 --&gt; T2
 T2 --&gt; T1
 T1 --&gt; SP
@@ -2238,12 +2263,13 @@ end
 </div>
 
 
+<p>Страница разделена на 5 четких зон:</p>
 <ol>
-<li><strong>PageHeaderData (Заголовок)</strong>: Хранит служебную информацию. Самое важное здесь — <strong>LSN (Log Sequence Number)</strong>, указатель на последнюю запись в WAL, изменившую эту страницу. Это нужно для восстановления после сбоев.</li>
-<li><strong>Line Pointers (Указатели строк)</strong>: Массив 32-битных чисел. Каждый указатель содержит смещение (офсет) в байтах от начала страницы, где физически лежат данные конкретной строки, и длину этой строки. Массив растет <em>сверху вниз</em>.</li>
-<li><strong>Tuples (Строки / Кортежи)</strong>: Сами данные строк. В отличие от указателей, строки пишутся <em>снизу вверх</em> (от конца страницы к началу).</li>
-<li><strong>Free Space (Свободное место)</strong>: Дыра между массивом указателей и строками. Когда они встречаются — страница заполнена.</li>
-<li><strong>Special Space</strong>: Зарезервированное место в самом конце страницы, используется в основном индексами для хранения ссылок на соседние страницы дерева (например, в B-Tree).</li>
+<li><strong>PageHeaderData (Заголовок страницы):</strong> Занимает первые 24 байта. Содержит флаги состояния, смещения начала свободного места (<code>pd_lower</code>) и конца свободного места (<code>pd_upper</code>), а главное — <strong>LSN (Log Sequence Number)</strong>. LSN указывает на позицию последней записи в журнале WAL, изменившей данную страницу. По этому номеру рантайм определяет, нужно ли накатывать повтор изменений при восстановлении после аварии.</li>
+<li><strong>Line Pointers (Указатели строк, <code>ItemIdData</code>):</strong> Непрерывный массив 32-битных (4 байта) структур в начале страницы. Каждый указатель содержит три поля: байтовое смещение начала строки (<code>lp_off</code>), статус указателя (<code>lp_flags</code>: используется, мертв, перенаправлен) и физическую длину строки (<code>lp_len</code>). Массив растет <strong>сверху вниз</strong> (от заголовка к центру).</li>
+<li><strong>Free Space (Свободное окно):</strong> Область незанятой памяти между концом массива указателей и началом последней сохраненной строки. Когда массив указателей и область кортежей соприкасаются (<code>pd_lower == pd_upper</code>), страница считается заполненной.</li>
+<li><strong>Tuples (Кортежи / Данные строк):</strong> Непосредственно тела строк. В отличие от массива указателей, строки записываются <strong>снизу вверх</strong> (начиная от конца страницы к центру).</li>
+<li><strong>Special Space (Специальная область):</strong> Небольшой хвост страницы переменного размера. В обычных таблицах Heap он пуст, но в индексах (например, в B-Tree) здесь хранятся ссылки на левую и правую соседние страницы для организации двусвязного списка листовых узлов.</li>
 </ol>
 <div class="callout callout-interview">
   <div class="callout-header">
@@ -2251,32 +2277,49 @@ end
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Зачем нужны Line Pointers? Почему бы индексам не ссылаться сразу на физическое смещение байтов строки внутри файла?<br />
-<strong>Ответ:</strong> Строки имеют переменную длину (например, из-за типа <code>VARCHAR</code>). Если мы обновим строку и она станет короче, образуется пустое место. Postgres периодически выполняет дефрагментацию внутри страницы. При этом физическое положение строки (<code>Tuple</code>) сдвигается, но её индекс в массиве <code>Line Pointers</code> остается неизменным! <br />
-Индексы в базе ссылаются не на байты, а на <strong>CTID (ItemPointer)</strong> — пару <code>Номер_страницы + Индекс_Line_Pointer</code>. Благодаря этому уровню косвенности, перемещение строки внутри страницы не требует перестроения всех индексов таблицы.</p>
+    <p><strong>Вопрос:</strong> Зачем в странице нужен уровень косвенности в виде массива <code>Line Pointers</code>? Почему бы записям в индексах не ссылаться напрямую на абсолютное смещение байтов строки внутри страницы?<br />
+<strong>Ответ:</strong> Строки в реляционной базе данных имеют переменную длину (из-за типов <code>TEXT</code>, <code>VARCHAR</code>, массивов или <code>JSONB</code>). В ходе операций <code>UPDATE</code> или очистки <code>VACUUM</code> кортеж может сжаться или быть перемещен внутри страницы в процессе локальной дефрагментации. <br />
+Если бы индексы хранили точные физические смещения байтов строки, то малейший сдвиг кортежа внутри 8-килобайтной страницы потребовал бы перестроения десятков внешних индексов таблицы! <br />
+Вместо этого индексы ссылаются на <strong>CTID (ItemPointer)</strong> — логический идентификатор кортежа в формате <code>Номер_страницы + Индекс_Line_Pointer</code> (пару <code>BlockNumber + OffsetNumber</code>). Например, CTID <code>(42, 3)</code> означает: «Блок номер 42, 3-й элемент массива Line Pointer». Внутри блока мы можем как угодно перемещать байты строки — пока указатель под номером 3 указывает на новое смещение, внешние индексы остаются на 100% валидными.</p>
   </div>
 </div>
 
 <hr />
-<h2 id="stroka-pod-kapotom-tuple">Строка под капотом (Tuple)</h2>
+<h2 id="vnutrennee-ustroystvo-stroki-heap-tuple">Внутреннее устройство строки (Heap Tuple)</h2>
 
-<p>Что представляет собой сама строка (Tuple)? Она состоит из заголовка (<code>HeapTupleHeaderData</code>) и самих полезных данных пользователя.</p>
-<p>Заголовок строки занимает минимум 23 байта (обычно больше из-за выравнивания) и содержит важнейшие системные поля:<br />
-* <code>t_xmin</code>: ID транзакции, которая создала (INSERT) эту версию строки.<br />
-* <code>t_xmax</code>: ID транзакции, которая удалила или обновила (DELETE/UPDATE) эту версию строки.<br />
-* <code>t_ctid</code>: Указатель на актуальную версию этой строки (если она была обновлена).</p>
-<p>Именно эти поля, хранящиеся прямо на диске вместе с вашими данными, являются фундаментом работы конкурентного доступа в PostgreSQL. Но мы не будем останавливаться на них сейчас — они станут главными героями в следующей статье про <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>.</p>
-<h3 id="optimizatsiya-pamyati-vyravnivanie-struktur-padding">Оптимизация памяти: Выравнивание структур (Padding)</h3>
+<p>Каждая физическая строка на странице состоит из двух компонентов: заголовка (<code>HeapTupleHeaderData</code>) и фактических пользовательских данных:</p>
+<pre><code>+-------------------------------------------------------------+-----------------------------+
+|                     HeapTupleHeaderData                     |        User Payload         |
+| t_xmin (4B) | t_xmax (4B) | t_cid/t_xvac (4B) | t_ctid (6B) | col1 | col2 | col3 | ...    |
+| infomask (4B)| hoff (1B)  |   null_bitmap (вар.)            |                             |
++-------------------------------------------------------------+-----------------------------+
+</code></pre>
+<p>Заголовок строки занимает минимум 23 байта (с учетом обязательного выравнивания под 8-байтовую границу — фактически <strong>24 байта</strong> или более):</p>
+<ul>
+<li><strong><code>t_xmin</code></strong> (4 байта): Идентификатор транзакции (<code>TransactionId</code>), которая создала данный кортеж в результате операции <code>INSERT</code>.</li>
+<li><strong><code>t_xmax</code></strong> (4 байта): Идентификатор транзакции, которая удалила кортеж (<code>DELETE</code>) или создала новую версию при <code>UPDATE</code>. Для активной живой строки равен 0.</li>
+<li><strong><code>t_cid</code></strong> (4 байта): Command Identifier — порядковый номер команды внутри одной транзакции (позволяет транзакции видеть собственные изменения).</li>
+<li><strong><code>t_ctid</code></strong> (6 байт): Указатель на текущую версию строки. Если строка не модифицировалась, он указывает сам на себя <code>(block, offset)</code>. Если строка была обновлена через <code>UPDATE</code>, <code>t_ctid</code> указывает на новую версию строки (возможно, на совершенно другой странице).</li>
+<li><strong><code>t_infomask</code></strong> (2 байта + 2 байта): Битовые флаги статуса кортежа (содержит ли строка NULL-поля, закоммичена ли создавшая транзакция <code>HEAP_XMIN_COMMITTED</code>, заблокирована ли строка).</li>
+<li><strong><code>t_hoff</code></strong> (1 байт): Header Offset — смещение от начала кортежа до первого байта пользовательских данных с учетом битовой маски NULL-значений (<code>null_bitmap</code>).</li>
+</ul>
+<p>Именно поля <code>t_xmin</code>, <code>t_xmax</code> и <code>t_ctid</code>, хранящиеся в каждом кортеже прямо на диске, обеспечивают феноменальную скорость неблокирующего параллельного чтения — фундаментальный механизм <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>.</p>
+<hr />
+<h2 id="vyravnivanie-struktur-dannykh-na-diske-data-alignment-padding">Выравнивание структур данных на диске (Data Alignment & Padding)</h2>
 
-<p>Здесь опыт Go-разработчика придется как нельзя кстати. Вы знаете, что в Go порядок полей в <code>struct</code> влияет на размер структуры в памяти из-за выравнивания (Memory Alignment) под машинное слово процессора (обычно 8 байт для 64-битных систем).</p>
-<p>В PostgreSQL <strong>абсолютно та же ситуация на диске</strong>. Типы данных имеют требования к выравниванию. <code>INT8</code> (8 байт) должен начинаться с адреса, кратного 8. <code>INT4</code> — кратного 4. </p>
+<p>Инженеры, пишущие на Go, отлично знают: процессор читает оперативную память машинными словами (по 8 байт на 64-битной архитектуре). Если поле структуры не выровнено по адресу, кратному его размеру, процессор выполняет невыровненный доступ (unaligned access), что на многих архитектурах вызывает двойные циклы чтения или падение производительности. Поэтому компилятор Go добавляет между полями невидимые байты-заполнители (<strong>Padding</strong>).</p>
+<p>В дисковом хранилище PostgreSQL действует <strong>абсолютно то же правило</strong>. Движок Heap строго выравнивает столбцы кортежа:<br />
+* 8-байтовые типы (<code>INT8</code>, <code>BIGINT</code>, <code>TIMESTAMP</code>, <code>DOUBLE PRECISION</code>, указатели) обязаны начинаться со смещения, кратного <strong>8 байтам</strong>.<br />
+* 4-байтовые типы (<code>INT4</code>, <code>INTEGER</code>, <code>REAL</code>, <code>DATE</code>) — кратного <strong>4 байтам</strong>.<br />
+* 2-байтовые типы (<code>INT2</code>, <code>SMALLINT</code>) — кратного <strong>2 байтам</strong>.<br />
+* 1-байтовые типы (<code>BOOLEAN</code>, <code>CHAR</code>) — не требуют выравнивания (кратность 1 байт).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Порядок колонок</span>
+    <span class="callout-title">Ловушка / Gotcha: Порядок объявления колонок в миграциях</span>
   </div>
   <div class="callout-body">
-    <p>Если вы создаете таблицу через миграцию в неудачном порядке:</p>
+    <p>Посмотрим на неудачно спроектированную таблицу:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2287,48 +2330,109 @@ end
     </button>
   </div>
   <pre class="language-sql"><code class="language-sql">CREATE TABLE bad_padding (
-    id INT8,          -- 8 bytes
-    is_active BOOLEAN,-- 1 byte
-                      -- [7 BYTES PADDING WASTED]
-    user_id INT8,     -- 8 bytes
-    is_banned BOOLEAN -- 1 byte
-                      -- [7 BYTES PADDING WASTED]
+    id INT8,          -- 8 байт (смещение 0..7)
+    is_active BOOLEAN,-- 1 байт (смещение 8)
+                      -- [7 БАЙТ ПУСТОГО PADDING] -&gt; выравнивание под INT8
+    user_id INT8,     -- 8 байт (смещение 16..23)
+    is_banned BOOLEAN -- 1 байт (смещение 24)
+                      -- [7 БАЙТ ПУСТОГО PADDING] -&gt; выравнивание всего кортежа
 );
 </code></pre>
 </div>
 
-<p>Из-за выравнивания каждая строка "съест" 14 лишних байт на пустые нули. При миллионах строк это гигабайты потерянного места на SSD и в драгоценном кэше <code>shared_buffers</code>!<br />
-<strong>Правило:</strong> При проектировании схемы располагайте колонки по убыванию их размера (от больших <code>INT8</code>/<code>TIMESTAMP</code> к мелким <code>INT4</code>, <code>INT2</code>, <code>BOOLEAN</code>).</p>
+<p>Полезные данные занимают: <code>8 + 1 + 8 + 1 = 18 байт</code>.<br />
+Но из-за двух интервалов выравнивания физический размер полезной нагрузки составит <code>32 байта</code>!<br />
+В каждой строке вы впустую теряете <strong>14 байт</strong> на пустые нули. При 100 миллионах строк это <strong>1.4 ГБ чистого мусора</strong> на NVMe-диске, в сетевом трафике репликации и в драгоценном кэше <code>shared_buffers</code>!</p>
+<p><strong>Золотое правило верстки таблиц:</strong> Объявляйте колонки <strong>по убыванию их выравнивания</strong>:<br />
+1. Сначала 8-байтовые: <code>BIGINT</code>, <code>TIMESTAMPTZ</code>, <code>FLOAT8</code>, <code>UUID</code>.<br />
+2. Затем 4-байтовые: <code>INTEGER</code>, <code>DATE</code>.<br />
+3. Затем 2-байтовые: <code>SMALLINT</code>.<br />
+4. В конце: 1-байтовые (<code>BOOLEAN</code>) и типы переменной длины (<code>TEXT</code>, <code>VARCHAR</code>, <code>JSONB</code>).</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">CREATE TABLE optimal_padding (
+    id INT8,          -- 8 байт
+    user_id INT8,     -- 8 байт
+    is_active BOOLEAN,-- 1 байт
+    is_banned BOOLEAN -- 1 байт
+                      -- [6 байт выравнивания в конце вместо 14 байт внутри]
+);
+</code></pre>
+</div>
+
   </div>
 </div>
 
 <hr />
-<h2 id="toast-khranenie-bolshikh-obektov">TOAST: Хранение больших объектов</h2>
+<h2 id="toast-khranenie-sverkhbolshikh-atributov-the-oversized-attribute-storage-techniq">TOAST: Хранение сверхбольших атрибутов (The Oversized-Attribute Storage Technique)</h2>
 
-<p>Мы выяснили, что размер страницы — 8 КБ. А строки не могут пересекать границы страниц. <br />
-Что произойдет, если мы попытаемся вставить в таблицу JSON-документ (о котором мы будем говорить в <a href="5-jsonb-i-rabota-s-json.html" class="wikilink">5. JSONB и работа с JSON</a>) или строку текста размером 10 мегабайт? </p>
-<p>Здесь вступает в игру механизм <strong>TOAST</strong> (The Oversized-Attribute Storage Technique). </p>
-<p>Если размер строки (Tuple) превышает примерно 2 КБ, Postgres запускает следующий алгоритм:<br />
-1. <strong>Сжатие (Compression)</strong>: Пытается сжать большое поле встроенным алгоритмом pglz (или LZ4 в новых версиях). Если после сжатия строка помещается в страницу — отлично.<br />
-2. <strong>Out-of-line storage</strong>: Если даже после сжатия данные огромны, Postgres "отрезает" это поле от основной строки.<br />
-3. Он нарезает эти данные на чанки (обычно по 2 КБ).<br />
-4. Сохраняет эти чанки в специальную, скрытую системную таблицу (TOAST-таблицу).<br />
-5. В основной таблице, в вашей строке, вместо мегабайта текста остается лишь небольшой <strong>TOAST Pointer</strong> (указатель), содержащий OID нужной TOAST-таблицы и идентификатор чанков.</p>
-<h3 id="mechanical-sympathy-pochemu-select-eto-zlo">Mechanical Sympathy: Почему `SELECT *` — это зло</h3>
+<p>Мы установили, что максимальный размер страницы в PostgreSQL строго равен 8 КБ. При этом кортеж данных <strong>не может пересекать границу страницы</strong> — строка обязана целиком помещаться внутри одного блока.</p>
+<p>Что произойдет, если пользователь загрузит документ размером 5 мегабайт в колонку <code>TEXT</code> или крупный JSONB-объект (с которым мы будем детально работать в <a href="5-jsonb-i-rabota-s-json.html" class="wikilink">5. JSONB и работа с JSON</a>)?</p>
+<p>Для решения этой задачи в PostgreSQL встроен элегантный механизм <strong>TOAST (The Oversized-Attribute Storage Technique)</strong>.</p>
+<p>Если размер кортежа превышает четверть страницы (порог <code>TOAST_TUPLE_THRESHOLD</code>, по умолчанию около <strong>2 КБ</strong>), движок активирует четырехуровневый протокол сжатия и выноса данных:</p>
 
-<p>Теперь, зная про TOAST, вы должны понимать, почему написание <code>SELECT * FROM users</code> (если вам нужны только <code>id</code> и <code>email</code>) — это грубейшая архитектурная ошибка.</p>
-<p>Если у пользователя есть колонка <code>bio</code> с огромным текстом или <code>avatar_bytes</code> (что само по себе антипаттерн), которые ушли в TOAST, то при <code>SELECT *</code> происходит следующее:<br />
-1. Executor читает 8 КБ страницу из основной таблицы.<br />
-2. Видит TOAST-указатель.<br />
-3. Вынужденно делает <strong>дополнительные случайные чтения (Random I/O)</strong> с диска, чтобы найти скрытую TOAST-таблицу.<br />
-4. Вычитывает все чанки.<br />
-5. Распаковывает их (тратя CPU-циклы на декомпрессию LZ4/pglz).<br />
-6. Аллоцирует огромный кусок памяти, чтобы склеить чанки, и отправляет их по сети в ваше Go-приложение.</p>
-<p>Если вы напишете <code>SELECT id, email FROM users</code>, Postgres прочитает только основную страницу (8 КБ), проигнорирует TOAST-указатели и мгновенно вернет результат, сэкономив I/O, CPU и сеть.</p>
-<h2 id="itog">Итог</h2>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Row[&quot;Новая строка превышает порог 2 КБ&quot;] --&gt; Step1[&quot;Шаг 1: Компрессия in-line &lt;br&gt; Алгоритм pglz или LZ4&quot;]
+Step1 --&gt; Decision1{&quot;Размер &lt;= 2 КБ?&quot;}
+Decision1 -- &quot;Да&quot; --&gt; SaveHeap[&quot;Сохранить сжатый кортеж &lt;br&gt; прямо на страницу 8 КБ&quot;]
+Decision1 -- &quot;Нет&quot; --&gt; Step2[&quot;Шаг 2: Out-of-line нарезка &lt;br&gt; Разделение данных на чанки по 2 КБ&quot;]
 
-<p>Архитектура Heap движка PostgreSQL строится вокруг неизменных 8-килобайтных страниц и строк с заголовками, описывающими их жизненный цикл транзакций. База работает максимально эффективно, когда данные плотно упакованы (без лишнего padding), а тяжелые колонки вынесены в TOAST и не запрашиваются без нужды. </p>
-<p>Но мы упомянули, что в заголовке каждой строки хранятся какие-то ID транзакций (<code>xmin</code> и <code>xmax</code>). Зачем базе хранить метаданные транзакций в каждой строке пользовательских данных? Это ключ к решению проблемы чтения и записи без блокировок. Об этом фундаментальном механизме мы поговорим в следующей статье: <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>.</p>
+Step2 --&gt; ToastTable[&quot;Запись чанков в системную &lt;br&gt; таблицу pg_toast_&lt;OID&gt;&quot;]
+ToastTable --&gt; ToastPointer[&quot;Формирование TOAST Pointer &lt;br&gt; (OID таблицы + ID чанков, 18 байт)&quot;]
+ToastPointer --&gt; HeapRecord[&quot;Запись TOAST Pointer &lt;br&gt; в основную строку таблицы Heap&quot;]
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>In-line Compression (Внутреннее сжатие):</strong> Движок пытается сжать тяжелый атрибут с помощью встроенного алгоритма <code>pglz</code> (или более быстрого <code>LZ4</code>, доступного начиная с PostgreSQL 14). Если после компрессии строка укладывается в целевой размер — она остается внутри обычной Heap-страницы.</li>
+<li><strong>Out-of-line Splitting (Вынос во внешнюю таблицу):</strong> Если сжатия недостаточно, PostgreSQL отсекает массив данных от основной строки.</li>
+<li>Данные нарезаются на фиксированные фрагменты (чанки) размером около 2 КБ.</li>
+<li>Чанки сохраняются в специальной изолированной системной таблице — <strong>TOAST-таблице</strong> (имеющей вид <code>pg_toast.pg_toast_&lt;OID_таблицы&gt;</code>).</li>
+<li>В теле исходной строки на обычной странице Heap вместо мегабайта данных сохраняется крошечный <strong>TOAST Pointer (указатель)</strong> размером около 18 байт, содержащий OID соответствующей TOAST-таблицы и логический идентификатор чанков.</li>
+</ol>
+<hr />
+<h3 id="mechanical-sympathy-pochemu-select-arkhitekturnyy-grekh">Mechanical Sympathy: Почему `SELECT *` — архитектурный грех</h3>
+
+<p>Теперь, осознавая устройство TOAST и страничной организации памяти, легко понять, почему вызов <code>SELECT * FROM users</code> (когда вам нужны только <code>id</code> и <code>email</code>) наносит сокрушительный удар по производительности системы:</p>
+<p>Представьте, что у пользователя есть колонка <code>bio TEXT</code> или <code>avatar_bytes BYTEA</code>, значения которых были вынесены в TOAST:</p>
+<ol>
+<li>Исполнитель запросов (<code>Executor</code>) находит нужную 8-килобайтную страницу в кэше <code>shared_buffers</code> и читает заголовок строки.</li>
+<li>Обнаружив запрос на выборку всех колонок (<code>*</code>), Executor видит TOAST Pointer для колонки <code>bio</code>.</li>
+<li>База вынуждена выполнить <strong>серию дополнительных случайных чтений (Random Disk I/O)</strong>, обращаясь к системной таблице <code>pg_toast</code> за всеми связанными чанками.</li>
+<li>Процессор тратит дорогостоящие такты на распаковку алгоритмом <code>LZ4</code>/<code>pglz</code>.</li>
+<li>Выделяется оперативная память для склейки чанков в единый буфер, после чего мегабайты бесполезных байтов прокачиваются через сеть в ваше Go-приложение, провоцируя аллокации в куче Go и нагружая GC.</li>
+</ol>
+<p>Если же вы выполните хирургически точный запрос <code>SELECT id, email FROM users</code>, PostgreSQL прочитает исключительно 8 КБ страницу из основной таблицы, проигнорирует наличие TOAST-указателя, не совершит ни единого лишнего дискового обращения к таблице TOAST и мгновенно вернет результат клиенту.</p>
+<hr />
+<h2 id="rezyume-dlya-inzhenera">Резюме для инженера</h2>
+
+<ol>
+<li><strong>Архитектура Heap:</strong> Таблицы хранятся в 1-гигабайтных сегментах, состоящих из 8-килобайтных страниц со slotted-структурой (встречный рост массива <code>Line Pointers</code> и кортежей <code>Tuples</code>).</li>
+<li><strong>Косвенная адресация CTID:</strong> Индексы ссылаются на пару <code>(номер страницы, индекс указателя)</code>. Локальное перемещение байтов строки не требует инвалидации внешних индексов.</li>
+<li><strong>Порядок атрибутов имеет значение:</strong> Грамотное расположение столбцов от 8-байтовых к 1-байтовым устраняет внутренний padding и экономит до 20–30% дискового пространства и оперативной памяти <code>shared_buffers</code>.</li>
+<li><strong>TOAST защищает страницы:</strong> Объекты крупнее 2 КБ сжимаются и выносятся в скрытые таблицы <code>pg_toast</code>, оставляя в строке легковесный указатель.</li>
+</ol>
+<p>Теперь, когда мы досконально изучили анатомию страницы и поняли, почему в заголовке строки постоянно присутствуют системные маркеры <code>t_xmin</code> и <code>t_xmax</code>, пришло время раскрыть главную тайну неблокирующего параллелизма: как разные транзакции видят различные версии одной и той же строки. О механизме многоверсионности — в следующей лекции: <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2356,7 +2460,7 @@ end
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-faylov-ot-bazy-k-gigabaytam">Анатомия файлов: От базы к гигабайтам</a></li><li class="toc-item toc-h2"><a href="#stranitsa-page-bazovaya-edinitsa-vvoda-vyvoda">Страница (Page): Базовая единица ввода-вывода</a></li><li class="toc-item toc-h3"><a href="#ustroystvo-stranitsy-page-layout">Устройство страницы (Page Layout)</a></li><li class="toc-item toc-h2"><a href="#stroka-pod-kapotom-tuple">Строка под капотом (Tuple)</a></li><li class="toc-item toc-h3"><a href="#optimizatsiya-pamyati-vyravnivanie-struktur-padding">Оптимизация памяти: Выравнивание структур (Padding)</a></li><li class="toc-item toc-h2"><a href="#toast-khranenie-bolshikh-obektov">TOAST: Хранение больших объектов</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-pochemu-select-eto-zlo">Mechanical Sympathy: Почему SELECT  — это зло</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#anatomiya-faylov-ot-bazy-dannykh-k-gigabaytnym-segmentam">Анатомия файлов: От базы данных к гигабайтным сегментам</a></li><li class="toc-item toc-h2"><a href="#stranitsa-page-nedelimyy-kvant-vvoda-vyvoda">Страница (Page): Неделимый квант ввода-вывода</a></li><li class="toc-item toc-h3"><a href="#vnutrennee-ustroystvo-8-kilobaytnoy-stranitsy-page-layout">Внутреннее устройство 8-килобайтной страницы (Page Layout)</a></li><li class="toc-item toc-h2"><a href="#vnutrennee-ustroystvo-stroki-heap-tuple">Внутреннее устройство строки (Heap Tuple)</a></li><li class="toc-item toc-h2"><a href="#vyravnivanie-struktur-dannykh-na-diske-data-alignment-padding">Выравнивание структур данных на диске (Data Alignment &amp; Padding)</a></li><li class="toc-item toc-h2"><a href="#toast-khranenie-sverkhbolshikh-atributov-the-oversized-attribute-storage-techniq">TOAST: Хранение сверхбольших атрибутов (The Oversized-Attribute Storage Technique)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-pochemu-select-arkhitekturnyy-grekh">Mechanical Sympathy: Почему SELECT  — архитектурный грех</a></li><li class="toc-item toc-h2"><a href="#rezyume-dlya-inzhenera">Резюме для инженера</a></li>
   </ul>
 </aside>
 

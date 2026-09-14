@@ -2168,43 +2168,62 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. MVCC в PostgreSQL</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Когда вы пишете многопоточный код на Go и вам нужно защитить разделяемое состояние (например, <code>map</code> в памяти), вы, скорее всего, используете <code>sync.RWMutex</code>. Это классический подход: множество горутин могут читать данные одновременно, но как только одна горутина хочет записать данные, она берет эксклюзивную блокировку (<code>Lock()</code>), и <strong>все читатели ждут</strong>.</p>
-<p>В контексте высоконагруженных баз данных такой подход означал бы смерть производительности. Если бы каждая транзакция, обновляющая баланс пользователя, блокировала чтение этого баланса для всех остальных, мы бы никогда не достигли тысяч RPS. </p>
-<p>Чтобы решить эту проблему, современные реляционные БД используют <strong>MVCC (Multi-Version Concurrency Control — Управление конкурентным доступом с помощью многоверсионности)</strong>. Главное правило MVCC: <strong>Читатели не блокируют писателей, а писатели не блокируют читателей.</strong></p>
-<p>В разделе по теории транзакций мы уже касались общих принципов в статье <a href="../05-tranzaktsii-i-vnutrennosti/7-mvcc-multi-version-concurrency-control.html" class="wikilink">7. MVCC. Multi Version Concurrency Control</a>, но реализация этого механизма в PostgreSQL кардинально отличается от MySQL или Oracle. И это отличие имеет прямые последствия для того, как вы должны писать код и проектировать таблицы.</p>
-<h2 id="filosofiya-postgresql-versii-pryamo-v-kuche">Философия PostgreSQL: Версии прямо в куче</h2>
+            <p>Когда вы проектируете многопоточное приложение на Go и вам требуется защитить разделяемое состояние в оперативной памяти (например, кэш на базе <code>map</code>), первым интуитивным решением становится мьютекс с разделением прав чтения и записи: <code>sync.RWMutex</code>. Логика проста: сотни горутин могут параллельно читать карту (<code>RLock()</code>), но как только одной горутине требуется обновить ключ, она захватывает эксклюзивную блокировку (<code>Lock()</code>), и <strong>все читатели замирают в ожидании</strong>.</p>
+<p>В мире высоконагруженных реляционных баз данных подобная блокировочная модель привела бы к катастрофической деградации пропускной способности. Если бы транзакция, обновляющая баланс пользователя в онлайн-банкинге или статус заказа в интернет-магазине, замораживала чтение этой записи для всех остальных клиентов, система не выдержала бы и сотни конкурентных запросов.</p>
+<p>Чтобы обеспечить высочайший параллелизм, современные СУБД опираются на парадигму <strong>MVCC (Multi-Version Concurrency Control — управление конкурентным доступом с помощью многоверсионности)</strong>. Золотое правило MVCC звучит так: <strong>Читатели никогда не блокируют писателей, а писатели никогда не блокируют читателей.</strong></p>
+<p>Мы уже разбирали теоретические основы многоверсионности в статье <a href="../05-tranzaktsii-i-vnutrennosti/7-mvcc-multi-version-concurrency-control.html" class="wikilink">7. MVCC. Multi Version Concurrency Control</a>. Однако физическая реализация MVCC в ядре PostgreSQL кардинально отличается от подходов MySQL (InnoDB) или Oracle. Это фундаментальное архитектурное отличие напрямую влияет на то, как бэкенд-инженер должен писать транзакционный код в Go и проектировать схемы реляционных таблиц.</p>
+<hr />
+<h2 id="filosofiya-postgresql-versii-dannykh-pryamo-v-kuche-in-place-heap">Философия PostgreSQL: Версии данных прямо в куче (In-Place Heap)</h2>
 
-<p>В MySQL (InnoDB) или Oracle новые версии строк при обновлении пишутся на место старых, а старые данные уезжают в специальный сегмент отката (Undo Log). </p>
-<p>PostgreSQL пошел другим путем: <strong>никаких Undo Logs нет</strong>. Все версии одной и той же строки (прошлая, текущая, будущая незакоммиченная) физически лежат в одном и том же файле таблицы (Heap, Куча), который мы разбирали в статье <a href="2-storage-engine-postgresql.html" class="wikilink">2. Storage engine PostgreSQL</a>.</p>
+<p>В большинстве классических реляционных СУБД (таких как MySQL с движком InnoDB или Oracle) при обновлении строки новая версия записывается непосредственно на место старой, а предыдущие значения столбцов вытесняются в специальный циклический журнал отката — <strong>Undo Log</strong>. Если параллельный запрос читает старый снимок данных, он на лету конструирует прежнюю версию строки, восстанавливая дельты изменений из Undo Log в оперативной памяти.</p>
+<p>Архитекторы PostgreSQL избрали радикально иной, бескомпромиссно надежный путь: <strong>в PostgreSQL вообще нет Undo Logs</strong>. <br />
+Все версии одной и той же строки (прошлая, текущая закоммиченная и будущая, модифицируемая незавершенной транзакцией) физически сосуществуют бок о бок в одном и том же файле таблицы — в той самой дисковой Куче (<strong>Heap</strong>), устройство которой мы детально изучали в <a href="2-storage-engine-postgresql.html" class="wikilink">2. Storage engine PostgreSQL</a>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Метаданные транзакций</span>
+    <span class="callout-title">Под капотом: Метаданные транзакций в заголовке кортежа</span>
   </div>
   <div class="callout-body">
-    <p>Чтобы база понимала, какая транзакция какую версию строки должна видеть, в заголовке <em>каждой</em> строки (Tuple Header) хранятся специальные скрытые системные колонки.<br />
-Главные из них — это 32-битные идентификаторы транзакций (Transaction ID или <code>xid</code>):<br />
-* <strong><code>t_xmin</code></strong>: ID транзакции, которая создала (INSERT) эту версию строки.<br />
-* <strong><code>t_xmax</code></strong>: ID транзакции, которая удалила (DELETE) эту версию строки. Значение <code>0</code> означает, что строка жива.</p>
+    <p>Чтобы сервер точно понимал, какая именно транзакция имеет право видеть ту или иную версию строки, в заголовке <em>каждого</em> кортежа (<code>HeapTupleHeaderData</code>) резервируются скрытые системные поля. <br />
+Главными среди них являются 32-битные монотонно возрастающие идентификаторы транзакций (Transaction ID, или <strong><code>xid</code></strong>):<br />
+* <strong><code>t_xmin</code></strong>: ID транзакции, создавшей (<code>INSERT</code>) данную физическую версию строки.<br />
+* <strong><code>t_xmax</code></strong>: ID транзакции, удалившей (<code>DELETE</code>) или обновившей эту версию. Для актуальной "живой" строки, не подвергавшейся удалению, поле <code>t_xmax</code> строго равно <strong><code>0</code></strong>.</p>
   </div>
 </div>
 
-<h3 id="anatomiya-update-pochemu-obnovlenie-eto-udalenie-vstavka">Анатомия UPDATE: Почему обновление — это удаление + вставка</h3>
+<hr />
+<h3 id="anatomiya-update-pochemu-obnovlenie-eto-udalenie-plyus-vstavka">Анатомия UPDATE: Почему обновление — это удаление плюс вставка</h3>
 
-<p>В PostgreSQL <strong>не существует операции <code>UPDATE</code> на физическом уровне</strong>. </p>
-<p>Когда вы выполняете <code>UPDATE users SET balance = 150 WHERE id = 1</code>, под капотом происходит следующее:<br />
-1. База находит текущую активную строку (<code>t_xmax</code> = 0).<br />
-2. Она помечает эту строку как удаленную, записывая в её <code>t_xmax</code> ID текущей транзакции (например, 105).<br />
-3. Она создает <strong>совершенно новую физическую строку</strong> с новыми данными (баланс 150).<br />
-4. У новой строки <code>t_xmin</code> устанавливается в 105, а <code>t_xmax</code> = 0.<br />
-5. Старая строка получает ссылку на новую через скрытое поле <code>t_ctid</code>.</p>
+<p>Поскольку старые версии строк не вытесняются в Undo Log, в движке PostgreSQL <strong>на физическом уровне не существует операции перезаписи данных (In-place UPDATE)</strong>!</p>
+<p>Когда вы отправляете в базу запрос:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">UPDATE users SET balance = 150 WHERE id = 1;
+</code></pre>
+</div>
+
+<p>под капотом страничного хранилища разворачивается следующая цепочка низкоуровневых операций:</p>
+<ol>
+<li>Движок отыскивает на 8-килобайтной странице текущую видимую версию кортежа (<code>t_xmax = 0</code>).</li>
+<li>Вместо физической модификации байтов баланса, СУБД «мягко удаляет» старую версию: в ее системное поле <code>t_xmax</code> записывается ID текущей транзакции (допустим, <code>105</code>).</li>
+<li>Рядом (на этой же странице, если хватает свободного места, либо на новой выделенной странице) создается <strong>совершенно новый физический кортеж</strong> со значением баланса <code>150</code>.</li>
+<li>У нового кортежа атрибут <code>t_xmin</code> устанавливается в <code>105</code>, а поле <code>t_xmax</code> инициализируется нулем (<code>0</code>).</li>
+<li>Старый кортеж получает физическую ссылку на новый через скрытое поле <code>t_ctid</code>, образуя цепочку версий.</li>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2219,82 +2238,184 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph &quot;Страница данных (8 КБ)&quot;
+subgraph Page [&quot;8-килобайтная страница Heap&quot;]
 direction TB
-V1[&quot;Версия 1 &lt;br&gt; id=1, balance=100 &lt;br&gt; xmin=100, xmax=105&quot;]
-V2[&quot;Версия 2 &lt;br&gt; id=1, balance=150 &lt;br&gt; xmin=105, xmax=0&quot;]
-V1 -.-&gt;|&quot;t_ctid связывает &lt;br&gt; старую и новую версию&quot;| V2
+V1[&quot;Версия 1 (Старая) &lt;br&gt; id=1, balance=100 &lt;br&gt; t_xmin=100, t_xmax=105&quot;]
+V2[&quot;Версия 2 (Новая) &lt;br&gt; id=1, balance=150 &lt;br&gt; t_xmin=105, t_xmax=0&quot;]
+V1 -.-&gt;|&quot;t_ctid указывает на новую строку&quot;| V2
 end
-TX105[&quot;Транзакция 105 &lt;br&gt; делает UPDATE&quot;] --&gt;|&quot;Пишет xmax в старую &lt;br&gt; Создает новую&quot;| V1
+
+TX105[&quot;Транзакция 105 &lt;br&gt; UPDATE users SET balance = 150 WHERE id = 1&quot;] --&gt;|&quot;1. Записывает t_xmax = 105&quot;| V1
+TX105 --&gt;|&quot;2. Создает новый кортеж (t_xmin = 105)&quot;| V2
   </pre>
 </div>
 
 
-<p>Обе строки физически находятся на диске (в рамках 8-килобайтной страницы). Транзакции, стартовавшие <em>до</em> коммита 105, будут читать старую строку (Версию 1). Транзакции, стартовавшие <em>после</em> коммита, увидят Версию 2.</p>
+<p>Обе физические версии строки одновременно присутствуют на страницах накопителя. Любая параллельная транзакция, стартовавшая <em>до</em> фиксации (коммита) транзакции 105, будет прозрачно читать Версию 1. Все последующие транзакции, инициированные <em>после</em> успешного коммита, увидят Версию 2.</p>
+<hr />
 <h2 id="snimki-dannykh-snapshots-i-pravila-vidimosti">Снимки данных (Snapshots) и правила видимости</h2>
 
-<p>Откуда запрос <code>SELECT</code> знает, на какую версию строки смотреть? </p>
-<p>В момент начала выполнения запроса (или начала транзакции, в зависимости от уровня изоляции, см. <a href="../05-tranzaktsii-i-vnutrennosti/3-read-committed-repeatable-read-serializable.html" class="wikilink">3. Read Committed, Repeatable Read, Serializable</a>), PostgreSQL делает <strong>Снимок (Snapshot)</strong>. <br />
-Снимок — это не физическое копирование данных! Это просто небольшая структура в оперативной памяти (в рантайме C), которая содержит:<br />
-* <code>xmin</code> снимка: минимальный активный <code>xid</code> в системе на данный момент.<br />
-* <code>xmax</code> снимка: максимальный <code>xid</code> + 1.<br />
-* <code>xip_list</code>: массив <code>xid</code> всех транзакций, которые активны прямо сейчас.</p>
-<p>Когда исполнитель запроса (Executor) сканирует 8-килобайтную страницу и натыкается на строку, он применяет к ней <strong>Правила видимости (Visibility Rules)</strong>. Это сложная логика, но упрощенно она звучит так:</p>
+<p>Каким образом исполнитель запросов (<code>Executor</code>) при выполнении <code>SELECT</code> безошибочно определяет, какая из версий кортежа является видимой для текущего клиента?</p>
+<p>В момент начала выполнения SQL-команды (или в момент старта транзакции — в зависимости от выбранного уровня изоляции, подробно разобранного в <a href="../05-tranzaktsii-i-vnutrennosti/3-read-committed-repeatable-read-serializable.html" class="wikilink">3. Read Committed, Repeatable Read, Serializable</a>), PostgreSQL генерирует легковесный <strong>Снимок данных (Snapshot)</strong>.</p>
+<p>Важно подчеркнуть: создание снимка — это <strong>не физическое копирование данных</strong>! Снимок представляет собой компактную структуру в оперативной памяти (в рантайме ядра СУБД), описывающую текущее состояние глобального счетчика транзакций:</p>
+<ul>
+<li><strong><code>xmin</code> снимка:</strong> Наименьший идентификатор транзакции (<code>xid</code>), которая еще активна (не закоммичена и не откачена) на момент фиксации снимка. Все транзакции с <code>xid &lt; xmin</code> гарантированно завершены, и их результаты считаются видимыми в прошлом.</li>
+<li><strong><code>xmax</code> снимка:</strong> Следующий еще не назначенный идентификатор транзакции (<code>next_xid</code>). Ни одна транзакция с <code>xid &gt;= xmax</code> еще не существовала в момент создания снимка, следовательно, ее изменения строго невидимы.</li>
+<li><strong><code>xip_list</code> (active transactions list):</strong> Срез идентификаторов всех транзакций, которые были активны (in-flight) ровно в момент снятия снапшота (между <code>xmin</code> и <code>xmax</code>).</li>
+</ul>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Snapshot [&quot;Структура Snapshot в памяти&quot;]
+S_XMIN[&quot;xmin: 100 &lt;br&gt; (Все xid &lt; 100 закоммичены)&quot;]
+S_XIP[&quot;xip_list: [102, 104] &lt;br&gt; (Активны прямо сейчас)&quot;]
+S_XMAX[&quot;xmax: 106 &lt;br&gt; (Будущие транзакции)&quot;]
+end
+
+subgraph Evaluation [&quot;Проверка кортежа при чтении&quot;]
+Tuple[&quot;Строка: t_xmin=102, t_xmax=0&quot;]
+Check{&quot;t_xmin в xip_list?&quot;}
+Verdict[&quot;Строка НЕВИДИМА &lt;br&gt; (Транзакция 102 еще не закоммичена)&quot;]
+end
+
+Snapshot --&gt; Evaluation
+Tuple --&gt; Check
+Check -- &quot;Да&quot; --&gt; Verdict
+  </pre>
+</div>
+
+
+<p>Когда исполнитель запроса сканирует 8-килобайтную страницу и инспектирует заголовок кортежа, он применяет математически строгие <strong>Правила видимости (Visibility Rules)</strong>:</p>
 <ol>
-<li>Если <code>t_xmin</code> строки больше нашего снимка или находится в <code>xip_list</code> (то есть транзакция-создатель еще не завершилась) — <strong>строку не видим</strong>.</li>
-<li>Если <code>t_xmax</code> строки (тот, кто удалил) еще активен (есть в <code>xip_list</code>) — мы видим старую версию, игнорируем удаление.</li>
-<li>Если <code>t_xmin</code> закоммичен в прошлом, а <code>t_xmax</code> равен <code>0</code> или закоммичен в будущем — <strong>строку видим</strong>.</li>
+<li>Если <code>t_xmin</code> кортежа больше или равен <code>xmax</code> снимка либо присутствует в списке активных транзакций <code>xip_list</code> (транзакция-создатель еще не зафиксирована) — <strong>кортеж невидим</strong>.</li>
+<li>Если создавшая транзакция <code>t_xmin</code> успешно завершена (<code>COMMITTED</code>), но удалившая транзакция <code>t_xmax</code> активна в <code>xip_list</code> или принадлежит будущему (<code>&gt;= xmax</code>) — <strong>кортеж видим</strong> (удаление для нас еще не произошло).</li>
+<li>Если <code>t_xmin</code> зафиксирован в прошлом, а поле <code>t_xmax</code> равно <code>0</code> (или транзакция, удалившая строку, была отменена <code>ABORTED</code>) — <strong>кортеж видим</strong>.</li>
 </ol>
-<p>Это происходит на лету в RAM (или кэшах L1/L2 процессора), без всяких системных вызовов к ОС. Это невероятно быстро.</p>
+<p>Эта проверка выполняется со скоростью машинных инструкций в L1/L2-кэшах процессора над байтами заголовка строки, без системных вызовов к ядру ОС и без ожидания дисковых операций.</p>
 <hr />
 <h2 id="mechanical-sympathy-razduvanie-tablits-table-bloat">Mechanical Sympathy: Раздувание таблиц (Table Bloat)</h2>
 
-<p>Решение хранить все версии в Куче имеет колоссальное влияние на производительность.</p>
-<p>Поскольку <code>UPDATE</code> порождает новые строки, таблица постоянно растет в физических размерах. Если вы часто обновляете одни и те же 10 000 строк (например, счетчики просмотров или координаты курьеров), со временем таблица может занять гигабайты, хотя актуальных строк в ней по-прежнему 10 000. </p>
-<p>Это называется <strong>Bloat (Раздувание)</strong>.<br />
-Чем больше раздута таблица, тем больше 8-килобайтных страниц базе приходится считывать с SSD в память (увеличивается IO-нагрузка), чтобы найти среди тысяч "мертвых" строк несколько живых. Снижается эффективность <code>shared_buffers</code>, растет задержка (Latency) приложения.</p>
-<p>Для борьбы с этим в Go есть свой Garbage Collector, а в PostgreSQL — <strong>Autovacuum</strong>. Он в фоновом режиме сканирует страницы, находит строки, которые больше не нужны ни одной транзакции (их <code>t_xmax</code> находится в далеком прошлом), и помечает их место как свободное (Free Space). О тюнинге этого процесса мы подробно поговорим в <a href="10-vacuum-analyze.html" class="wikilink">10. VACUUM, ANALYZE</a>.</p>
+<p>Хранение всех версий данных непосредственно в Куче дает невероятную скорость чтения и изоляцию, но имеет оборотную сторону: <strong>раздувание таблиц и индексов (Table and Index Bloat)</strong>.</p>
+<p>Поскольку каждая операция <code>UPDATE</code> порождает новый физический кортеж, а <code>DELETE</code> лишь выставляет маркер <code>t_xmax</code>, таблица постоянно прирастает физическими страницами. Если ваша система интенсивно обновляет один и тот же набор из 10 000 строк (например, статусы очередей задач, остатки товаров или координаты курьеров), со временем таблица может разрастись до 10 гигабайт на диске, хотя полезных данных в ней по-прежнему содержится всего 10 000 записей!</p>
+<p><strong>Чем опасно раздувание?</strong><br />
+* Резко возрастает дисковый ввод-вывод (I/O): чтобы прочитать 1 000 живых строк, базе приходится вычитывать с SSD сотни тысяч 8-килобайтных страниц с "мертвыми" кортежами.<br />
+* Катастрофически падает утилизация кэша <code>shared_buffers</code>: ценная оперативная память забивается страницами с мертвыми версиями, вытесняя полезные горячие данные.<br />
+* Растет задержка (Latency) клиентских запросов в Go-сервисах.</p>
+<p>Для утилизации мертвых строк в рантайм PostgreSQL встроен компонент <strong>Autovacuum</strong> (фоновый сборщик мусора СУБД). Он обходит страницы, находит кортежи, чей <code>t_xmax</code> находится глубже горизонта видимости всех активных транзакций, и освобождает занимаемое ими пространство для новых записей (детально о его тонкой настройке — в <a href="10-vacuum-analyze.html" class="wikilink">10. VACUUM, ANALYZE</a>).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Долгие транзакции убивают базу</span>
+    <span class="callout-title">Ловушка / Gotcha: «Зависшие» транзакции в Go и паралич базы данных</span>
   </div>
   <div class="callout-body">
-    <p>Представьте, что в вашем Go-приложении есть баг: вы открыли транзакцию <code>tx, err := db.Begin()</code>, сделали <code>SELECT</code>, а затем ушли в долгий сетевой вызов к стороннему API, забыв сделать <code>tx.Commit()</code> или <code>tx.Rollback()</code>. <br />
-Пока эта транзакция висит, её <code>xid</code> остается активным. Значит, Vacuum <strong>не имеет права</strong> физически удалять старые версии строк в <em>любых</em> таблицах базы данных (вдруг ваша транзакция решит их прочитать?). База начинает катастрофически раздуваться, деградирует IO, и в конечном итоге может закончиться место на диске. <br />
-<strong>Никогда не держите открытые транзакции во время сетевых или долгих CPU-bound операций.</strong></p>
+    <p>Классическая авария в микросервисах на Go выглядит так:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">tx, err := db.Begin()
+if err != nil {
+    return err
+}
+// Выполнили быстрый SELECT
+rows, err := tx.Query(&quot;SELECT balance FROM accounts WHERE id = $1&quot;, accountID)
+// ... обработали строки ...
+
+// ОШИБКА: Долгий сетевой вызов к внешнему платежному шлюзу без закрытия транзакции!
+resp, err := httpClient.Post(&quot;https://payment-gateway/charge&quot;, ...)
+if err != nil {
+    // Забыли вызвать tx.Rollback() при ошибке сетевого тайм-аута!
+    return err 
+}
+tx.Commit()
+</code></pre>
+</div>
+
+<p>Пока транзакция в Go ждет ответа от внешнего шлюза (или зависает из-за отсутствия контекстных таймаутов), ее идентификатор <code>xid</code> удерживает <strong>горизонт транзакций (Transaction Horizon)</strong> всей базы данных.<br />
+Autovacuum не имеет права физически удалить ни один мертвый кортеж ни в одной таблице кластера, если этот кортеж был модифицирован после старта вашей "зависшей" транзакции! Вся база данных начинает лавинообразно раздуваться (Bloat), пожирая терабайты диска.<br />
+<strong>Инженерный закон:</strong> Никогда не выполняйте внешние сетевые вызовы (<code>http.Client</code>, gRPC, очереди сообщений) и тяжелые вычисления внутри активной транзакции БД. Всегда закрывайте транзакцию через <code>defer tx.Rollback()</code> немедленно после инициализации!</p>
   </div>
 </div>
 
 <hr />
-<h2 id="hot-updates-heap-only-tuples">HOT Updates (Heap-Only Tuples)</h2>
+<h2 id="optimizatsiya-hot-heap-only-tuples">Оптимизация HOT (Heap-Only Tuples)</h2>
 
-<p>Чтобы смягчить проблему раздувания и обновления индексов, в PostgreSQL есть гениальная оптимизация — <strong>HOT (Heap-Only Tuples)</strong>.</p>
-<p>Если <code>UPDATE</code> изменяет колонку, которая <strong>не участвует ни в одном индексе</strong>, и на текущей странице (8 КБ) еще есть свободное место, Postgres делает HOT-обновление.</p>
-<p><strong>Почему это важно?</strong><br />
-Обычно, когда вставляется новая физическая строка, СУБД должна обойти <em>все</em> индексы таблицы (B-Tree) и вставить в них новые указатели на новую строку. Это огромная I/O нагрузка. <br />
-При HOT-обновлении база не трогает индексы вообще! Внутри самой 8-килобайтной страницы старая строка просто получает <code>HOT-link</code> на новую. Когда индекс указывает на старую строку, механизм чтения понимает: "Ага, тут HOT-цепочка, надо просто пройти по ней внутри страницы".</p>
+<p>Чтобы снизить чудовищный оверхед при обновлении записей, в PostgreSQL реализован элегантный механизм <strong>HOT (Heap-Only Tuples — кортежи только в куче)</strong>.</p>
+<p>В стандартном сценарии при вставке нового кортежа СУБД обязана обновить <strong>все до единого индексы таблицы</strong> (B-Tree, Hash), вставив в них ссылки на новый <code>CTID</code>. Если у вас на таблице висит 6 вторичных индексов, один <code>UPDATE</code> вызывает лавину случайных записей в 6 индексных деревьев!</p>
+<p><strong>Когда срабатывает HOT?</strong><br />
+HOT-оптимизация включается автоматически, если соблюдены два строгих условия:<br />
+1. Запрос <code>UPDATE</code> <strong>не модифицирует ни одной колонки, по которой построен хотя бы один индекс</strong>.<br />
+2. На текущей 8-килобайтной странице данных Heap имеется <strong>достаточно свободного места</strong> (<code>Free Space</code>) для размещения новой версии строки.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Index[&quot;B-Tree Index Entry &lt;br&gt; (Root -&gt; Leaf: key=42)&quot;] --&gt;|&quot;CTID (Block 1, Item 1)&quot;| V1
+
+subgraph Page1 [&quot;Страница 8 KB (Block 1)&quot;]
+direction TB
+V1[&quot;Старый кортеж (Item 1) &lt;br&gt; t_xmax=200, HOT-link -&gt; Item 2&quot;]
+V2[&quot;Новый кортеж (Item 2) &lt;br&gt; t_xmin=200, t_xmax=0&quot;]
+V1 -.-&gt;|&quot;Внутренний HOT-link&quot;| V2
+end
+  </pre>
+</div>
+
+
+<p>При HOT-обновлении база данных <strong>вообще не касается индексных структур</strong>! <br />
+В листовом узле B-Tree остается прежний указатель на исходную строку (<code>Item 1</code>). Когда поисковый запрос по индексу приходит на страницу данных, он считывает заголовок старой строки, мгновенно видит флаг <code>HEAP_HOT_UPDATED</code> и переходит по внутренней ссылке к актуальной версии (<code>Item 2</code>). Экономия на дисковом вводе-выводе и блокировках индексов достигает 80–90%!</p>
+<p>Чтобы обеспечить постоянное наличие свободного места для HOT-обновлений, на часто модифицируемых таблицах настраивают параметр заполнения страниц: <code>ALTER TABLE accounts SET (fillfactor = 70);</code>. Это оставляет 30% каждой страницы про запас специально для HOT-цепочек.</p>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что такое Transaction ID Wraparound (Переполнение счетчика транзакций)?<br />
-<strong>Ответ:</strong> Поля <code>xmin</code> и <code>xmax</code> имеют размер 32 бита, что дает около 4 миллиардов значений (в реальности база делит их пополам: 2 млрд "в прошлом" и 2 млрд "в будущем" из-за кольцевой природы). Если высоконагруженная система сделает 2 миллиарда транзакций, счетчик пойдет по кругу и сбросится в ноль. Внезапно все "старые" строки окажутся для базы "в будущем" и станут невидимыми (база просто "исчезнет"). <br />
-Чтобы этого не произошло, Vacuum выполняет процесс <strong>Freezing (Заморозка)</strong> — он меняет старые <code>xmin</code> на специальный флаг <code>FrozenTransactionId</code> (равен 2), который всегда считается прошлым. Если база не успевает делать Freeze (например, из-за долгих транзакций или неверной настройки), при достижении критического лимита PostgreSQL жестко останавливается в режиме read-only (отключается), требуя ручного обслуживания.</p>
+    <p><strong>Вопрос:</strong> Что такое переполнение счетчика транзакций (Transaction ID Wraparound) в PostgreSQL и чем оно смертельно опасно?<br />
+<strong>Ответ:</strong> Идентификаторы транзакций <code>xmin</code> и <code>xmax</code> имеют физический размер 32 бита, что дает $2^{32} \approx 4.29$ миллиарда уникальных значений. Для корректного упорядочивания база трактует их как кольцевой буфер (modulo $2^{32}$): ровно 2 миллиарда транзакций считаются лежащими "в прошлом", а 2 миллиарда — "в будущем".<br />
+Если система выполнит более 2 миллиардов транзакций без специального обслуживания, счетчик сделает оборот (Wraparound). Внезапно исторические транзакции окажутся "в будущем", и с точки зрения правил видимости все данные таблицы <strong>мгновенно исчезнут</strong> (станут невидимыми)!<br />
+Чтобы предотвратить катастрофу, процесс Vacuum регулярно выполняет <strong>Freezing (Заморозку)</strong>: он подменяет старые <code>xmin</code> на специальный идентификатор <code>FrozenTransactionId</code> (значение <code>2</code>), который правилами видимости трактуется как "всегда закоммиченный в бесконечном прошлом". Если база приближается к лимиту в 2 млрд транзакций из-за сбоев Autovacuum или зависших транзакций, PostgreSQL принудительно аварийно останавливается и переходит в режим read-only для спасения целостности данных.</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume-dlya-inzhenera">Резюме для инженера</h2>
 
 <ol>
-<li><strong>MVCC в PostgreSQL</strong> реализован через хранение множества версий строк в самой таблице (Heap).</li>
-<li><strong><code>UPDATE</code> = <code>DELETE</code> + <code>INSERT</code></strong>, что неизбежно ведет к появлению мертвых строк и раздуванию (Bloat) таблиц.</li>
-<li><strong>Снимки (Snapshots)</strong> позволяют <code>SELECT</code>-ам читать консистентные данные без блокировок, используя <code>xmin</code> и <code>xmax</code>.</li>
-<li><strong>HOT Updates</strong> экономят ресурсы на обновление индексов, если мы не меняем индексируемые поля.</li>
+<li><strong>Архитектура без Undo Log:</strong> Все версии строк хранятся непосредственно в страницах Heap, что исключает накладные расходы на поддержание отдельного журнала отката.</li>
+<li><strong><code>UPDATE</code> — это дублирование:</strong> Каждое обновление физически создает новый кортеж и помечает старый через <code>t_xmax</code>, неизбежно порождая раздувание (Bloat) при высокой частоте модификаций.</li>
+<li><strong>Снимки (Snapshots):</strong> Обеспечивают консистентное неблокирующее чтение через сравнение системных полей <code>t_xmin</code>/<code>t_xmax</code> со списком активных транзакций <code>xip_list</code>.</li>
+<li><strong>HOT Updates:</strong> Спасают производительность, исключая модификацию вторичных индексов при условии наличия свободного места на странице.</li>
+<li><strong>Опасность долгих транзакций:</strong> Зависшие транзакции в Go блокируют очистку мертвых строк Autovacuum'ом и могут привести к неконтролируемому раздуванию базы или даже угрозе Transaction ID Wraparound.</li>
 </ol>
-<p>Теперь мы знаем, как данные лежат на диске и как они версионируются для безопасного конкурентного доступа. Но чтобы находить нужные строки за миллисекунды среди миллионов записей, нам не обойтись без деревьев поиска. В следующей статье мы разберем: <a href="4-indeksy-v-postgresql.html" class="wikilink">4. Индексы в PostgreSQL</a>.</p>
+<p>Зная, как хранятся и версионируются данные на диске, мы можем перейти к следующему краеугольному камню производительности — поисковым деревьям и индексам. В следующей лекции: <a href="4-indeksy-v-postgresql.html" class="wikilink">4. Индексы в PostgreSQL</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2322,7 +2443,7 @@ TX105[&quot;Транзакция 105 &lt;br&gt; делает UPDATE&quot;] --&gt
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#filosofiya-postgresql-versii-pryamo-v-kuche">Философия PostgreSQL: Версии прямо в куче</a></li><li class="toc-item toc-h3"><a href="#anatomiya-update-pochemu-obnovlenie-eto-udalenie-vstavka">Анатомия UPDATE: Почему обновление — это удаление + вставка</a></li><li class="toc-item toc-h2"><a href="#snimki-dannykh-snapshots-i-pravila-vidimosti">Снимки данных (Snapshots) и правила видимости</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-razduvanie-tablits-table-bloat">Mechanical Sympathy: Раздувание таблиц (Table Bloat)</a></li><li class="toc-item toc-h2"><a href="#hot-updates-heap-only-tuples">HOT Updates (Heap-Only Tuples)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#filosofiya-postgresql-versii-dannykh-pryamo-v-kuche-in-place-heap">Философия PostgreSQL: Версии данных прямо в куче (In-Place Heap)</a></li><li class="toc-item toc-h3"><a href="#anatomiya-update-pochemu-obnovlenie-eto-udalenie-plyus-vstavka">Анатомия UPDATE: Почему обновление — это удаление плюс вставка</a></li><li class="toc-item toc-h2"><a href="#snimki-dannykh-snapshots-i-pravila-vidimosti">Снимки данных (Snapshots) и правила видимости</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-razduvanie-tablits-table-bloat">Mechanical Sympathy: Раздувание таблиц (Table Bloat)</a></li><li class="toc-item toc-h2"><a href="#optimizatsiya-hot-heap-only-tuples">Оптимизация HOT (Heap-Only Tuples)</a></li><li class="toc-item toc-h2"><a href="#rezyume-dlya-inzhenera">Резюме для инженера</a></li>
   </ul>
 </aside>
 

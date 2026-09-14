@@ -2168,28 +2168,122 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">10. VACUUM, ANALYZE</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статье про <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a> мы выяснили, что PostgreSQL никогда не удаляет данные "на месте" и не обновляет их физически. Вместо этого он плодит версии строк. Без специального механизма очистки любая база данных на Postgres со временем превратилась бы в раздутый кусок мусора, где 99% места занимают "мертвые" кортежи (dead tuples).</p>
-<p>За поддержание чистоты и актуальности данных отвечают две фундаментальные операции: <strong>VACUUM</strong> и <strong>ANALYZE</strong>. Для Go-разработчика понимание их работы — это разница между стабильным бэкендом и внезапным "торможением" всей системы в три часа ночи.</p>
+            <p>В лекции про многоверсионность <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a> мы столкнулись с фундаментальным архитектурным фактом: движок PostgreSQL никогда не модифицирует существующие данные «на месте» (in-place) и физически не стирает строки при вызове <code>DELETE</code>. Каждая операция обновления или удаления оставляет за собой «мертвый» кортеж (dead tuple), помеченный системным идентификатором транзакции <code>t_xmax</code>.</p>
+<p>Если бы в архитектуре не было встроенного механизма непрерывной санитарной очистки, любая высоконагруженная база данных за считанные недели превратилась бы в гигантский мусорный полигон: полезные данные утонули бы в терабайтах мертвых версий, дисковое пространство исчерпалось, а эффективность кэша <code>shared_buffers</code> рухнула до нуля.</p>
+<p>За поддержание физической чистоты страниц и математической зоркости планировщика отвечают две фундаментальные системные операции: <strong>VACUUM</strong> и <strong>ANALYZE</strong>. Для Go-разработчика понимание их внутренней механики — это граница, отделяющая стабильно работающий бэкенд от внезапного паралича продакшена посреди ночи.</p>
 <hr />
 <h2 id="1-vacuum-musorshchik-v-mire-mvcc">1. VACUUM: Мусорщик в мире MVCC</h2>
 
 <p><strong>VACUUM</strong> — это процесс, который сканирует таблицы и помечает место, занятое мертвыми строками, как свободное. </p>
 <p>Важно понимать: обычный <code>VACUUM</code> <strong>не возвращает место операционной системе</strong>. Он просто говорит PostgreSQL: <em>"Эти байты внутри 8-килобайтной страницы больше не нужны, сюда можно записать новый INSERT"</em>.</p>
-<h3 id="kak-rabotaet-vacuum-poshagovo">Как работает VACUUM (пошагово)</h3>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph PageBefore [&quot;1. Страница Heap до очистки (8 KB)&quot;]
+direction TB
+T1[&quot;Живой кортеж A (t_xmax = 0)&quot;]
+T2[&quot;Мертвый кортеж B (t_xmax = 100, COMMIT в прошлом)&quot;]
+T3[&quot;Живой кортеж C (t_xmax = 0)&quot;]
+end
+
+subgraph VacuumAction [&quot;2. Проход VACUUM&quot;]
+VProc[&quot;VACUUM Worker: &lt;br&gt; • Удаление ссылок из B-Tree индексов &lt;br&gt; • Пометка слота B как свободного &lt;br&gt; • Обновление Free Space Map (FSM) &lt;br&gt; • Выставление бита all_visible в Visibility Map&quot;]
+end
+
+subgraph PageAfter [&quot;3. Страница после VACUUM (8 KB)&quot;]
+direction TB
+CT1[&quot;Живой кортеж A&quot;]
+CFS[&quot;[ Свободное окно для записи (Free Space) ]&quot;]
+CT3[&quot;Живой кортеж C&quot;]
+end
+
+PageBefore --&gt; VacuumAction
+VacuumAction --&gt; PageAfter
+CFS -.-&gt;|&quot;Новый INSERT из Go&quot;| NewInsert[&quot;Новый кортеж D без расширения файла!&quot;]
+  </pre>
+</div>
+
+
+<h3 id="kak-fizicheski-rabotaet-konveyer-vacuum-poshagovo">Как физически работает конвейер VACUUM (пошагово)</h3>
 <ol>
-<li><strong>Сканирование Heap</strong>: Процесс читает страницы таблицы.</li>
-<li><strong>Проверка видимости</strong>: Используя текущий список транзакций, он определяет, какие строки не видны ни одной активной транзакции.</li>
-<li><strong>Очистка индексов</strong>: Сначала удаляются ссылки на мертвые строки из всех индексов (B-Tree, GIN и т.д.).</li>
-<li><strong>Очистка Heap</strong>: Мертвые строки помечаются как свободное пространство (Free Space).</li>
-<li><strong>Обновление Free Space Map (FSM)</strong>: База записывает в специальный файл информацию о том, что в этой странице появилось место.</li>
+<li><strong>Сканирование Heap:</strong> Воркер вакуума считывает страницы таблицы из <code>shared_buffers</code> или поднимает их с диска.</li>
+<li><strong>Проверка горизонта транзакций:</strong> Сверяясь с глобальным снимком активных транзакций, процесс выявляет мертвые кортежи, чей <code>t_xmax</code> гарантированно завершен и невидим ни для одной текущей или потенциальной сессии.</li>
+<li><strong>Двухфазная очистка индексов:</strong> Это критически важный шаг! Сначала вакуум собирает список адресов <code>CTID</code> мертвых строк в буфер <code>maintenance_work_mem</code>, обходит <strong>все до единого индексы таблицы</strong> (B-Tree, GIN, GiST) и вычищает из их листовых страниц указатели на эти мертвые кортежи.</li>
+<li><strong>Очистка страниц Heap:</strong> Только после того, как все ссылки из индексов гарантированно удалены, вакуум возвращается к страницам Heap и переводит слоты мертвых кортежей в статус свободного пространства.</li>
+<li><strong>Обновление Free Space Map (FSM):</strong> В специальный вспомогательный файл (<code>_fsm</code>) записывается точный объем свободного места на каждой странице, чтобы последующие операции <code>INSERT</code> мгновенно находили свободные блоки без линейного сканирования файлов.</li>
 </ol>
+<hr />
+<h3 id="vacuum-full-kogda-vsyo-ochen-plokho">VACUUM FULL: Когда всё очень плохо</h3>
+
+<p>Существует специальная агрессивная форма очистки — команда <code>VACUUM FULL</code>. В отличие от обычного вакуума, она физически возвращает неиспользуемые байты операционной системе:<br />
+1. Создает <strong>абсолютно новый файл таблицы</strong> на диске.<br />
+2. Последовательно переносит в новый файл исключительно живые кортежи, упаковывая их максимально плотно без малейших зазоров.<br />
+3. С нуля перестраивает все индексы таблицы.<br />
+4. Физически удаляет старый раздутый файл, возвращая гигабайты пространства ОС.</p>
+<div class="callout callout-danger">
+  <div class="callout-header">
+    <span class="callout-icon">🚨</span>
+    <span class="callout-title">Внимание: Смертоносный Exclusive Lock</span>
+  </div>
+  <div class="callout-body">
+    <p>Команда <code>VACUUM FULL</code> захватывает жесткую исключительную блокировку таблицы — <strong>AccessExclusiveLock</strong>.<br />
+На все время выполнения операции (которое для терабайтной таблицы может растянуться на много часов) <strong>запрещены любые параллельные операции, включая обычный <code>SELECT</code></strong>! Ваше Go-приложение намертво зависнет на попытке прочитать таблицу, а пул соединений исчерпается за секунды.<br />
+В современных промышленных системах <code>VACUUM FULL</code> под боевой нагрузкой практически никогда не вызывают вручную. Для дефрагментации таблиц "на лету" без блокировки читателей и писателей используют внешнюю утилиту <strong><code>pg_repack</code></strong>.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="2-autovacuum-tvoy-nevidimyy-pomoshchnik">2. Autovacuum: Твой невидимый помощник</h2>
+
+<p>В современных версиях PostgreSQL администраторам редко приходится инициировать очистку вручную: за чистотой следит системный демон — <strong>Autovacuum Launcher</strong> и пул его дочерних воркеров.</p>
+<p>Демон пробуждается раз в период времени, заданный параметром <code>autovacuum_naptime</code> (по умолчанию раз в 1 минуту), опрашивает статистику подсистемы сбора метрик и вычисляет, не пора ли запустить вакуум для конкретной таблицы.</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> По какой математической формуле Autovacuum определяет, что наступил момент для очистки таблицы?<br />
+<strong>Ответ:</strong> Запуск вакуума инициируется, когда число накопившихся мертвых кортежей превышает расчетный порог:<br />
+$$\text{Порог запуска} = \text{autovacuum_vacuum_threshold} + (\text{autovacuum_vacuum_scale_factor} \times \text{reltuples})$$<br />
+* <code>autovacuum_vacuum_threshold</code>: Базовое минимальное количество мертвых строк (по умолчанию <code>50</code>).<br />
+* <code>autovacuum_vacuum_scale_factor</code>: Доля изменений от общего числа строк в таблице <code>reltuples</code> (по умолчанию <code>0.2</code> или 20%).</p>
+  </div>
+</div>
+
+<h3 id="mechanical-sympathy-dlya-highload">Mechanical Sympathy для Highload</h3>
+<p>Представьте таблицу на 100 миллионов строк. При стандартном коэффициенте <code>scale_factor = 0.2</code> Autovacuum запустится только тогда, когда в таблице накопится:<br />
+$$50 + (0.2 \times 100\,000\,000) \approx 20\,000\,000 \text{ мертвых строк!}$$<br />
+Накопление 20 миллионов мертвых строк означает чудовищное раздувание таблицы (Table Bloat), деградацию дискового ввода-вывода и засорение <code>shared_buffers</code>.<br />
+В высоконагруженных проектах для тяжелых таблиц значение <code>scale_factor</code> принудительно снижают до <strong><code>0.01</code> (1%)</strong> или даже <code>0.005</code> (0.5%), обеспечивая непрерывную, мягкую и незаметную для пользователей очистку.</p>
+<hr />
+<h2 id="3-analyze-glaza-i-matematicheskiy-kompas-planirovshchika">3. ANALYZE: Глаза и математический компас планировщика</h2>
+
+<p>Если задача <code>VACUUM</code> — физическое освобождение дискового пространства внутри страниц, то миссия команды <strong>ANALYZE</strong> — обеспечение интеллектуальной работы планировщика запросов.</p>
+<p>Как мы разбирали в <a href="9-optimizatsiya-postgresql.html" class="wikilink">9. Оптимизация PostgreSQL</a>, стоимостной оптимизатор принимает решение о выборе алгоритма (Index Scan, Bitmap Scan, Seq Scan, Hash Join, Merge Join) исключительно на базе <strong>математической статистики</strong>.<br />
+Процесс <strong>ANALYZE</strong> инспектирует репрезентативную случайную выборку строк таблицы и рассчитывает:<br />
+* Общее число физических страниц и строк в таблице.<br />
+* <strong>Selection Cardinality</strong> (степень уникальности значений в каждом столбце — <code>n_distinct</code>).<br />
+* Список наиболее частых значений (Most Common Values, MCV) и их процентную частоту.<br />
+* Гистограммы квантилей распределения значений (Histogram Bounds).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2204,112 +2298,76 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-subgraph Page[&quot;Страница на диске (8 КБ)&quot;]
-direction TB
-T1[&quot;Живая строка&quot;]
-T2[&quot;Мертвая строка (после UPDATE)&quot;]
-T3[&quot;Живая строка&quot;]
-end
-
-VAC[&quot;VACUUM&quot;] --&gt; Page
-Page --&gt; CleanedPage[&quot;Очищенная страница&quot;]
-
-subgraph CleanedPage[&quot;Очищенная страница&quot;]
-direction TB
-CT1[&quot;Живая строка&quot;]
-CFS[&quot;[ Свободное место ]&quot;]
-CT3[&quot;Живая строка&quot;]
-end
-
-CFS -.-&gt;|&quot;Новый INSERT из Go&quot;| NewData[&quot;Новая строка&quot;]
+Table[&quot;Таблица orders &lt;br&gt; (10 млн строк)&quot;] --&gt; Sampler[&quot;ANALYZE: &lt;br&gt; Случайная выборка ~30 000 строк&quot;]
+Sampler --&gt; StatsCalc[&quot;Расчет метрик: &lt;br&gt; • n_distinct &lt;br&gt; • Гистограммы MCV&quot;]
+StatsCalc --&gt; Catalog[&quot;Системный каталог pg_statistic &lt;br&gt; (Используется Planner при каждом EXPLAIN)&quot;]
   </pre>
 </div>
 
 
-<h3 id="vacuum-full-kogda-vsyo-ochen-plokho">VACUUM FULL: Когда всё очень плохо</h3>
-<p>Существует команда <code>VACUUM FULL</code>. В отличие от обычного вакуума, она:<br />
-1. Создает <strong>полную новую копию</strong> файла таблицы на диске.<br />
-2. Переносит туда только живые строки, упаковывая их максимально плотно.<br />
-3. Удаляет старый файл.</p>
-<div class="callout callout-danger">
-  <div class="callout-header">
-    <span class="callout-icon">🚨</span>
-    <span class="callout-title">Внимание</span>
-  </div>
-  <div class="callout-body">
-    <p><code>VACUUM FULL</code> берет <strong>Exclusive Lock</strong> на таблицу. Пока он идет, ваше Go-приложение не сможет даже сделать <code>SELECT</code>. В production эта команда используется только в экстренных случаях.</p>
-  </div>
-</div>
-
+<h3 id="pochemu-aktualnost-statistiki-kritichna-dlya-go-prilozheniya">Почему актуальность статистики критична для Go-приложения?</h3>
+<p>Представьте таблицу задач <code>tasks</code> со столбцом <code>status</code>:<br />
+* 99% строк имеют статус <code>'COMPLETED'</code>.<br />
+* 1% строк имеют статус <code>'IN_PROGRESS'</code>.</p>
+<p>Если статистика актуальна, то при выполнении запроса <code>SELECT * FROM tasks WHERE status = 'IN_PROGRESS'</code> планировщик безошибочно выберет точечный <strong>Index Scan</strong>, прочитав пару индексных страниц за 1 миллисекунду.<br />
+Если же статистика устарела (например, база считает, что статусы распределены 50/50), оптимизатор решит, что индекс неэффективен, и запустит <strong>Sequential Scan</strong> по всей многогигабайтной таблице, превратив быстрый микросервисный запрос в катастрофическую блокировку ввода-вывода!</p>
 <hr />
-<h2 id="2-autovacuum-tvoy-nevidimyy-pomoshchnik">2. Autovacuum: Твой невидимый помощник</h2>
+<h2 id="4-zashchita-tselostnosti-visibility-map-i-predotvrashchenie-wraparound">4. Защита целостности: Visibility Map и предотвращение Wraparound</h2>
 
-<p>В современных версиях PostgreSQL вам редко нужно запускать <code>VACUUM</code> вручную. Этим занимается <strong>Autovacuum Daemon</strong>.</p>
-<p>Он просыпается раз в минуту (настраивается через <code>autovacuum_naptime</code>) и проверяет статистику: сколько строк было изменено или удалено в каждой таблице с момента последней очистки.</p>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Какие основные параметры влияют на запуск Autovacuum?<br />
-<strong>Ответ:</strong> &gt; 1. <code>autovacuum_vacuum_threshold</code>: Минимальное количество мертвых строк (дефолт 50).<br />
-2. <code>autovacuum_vacuum_scale_factor</code>: Процент мертвых строк от общего объема таблицы (дефолт 0.2 или 20%).<br />
-Формула: <code>threshold + scale_factor * number_of_tuples</code>.</p>
-  </div>
-</div>
-
-<p><strong>Mechanical Sympathy для Highload:</strong><br />
-Для таблицы в 100 млн строк дефолтные 20% означают, что Autovacuum придет только тогда, когда накопится 20 млн мертвых строк. Это огромный Bloat (раздувание). В высоконагруженных системах <code>scale_factor</code> для больших таблиц снижают до 0.01 (1%) или даже 0.005.</p>
+<p>Помимо базовой сборки мусора, Autovacuum выполняет две жизненно важные архитектурные функции, без которых надежное функционирование СУБД невозможно:</p>
+<h3 id="1-aktualizatsiya-karty-vidimosti-visibility-map">1. Актуализация карты видимости (Visibility Map)</h3>
+<p>Каждый раз, когда <code>VACUUM</code> обрабатывает страницу и убеждается, что на ней больше нет ни одного мертвого кортежа и незакоммиченных транзакций, он выставляет бит <code>all_visible</code> в файле Visibility Map.<br />
+Как мы выяснили в <a href="4-indeksy-v-postgresql.html" class="wikilink">4. Индексы в PostgreSQL</a>, именно этот бит позволяет планировщику применять сверхбыстрый <strong>Index-Only Scan</strong>, извлекая данные непосредственно из B-Tree индекса без единого обращения к диску за страницами Heap.</p>
+<h3 id="2-zamorozka-tranzaktsiy-freezing-i-ugroza-wraparound">2. Заморозка транзакций (Freezing) и угроза Wraparound</h3>
+<p>Идентификаторы транзакций <code>xmin</code>/<code>xmax</code> имеют размер 32 бита (лимит около 4 миллиардов значений, закольцованных по модулю $2^{32}$). Если счетчик сделает полный оборот, старые транзакции окажутся «в будущем», и данные базы мгновенно исчезнут для всех правил видимости!<br />
+Чтобы исключить эту катастрофу, вакуум регулярно выполняет процедуру <strong>Freezing (Заморозку)</strong>: он инспектирует старые строки и заменяет их <code>xmin</code> на фиксированный служебный маркер <code>FrozenTransactionId</code> (равный <code>2</code>), который навсегда закрепляет строку как видимую в абсолютном прошлом. Если Autovacuum не успевает за темпом генерации <code>xid</code>, PostgreSQL принудительно аварийно останавливается и переходит в режим read-only для спасения данных от переполнения.</p>
 <hr />
-<h2 id="3-analyze-glaza-planirovshchika">3. ANALYZE: Глаза планировщика</h2>
+<h2 id="5-prakticheskie-sovety-po-tyuningu-i-konfigurirovaniyu">5. Практические советы по тюнингу и конфигурированию</h2>
 
-<p>Если <code>VACUUM</code> заботится о месте на диске, то <strong>ANALYZE</strong> заботится о производительности ваших запросов.</p>
-<p>Как мы знаем из <a href="9-optimizatsiya-postgresql.html" class="wikilink">9. Оптимизация PostgreSQL</a>, планировщик строит план выполнения на основе статистики. <strong>ANALYZE</strong> — это процесс сбора этой статистики. Он выбирает случайную выборку строк из таблицы и вычисляет:<br />
-* Сколько строк в таблице.<br />
-* Насколько уникальны значения в каждой колонке (<strong>Selection Cardinality</strong>).<br />
-* Гистограммы распределения значений (какие данные встречаются часто, а какие редко).</p>
-<h3 id="pochemu-eto-vazhno-dlya-go-razrabotchika">Почему это важно для Go-разработчика?</h3>
-<p>Представьте, что у вас есть таблица <code>tasks</code> с колонкой <code>status</code>.<br />
-99% задач имеют статус <code>COMPLETED</code> и 1% — <code>IN_PROGRESS</code>.<br />
-* Если планировщик знает об этом (статистика актуальна), для поиска <code>IN_PROGRESS</code> он выберет <strong>Index Scan</strong>.<br />
-* Если статистика устарела и база думает, что статусы распределены 50/50, она может выбрать <strong>Sequential Scan</strong>, что убьет производительность.</p>
-<hr />
-<h2 id="4-visibility-map-i-frozen-xid">4. Visibility Map и Frozen XID</h2>
-
-<p>У Autovacuum есть две важные побочные задачи, о которых часто забывают на Middle-уровне.</p>
-<h3 id="visibility-map-karta-vidimosti">Visibility Map (Карта видимости)</h3>
-<p><code>VACUUM</code> обновляет файл карты видимости. Как мы обсуждали в <a href="4-indeksy-v-postgresql.html" class="wikilink">4. Индексы в PostgreSQL</a>, это позволяет базе делать <strong>Index-Only Scans</strong>. Если <code>VACUUM</code> давно не заходил на страницу, база не "уверена" в её чистоте и будет вынуждена лезть в Heap даже при наличии индекса.</p>
-<h3 id="frozen-xid-zashchita-ot-wraparound">Frozen XID (Защита от Wraparound)</h3>
-<p>Идентификаторы транзакций в Postgres — 32-битные. Если счетчик перевалит за 2 млрд, база "сломается" (Wraparound). <code>VACUUM</code> выполняет "заморозку" (Freezing) старых транзакций, помечая их как бесконечно старые. Если Autovacuum не будет успевать это делать, Postgres в какой-то момент просто выключится и уйдет в Read-Only режим для спасения данных.</p>
-<hr />
-<h2 id="5-prakticheskie-sovety-po-tyuningu">5. Практические советы по тюнингу</h2>
-
-<p>Если вы видите в логах или через мониторинг, что база начинает тормозить, проверьте следующие настройки:</p>
+<p>В высоконагруженных системах стандартная конфигурация Autovacuum требует осознанной калибровки:</p>
 <ol>
-<li><strong><code>maintenance_work_mem</code></strong>: Количество памяти, которое может использовать один воркер вакуума. Если памяти мало, вакуум будет делать много проходов по индексам, что замедлит процесс. Ставьте от 512 МБ до 2 ГБ на мощных серверах.</li>
-<li><strong><code>autovacuum_max_workers</code></strong>: По умолчанию 3. Если у вас сотни таблиц, 3 воркера могут не успевать обходить их все. Увеличьте до 5-8.</li>
-<li><strong><code>autovacuum_vacuum_cost_limit</code></strong>: Ограничитель нагрузки на IO. Если вакуум работает слишком медленно и не успевает за потоком <code>UPDATE</code> из вашего Go-сервиса, увеличьте этот лимит.</li>
+<li><strong><code>maintenance_work_mem</code></strong>: Объем оперативной памяти, выделяемый воркеру вакуума для удержания буфера <code>CTID</code> мертвых строк при обходе индексов. Если памяти недостаточно, процессу придется совершать множественные проходы по тяжелым B-Tree деревьям. В промышленных серверах устанавливайте от <strong>512 МБ до 2 ГБ</strong>.</li>
+<li><strong><code>autovacuum_max_workers</code></strong>: По умолчанию равен <code>3</code>. Если в вашем кластере сотни активных таблиц с постоянными вставками и обновлениями, три воркера не справятся с нагрузкой. Увеличьте пул до <strong>5–8 воркеров</strong> (при наличии свободных ядер CPU).</li>
+<li><strong><code>autovacuum_vacuum_cost_limit</code></strong>: Ограничитель бюджета дискового ввода-вывода. По умолчанию вакуум делает паузы, чтобы не мешать пользовательским запросам. Если вакуум отстает от потока операций <code>UPDATE</code> из вашего Go-сервиса, увеличьте этот лимит (например, с 200 до 1000–2000 единиц) или снизьте задержку <code>autovacuum_vacuum_cost_delay</code>.</li>
 </ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Long Running Transactions</span>
+    <span class="callout-title">Ловушка / Gotcha: «Зависшие» транзакции блокируют очистку (Long-Running Transactions)</span>
   </div>
   <div class="callout-body">
-    <p>Ни <code>VACUUM</code>, ни <code>ANALYZE</code> не смогут нормально работать, если в вашей системе есть "зависшая" транзакция. Пока она открыта, Postgres обязан хранить все версии строк, созданные после её старта. <strong>Одна забытая транзакция в Go-коде может заблокировать очистку всей базы.</strong></p>
+    <p>Никакие тонкие настройки Autovacuum не помогут, если в вашем коде на Go есть транзакция, остающаяся открытой часами:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Открыли транзакцию и уснули / ушли в долгий сетевой запрос
+tx, _ := db.Begin()
+defer tx.Rollback()
+time.Sleep(2 * time.Hour) 
+</code></pre>
+</div>
+
+<p>Пока транзакция удерживает старый <code>xid</code>, <strong>Autovacuum не имеет физического права удалить ни один мертвый кортеж</strong>, модифицированный после ее старта. Одна «забытая» транзакция в сервисе на Go парализует очистку всего кластера и гарантированно раздует таблицы до отказа диска.</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume-dlya-inzhenera">Резюме для инженера</h2>
 
 <ol>
-<li><strong>VACUUM</strong> очищает место внутри страниц, но не уменьшает размер файла (кроме хвоста).</li>
-<li><strong>ANALYZE</strong> собирает статистику, без которой планировщик будет выбирать ужасные планы запросов.</li>
-<li><strong>Autovacuum</strong> должен быть включен и агрессивно настроен для больших, часто обновляемых таблиц.</li>
-<li><strong>Visibility Map</strong>, обновляемая вакуумом — ключ к быстрым Index-Only запросам.</li>
+<li><strong>VACUUM освобождает страницы изнутри:</strong> Он не уменьшает размер файлов ОС, но открывает слоты для новых <code>INSERT</code> и <code>UPDATE</code>.</li>
+<li><strong>ANALYZE питает планировщик:</strong> Без актуальной статистики кардинальности и гистограмм распределения база неизбежно начнет деградировать на неоптимальных планах.</li>
+<li><strong>Агрессивный Autovacuum:</strong> Снижайте <code>scale_factor</code> на больших таблицах, чтобы не накапливать миллионы мертвых строк.</li>
+<li><strong>Visibility Map и Freeze:</strong> Регулярный вакуум делает возможным Index-Only Scan и предотвращает катастрофу Transaction ID Wraparound.</li>
+<li><strong>Транзакционная гигиена в Go:</strong> Строго контролируйте таймауты контекста и не допускайте долгоживущих открытых транзакций.</li>
 </ol>
-<p>Мы закончили глубокое погружение в устройство PostgreSQL. Теперь вы понимаете всё: от байтов на диске до планирования запросов. В завершение раздела по PostgreSQL мы разберем тему, критичную для надежности любого бэкенда: <a href="11-replikatsiya-v-postgresql.html" class="wikilink">11. Репликация в PostgreSQL</a>, чтобы понять, как обеспечить отказоустойчивость и масштабировать чтение.</p>
+<p>Мы завершили детальный разбор внутреннего устройства одиночного сервера PostgreSQL: от физического слоя страниц и MVCC до тонкостей планировщика и фоновой сборки мусора. Однако надежность критически важных информационных систем никогда не доверяется одной машине. В заключительной лекции раздела мы разберем, как объединять серверы в отказоустойчивые кластеры: <a href="11-replikatsiya-v-postgresql.html" class="wikilink">11. Репликация в PostgreSQL</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2337,7 +2395,7 @@ CFS -.-&gt;|&quot;Новый INSERT из Go&quot;| NewData[&quot;Новая ст
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-vacuum-musorshchik-v-mire-mvcc">1. VACUUM: Мусорщик в мире MVCC</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-vacuum-poshagovo">Как работает VACUUM (пошагово)</a></li><li class="toc-item toc-h3"><a href="#vacuum-full-kogda-vsyo-ochen-plokho">VACUUM FULL: Когда всё очень плохо</a></li><li class="toc-item toc-h2"><a href="#2-autovacuum-tvoy-nevidimyy-pomoshchnik">2. Autovacuum: Твой невидимый помощник</a></li><li class="toc-item toc-h2"><a href="#3-analyze-glaza-planirovshchika">3. ANALYZE: Глаза планировщика</a></li><li class="toc-item toc-h3"><a href="#pochemu-eto-vazhno-dlya-go-razrabotchika">Почему это важно для Go-разработчика?</a></li><li class="toc-item toc-h2"><a href="#4-visibility-map-i-frozen-xid">4. Visibility Map и Frozen XID</a></li><li class="toc-item toc-h3"><a href="#visibility-map-karta-vidimosti">Visibility Map (Карта видимости)</a></li><li class="toc-item toc-h3"><a href="#frozen-xid-zashchita-ot-wraparound">Frozen XID (Защита от Wraparound)</a></li><li class="toc-item toc-h2"><a href="#5-prakticheskie-sovety-po-tyuningu">5. Практические советы по тюнингу</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-vacuum-musorshchik-v-mire-mvcc">1. VACUUM: Мусорщик в мире MVCC</a></li><li class="toc-item toc-h3"><a href="#kak-fizicheski-rabotaet-konveyer-vacuum-poshagovo">Как физически работает конвейер VACUUM (пошагово)</a></li><li class="toc-item toc-h3"><a href="#vacuum-full-kogda-vsyo-ochen-plokho">VACUUM FULL: Когда всё очень плохо</a></li><li class="toc-item toc-h2"><a href="#2-autovacuum-tvoy-nevidimyy-pomoshchnik">2. Autovacuum: Твой невидимый помощник</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-dlya-highload">Mechanical Sympathy для Highload</a></li><li class="toc-item toc-h2"><a href="#3-analyze-glaza-i-matematicheskiy-kompas-planirovshchika">3. ANALYZE: Глаза и математический компас планировщика</a></li><li class="toc-item toc-h3"><a href="#pochemu-aktualnost-statistiki-kritichna-dlya-go-prilozheniya">Почему актуальность статистики критична для Go-приложения?</a></li><li class="toc-item toc-h2"><a href="#4-zashchita-tselostnosti-visibility-map-i-predotvrashchenie-wraparound">4. Защита целостности: Visibility Map и предотвращение Wraparound</a></li><li class="toc-item toc-h3"><a href="#1-aktualizatsiya-karty-vidimosti-visibility-map">1. Актуализация карты видимости (Visibility Map)</a></li><li class="toc-item toc-h3"><a href="#2-zamorozka-tranzaktsiy-freezing-i-ugroza-wraparound">2. Заморозка транзакций (Freezing) и угроза Wraparound</a></li><li class="toc-item toc-h2"><a href="#5-prakticheskie-sovety-po-tyuningu-i-konfigurirovaniyu">5. Практические советы по тюнингу и конфигурированию</a></li><li class="toc-item toc-h2"><a href="#rezyume-dlya-inzhenera">Резюме для инженера</a></li>
   </ul>
 </aside>
 

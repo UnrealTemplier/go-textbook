@@ -2168,41 +2168,66 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Индексы в PostgreSQL</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы разобрали, что данные физически хранятся в 8-килобайтных страницах (<a href="2-storage-engine-postgresql.html" class="wikilink">2. Storage engine PostgreSQL</a>), а из-за механизма <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a> в этих страницах копятся разные версии одних и тех же строк.</p>
-<p>Когда ваше Go-приложение выполняет <code>SELECT * FROM users WHERE email = 'test@example.com'</code>, исполнитель (Executor) по умолчанию запускает <strong>Sequential Scan (Последовательное сканирование)</strong>. Он читает с диска в память <em>каждую</em> 8-килобайтную страницу таблицы (Heap), просматривает каждую строку и проверяет её <code>t_xmin</code> / <code>t_xmax</code>, чтобы понять, видна ли она текущей транзакции. </p>
-<p>Для таблицы в 10 гигабайт это означает вычитывание 10 гигабайт с SSD ради одной строчки. Чтобы избежать этого линейного поиска $O(N)$, используются индексы.</p>
-<h2 id="chto-takoe-indeks-fizicheski">Что такое индекс физически?</h2>
+            <p>В предыдущих главах мы подробно исследовали, как данные физически укладываются в 8-килобайтные страницы дискового накопителя (<a href="2-storage-engine-postgresql.html" class="wikilink">2. Storage engine PostgreSQL</a>) и как благодаря механизму многоверсионности <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a> внутри этих страниц мирно уживаются разные поколения одних и тех же строк.</p>
+<p>Когда ваше Go-приложение отправляет в базу невинный на первый взгляд запрос:</p>
 
-<p>В PostgreSQL индекс — это <strong>совершенно отдельная структура данных</strong>, которая хранится в собственных файлах (со своими OID), независимо от основной Кучи (Heap). Индексы также разбиты на страницы по 8 КБ.</p>
-<p>Если Куча — это огромный склад коробок с записями в случайном порядке, то индекс — это отсортированный каталог, в котором написано: <em>"Запись с email 'test@example.com' лежит в коробке №45, на позиции 3"</em>.</p>
-<p>Эта "коробка и позиция" называется <strong>CTID (ItemPointer)</strong>.<br />
-Как мы помним, <code>CTID</code> состоит из двух чисел: <code>Номер_страницы</code> и <code>Индекс_Line_Pointer</code>. </p>
-<p>Абсолютно любой индекс в PostgreSQL (B-Tree, Hash, GIN) в конечном итоге возвращает массив <code>CTID</code>, по которым база лезет в Кучу (Heap) за самими данными.</p>
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">SELECT * FROM users WHERE email = 'test@example.com';
+</code></pre>
+</div>
+
+<p>и на колонке <code>email</code> нет индекса, исполнитель запросов (<code>Executor</code>) не имеет иного выбора, кроме как инициировать <strong>Sequential Scan (Последовательное сканирование таблицы)</strong>. Он методично считывает с блочного накопителя в оперативную память абсолютно <em>каждую</em> 8-килобайтную страницу Кучи (Heap), распаковывает каждый кортеж и проверяет системные поля <code>t_xmin</code>/<code>t_xmax</code>, выясняя, видна ли запись текущей транзакции.</p>
+<p>Для таблицы объемом 10 гигабайт это означает физическую прокачку 10 ГБ данных через системную шину и дисковый контроллер ради поиска единственной 50-байтовой строки — классическая катастрофа алгоритмической сложности $O(N)$. Чтобы превратить линейный перебор в мгновенный логарифмический поиск $O(\log N)$, реляционные СУБД используют вспомогательные структуры быстрого доступа — <strong>Индексы</strong>.</p>
+<hr />
+<h2 id="fizicheskaya-priroda-indeksa-v-postgresql">Физическая природа индекса в PostgreSQL</h2>
+
+<p>В архитектуре PostgreSQL индекс — это <strong>полноценное независимое отношение (Relation)</strong>. Он хранится в собственных бинарных файлах в директории <code>base/</code> (со своим индивидуальным OID) совершенно отдельно от файлов основной Кучи (Heap). Файлы индексов точно так же нарезаны на страницы фиксированного размера по <strong>8 КБ</strong>.</p>
+<p>Если Куча представляет собой хаотичный склад пронумерованных ящиков с записями произвольной длины, то индекс — это строго упорядоченный алфавитный каталог в библиотеке. В этом каталоге каждой поисковой карточке сопоставлен точный физический адрес: <em>«Кортеж со значением ключа 'test@example.com' находится на странице №45, в слоте указателя №5»</em>.</p>
+<p>Этот адрес в PostgreSQL называется <strong>CTID (ItemPointer)</strong>. Как мы помним, <code>CTID</code> кодируется парой целых чисел: <code>Номер_страницы</code> (BlockNumber) и <code>Индекс_Line_Pointer</code> (OffsetNumber), например <code>(45, 5)</code>.</p>
+<p>Запомните важнейшее архитектурное правило: <strong>Абсолютно любой индекс в PostgreSQL (будь то B-Tree, Hash, GIN, GiST или BRIN) никогда не хранит копию всей строки</strong>. Индекс лишь упорядочивает поисковые ключи и сопоставляет им массив соответствующих <code>CTID</code>, по которым исполнитель запроса совершает точечный прыжок в Кучу (Heap) за пользовательскими данными.</p>
 <hr />
 <h2 id="b-tree-indeks-po-umolchaniyu">B-Tree: Индекс по умолчанию</h2>
 
-<p>Если вы пишете <code>CREATE INDEX idx_email ON users(email)</code>, Postgres создает индекс типа <strong>B-Tree (B-дерево)</strong>. Это самобалансирующееся дерево поиска, оптимизированное для работы с блочными устройствами (жесткими дисками и SSD).</p>
+<p>Когда вы выполняете стандартную DDL-команду:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">CREATE INDEX idx_email ON users(email);
+</code></pre>
+</div>
+
+<p>PostgreSQL создает сбалансированное дерево поиска типа <strong>B-Tree (B-дерево, вариант Lehman &amp; Yao B-link tree)</strong>. Этот алгоритм специально спроектирован для минимизации операций ввода-вывода при работе с блочными накопителями (HDD/SSD).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Дерево в страницах</span>
+    <span class="callout-title">Под капотом: Архитектура широкого дерева (Fanout)</span>
   </div>
   <div class="callout-body">
-    <p>В классическом бинарном дереве у каждого узла 2 потомка. В B-Tree узел — это целая 8-килобайтная страница, которая может вмещать сотни указателей (ветвлений). Это делает дерево очень "широким" и "неглубоким". Для таблицы в миллиард строк глубина B-Tree в Postgres обычно не превышает 3–4 уровней. Это значит, что для поиска любой записи нужно прочитать с диска всего 3-4 страницы (24-32 КБ).</p>
+    <p>В традиционных двоичных деревьях поиска (AVL, Красно-черные деревья) каждый узел имеет не более двух потомков. Если упаковать такое дерево на диск, глубина для миллиарда записей превысит 30 уровней: чтобы найти элемент, процессору пришлось бы сделать 30 последовательных случайных чтений с диска!<br />
+В B-Tree узлом является <strong>целая 8-килобайтная страница</strong>, способная вмещать сотни ключей и указателей на дочерние узлы (высокий коэффициент ветвления — Fanout). Благодаря этому дерево получается исключительно плоским: даже для таблицы с миллиардом строк глубина B-Tree в PostgreSQL редко превышает <strong>3–4 уровня</strong>. Для извлечения произвольного ключа достаточно прочитать всего 3–4 страницы (24–32 КБ), которые, как правило, уже прогреты в оперативной памяти <code>shared_buffers</code>!</p>
   </div>
 </div>
 
-<p>Структура B-Tree индекса:<br />
-1. <strong>Root Page (Корень)</strong>: Верхняя страница.<br />
-2. <strong>Branch Pages (Ветви)</strong>: Промежуточные страницы, содержащие диапазоны значений ключей и ссылки на дочерние страницы.<br />
-3. <strong>Leaf Pages (Листья)</strong>: Самый нижний уровень. Именно здесь хранятся сами значения ключа (<code>test@example.com</code>) и целевой <code>CTID</code> (ссылка на Heap).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2217,69 +2242,166 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Root[&quot;Root Page&lt;br&gt;Ключи - диапазоны&quot;] --&gt;|&quot;email &lt; m@ex.com&quot;| B1[&quot;Branch Page 1&quot;]
-Root --&gt;|&quot;email &gt;= m@ex.com&quot;| B2[&quot;Branch Page 2&quot;]
+Root[&quot;1. Root Page (Корень дерева) &lt;br&gt; [ email &lt; m@ex.com | email &gt;= m@ex.com ]&quot;]
 
-B1 --&gt; L1[&quot;Leaf Page&lt;br&gt;Ключ: a@ex.com &lt;br&gt; CTID: 10/2&quot;]
-B1 --&gt; L2[&quot;Leaf Page&lt;br&gt;Ключ: b@ex.com &lt;br&gt; CTID: 45/5&quot;]
+Root --&gt;|&quot;email &lt; m@ex.com&quot;| B1[&quot;2. Branch Page 1 (Ветвь)&quot;]
+Root --&gt;|&quot;email &gt;= m@ex.com&quot;| B2[&quot;2. Branch Page 2 (Ветвь)&quot;]
 
-L2 -.-&gt;|&quot;Index Scan - прыжок в Кучу&quot;| H[&quot;Heap Page 45&lt;br&gt;Line Pointer 5 -&gt; Строка&quot;]
+B1 --&gt; L1[&quot;3. Leaf Page 1 (Лист) &lt;br&gt; a@ex.com -&gt; CTID: (10, 2)&quot;]
+B1 --&gt; L2[&quot;3. Leaf Page 2 (Лист) &lt;br&gt; b@ex.com -&gt; CTID: (45, 5)&quot;]
+
+L2 -.-&gt;|&quot;Прыжок в Кучу (Random I/O)&quot;| H[&quot;Heap Page 45 (8 KB) &lt;br&gt; Line Pointer 5 -&gt; User Tuple&quot;]
   </pre>
 </div>
 
 
-<h3 id="mekhanika-index-scan">Механика Index Scan</h3>
+<h3 id="struktura-urovney-b-tree">Структура уровней B-Tree</h3>
+<ol>
+<li><strong>Root Page (Корневая страница):</strong> Верхний узел дерева. Содержит граничные значения ключей и ссылки на страницы промежуточного уровня.</li>
+<li><strong>Branch Pages (Промежуточные ветви):</strong> Направляют поиск по диапазонам значений, сужая область сканирования.</li>
+<li><strong>Leaf Pages (Листовые страницы):</strong> Нижний уровень иерархии. Содержит упорядоченные пары <code>(значение ключа, CTID)</code>. Листовые страницы связаны между собой двусвязным списком (через служебную область <code>Special Space</code> в конце страницы 8 КБ), что позволяет тривиально быстро выполнять интервальные запросы вида <code>WHERE created_at BETWEEN ... AND ...</code>.</li>
+</ol>
+<h3 id="mekhanika-index-scan-shag-za-shagom">Механика Index Scan шаг за шагом</h3>
 
 <ol>
-<li>Запрос приходит в базу.</li>
-<li>Планировщик решает использовать индекс (Index Scan).</li>
-<li>Postgres читает Root страницу, сравнивает искомое значение с диапазонами, спускается к Branch, затем к Leaf.</li>
-<li>Находит в Leaf-странице нужный ключ и забирает <code>CTID</code> (например, 45/5).</li>
-<li>Postgres идет в Heap, читает страницу 45, берет строку под номером 5.</li>
-<li><strong>Критический момент:</strong> Postgres проверяет заголовки MVCC (<code>t_xmin</code>, <code>t_xmax</code>) этой строки. Если строка удалена или создана в будущем, база её игнорирует и продолжает поиск.</li>
+<li>Go-клиент отправляет запрос с фильтром по индексу.</li>
+<li>Планировщик (<code>Planner</code>) выбирает стратегию <strong>Index Scan</strong>.</li>
+<li>Исполнитель считывает корневую страницу B-Tree (<code>Root Page</code>), бинарным поиском внутри 8 КБ находит нужный диапазон, спускается к ветви (<code>Branch Page</code>) и достигает листовой страницы (<code>Leaf Page</code>).</li>
+<li>В листовой странице отыскивается искомый ключ (<code>test@example.com</code>) и извлекается целевой <code>CTID</code> (например, <code>45/5</code>).</li>
+<li>Движок обращается к странице Heap с номером <code>45</code> в <code>shared_buffers</code> (или запрашивает ее чтение с диска) и находит кортеж по указателю <code>Line Pointer 5</code>.</li>
+<li><strong>Критический шаг MVCC:</strong> Движок инспектирует заголовок кортежа (<code>t_xmin</code>, <code>t_xmax</code>) и сверяет его со снимком транзакции (<code>Snapshot</code>). Если кортеж был удален или модифицирован параллельной транзакцией, он отбрасывается, и база продолжает поиск по индексу.</li>
 </ol>
 <hr />
 <h2 id="mechanical-sympathy-index-only-scan-i-visibility-map">Mechanical Sympathy: Index-Only Scan и Visibility Map</h2>
 
-<p>Здесь кроется фундаментальное отличие PostgreSQL от MySQL (InnoDB). <br />
-В InnoDB индексы хранят информацию о версионности, а кластерный индекс (Primary Key) содержит сами данные.<br />
-В PostgreSQL индексы <strong>не содержат данных MVCC</strong>. В индексе лежат только ключи и CTID. </p>
-<p>Это порождает проблему: когда мы находим ключ в индексе, мы <em>не знаем</em>, жива ли физическая строка в Куче для нашей транзакции. Нам <strong>приходится</strong> делать системный вызов, читать Heap-страницу и проверять <code>xmin</code>/<code>xmax</code>.</p>
-<p>Если вы делаете запрос <code>SELECT email FROM users WHERE email = 'test@example.com'</code>, по логике, все данные уже есть в самом индексе (там же хранится сам email!). Зачем лезть в Кучу?</p>
-<p>Чтобы избежать лишнего I/O, разработчики PostgreSQL придумали <strong>Visibility Map (Карту видимости)</strong>.<br />
-Это крошечный файл, где на каждую 8-килобайтную Heap-страницу выделено всего 2 бита. Если бит <code>all_visible</code> установлен в 1, это значит: <em>"Все строки на этой странице старые и закоммиченные, они видны абсолютно всем транзакциям"</em>.</p>
-<p>Если планировщик запускает <strong>Index-Only Scan</strong>, он:<br />
-1. Находит <code>email</code> и <code>CTID</code> в индексе.<br />
-2. Смотрит в Visibility Map (которая кэшируется в памяти и работает мгновенно).<br />
-3. Если для Heap-страницы стоит флаг <code>all_visible</code>, Postgres <strong>не читает Кучу вообще</strong>, а сразу отдает <code>email</code> из индекса вашему Go-приложению. Это дает колоссальный буст производительности для аналитических и агрегирующих <a href="../04-indeksy-i-proizvoditelnost/15-optimizatsiya-select.html" class="wikilink">15. Оптимизация SELECT</a> запросов.</p>
+<p>Здесь раскрывается одно из самых глубоких архитектурных различий между PostgreSQL и MySQL (InnoDB):</p>
+<p>В MySQL InnoDB вторичные индексы хранят значение первичного ключа, а сам кластерный индекс таблицы организован по принципу B-Tree, где листовые узлы содержат непосредственно тела строк.<br />
+В PostgreSQL индексы принципиально <strong>не содержат никакой метаинформации о версионности MVCC</strong>. В индексе хранятся только значения ключей и "слепые" указатели <code>CTID</code>.</p>
+<p>Отсюда вытекает фундаментальная проблема: обнаружив нужный ключ в B-Tree индексе, база данных <strong>не может знать</strong>, является ли эта строка живой и видимой для текущего снимка транзакции! Движок <em>вынужден</em> совершить случайное чтение страницы Heap и проверить поля <code>xmin</code>/<code>xmax</code>.</p>
+<p>Представьте запрос:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">SELECT email FROM users WHERE email = 'test@example.com';
+</code></pre>
+</div>
+
+<p>Казалось бы, значение <code>email</code> уже прочитано из листовой страницы B-Tree. Зачем тратить драгоценный дисковый ввод-вывод на загрузку 8 КБ страницы Кучи?</p>
+<p>Чтобы разрешить эту дилемму и избежать лишнего Random I/O, инженеры PostgreSQL разработали <strong>Visibility Map (Карту видимости)</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Idx[&quot;B-Tree Index &lt;br&gt; (Key: test@ex.com, CTID: 45/5)&quot;] --&gt; VMCheck{&quot;Проверка Visibility Map &lt;br&gt; для Heap Page 45&quot;}
+VMCheck -- &quot;all_visible == 1&quot; --&gt; ReturnVal[&quot;Index-Only Scan! &lt;br&gt; Мгновенный возврат email &lt;br&gt; (БЕЗ чтения Heap!)&quot;]
+VMCheck -- &quot;all_visible == 0&quot; --&gt; HeapJump[&quot;Обычный Index Scan: &lt;br&gt; Чтение Heap Page 45 &lt;br&gt; Проверка t_xmin / t_xmax&quot;]
+  </pre>
+</div>
+
+
+<p>Visibility Map представляет собой компактный бинарный файл (<code>&lt;relfilenode&gt;_vm</code>), где на каждый 8-килобайтный блок Кучи отведено всего 2 бита памяти:<br />
+* Бит <strong><code>all_visible</code></strong>: Если он равен <code>1</code>, это гарантирует: <em>абсолютно все кортежи на данной странице Heap созданы давно закоммиченными транзакциями и не содержат незафиксированных изменений или мертвых версий</em>. Они гарантированно видны любой активной транзакции в системе!<br />
+* Бит <strong><code>all_frozen</code></strong>: Означает, что все кортежи страницы "заморожены" (Freezing) и защищены от Transaction ID Wraparound.</p>
+<p>Если планировщик видит, что все запрашиваемые в <code>SELECT</code> колонки покрыты индексом, он инициирует <strong>Index-Only Scan</strong>:<br />
+1. Извлекает ключ из листового узла B-Tree.<br />
+2. Проверяет бит <code>all_visible</code> в Visibility Map (которая держится целиком в оперативной памяти и проверяется за микросекунды).<br />
+3. Если бит равен <code>1</code>, PostgreSQL <strong>вообще не обращается к страницам Heap</strong>! Значение отдается клиенту прямо из индекса. Это обеспечивает колоссальный выигрыш в RPS для аналитических запросов и агрегаций (<code>COUNT</code>, <code>SUM</code>), описанных в <a href="../04-indeksy-i-proizvoditelnost/15-optimizatsiya-select.html" class="wikilink">15. Оптимизация SELECT</a>.</p>
 <hr />
 <h2 id="shtraf-za-zapis-write-penalty-i-razduvanie-indeksov">Штраф за запись (Write Penalty) и раздувание индексов</h2>
 
-<p>Индексы ускоряют чтение, но замедляют запись. В PostgreSQL этот штраф особенно высок из-за архитектуры MVCC.</p>
+<p>Индексы кардинально ускоряют выборку, но каждый созданный индекс — это прямой налог на операции модификации (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Вы добавили 5 индексов на разные колонки в таблицу. Как изменится скорость выполнения <code>UPDATE</code>, который меняет только <em>одну</em> неиндексируемую колонку?<br />
-<strong>Ответ:</strong> Зависит от того, произойдет ли HOT-update. Если на странице нет свободного места, Postgres создаст новую версию строки (новый CTID). А значит, ему придется обойти <strong>все 5 индексов</strong> и вставить туда новые указатели на этот новый CTID. Это называется Write Amplification (Усиление записи). Поэтому в Postgres лишние индексы убивают базу быстрее, чем в других СУБД.</p>
+    <p><strong>Вопрос:</strong> Вы добавили 5 вспомогательных B-Tree индексов на разные колонки таблицы. Как изменится производительность запроса <code>UPDATE</code>, если он изменяет значение всего одной <em>неиндексируемой</em> колонки?<br />
+<strong>Ответ:</strong> Все зависит от того, сработает ли HOT-оптимизация (Heap-Only Tuples).<br />
+Если на целевой 8-килобайтной странице Heap осталось свободное место, произойдет HOT-update: старая строка получит ссылку на новую внутри страницы, и <strong>ни один из 5 индексов не будет затронут</strong>.<br />
+Но если страница заполнена под завязку, СУБД выделит под новую версию строки новый блок Heap, сгенерировав новый <code>CTID</code>. В этот момент PostgreSQL будет вынужден совершить обход <strong>всех 5 индексов</strong> и вставить в каждый листовой узел новую запись с новым <code>CTID</code>! Это порождает драматическое явление — <strong>Write Amplification (Усиление записи)</strong>: одна логическая операция в Go превращается в серию случайных записей на диск.</p>
   </div>
 </div>
 
-<p>Более того, индексы тоже страдают от <strong>Bloat (Раздувания)</strong>. Когда старые версии строк удаляются процессом Vacuum, в Leaf-страницах B-Tree остаются пустые дыры. Со временем индекс может стать в два раза больше реального объема данных, увеличивая нагрузку на память (<code>shared_buffers</code>). Лечится это командой <code>REINDEX CONCURRENTLY</code>.</p>
+<p>Кроме того, B-Tree индексы подвержены <strong>Bloat (Раздуванию)</strong>. Когда строки удаляются или обновляются, в листовых узлах дерева остаются пустые диапазоны. Дерево неохотно сжимается обратно. Со временем физический размер индекса на диске может в разы превысить объем полезных данных, вытесняя горячие страницы из <code>shared_buffers</code>.<br />
+В боевых системах раздутые индексы перестраивают на лету без блокировки пишущих транзакций с помощью команды <code>REINDEX CONCURRENTLY</code>:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">REINDEX TABLE CONCURRENTLY users;
+</code></pre>
+</div>
+
 <hr />
 <h2 id="drugie-tipy-indeksov">Другие типы индексов</h2>
 
-<p>PostgreSQL славится своей расширяемостью, в том числе в алгоритмах поиска:</p>
+<p>Архитектура PostgreSQL спроектирована по принципам модульности Bell Labs: интерфейс доступа к индексам абстрагирован, что позволило реализовать семейство мощных специализированных структур:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+graph TD
+Indexes[&quot;Индексные структуры PostgreSQL&quot;]
+Indexes --&gt; BTree[&quot;B-Tree: Универсальный &lt;br&gt; (=, &lt;, &lt;=, &gt;, &gt;=, BETWEEN, ORDER BY)&quot;]
+Indexes --&gt; Hash[&quot;Hash: Точечные проверки &lt;br&gt; (Исключительно на равенство =)&quot;]
+Indexes --&gt; GiST[&quot;GiST: Пространственные данные &lt;br&gt; (R-Tree, PostGIS, диапазоны, геометрия)&quot;]
+Indexes --&gt; GIN[&quot;GIN: Инвертированный индекс &lt;br&gt; (Массивы, JSONB, Full Text Search)&quot;]
+Indexes --&gt; BRIN[&quot;BRIN: Блочные диапазоны &lt;br&gt; (Time-Series, упорядоченные логи, IoT)&quot;]
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>Hash</strong>: Используется только для проверок на равенство (<code>=</code>). Исторически был нестабильным, но с 10-й версии стал write-ahead logged (устойчивым к сбоям). Работает чуть быстрее B-Tree при точечном поиске, но не поддерживает диапазоны (<code>&gt;</code>, <code>&lt;</code>).</li>
-<li><strong>GiST (Generalized Search Tree)</strong>: Фреймворк для сложных геометрических и полнотекстовых данных. Позволяет индексировать координаты (например, поиск "кто находится в радиусе 5 км" через расширение PostGIS).</li>
-<li><strong>BRIN (Block Range Index)</strong>: Идеален для логов и time-series данных, которые вставляются последовательно. Вместо хранения каждого ключа, он хранит минимальное и максимальное значение для блоков страниц. Занимает в 100 раз меньше места в RAM, чем B-Tree.</li>
-<li><strong>GIN (Generalized Inverted Index)</strong>: Инвертированный индекс. Король для работы с массивами, полнотекстовым поиском и JSON.</li>
+<li><strong>Hash (Хэш-индекс):</strong><br />
+   Оптимизирован исключительно для точечных проверок на равенство (<code>WHERE id = 'uuid'</code>). Долгое время считался экспериментальным, но начиная с PostgreSQL 10 хэш-индексы получили полноценную поддержку WAL (Crash Recovery) и репликации. Работают чуть быстрее B-Tree на длинных строках, но не поддерживают сортировку и поиск по диапазонам.</li>
+<li><strong>GiST (Generalized Search Tree):</strong><br />
+   Расширяемый каркас для иерархических структур данных (в частности, R-деревьев). Незаменим для геометрических запросов, поиска пересечений интервалов и пространственных выборок («найти все объекты в радиусе 5 км») в расширении PostGIS.</li>
+<li><strong>BRIN (Block Range Index):</strong><br />
+   Гениальное решение для гигантских Time-Series таблиц и логов, данные в которые пишутся строго последовательно по времени. BRIN не индексирует каждую строку! Он сохраняет лишь минимальное и максимальное значение ключа на диапазон из нескольких сотен страниц (например, 1 МБ данных). BRIN-индекс занимает в сотни раз меньше памяти, чем B-Tree, помещаясь целиком в L3-кэш процессора.</li>
+<li><strong>GIN (Generalized Inverted Index):</strong><br />
+   Инвертированный индекс — абсолютный чемпион при работе со сложноструктурированными типами: массивами, документами переменной схемы и полнотекстовым поиском.</li>
 </ol>
-<p>Мы разобрали, как классические индексы B-Tree помогают находить реляционные данные. Но современный бэкенд редко ограничивается строгими колонками. Часто нам нужно хранить схемы произвольной вложенности (динамические конфиги, payload от внешних API) и эффективно по ним искать. </p>
-<p>Для этого в Postgres есть уникальный механизм, который делает его гибридом SQL и NoSQL баз данных. О том, как хранить и индексировать документы (с помощью GIN индексов), мы поговорим в следующей статье: <a href="5-jsonb-i-rabota-s-json.html" class="wikilink">5. JSONB и работа с JSON</a>.</p>
+<hr />
+<h2 id="rezyume-dlya-inzhenera">Резюме для инженера</h2>
+
+<ol>
+<li><strong>Индексы отделены от Кучи:</strong> Индекс хранит отсортированные ключи и физические координаты <code>CTID</code>, но не содержит данных пользовательских колонок и служебных полей MVCC.</li>
+<li><strong>Index-Only Scan ускоряется картой видимости:</strong> Благодаря Visibility Map база может считывать данные напрямую из индекса, минуя обращения к диску за страницами Heap.</li>
+<li><strong>Контролируйте Write Amplification:</strong> Избыточные индексы превращают единичные <code>UPDATE</code> в шторм дисковых операций записи. Всегда следите за HOT-update и настраивайте <code>fillfactor</code>.</li>
+<li><strong>Выбирайте правильный движок:</strong> B-Tree — надежный универсал; GIN — для JSONB и массивов; BRIN — для гигантских неизменяемых временных рядов.</li>
+</ol>
+<p>Мы упомянули, что современный бэкенд на Go постоянно сталкивается с полуструктурированными документами переменной схемы: полезной нагрузкой внешних webhook'ов, динамическими конфигурациями и событиями. Как PostgreSQL умудряется объединить строгость реляционной модели с гибкостью документоориентированных баз данных — разберем в следующей лекции: <a href="5-jsonb-i-rabota-s-json.html" class="wikilink">5. JSONB и работа с JSON</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2307,7 +2429,7 @@ L2 -.-&gt;|&quot;Index Scan - прыжок в Кучу&quot;| H[&quot;Heap Page 
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#chto-takoe-indeks-fizicheski">Что такое индекс физически?</a></li><li class="toc-item toc-h2"><a href="#b-tree-indeks-po-umolchaniyu">B-Tree: Индекс по умолчанию</a></li><li class="toc-item toc-h3"><a href="#mekhanika-index-scan">Механика Index Scan</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-index-only-scan-i-visibility-map">Mechanical Sympathy: Index-Only Scan и Visibility Map</a></li><li class="toc-item toc-h2"><a href="#shtraf-za-zapis-write-penalty-i-razduvanie-indeksov">Штраф за запись (Write Penalty) и раздувание индексов</a></li><li class="toc-item toc-h2"><a href="#drugie-tipy-indeksov">Другие типы индексов</a></li>
+    <li class="toc-item toc-h2"><a href="#fizicheskaya-priroda-indeksa-v-postgresql">Физическая природа индекса в PostgreSQL</a></li><li class="toc-item toc-h2"><a href="#b-tree-indeks-po-umolchaniyu">B-Tree: Индекс по умолчанию</a></li><li class="toc-item toc-h3"><a href="#struktura-urovney-b-tree">Структура уровней B-Tree</a></li><li class="toc-item toc-h3"><a href="#mekhanika-index-scan-shag-za-shagom">Механика Index Scan шаг за шагом</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-index-only-scan-i-visibility-map">Mechanical Sympathy: Index-Only Scan и Visibility Map</a></li><li class="toc-item toc-h2"><a href="#shtraf-za-zapis-write-penalty-i-razduvanie-indeksov">Штраф за запись (Write Penalty) и раздувание индексов</a></li><li class="toc-item toc-h2"><a href="#drugie-tipy-indeksov">Другие типы индексов</a></li><li class="toc-item toc-h2"><a href="#rezyume-dlya-inzhenera">Резюме для инженера</a></li>
   </ul>
 </aside>
 

@@ -2168,36 +2168,68 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">9. Оптимизация PostgreSQL</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Заставить PostgreSQL работать быстро под нагрузкой — это не магия, а комбинация трех факторов: настройки параметров рантайма, понимания "железа" (Mechanical Sympathy) и управления поведением планировщика. Если ваше Go-приложение начинает тормозить на запросах к БД, проблема редко кроется в коде — чаще всего она в том, что база "задыхается" от дефолтных настроек или неверного профиля нагрузки.</p>
-<p>В этой статье мы разберем, как выжать максимум из PostgreSQL, превращая его из "черного ящика" в послушный инструмент.</p>
+            <p>Заставить PostgreSQL работать с предельной производительностью под высокими нагрузками — это не эзотерическая магия и не шаманство с сотнями разрозненных флагов. Это осознанная инженерная дисциплина, опирающаяся на три кита: <strong>механическое сочувствие к оборудованию (Mechanical Sympathy)</strong>, глубокое понимание устройства планировщика запросов и грамотное взаимодействие со стороны клиентского Go-приложения.</p>
+<p>Если ваш сервис на Go начинает демонстрировать тревожный рост задержек (Latency p99) на операциях с базой данных, корень проблемы редко кроется в сетевом драйвере или рантайме Go. В 9 случаях из 10 база данных попросту «задыхается» в смирительной рубашке консервативных настроек по умолчанию, либо планировщик генерирует чудовищные планы выполнения из-за устаревшей статистики.</p>
+<p>В этой главе мы систематизируем принципы глубокого тюнинга PostgreSQL, превращая неповоротливый «черный ящик» в предсказуемый и послушный реактивный двигатель вашего бэкенда.</p>
 <hr />
-<h2 id="1-konfiguratsiya-tyuning-pod-zhelezo">1. Конфигурация: Тюнинг под железо</h2>
+<h2 id="1-konfiguratsiya-tyuning-parametrov-pod-sovremennoe-zhelezo">1. Конфигурация: Тюнинг параметров под современное железо</h2>
 
-<p>Дефолтные настройки PostgreSQL (файл <code>postgresql.conf</code>) рассчитаны на то, чтобы запуститься на микроволновке с 512 МБ RAM. Для Senior Go-разработчика понимание этих параметров — база.</p>
-<h3 id="pamyat-shared-buffers-i-keshirovanie">Память: Shared Buffers и кэширование</h3>
+<p>Конфигурационный файл по умолчанию (<code>postgresql.conf</code>) исторически настроен так, чтобы сервер гарантированно запустился даже на скромном виртуальном сервере с 512 МБ оперативной памяти. Для промышленного инженера понимание физического смысла ключевых директив — обязательный базовый навык.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph RAMAllocation [&quot;Распределение оперативной памяти сервера (RAM)&quot;]
+direction TB
+SB[&quot;shared_buffers: ~25% RAM &lt;br&gt; (Кэш страниц 8KB внутри СУБД)&quot;]
+OS[&quot;Linux Page Cache: ~50-60% RAM &lt;br&gt; (Удержание файлов базы в кэше ОС)&quot;]
+WM[&quot;work_mem * Active_Queries &lt;br&gt; (Память на сортировки и Hash JOIN)&quot;]
+end
+
+subgraph PlannerEstimate [&quot;Ориентиры планировщика (Planner Hints)&quot;]
+ECS[&quot;effective_cache_size: ~75% RAM &lt;br&gt; (Суммарный объем кэша для оценки планов)&quot;]
+RPC[&quot;random_page_cost: 1.1 (для NVMe SSD) &lt;br&gt; (Стоимость случайного чтения против Seq Scan)&quot;]
+end
+
+RAMAllocation -.-&gt;|&quot;Информирует&quot;| PlannerEstimate
+  </pre>
+</div>
+
+
+<h3 id="pamyat-sharedbuffers-i-keshirovanie">Память: `shared_buffers` и кэширование</h3>
 <ul>
-<li><strong><code>shared_buffers</code></strong>: Как мы обсуждали в <a href="1-arkhitektura-postgresql.html" class="wikilink">1. Архитектура PostgreSQL</a>, это кэш страниц. Для большинства систем оптимальное значение — <strong>25% от всей RAM</strong>. </li>
-<li><em>Почему не больше?</em> PostgreSQL полагается на Page Cache операционной системы. Если отдать слишком много под <code>shared_buffers</code>, вы лишите ОС возможности кэшировать файлы на уровне ядра, что приведет к двойному буферизированию и деградации производительности.</li>
-<li><strong><code>effective_cache_size</code></strong>: Это не аллокация памяти, а "подсказка" планировщику о том, сколько памяти (включая Page Cache ОС) доступно для кэширования данных. Обычно ставится в <strong>75% от всей RAM</strong>. Если занизить этот параметр, планировщик будет чаще выбирать Sequential Scan, считая, что индексы не влезут в память.</li>
+<li><strong><code>shared_buffers</code></strong>: Как мы выяснили в <a href="1-arkhitektura-postgresql.html" class="wikilink">1. Архитектура PostgreSQL</a>, это сегмент разделяемой памяти для кэширования 8-килобайтных страниц данных. Для большинства промышленных инсталляций золотым стандартом является значение в <strong>25% от общего объема физической RAM</strong>.</li>
+<li><em>Почему не отдать все 80%, как в MySQL?</em> PostgreSQL намеренно не использует прямой ввод-вывод (<code>O_DIRECT</code>), всецело доверяя кэшированию страниц ядру Linux (Page Cache). Если забрать под <code>shared_buffers</code> почти всю память, вы спровоцируете эффект двойного буферизирования и лишите ядро ОС возможности кэшировать чтение файлов на системном уровне.</li>
+<li><strong><code>effective_cache_size</code></strong>: Важнейший параметр, который <strong>не выделяет память физически</strong>, а служит эвристической подсказкой стоимостному оптимизатору. Он сообщает планировщику, какой суммарный объем памяти (включая <code>shared_buffers</code> и файловый Page Cache ОС) предположительно доступен для удержания индексов и таблиц. Обычно выставляется в <strong>75% от всей RAM</strong>. Если занизить этот параметр, планировщик решит, что индексы не поместятся в оперативной памяти, и начнет ошибочно выбирать медленный Sequential Scan.</li>
 </ul>
 <h3 id="rabota-s-diskom-i-wal">Работа с диском и WAL</h3>
 <ul>
-<li><strong><code>random_page_cost</code></strong>: По умолчанию равен 4.0. Это коэффициент, показывающий, во сколько раз чтение случайной страницы (Index Scan) дороже последовательного чтения (Seq Scan). </li>
-<li><em>Тюнинг:</em> Для современных <strong>NVMe/SSD</strong> дисков разницы между последовательным и случайным чтением почти нет. Смело ставьте <strong>1.1</strong>. Это заставит планировщик гораздо охотнее использовать индексы.</li>
-<li><strong><code>synchronous_commit</code></strong>: По умолчанию <code>on</code>. На каждый <code>COMMIT</code> база ждет физического сброса WAL на диск. </li>
-<li><em>Highload tip:</em> Если для вашего сервиса допустима потеря данных за последние 200мс при сбое питания (например, логи или некритичные события), поставьте <code>off</code>. Это даст колоссальный буст к пропускной способности (Throughput) на запись, так как транзакции перестанут блокироваться на IO.</li>
+<li><strong><code>random_page_cost</code></strong>: По умолчанию равен <code>4.0</code>. Это исторический коэффициент, отражающий реалии эпохи вращающихся магнитных дисков (HDD), где перемещение магнитной головки (случайный доступ при Index Scan) стоило в 4 раза дороже линейного чтения дорожки (Seq Scan).  </li>
+<li><em>Тюнинг под NVMe SSD:</em> На современных твердотельных накопителях задержка случайного чтения микросекундна и практически не отличается от последовательного. <strong>Смело выставляйте значение <code>1.1</code></strong>! Это снимет необоснованный штраф с индексов и заставит оптимизатор охотно задействовать B-Tree и GiST структуры.</li>
+<li><strong><code>synchronous_commit</code></strong>: По умолчанию равен <code>on</code>. При каждом коммите транзакции сервер ожидает физического завершения системного вызова <code>fsync()</code> от дискового контроллера журнала WAL.  </li>
+<li><em>Highload-оптимизация:</em> Если ваша система обрабатывает поток некритичных событий (метрики, клики, аудит-логи), для которых потеря последних 100–200 миллисекунд данных при внезапном обесточивании стойки не является трагедией, установите <code>synchronous_commit = off</code>. Процессы перестанут синхронно замирать в ожидании диска, что поднимет пропускную способность записи (Write Throughput) в разы!</li>
 </ul>
 <hr />
 <h2 id="2-analiz-zaprosov-kogda-planirovshchik-oshibaetsya">2. Анализ запросов: Когда планировщик ошибается</h2>
 
-<p>Даже идеально настроенная база будет тормозить, если запросы написаны неэффективно. Основной инструмент здесь — <code>EXPLAIN (ANALYZE, BUFFERS)</code>.</p>
+<p>Даже идеально сконфигурированный кластер будет тормозить, если SQL-запросы составлены неграмотно. Главным диагностическим микроскопом инженера является команда <code>EXPLAIN (ANALYZE, BUFFERS)</code> (или просто <code>EXPLAIN ANALYZE</code>):</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2218,41 +2250,91 @@ SELECT * FROM orders WHERE user_id = 500 AND status = 'pending';
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> На что в первую очередь смотреть в выводе <code>EXPLAIN ANALYZE</code>?<br />
+    <p><strong>Вопрос:</strong> На что в первую очередь следует обращать внимание при разборе плана <code>EXPLAIN ANALYZE</code>?<br />
 <strong>Ответ:</strong><br />
-1. <strong>Actual time</strong>: Реальное время выполнения.<br />
-2. <strong>Rows Removed by Filter</strong>: Если это число большое, значит индекс неэффективен или база вычитала лишние данные, которые потом отбросила.<br />
-3. <strong>Buffers: Shared Hit/Read</strong>: Показывает, сколько страниц взято из RAM (Hit), а сколько прочитано с диска (Read). Наша цель — минимизировать Read.<br />
-4. <strong>JIT (Just-In-Time)</strong>: Для очень простых, но частых запросов JIT может тратить на компиляцию больше времени, чем занимает само выполнение. В таких случаях JIT лучше отключать.</p>
+1. <strong><code>Actual time</code></strong>: Реальное астрономическое время выполнения узла плана (в миллисекундах), в отличие от условных единиц <code>cost</code>.<br />
+2. <strong><code>Rows Removed by Filter</code></strong>: Если это число велико, индекс работает неэффективно: сервер вычитал тысячи лишних страниц, а затем отбросил строки предикатом фильтрации. Требуется составной индекс.<br />
+3. <strong><code>Buffers: shared hit / read</code></strong>: Ключевой индикатор ввода-вывода. <code>shared hit</code> показывает число 8 КБ страниц, мгновенно взятых из RAM (<code>shared_buffers</code>), а <code>shared read</code> — страницы, которые пришлось поднимать с физического диска. Наша цель — свести <code>read</code> к минимуму.<br />
+4. <strong><code>JIT (Just-In-Time Compilation)</code></strong>: Для простых высокочастотных OLTP-запросов время компиляции LLVM-байткода JIT может в разы превышать само время выполнения запроса. Если видите в плане задержки на фазе JIT, отключайте его для OLTP (<code>jit = off</code>).</p>
   </div>
 </div>
 
-<h3 id="problema-cardinality-i-statistiki">Проблема Cardinality и Статистики</h3>
-<p>Планировщик строит план на основе <strong>статистики</strong> (распределения данных в колонках). Если статистика устарела, он выберет плохой план.<br />
-* <strong>Решение:</strong> Если вы только что залили в таблицу 10 миллионов строк, обязательно вызовите <code>ANALYZE table_name;</code>. Это обновит гистограммы распределения данных.</p>
+<h3 id="problema-cardinality-i-aktualizatsiya-statistiki">Проблема Cardinality и актуализация статистики</h3>
+<p>Оптимизатор вычисляет траекторию выполнения запроса на основе <strong>математической статистики</strong> (гистограмм распределения значений в столбцах, хранящихся в <code>pg_statistic</code>). Если распределение данных резко изменилось (например, ночной batch-воркер залил 10 миллионов новых заказов), планировщик ошибется в оценке мощности множества (Cardinality) и выберет катастрофический план (например, вложенные циклы <code>Nested Loop</code> вместо <code>Hash Join</code>).<br />
+<em> </em><em>Решение:</em>* После массивных пакетных вставок или миграций всегда инициируйте ручной сбор статистики:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">ANALYZE table_name;
+</code></pre>
+</div>
+
 <hr />
 <h2 id="3-optimizatsiya-na-urovne-go-prilozheniya">3. Оптимизация на уровне Go-приложения</h2>
 
-<p>Вы как Go-разработчик напрямую влияете на производительность БД через то, как используете драйвер и пул соединений.</p>
-<h3 id="prepared-statements-podgotovlennye-vyrazheniya">Prepared Statements (Подготовленные выражения)</h3>
-<p>Использование <code>db.Query("SELECT ... WHERE id = $1", id)</code> делает две вещи:<br />
-1. Защищает от <a href="../10-praktika-i-arkhitektura/21-sql-injection.html" class="wikilink">21. SQL Injection</a>.<br />
-2. Позволяет использовать <strong>Prepared Statements</strong>.</p>
-<p>Когда вы используете <code>pgx</code> (рекомендуемый драйвер), он автоматически подготавливает запрос. База парсит запрос и строит план выполнения <strong>один раз</strong>, а затем переиспользует его для разных ID. Это экономит CPU базы данных на этапе парсинга.</p>
+<p>Инженер, разрабатывающий сервис на Go, оказывает прямое влияние на здоровье базы данных через выбор драйвера и архитектуру взаимодействия с пулом соединений.</p>
+<h3 id="podgotovlennye-vyrazheniya-prepared-statements">Подготовленные выражения (Prepared Statements)</h3>
+<p>Использование параметризованных вызовов вроде <code>db.Query("SELECT ... WHERE id = $1", id)</code> решает две фундаментальные задачи:<br />
+1. Обеспечивает абсолютную защиту от атак класса <a href="../10-praktika-i-arkhitektura/21-sql-injection.html" class="wikilink">21. SQL Injection</a>.<br />
+2. Задействует механизм <strong>Prepared Statements (Подготовленных выражений)</strong>.</p>
+<p>При использовании драйвера <code>pgx</code> подготовка запросов происходит автоматически: сервер компилирует дерево синтаксического разбора и строит план выполнения <strong>ровно один раз</strong>, кэшируя его в памяти Backend-процесса, а при последующих вызовах лишь подставляет новые аргументы. Это экономит до 20–30% тактов CPU сервера на этапе парсинга.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Prepared Statements и PgBouncer</span>
+    <span class="callout-title">Ловушка / Gotcha: Конфликт Prepared Statements и транзакционного PgBouncer</span>
   </div>
   <div class="callout-body">
-    <p>Если вы используете PgBouncer в режиме транзакций (transaction mode), классические Prepared Statements <strong>сломаются</strong>, так как они живут в рамках сессии процесса, а PgBouncer может перекинуть ваш следующий запрос на другой Backend Process. <br />
-<em>Решение:</em> Используйте <code>pgx</code> с настройкой <code>PreferSimpleProtocol: true</code> или используйте встроенную поддержку именованных стейтментов в современных версиях пулеров.</p>
+    <p>Если в вашей архитектуре между Go-сервисом и PostgreSQL развернут <strong>PgBouncer в режиме транзакций (transaction pooling)</strong>, использование классических серверных Prepared Statements приведет к непредсказуемым ошибкам.<br />
+Подготовленные выражения привязаны к конкретной сессии Unix-процесса PostgreSQL. В транзакционном режиме PgBouncer может отправить ваш первый запрос в Backend-процесс <code>PID 101</code>, а второй запрос той же функции Go — в процесс <code>PID 102</code>, где этот стейтмент не подготовлен!<br />
+<em>Решение:</em> Настройте пул <code>pgx</code> на использование неименованных стейтментов или активируйте параметр <code>PreferSimpleProtocol: true</code>, либо используйте современные версии PgBouncer (1.21+), обладающие встроенной поддержкой трансляции prepared statements.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="paketnaya-vstavka-batching">Пакетная вставка (Batching)</h3>
-<p>Никогда не вставляйте 1000 строк по одной в цикле. Это 1000 сетевых round-trip-ов и 1000 фиксаций в WAL.<br />
-В <code>pgx</code> используйте <code>pgx.Batch</code>:</p>
+<p>Худшее, что может сделать Go-разработчик при вставке 10 000 строк — запустить цикл с единичными <code>Exec()</code>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph BadPattern [&quot;Антипаттерн: Одиночные вставки в цикле (1000 запросов)&quot;]
+direction LR
+G1[&quot;Go App&quot;] --&gt;|&quot;1. INSERT (TCP)&quot;| PG1[&quot;Postgres&quot;]
+PG1 --&gt;|&quot;fsync WAL&quot;| PG1
+PG1 --&gt;|&quot;ACK (TCP)&quot;| G1
+G1 --&gt;|&quot;2. INSERT (TCP)&quot;| PG1
+PG1 --&gt;|&quot;fsync WAL&quot;| PG1
+PG1 --&gt;|&quot;ACK (TCP)&quot;| G1
+end
+
+subgraph GoodPattern [&quot;Идиоматичный Batching: pgx.Batch (1 сетевой round-trip)&quot;]
+direction LR
+G2[&quot;Go App&quot;] --&gt;|&quot;Batch Buffer (1000 записей за 1 TCP фрейм)&quot;| PG2[&quot;Postgres Engine&quot;]
+PG2 --&gt;|&quot;Один Group Commit в WAL&quot;| PG2
+PG2 --&gt;|&quot;Единый Batch Response&quot;| G2
+end
+  </pre>
+</div>
+
+
+<p>Одиночные вставки генерируют 1 000 сетевых пересылок (Round-trip time) и заставляют базу выполнять тысячи дорогостоящих блокировок.<br />
+В драйвере <code>pgx</code> для этого реализован высокопроизводительный механизм <code>pgx.Batch</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2262,23 +2344,49 @@ SELECT * FROM orders WHERE user_id = 500 AND status = 'pending';
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">batch := &amp;pgx.Batch{}
-for _, row := range rows {
-    batch.Queue(&quot;INSERT INTO metrics (val) VALUES ($1)&quot;, row.Val)
+  <pre class="language-go"><code class="language-go">package repository
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+
+    &quot;github.com/jackc/pgx/v5&quot;
+    &quot;github.com/jackc/pgx/v5/pgxpool&quot;
+)
+
+type Metric struct {
+    Name  string
+    Value float64
 }
-br := db.SendBatch(ctx, batch)
-// ...
+
+func InsertMetricsBatch(ctx context.Context, pool *pgxpool.Pool, metrics []Metric) error {
+    batch := &amp;pgx.Batch{}
+
+    for _, m := range metrics {
+        batch.Queue(&quot;INSERT INTO metrics (name, value) VALUES ($1, $2)&quot;, m.Name, m.Value)
+    }
+
+    br := pool.SendBatch(ctx, batch)
+    defer br.Close()
+
+    for range metrics {
+        if _, err := br.Exec(); err != nil {
+            return fmt.Errorf(&quot;batch execution failed: %w&quot;, err)
+        }
+    }
+
+    return br.Close()
+}
 </code></pre>
 </div>
 
-<p>Это отправит все данные за один сетевой пакет, что ускоряет вставку в 10-50 раз.</p>
+<p>Пакетная вставка упаковывает данные в единый сетевой пакет и выполняет единый групповой коммит в WAL, ускоряя операции модификации в <strong>10–50 раз</strong>!</p>
 <hr />
-<h2 id="4-obsluzhivanie-borba-s-bloat">4. Обслуживание: Борьба с Bloat</h2>
+<h2 id="4-ekspluatatsionnoe-obsluzhivanie-predotvrashchenie-bloat">4. Эксплуатационное обслуживание: Предотвращение Bloat</h2>
 
-<p>Как мы знаем из <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>, база постоянно порождает мертвые строки. Если Autovacuum не успевает их вычищать, возникает раздувание (Bloat).</p>
-<h3 id="kogda-autovacuum-ne-spravlyaetsya">Когда Autovacuum не справляется?</h3>
-<p>Если в таблице 100 млн строк, а вы обновляете 1% ежедневно, дефолтный Autovacuum может запускаться слишком редко.<br />
-<strong>Тюнинг для больших таблиц:</strong></p>
+<p>Как мы подробно разбирали в <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>, операции <code>UPDATE</code> и <code>DELETE</code> оставляют на страницах Heap мертвые кортежи. Если фоновый демон Autovacuum отстает от темпа записи, таблицы катастрофически раздуваются (Bloat).</p>
+<h3 id="tyuning-dlya-bolshikh-tablits">Тюнинг для больших таблиц:</h3>
+<p>Если в таблице 100 млн строк, а вы обновляете 1% ежедневно, дефолтный Autovacuum может запускаться слишком редко.</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2289,17 +2397,38 @@ br := db.SendBatch(ctx, batch)
     </button>
   </div>
   <pre class="language-sql"><code class="language-sql">ALTER TABLE large_table SET (
-  autovacuum_vacuum_scale_factor = 0.01, -- запускать при 1% изменений вместо 20%
-  autovacuum_vacuum_cost_limit = 1000    -- дать процессу больше ресурсов
+  autovacuum_vacuum_scale_factor = 0.01, -- запускать сборку уже при 1% изменений вместо 20%
+  autovacuum_vacuum_cost_limit = 1000    -- дать процессу больше ресурсов и квот ввода-вывода
 );
 </code></pre>
 </div>
 
 <h3 id="indeksy-kachestvo-protiv-kolichestva">Индексы: Качество против количества</h3>
 <ul>
-<li><strong>Composite Indexes</strong>: Если вы часто ищете по <code>user_id</code> и <code>status</code>, один индекс на <code>(user_id, status)</code> будет в разы эффективнее, чем два отдельных индекса.</li>
-<li><strong>Unused Indexes</strong>: Каждый индекс замедляет <code>INSERT/UPDATE</code>. Используйте системное вью <code>pg_stat_user_indexes</code>, чтобы найти индексы с <code>idx_scan = 0</code> и безжалостно их удалить.</li>
+<li><strong>Composite Indexes</strong>: Если вы часто ищете по <code>user_id</code> и <code>status</code>, один составной индекс на <code>(user_id, status)</code> будет в разы эффективнее, чем два отдельных индекса.</li>
+<li><strong>Unused Indexes</strong>: Каждый индекс замедляет операции <code>INSERT/UPDATE</code>. Системный каталог позволяет мгновенно выявить бесполезные индексы, потребляющие дисковое пространство:</li>
 </ul>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">SELECT 
+    relname AS table_name,
+    indexrelname AS index_name,
+    idx_scan,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+ORDER BY pg_relation_size(indexrelid) DESC;
+</code></pre>
+</div>
+
+<p>Если индекс имеет <code>idx_scan = 0</code> на протяжении месяцев промышленной эксплуатации, он должен быть безжалостно удален (<code>DROP INDEX CONCURRENTLY</code>).</p>
 <hr />
 <h2 id="5-ispolzovanie-rasshireniy-dlya-analiza">5. Использование расширений для анализа</h2>
 
@@ -2321,16 +2450,18 @@ LIMIT 5;
 </code></pre>
 </div>
 
-<h2 id="itog">Итог</h2>
+<p>Инспектируя этот отчет, вы безошибочно определите, где оптимизация даст максимальный финансовый и архитектурный эффект.</p>
+<hr />
+<h2 id="rezyume-dlya-inzhenera">Резюме для инженера</h2>
 
 <ol>
-<li><strong>Конфигурация</strong>: Настройте <code>shared_buffers</code>, <code>random_page_cost</code> и <code>effective_cache_size</code> под ваше железо (SSD).</li>
-<li><strong>Профилирование</strong>: Используйте <code>EXPLAIN (ANALYZE, BUFFERS)</code> для поиска узких мест в планах.</li>
-<li><strong>Go-уровень</strong>: Используйте пулинг соединений, Batching и избегайте долгих транзакций.</li>
-<li><strong>Обслуживание</strong>: Следите за Bloat и вовремя обновляйте статистику через <code>ANALYZE</code>.</li>
-<li><strong>Мониторинг</strong>: Держите <code>pg_stat_statements</code> включенным всегда.</li>
+<li><strong>Конфигурация под SSD:</strong> Выделите 25% RAM под <code>shared_buffers</code>, 75% под <code>effective_cache_size</code> и обязательно понизьте <code>random_page_cost</code> до <code>1.1</code>.</li>
+<li><strong>Диагностика планов:</strong> Регулярно запускайте <code>EXPLAIN (ANALYZE, BUFFERS)</code> и стремитесь к минимизации параметра <code>shared read</code>.</li>
+<li><strong>Паттерны в Go:</strong> Используйте подготовленные выражения с осторожностью при транзакционных пулерах, применяйте <code>pgx.Batch</code> и избегайте удержания открытых транзакций.</li>
+<li><strong>Управление раздуванием:</strong> Агрессивно настраивайте <code>autovacuum_vacuum_scale_factor</code> на горячих таблицах и удаляйте неиспользуемые индексы с <code>idx_scan = 0</code>.</li>
+<li><strong>Непрерывный мониторинг:</strong> Анализируйте профиль нагрузки через <code>pg_stat_statements</code>.</li>
 </ol>
-<p>Оптимизация одиночного инстанса имеет свои пределы. Когда данных становится слишком много для одного сервера, нам приходится переходить к вопросам эксплуатации: очистке мусора и масштабированию. В следующей статье мы подробно разберем, как работает "дворник" PostgreSQL: <a href="10-vacuum-analyze.html" class="wikilink">10. VACUUM, ANALYZE</a>.</p>
+<p>Оптимизация параметров и планов имеет свои естественные физические пределы. Когда нагрузка на запись растет, на сцену выходит главный системный дворник PostgreSQL, от здоровья которого зависит выживание всего кластера. О том, как устроен и как настраивается сборщик мусора СУБД — в следующей лекции: <a href="10-vacuum-analyze.html" class="wikilink">10. VACUUM, ANALYZE</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2358,7 +2489,7 @@ LIMIT 5;
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-konfiguratsiya-tyuning-pod-zhelezo">1. Конфигурация: Тюнинг под железо</a></li><li class="toc-item toc-h3"><a href="#pamyat-shared-buffers-i-keshirovanie">Память: Shared Buffers и кэширование</a></li><li class="toc-item toc-h3"><a href="#rabota-s-diskom-i-wal">Работа с диском и WAL</a></li><li class="toc-item toc-h2"><a href="#2-analiz-zaprosov-kogda-planirovshchik-oshibaetsya">2. Анализ запросов: Когда планировщик ошибается</a></li><li class="toc-item toc-h3"><a href="#problema-cardinality-i-statistiki">Проблема Cardinality и Статистики</a></li><li class="toc-item toc-h2"><a href="#3-optimizatsiya-na-urovne-go-prilozheniya">3. Оптимизация на уровне Go-приложения</a></li><li class="toc-item toc-h3"><a href="#prepared-statements-podgotovlennye-vyrazheniya">Prepared Statements (Подготовленные выражения)</a></li><li class="toc-item toc-h3"><a href="#paketnaya-vstavka-batching">Пакетная вставка (Batching)</a></li><li class="toc-item toc-h2"><a href="#4-obsluzhivanie-borba-s-bloat">4. Обслуживание: Борьба с Bloat</a></li><li class="toc-item toc-h3"><a href="#kogda-autovacuum-ne-spravlyaetsya">Когда Autovacuum не справляется?</a></li><li class="toc-item toc-h3"><a href="#indeksy-kachestvo-protiv-kolichestva">Индексы: Качество против количества</a></li><li class="toc-item toc-h2"><a href="#5-ispolzovanie-rasshireniy-dlya-analiza">5. Использование расширений для анализа</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-konfiguratsiya-tyuning-parametrov-pod-sovremennoe-zhelezo">1. Конфигурация: Тюнинг параметров под современное железо</a></li><li class="toc-item toc-h3"><a href="#pamyat-sharedbuffers-i-keshirovanie">Память: sharedbuffers и кэширование</a></li><li class="toc-item toc-h3"><a href="#rabota-s-diskom-i-wal">Работа с диском и WAL</a></li><li class="toc-item toc-h2"><a href="#2-analiz-zaprosov-kogda-planirovshchik-oshibaetsya">2. Анализ запросов: Когда планировщик ошибается</a></li><li class="toc-item toc-h3"><a href="#problema-cardinality-i-aktualizatsiya-statistiki">Проблема Cardinality и актуализация статистики</a></li><li class="toc-item toc-h2"><a href="#3-optimizatsiya-na-urovne-go-prilozheniya">3. Оптимизация на уровне Go-приложения</a></li><li class="toc-item toc-h3"><a href="#podgotovlennye-vyrazheniya-prepared-statements">Подготовленные выражения (Prepared Statements)</a></li><li class="toc-item toc-h3"><a href="#paketnaya-vstavka-batching">Пакетная вставка (Batching)</a></li><li class="toc-item toc-h2"><a href="#4-ekspluatatsionnoe-obsluzhivanie-predotvrashchenie-bloat">4. Эксплуатационное обслуживание: Предотвращение Bloat</a></li><li class="toc-item toc-h3"><a href="#tyuning-dlya-bolshikh-tablits">Тюнинг для больших таблиц:</a></li><li class="toc-item toc-h3"><a href="#indeksy-kachestvo-protiv-kolichestva">Индексы: Качество против количества</a></li><li class="toc-item toc-h2"><a href="#5-ispolzovanie-rasshireniy-dlya-analiza">5. Использование расширений для анализа</a></li><li class="toc-item toc-h2"><a href="#rezyume-dlya-inzhenera">Резюме для инженера</a></li>
   </ul>
 </aside>
 

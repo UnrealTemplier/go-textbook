@@ -2168,23 +2168,27 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Расширения PostgreSQL</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущей статье мы увидели, как PostgreSQL реализует <a href="6-full-text-search.html" class="wikilink">6. Full Text Search</a> своими силами. Однако истинная мощь этой базы данных заключается не в том, сколько фич разработчики успели «зашить» в ядро, а в том, что PostgreSQL — это скорее <strong>фреймворк для создания баз данных</strong>.</p>
-<p>Если вам не хватает стандартных индексов, типов данных или даже парадигмы хранения (например, вам нужна колоночная или time-series база), вам не обязательно менять СУБД. Вы можете изменить сам PostgreSQL, загрузив в него <strong>Расширение (Extension)</strong>.</p>
-<p>Для бэкенд-разработчика понимание архитектуры расширений критически важно, так как именно они превращают "просто реляционную базу" в мощнейший инструмент, способный заменить Redis, ElasticSearch или InfluxDB в рамках одного проекта.</p>
-<h2 id="pod-kapotom-kak-rabotayut-rasshireniya">Под капотом: Как работают расширения?</h2>
+            <p>В предыдущей лекции мы увидели, как PostgreSQL реализует <a href="6-full-text-search.html" class="wikilink">6. Full Text Search</a> своими силами, без необходимости разворачивать внешний кластер. Однако истинная мощь и уникальность этой СУБД заключается не в том, сколько готовых возможностей разработчики успели «зашить» в базовый бинарник, а в том, что PostgreSQL изначально проектировался как <strong>расширяемый программный каркас (фреймворк) для создания баз данных</strong>.</p>
+<p>Если вашей предметной области не хватает стандартных индексных структур, экзотических типов данных или даже классической строковой модели хранения (например, вам требуется колоночная аналитика, работа с графами, векторный поиск для LLM или хранилище временных рядов Time-Series), вам не нужно менять СУБД и переписывать бэкенд на Go. Вы можете изменить сам PostgreSQL, динамически подключив к нему <strong>Расширение (Extension)</strong>.</p>
+<p>Для бэкенд-инженера понимание архитектуры расширений критически важно: именно они превращают «просто реляционную базу» в мощнейший швейцарский нож, способный в рамках единой инсталляции заменить Redis, Elasticsearch, ClickHouse или InfluxDB.</p>
+<hr />
+<h2 id="arkhitektura-c-plaginov-i-sistema-khukov-hook-system">Архитектура C-плагинов и система хуков (Hook System)</h2>
 
-<p>PostgreSQL написан на языке C. Архитектурно он спроектирован так, чтобы позволять динамическую загрузку скомпилированных C-библиотек (файлов <code>.so</code> в Linux или <code>.dll</code> в Windows) прямо в адресное пространство рабочих процессов (Backend Processes) или даже главного процесса Postmaster (см. <a href="1-arkhitektura-postgresql.html" class="wikilink">1. Архитектура PostgreSQL</a>).</p>
-<p>Когда вы загружаете библиотеку, она получает доступ к внутреннему C-API базы данных. </p>
-<p>Главный механизм, позволяющий расширениям менять поведение базы — это <strong>Система Хуков (Hook System)</strong>.<br />
-Во всем исходном коде PostgreSQL (в парсере, планировщике, исполнителе) разбросаны глобальные указатели на функции. </p>
-<p>Если расширение загружено, оно подменяет этот глобальный указатель на свою собственную функцию. База вызывает хук расширения, расширение делает свою логику (например, замеряет время или меняет план запроса), а затем вызывает оригинальную функцию ядра.</p>
+<p>Ядро PostgreSQL написано на чистом языке C в строгих традициях Unix и Bell Labs. Архитектурно СУБД спроектирована так, чтобы динамически компоновать скомпилированные разделяемые C-библиотеки (файлы <code>.so</code> в Linux или <code>.dll</code> в Windows) прямо в виртуальное адресное пространство процессов PostgreSQL — как в дочерние серверные обработчики (Backend Processes), так и в управляющий процесс Postmaster (разобранный в <a href="1-arkhitektura-postgresql.html" class="wikilink">1. Архитектура PostgreSQL</a>).</p>
+<p>Когда разделяемая библиотека подгружается в память, она получает прямой доступ к внутреннему API рантайма PostgreSQL через <strong>Систему Хуков (Hook System)</strong>.</p>
+<h3 id="kak-fizicheski-ustroeny-khuki">Как физически устроены хуки?</h3>
+<p>По всему исходному коду ядра PostgreSQL (в модуле синтаксического разбора <code>Parser</code>, логическом оптимизаторе <code>Planner</code> и конвейере выполнения <code>Executor</code>) объявлены глобальные указатели на функции. По умолчанию эти указатели равны <code>NULL</code> или ведут на базовые реализации ядра.</p>
+<p>Когда расширение инициализируется в оперативной памяти:<br />
+1. Оно считывает адрес стандартного обработчика из глобального указателя.<br />
+2. Сохраняет этот адрес в собственной локальной переменной (чтобы не разорвать цепочку вызовов).<br />
+3. <strong>Подменяет глобальный указатель на собственную функцию-перехватчик</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2199,43 +2203,69 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Client[&quot;Go App&quot;] --&gt;|SQL Query| Parser[&quot;Parser &lt;br&gt; Синтаксический анализ&quot;]
-Parser --&gt; Planner[&quot;Planner / Optimizer &lt;br&gt; Построение плана&quot;]
-Planner --&gt; Exec[&quot;Executor &lt;br&gt; Исполнитель запроса&quot;]
-Exec --&gt; Storage[&quot;Storage Engine &lt;br&gt; Чтение страниц&quot;]
+Client[&quot;Go App (Driver)&quot;] --&gt;|&quot;SQL-запрос&quot;| Parser[&quot;1. Parser &lt;br&gt; (Синтаксический разбор)&quot;]
+Parser --&gt; Planner[&quot;2. Planner / Optimizer &lt;br&gt; (Построение дерева плана)&quot;]
+Planner --&gt; Exec[&quot;3. Executor &lt;br&gt; (Исполнение плана)&quot;]
+Exec --&gt; Storage[&quot;4. Storage Engine (Heap) &lt;br&gt; (Чтение 8KB страниц)&quot;]
 
-subgraph &quot;Extension: pg_stat_statements&quot;
-Hook[&quot;ExecutorRun_hook&quot;]
-Stat[&quot;Обновление статистики &lt;br&gt; Время, CPU, IO&quot;]
+subgraph ExtHook [&quot;Расширение: pg_stat_statements&quot;]
+Hook[&quot;Хук: ExecutorRun_hook&quot;]
+Stat[&quot;Сбор телеметрии: &lt;br&gt; Время CPU, задержка IO, блокировки&quot;]
 end
 
-Exec -.-&gt;|&quot;1 - Перехват управления&quot;| Hook
-Hook -.-&gt;|&quot;2 - Замер старта&quot;| Stat
-Hook -.-&gt;|&quot;3 - Возврат управления ядру&quot;| Exec
+Exec -.-&gt;|&quot;1. Перехват управления&quot;| Hook
+Hook -.-&gt;|&quot;2. Фиксация таймингов&quot;| Stat
+Hook -.-&gt;|&quot;3. Вызов оригинального ядра&quot;| Exec
   </pre>
 </div>
 
 
+<p>Когда ядро доходит до шага выполнения плана, оно вызывает <code>ExecutorRun_hook</code>. Управление мгновенно передается в код расширения: плагин замеряет такты CPU, инспектирует буферы ввода-вывода, выполняет служебные действия и возвращает поток управления стандартному коду базы данных.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Опасность C-кода</span>
+    <span class="callout-title">Под капотом: Обратная сторона нативной C-скорости</span>
   </div>
   <div class="callout-body">
-    <p>Поскольку расширения работают в том же адресном пространстве (Ring 3), что и сам рабочий процесс (Backend Process), они имеют полный доступ к памяти базы. <br />
-С одной стороны, это дает невероятную производительность: расширения читают страницы прямо из <code>shared_buffers</code> без системных вызовов.<br />
-С другой стороны, если в C-коде стороннего расширения есть утечка памяти или ошибка сегментации (Segfault), упадет весь процесс, обслуживающий ваше TCP-соединение. ОС убьет процесс, клиент (Go-приложение) получит ошибку <code>connection reset by peer</code>, а базе, возможно, придется делать микро-рестарт для восстановления консистентности разделяемой памяти.</p>
+    <p>Поскольку расширения исполняются в том же пространстве пользователя (Ring 3) и в том же адресном пространстве процесса ОС, что и рабочий Backend-процесс, они обладают феноменальной скоростью: расширение читает буферы <code>shared_buffers</code> напрямую из оперативной памяти без единого системного вызова к ядру Linux.<br />
+Однако платой за эту скорость является <strong>риск стабильности</strong>. Если в коде стороннего C-расширения допущена ошибка с разыменованием нулевого указателя или порчей памяти, операционная система немедленно пошлет процессу сигнал <code>SIGSEGV</code> (Segmentation Fault). Рабочий процесс аварийно завершится, клиентское Go-приложение получит обрыв TCP-сокета (<code>connection reset by peer</code>), а Postmaster будет вынужден инициировать процедуру восстановления разделяемой памяти, сбросив соединения остальных параллельных клиентов. Всегда используйте только зрелые, проверенные сообществом расширения!</p>
   </div>
 </div>
 
 <hr />
-<h2 id="dva-etapa-zhizni-rasshireniya">Два этапа жизни расширения</h2>
+<h2 id="dva-etapa-zhiznennogo-tsikla-rasshireniya">Два этапа жизненного цикла расширения</h2>
 
-<p>Частая ловушка для новичков — путаница между установкой библиотеки и её активацией. В PostgreSQL это два разных шага.</p>
-<h3 id="1-zagruzka-biblioteki-sharedpreloadlibraries">1. Загрузка библиотеки (`shared_preload_libraries`)</h3>
-<p>Некоторые расширения требуют выделения разделяемой памяти (Shared Memory) для всех процессов БД, либо им нужно запустить свои собственные фоновые процессы (Background Workers). <br />
-Сделать это можно <strong>только при старте главного процесса Postmaster</strong>.</p>
-<p>Для таких расширений необходимо прописать их в конфигурационном файле <code>postgresql.conf</code>:</p>
+<p>Распространенная ошибка начинающих разработчиков — путаница между системной загрузкой разделяемой библиотеки и ее активацией в схеме базы данных. Это два принципиально разных этапа.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph BootStage [&quot;Этап 1: Старт Postmaster (ОС)&quot;]
+Conf[&quot;postgresql.conf &lt;br&gt; shared_preload_libraries&quot;] --&gt; Postmaster[&quot;Инициализация Shared Memory &lt;br&gt; Выделение структур и спинлоков&quot;]
+end
+
+subgraph DDLStage [&quot;Этап 2: Выполнение SQL (Сессия Go)&quot;]
+SQL[&quot;CREATE EXTENSION ...&quot;] --&gt; Catalog[&quot;Создание объектов в pg_catalog: &lt;br&gt; Функции, VIEW, операторы, типы&quot;]
+end
+
+BootStage --&gt; DDLStage
+  </pre>
+</div>
+
+
+<h3 id="1-zagruzka-razdelyaemoy-biblioteki-sharedpreloadlibraries">1. Загрузка разделяемой библиотеки (`shared_preload_libraries`)</h3>
+<p>Если расширению требуется глобальное разделяемое состояние (Shared Memory) для координации между всеми процессами БД или запуск собственных фоновых демонов (Background Workers), оно обязано быть загружено <strong>в момент первичного старта Postmaster</strong>.</p>
+<p>Для этого библиотека явно прописывается в конфигурационном файле <code>postgresql.conf</code>:</p>
 
 <div class="code-block" data-lang="ini">
   <div class="code-header">
@@ -2249,9 +2279,9 @@ Hook -.-&gt;|&quot;3 - Возврат управления ядру&quot;| Exec
 </code></pre>
 </div>
 
-<p><em>После изменения этого параметра требуется полный перезапуск сервера БД.</em></p>
-<h3 id="2-sozdanie-obektov-v-baze-create-extension">2. Создание объектов в базе (`CREATE EXTENSION`)</h3>
-<p>Даже если библиотека загружена в память, база данных о ней не знает на уровне SQL (нет новых функций, типов данных или таблиц). Чтобы они появились, вы должны выполнить команду в конкретной логической БД:</p>
+<p><em>Изменение этого параметра требует обязательного физического перезапуска экземпляра PostgreSQL (<code>systemctl restart postgresql</code>).</em></p>
+<h3 id="2-registratsiya-obektov-v-kataloge-create-extension">2. Регистрация объектов в каталоге (`CREATE EXTENSION`)</h3>
+<p>Даже если код библиотеки уже загружен в оперативную память Postmaster, конкретная логическая база данных не знает о доступных функциях, типах данных и представлениях. Для их регистрации в целевой БД выполняется SQL-команда:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2265,33 +2295,33 @@ Hook -.-&gt;|&quot;3 - Возврат управления ядру&quot;| Exec
 </code></pre>
 </div>
 
-<p>Эта команда читает специальный SQL-скрипт расширения (control-файл) и создает нужные <code>VIEW</code>, функции и операторы.</p>
+<p>Эта команда находит управляющий control-файл расширения (например, <code>pg_stat_statements.control</code>), исполняет SQL-скрипт установки и вносит сигнатуры функций и представлений в системный каталог <code>pg_catalog</code>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Вы добавили расширение <code>pg_stat_statements</code>, выполнили <code>CREATE EXTENSION</code>, но при попытке сделать <code>SELECT</code> из его вьюхи получаете ошибку, что расширение должно быть загружено через <code>shared_preload_libraries</code>. Почему?<br />
-<strong>Ответ:</strong> Команда <code>CREATE EXTENSION</code> лишь создает метаданные (сигнатуры функций) в системных каталогах PostgreSQL. Но само расширение <code>pg_stat_statements</code> собирает метрики со <em>всех</em> процессов БД. Для этого ему нужен кусок разделяемой памяти (Shared Memory), чтобы процессы могли безопасно писать туда статистику (через атомарные операции или спинлоки). Эту память может выделить только Postmaster при старте ядра ОС, поэтому требуется изменение конфига и рестарт.</p>
+    <p><strong>Вопрос:</strong> Разработчик выполнил команду <code>CREATE EXTENSION pg_stat_statements;</code> в новой базе данных, но при попытке сделать выборку <code>SELECT * FROM pg_stat_statements;</code> получает фатальную ошибку: <code>pg_stat_statements must be loaded via shared_preload_libraries</code>. В чем физическая причина ошибки?<br />
+<strong>Ответ:</strong> Команда <code>CREATE EXTENSION</code> лишь регистрирует интерфейс: она создает системное представление <code>VIEW</code> и связывает его с сигнатурами C-функций в каталоге. Однако для своей фактической работы модуль <code>pg_stat_statements</code> обязан непрерывно агрегировать счетчики со <em>всех</em> параллельных Backend-процессов кластера.<br />
+Для этого ему требуется монолитный сегмент разделяемой памяти (Shared Memory), защищенный быстрыми атомарными счетчиками и спинлоками (spinlocks). Выделить такой разделяемый сегмент операционная система может только в момент инициализации главного процесса Postmaster через конфигурационный параметр <code>shared_preload_libraries</code>. Без перезапуска с этим флагом разделяемая память физически отсутствует.</p>
   </div>
 </div>
 
 <hr />
-<h2 id="must-have-rasshireniya-dlya-bekend-razrabotchika">Must-have расширения для бэкенд-разработчика</h2>
+<h2 id="promyshlennye-rasshireniya-pervoy-neobkhodimosti-must-have">Промышленные расширения первой необходимости (Must-Have)</h2>
 
-<p>В экосистеме Postgres тысячи расширений, но следующие вы встретите практически в любом production-проекте.</p>
-<h3 id="1-pgstatstatements-nablyudaemost">1. pg_stat_statements (Наблюдаемость)</h3>
-<p>Абсолютный король расширений. Без него профилирование базы в production невозможно.<br />
-Оно перехватывает этап Executor и записывает статистику по каждому уникальному SQL-запросу (параметры <code>$1, $2</code> игнорируются, запросы нормализуются).</p>
-<p>Позволяет ответить на вопросы:<br />
-* Какой запрос потребляет больше всего процессорного времени (<code>total_exec_time</code>)?<br />
-* Какой запрос вымывает данные из кэша, заставляя базу читать с жесткого диска (<code>shared_blks_read</code> vs <code>shared_blks_hit</code>)?<br />
-О том, как использовать эти данные для ускорения БД, мы поговорим в разделе <a href="../10-praktika-i-arkhitektura/19-observability-bd.html" class="wikilink">19. Observability БД</a>.</p>
-<h3 id="2-pgtrgm-poisk-po-podstroke">2. pg_trgm (Поиск по подстроке)</h3>
-<p>В прошлой статье мы говорили, что <code>LIKE '%query%'</code> — это зло, так как он вызывает Sequential Scan. <br />
-Расширение <code>pg_trgm</code> решает эту проблему. Оно добавляет поддержку триграмм (разбиение слова на группы по 3 буквы: <code>foo</code> -&gt; <code>f</code>, <code>fo</code>, <code>foo</code>, <code>oo</code>). <br />
-Оно добавляет возможность использовать GIN-индексы для операторов <code>LIKE</code> и <code>ILIKE</code>.</p>
+<p>Среди тысяч доступных плагинов существует проверенная временем классика, присутствующая практически в любом высоконагруженном production-проекте:</p>
+<h3 id="1-pgstatstatements-skvoznaya-nablyudaemost">1. `pg_stat_statements` (Сквозная наблюдаемость)</h3>
+<p>Без этого расширения профессиональная эксплуатация и оптимизация PostgreSQL в production попросту невозможны.<br />
+Плагин перехватывает этап исполнения запросов (<code>ExecutorRun_hook</code>) и накапливает в разделяемой памяти сводную телеметрию по каждому уникальному шаблону SQL-запроса (параметры <code>$1, $2</code> заменяются плейсхолдерами, объединяя тысячи однотипных запросов в единую запись).</p>
+<p><code>pg_stat_statements</code> дает точные ответы на фундаментальные вопросы:<br />
+* Какие запросы генерируют наибольшую нагрузку на процессор (<code>total_exec_time</code> / <code>mean_exec_time</code>)?<br />
+* Какие запросы вымывают полезные страницы из кэша, вызывая шторм физического чтения с SSD (<code>shared_blks_read</code> против <code>shared_blks_hit</code>)?<br />
+* Подробнее об анализе этих метрик мы поговорим в лекции <a href="../10-praktika-i-arkhitektura/19-observability-bd.html" class="wikilink">19. Observability БД</a>.</p>
+<h3 id="2-pgtrgm-polnotekstovyy-i-nechetkiy-poisk-po-trigrammam">2. `pg_trgm` (Полнотекстовый и нечеткий поиск по триграммам)</h3>
+<p>В предыдущей статье мы выяснили, что префиксный <code>LIKE '%query%'</code> приводит к Sequential Scan. Расширение <code>pg_trgm</code> элегантно решает эту проблему, разбивая текст на триграммы — перекрывающиеся цепочки из 3 символов подряд (например, слово <code>'foo'</code> порождает триграммы <code>'  f'</code>, <code>' fo'</code>, <code>'foo'</code>, <code>'oo '</code>).</p>
+<p><code>pg_trgm</code> добавляет специализированный класс операторов для GIN-индексов (<code>gin_trgm_ops</code>), позволяя индексировать произвольные подстроки и производить нечеткий поиск (Fuzzy Search):</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2302,32 +2332,61 @@ Hook -.-&gt;|&quot;3 - Возврат управления ядру&quot;| Exec
     </button>
   </div>
   <pre class="language-sql"><code class="language-sql">CREATE EXTENSION pg_trgm;
+
+-- Создаем GIN-индекс по триграммам email
 CREATE INDEX idx_users_email_trgm ON users USING GIN (email gin_trgm_ops);
--- Теперь этот запрос будет использовать индекс и отработает за миллисекунды:
+
+-- Запрос с wildcard в начале теперь использует индекс и отрабатывает за доли миллисекунды:
 SELECT * FROM users WHERE email ILIKE '%@gmail.com%';
 </code></pre>
 </div>
 
-<h3 id="3-pgcrypto-shifrovanie-i-kheshirovanie">3. pgcrypto (Шифрование и хеширование)</h3>
-<p>Позволяет выполнять криптографические операции прямо в базе данных, не гоняя чувствительные данные (например, пароли или токены) через сеть в Go-приложение.<br />
-Раньше активно использовалось для генерации UUIDv4 (<code>gen_random_uuid()</code>), но с 13-й версии PostgreSQL эта функция встроена в ядро (хотя расширение <code>uuid-ossp</code> все еще существует для старых версий и других форматов UUID).</p>
+<h3 id="3-pgcrypto-kriptografiya-vnutri-bazy-dannykh">3. `pgcrypto` (Криптография внутри базы данных)</h3>
+<p>Предоставляет криптографические примитивы (хеширование паролей алгоритмом bcrypt, HMAC, AES-шифрование), исполняемые непосредственно на сервере БД без передачи чувствительных открытых ключей и паролей по сети в Go-сервис.<br />
+Исторически расширение использовалось для генерации случайных идентификаторов через <code>gen_random_uuid()</code>, но начиная с PostgreSQL 13 эта функция стала стандартной частью ядра (хотя модуль <code>uuid-ossp</code> по-прежнему востребован для генерации UUIDv1 по времени и MAC-адресу).</p>
 <hr />
-<h2 id="arkhitekturnye-rasshireniya-menyayushchie-paradigmu">Архитектурные расширения (Меняющие парадигму)</h2>
+<h2 id="arkhitekturnye-rasshireniya-menyayushchie-paradigmu-subd">Архитектурные расширения, меняющие парадигму СУБД</h2>
 
-<p>Существуют расширения-монстры, которые превращают PostgreSQL в совершенно другие базы данных.</p>
-<ol>
-<li><strong>TimescaleDB</strong>: Превращает Postgres в мощнейшую Time-Series Database (TSDB) для хранения метрик, IoT-данных и логов. Автоматически партицирует таблицы по времени (создает "чанки"), добавляет аналитические SQL-функции для работы с временными рядами и сжимает старые данные колоночным методом (Columnar Storage), уменьшая их размер в 10-20 раз.</li>
-<li><strong>Citus</strong>: Превращает одиночный PostgreSQL в распределенную (Distributed) базу данных. Позволяет делать шардирование (<a href="../08-raspredelennye-bazy-dannykh/4-sharding.html" class="wikilink">4. Sharding</a>) таблиц по кластеру из десятков машин, при этом для Go-приложения кластер выглядит как один обычный инстанс Postgres. Citus сам переписывает SQL-запросы, отправляет их на нужные шарды и агрегирует результаты (MapReduce под капотом).</li>
-</ol>
-<h2 id="itog">Итог</h2>
+<p>Некоторые расширения представляют собой настолько масштабные инженерные системы, что они полностью меняют внутреннее устройство хранилища и превращают PostgreSQL в специализированные платформы:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+PG[&quot;PostgreSQL Core Engine&quot;] --&gt; Timescale[&quot;TimescaleDB &lt;br&gt; (Автоматическое шардирование по времени, &lt;br&gt; гипертаблицы, колоночное сжатие LZ4)&quot;]
+PG --&gt; Citus[&quot;Citus &lt;br&gt; (Превращение в распределенный кластер, &lt;br&gt; шардирование таблиц, параллельный MapReduce)&quot;]
+PG --&gt; PGVector[&quot;pgvector &lt;br&gt; (Векторные базы данных для AI/LLM, &lt;br&gt; HNSW и IVFFlat индексы embeddings)&quot;]
+  </pre>
+</div>
+
 
 <ol>
-<li>PostgreSQL — это расширяемая платформа благодаря загружаемым C-библиотекам и архитектуре хуков.</li>
-<li>Подключение тяжелых расширений требует перезапуска (через <code>shared_preload_libraries</code>) для аллокации разделяемой памяти.</li>
-<li>Расширения исполняются в памяти рабочих процессов. Они невероятно быстры, но критические ошибки в их коде могут "уронить" соединение.</li>
-<li><code>pg_stat_statements</code> — обязательный инструмент для любого бэкендера, который хочет понимать, что происходит с базой под нагрузкой.</li>
+<li><strong>TimescaleDB:</strong><br />
+   Трансформирует классический PostgreSQL в мощнейшую платформу для обработки временных рядов (Time-Series Database, TSDB). Автоматически разрезает таблицы на временные интервалы («чанки»), реализует аналитические оконные функции и сжимает устаревшие данные в гибридный колоночный формат (Columnar Storage), уменьшая занимаемое дисковое пространство в 10–20 раз при сохранении полной поддержки SQL.</li>
+<li><strong>Citus:</strong><br />
+   Превращает одиночный PostgreSQL в горизонтально масштабируемый распределенный кластер. Citus прозрачно реализует шардирование данных (<a href="../08-raspredelennye-bazy-dannykh/4-sharding.html" class="wikilink">4. Sharding</a>) по десяткам физических серверов: для Go-приложения кластер выглядит как один обычный инстанс PostgreSQL, а Citus самостоятельно распределяет SQL-запросы по координаторам и объединяет ответы по принципу MapReduce.</li>
+<li><strong>pgvector:</strong><br />
+   Современный стандарт де-факто для хранения и поиска векторных представлений (Embeddings) в эпоху искусственного интеллекта и Large Language Models (LLM). Внедряет векторные типы данных и алгоритмы приближенного поиска ближайших соседей (HNSW, IVFFlat), избавляя команды от необходимости эксплуатировать специализированные векторные БД вроде Pinecone или Milvus.</li>
 </ol>
-<p>Возможность расширять типы данных и алгоритмы поиска сделала PostgreSQL стандартом де-факто в еще одной сложнейшей инженерной области — работе с геоданными и картами. В следующей статье мы разберем расширение, которое стало настолько успешным, что фактически превратилось в отдельный продукт: <a href="8-postgis.html" class="wikilink">8. PostGIS</a>.</p>
+<hr />
+<h2 id="rezyume-dlya-inzhenera">Резюме для инженера</h2>
+
+<ol>
+<li><strong>Расширяемый каркас:</strong> Архитектура PostgreSQL построена на модульных C-библиотеках и глобальной системе хуков (<code>ExecutorRun_hook</code>, <code>Planner_hook</code>), перехватывающих внутренние этапы обработки запросов.</li>
+<li><strong>Низкоуровневая скорость и ответственность:</strong> Плагины работают в общем адресном пространстве с ядром СУБД и читают <code>shared_buffers</code> напрямую, но аппаратный сбой или Segfault в коде расширения может вызвать аварийный перезапуск сессии.</li>
+<li><strong>Разделяемая память требует рестарта:</strong> Системные расширения (такие как <code>pg_stat_statements</code>) резервируют сегменты Shared Memory и настраиваются через параметр <code>shared_preload_libraries</code> с последующим перезапуском Postmaster.</li>
+<li><strong>Универсальность экосистемы:</strong> Расширения <code>pg_stat_statements</code>, <code>pg_trgm</code>, <code>TimescaleDB</code> и <code>pgvector</code> закрывают колоссальный спектр инфраструктурных потребностей силами единой реляционной платформы.</li>
+</ol>
+<p>Способность PostgreSQL адаптировать специализированные структуры данных и алгоритмы поиска сделала его абсолютным мировым стандартом в еще одной сложнейшей инженерной дисциплине — обработке геопространственных данных, геометрии и картографии. О флагманском гео-расширении — в следующей лекции: <a href="8-postgis.html" class="wikilink">8. PostGIS</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2355,7 +2414,7 @@ SELECT * FROM users WHERE email ILIKE '%@gmail.com%';
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pod-kapotom-kak-rabotayut-rasshireniya">Под капотом: Как работают расширения?</a></li><li class="toc-item toc-h2"><a href="#dva-etapa-zhizni-rasshireniya">Два этапа жизни расширения</a></li><li class="toc-item toc-h3"><a href="#1-zagruzka-biblioteki-sharedpreloadlibraries">1. Загрузка библиотеки (sharedpreloadlibraries)</a></li><li class="toc-item toc-h3"><a href="#2-sozdanie-obektov-v-baze-create-extension">2. Создание объектов в базе (CREATE EXTENSION)</a></li><li class="toc-item toc-h2"><a href="#must-have-rasshireniya-dlya-bekend-razrabotchika">Must-have расширения для бэкенд-разработчика</a></li><li class="toc-item toc-h3"><a href="#1-pgstatstatements-nablyudaemost">1. pgstatstatements (Наблюдаемость)</a></li><li class="toc-item toc-h3"><a href="#2-pgtrgm-poisk-po-podstroke">2. pgtrgm (Поиск по подстроке)</a></li><li class="toc-item toc-h3"><a href="#3-pgcrypto-shifrovanie-i-kheshirovanie">3. pgcrypto (Шифрование и хеширование)</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-rasshireniya-menyayushchie-paradigmu">Архитектурные расширения (Меняющие парадигму)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#arkhitektura-c-plaginov-i-sistema-khukov-hook-system">Архитектура C-плагинов и система хуков (Hook System)</a></li><li class="toc-item toc-h3"><a href="#kak-fizicheski-ustroeny-khuki">Как физически устроены хуки?</a></li><li class="toc-item toc-h2"><a href="#dva-etapa-zhiznennogo-tsikla-rasshireniya">Два этапа жизненного цикла расширения</a></li><li class="toc-item toc-h3"><a href="#1-zagruzka-razdelyaemoy-biblioteki-sharedpreloadlibraries">1. Загрузка разделяемой библиотеки (sharedpreloadlibraries)</a></li><li class="toc-item toc-h3"><a href="#2-registratsiya-obektov-v-kataloge-create-extension">2. Регистрация объектов в каталоге (CREATE EXTENSION)</a></li><li class="toc-item toc-h2"><a href="#promyshlennye-rasshireniya-pervoy-neobkhodimosti-must-have">Промышленные расширения первой необходимости (Must-Have)</a></li><li class="toc-item toc-h3"><a href="#1-pgstatstatements-skvoznaya-nablyudaemost">1. pgstatstatements (Сквозная наблюдаемость)</a></li><li class="toc-item toc-h3"><a href="#2-pgtrgm-polnotekstovyy-i-nechetkiy-poisk-po-trigrammam">2. pgtrgm (Полнотекстовый и нечеткий поиск по триграммам)</a></li><li class="toc-item toc-h3"><a href="#3-pgcrypto-kriptografiya-vnutri-bazy-dannykh">3. pgcrypto (Криптография внутри базы данных)</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-rasshireniya-menyayushchie-paradigmu-subd">Архитектурные расширения, меняющие парадигму СУБД</a></li><li class="toc-item toc-h2"><a href="#rezyume-dlya-inzhenera">Резюме для инженера</a></li>
   </ul>
 </aside>
 

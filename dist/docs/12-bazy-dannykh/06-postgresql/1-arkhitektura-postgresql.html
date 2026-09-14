@@ -2168,24 +2168,27 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 12</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Архитектура PostgreSQL</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В отличие от вашего приложения на Go, где сотни тысяч горутин легковесно мультиплексируются на несколько потоков ОС (G-M-P планировщик), или от MySQL, где используется многопоточная архитектура (thread-per-connection), PostgreSQL исторически пошел по пути <strong>Process-Per-Connection (процесс на соединение)</strong>. </p>
-<p>Для бэкенд-разработчика это фундаментальное отличие диктует правила работы с БД: то, как мы настраиваем пулинг соединений, как база утилизирует память и почему тысячи коннектов убивают производительность быстрее, чем тяжелые запросы.</p>
-<h2 id="process-per-connection-anatomiya-zapuska">Process-Per-Connection: Анатомия запуска</h2>
+            <p>В отличие от вашего приложения на Go, где сотни тысяч горутин легковесно мультиплексируются на несколько системных потоков ОС силами планировщика рантайма (модель G-M-P), или от MySQL, где традиционно применяется многопоточная архитектура (thread-per-connection), PostgreSQL исторически пошел по бескомпромиссно надежному пути <strong>Process-Per-Connection (выделенный процесс на каждое клиентское соединение)</strong>.</p>
+<p>Для бэкенд-инженера это фундаментальное архитектурное решение диктует жесткие правила игры: то, как мы настраиваем пулинг соединений в Go, как СУБД утилизирует оперативную память и почему тысячи наивных коннектов способны поставить сервер базы данных на колени быстрее, чем самые неоптимальные аналитические запросы.</p>
+<hr />
+<h2 id="process-per-connection-anatomiya-zapuska-i-izolyatsiya">Process-Per-Connection: Анатомия запуска и изоляция</h2>
 
-<p>PostgreSQL не использует потоки (threads). Вся его архитектура построена на классических Unix-процессах и разделяемой памяти (Shared Memory). </p>
-<p>Когда вы запускаете Postgres, стартует главный процесс — <strong>Postmaster</strong> (или просто <code>postgres</code>). Он слушает заданный порт (обычно 5432) и ждет входящих соединений.</p>
-<p>Когда ваше Go-приложение делает <code>db.Query()</code> и драйвер (например, <code>pgx</code>) открывает новое TCP-соединение, происходит следующее:<br />
-1. Postmaster получает TCP-запрос на соединение.<br />
-2. Postmaster делает системный вызов <code>fork()</code>, клонируя себя.<br />
-3. Создается новый <strong>Backend Process</strong> (рабочий процесс), который перехватывает этот сокет и начинает обрабатывать команды от конкретного клиента.<br />
-4. Этот процесс живет до тех пор, пока TCP-соединение не будет закрыто.</p>
+<p>PostgreSQL принципиально не использует потоки выполнения (threads) внутри своих рабочих обработчиков. Вся его архитектура опирается на классические Unix-процессы и механизмы разделяемой памяти (Shared Memory IPC). </p>
+<p>Когда сервер базы данных инициализируется, операционная система запускает главный процесс — <strong>Postmaster</strong> (в современных версиях исполняемый файл называется просто <code>postgres</code>). Он открывает сетевой сокет, слушает заданный TCP-порт (по умолчанию 5432) и ожидает входящих клиентских подключений.</p>
+<p>Когда ваше Go-приложение вызывает <code>sql.Open()</code>, инициализирует пул через <code>pgx</code> или выполняет <code>db.Query()</code>, происходит следующий каскад событий:</p>
+<ol>
+<li><strong>Postmaster</strong> принимает входящее TCP-соединение через системный вызов <code>accept()</code>.</li>
+<li>Postmaster совершает системный вызов <code>fork()</code>, порождая точную копию своего адресного пространства.</li>
+<li>Дочерний процесс превращается в <strong>Backend Process</strong> (индивидуальный серверный рабочий процесс с собственным PID), перехватывает файловый дескриптор клиентского сокета и берет на себя всю дальнейшую обработку SQL-команд данной сессии.</li>
+<li>Этот процесс живет ровно столько, сколько активно данное сетевое соединение, после чего завершается (<code>exit()</code>), отдавая ресурсы операционной системе.</li>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2200,25 +2203,31 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-C[&quot;Go App &lt;br&gt; database/sql&quot;]--&gt;|&quot;TCP Socket&quot;|PM[&quot;Postmaster &lt;br&gt; main process&quot;]
-PM--&gt;|&quot;syscall fork&quot;|BP1[&quot;Backend Process 1 &lt;br&gt; PID 101&quot;]
-PM--&gt;|&quot;syscall fork&quot;|BP2[&quot;Backend Process 2 &lt;br&gt; PID 102&quot;]
+C[&quot;Go App &lt;br&gt; (database/sql / pgx)&quot;] --&gt;|&quot;TCP Socket (Port 5432)&quot;| PM[&quot;Postmaster &lt;br&gt; (Main Daemon Process)&quot;]
+PM --&gt;|&quot;syscall fork()&quot;| BP1[&quot;Backend Process 1 &lt;br&gt; (PID 101, Client Session A)&quot;]
+PM --&gt;|&quot;syscall fork()&quot;| BP2[&quot;Backend Process 2 &lt;br&gt; (PID 102, Client Session B)&quot;]
 
-subgraph &quot;PostgreSQL Shared Memory&quot;
-SB[&quot;Shared Buffers&quot;]
-WB[&quot;WAL Buffers&quot;]
+subgraph SharedMem [&quot;PostgreSQL Shared Memory (IPC)&quot;]
+SB[&quot;Shared Buffers &lt;br&gt; (Кэш страниц данных 8 KB)&quot;]
+WB[&quot;WAL Buffers &lt;br&gt; (Буфер журнала предзаписи)&quot;]
+LW[&quot;Lock &amp; Proc Tables &lt;br&gt; (Блокировки и служебные структуры)&quot;]
 end
 
-BP1--&gt;|&quot;read/write&quot;|SB
-BP2--&gt;|&quot;read/write&quot;|SB
+BP1 --&gt;|&quot;read / write pages&quot;| SB
+BP1 --&gt;|&quot;append log records&quot;| WB
+BP2 --&gt;|&quot;read / write pages&quot;| SB
+BP2 --&gt;|&quot;append log records&quot;| WB
 
-subgraph &quot;Background Processes&quot;
-BGW[&quot;Background Writer&quot;]
-WALW[&quot;WAL Writer&quot;]
+subgraph BGWorkers [&quot;Background Helper Processes&quot;]
+BGW[&quot;Background Writer &lt;br&gt; (Сброс dirty pages)&quot;]
+WALW[&quot;WAL Writer &lt;br&gt; (Периодический fsync)&quot;]
+CHK[&quot;Checkpointer &lt;br&gt; (Точки согласованности)&quot;]
+AV[&quot;Autovacuum Launcher &lt;br&gt; &amp; Workers&quot;]
 end
 
-SB--&gt;|&quot;flush&quot;|BGW
-WB--&gt;|&quot;fsync&quot;|WALW
+SB --&gt;|&quot;flush dirty pages&quot;| BGW
+WB --&gt;|&quot;fsync WAL buffers&quot;| WALW
+SB --&gt;|&quot;checkpoint sync&quot;| CHK
   </pre>
 </div>
 
@@ -2226,46 +2235,85 @@ WB--&gt;|&quot;fsync&quot;|WALW
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Почему процессы, а не потоки?</span>
+    <span class="callout-title">Под капотом: Почему независимые процессы, а не потоки?</span>
   </div>
   <div class="callout-body">
-    <p>Главная причина — <strong>надежность и изоляция памяти</strong>. В C/C++ баг с некорректным указателем (segfault) в одном потоке убивает весь процесс. В PostgreSQL, если один Backend Process падает из-за критической ошибки в C-коде расширения, падает <em>только этот процесс</em>. Соединение обрывается, но сама база и остальные клиенты продолжают работать. Операционная система сама очистит память упавшего процесса.</p>
+    <p>Главная причина этого выбора, сделанного еще архитекторами проекта POSTGRES в Беркли, — <strong>абсолютная надежность и изоляция памяти</strong>. <br />
+В традиционной многопоточной C/C++ программе ошибка с "висячим" указателем (dangling pointer), повреждение памяти или сегфолт (<code>SIGSEGV</code>) в одном потоке немедленно крашат весь процесс целиком, унося с собой подключения всех пользователей. <br />
+В архитектуре PostgreSQL, если какой-то Backend Process падает из-за критического сбоя в стороннем C-расширении или аппаратной ошибки, погибает <strong>исключительно этот изолированный процесс</strong>. Сетевое соединение одного клиента аварийно обрывается, но сам сервер, Postmaster и сотни остальных клиентов продолжают функционировать без единой паузы. Ядро Linux самостоятельно и мгновенно очищает виртуальную память и закрывает дескрипторы погибшего процесса.</p>
   </div>
 </div>
 
-<p>Но за эту надежность мы платим цену:<br />
-* Системный вызов <code>fork()</code> — тяжелая операция. ОС нужно скопировать таблицы страниц памяти (Page Tables) для нового процесса, даже с учетом механизма Copy-On-Write (CoW).<br />
-* Контекст-свичинг (Context Switch) между процессами на уровне ядра ОС обходится дороже, чем между потоками, и несоизмеримо дороже, чем переключение горутин в User Space.<br />
-* Каждый процесс съедает базовый overhead по памяти (несколько мегабайт просто за факт своего существования).</p>
+<p>Однако за надежность и простоту отладки приходится платить существенную системную цену:<br />
+* <strong>Накладные расходы <code>fork()</code>:</strong> Системный вызов <code>fork()</code> требует от ядра ОС дублирования таблиц страниц памяти (Page Tables) процесса. Даже с оптимизацией Copy-On-Write (CoW) создание сотен процессов в секунду генерирует огромную нагрузку на подсистему управления памятью Linux.<br />
+* <strong>Переключение контекста (Context Switching):</strong> Переключение контекста между независимыми процессами (смена таблиц страниц в регистре <code>CR3</code>, сброс TLB-кэша процессора) стоит в разы дороже переключения потоков, и несоизмеримо дороже кооперативного планирования горутин Go в пространстве пользователя.<br />
+* <strong>Базовый overhead памяти:</strong> Каждый Backend Process резервирует индивидуальный стек, служебные структуры дескрипторов и локальные буферы (от 5–10 МБ оперативной памяти просто по факту своего существования).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему при нагрузке в 10 000 RPS нельзя просто открыть 10 000 соединений к PostgreSQL из Go?<br />
-<strong>Ответ:</strong> 10 000 активных соединений означают 10 000 процессов ОС. Планировщик ядра Linux сойдет с ума, пытаясь распределить кванты времени CPU между ними (CPU Thrashing). Большая часть процессорного времени уйдет на переключение контекста, а не на выполнение запросов. Кроме того, база может просто упасть по OOM (Out Of Memory). Именно поэтому перед PostgreSQL всегда ставят PgBouncer или строго лимитируют размер <a href="../10-praktika-i-arkhitektura/2-connection-pool.html" class="wikilink">2. Connection pool</a> в приложении (обычно не более <code>2 * Core_Count + Эффективная глубина шпинделя</code>).</p>
+    <p><strong>Вопрос:</strong> Почему при входящей нагрузке веб-сервиса в 10 000 RPS категорически нельзя открыть 10 000 параллельных соединений из Go напрямую к PostgreSQL?<br />
+<strong>Ответ:</strong> 10 000 активных TCP-подключений трансформируются в 10 000 тяжелых процессов ОС Linux. Планировщик CFS/EEVDF ядра Linux захлебнется в попытках распределить кванты процессорного времени между ними (эффект CPU Thrashing). Более 80% времени процессора будет сгорать впустую на переключениях контекста и инвалидации кэшей процессора (L1/L2/L3), а полезная работа остановится. Сервер быстро исчерпает свободную RAM и упадет по OOM (Out Of Memory). Именно поэтому перед PostgreSQL всегда устанавливают пул соединений: встроенный в приложение <a href="../10-praktika-i-arkhitektura/2-connection-pool.html" class="wikilink">2. Connection pool</a> (ограниченный формулой <code>2 * CPU_Cores + Disk_Spindle_Depth</code>) либо внешний транзакционный прокси вроде <strong>PgBouncer</strong> или <strong>Odyssey</strong>.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="arkhitektura-pamyati-postgresql">Архитектура памяти PostgreSQL</h2>
 
-<p>Память в PostgreSQL жестко разделена на две категории: Локальная (для каждого процесса) и Разделяемая (Shared, для всей инсталляции).</p>
-<h3 id="1-lokalnaya-pamyat-local-memory">1. Локальная память (Local Memory)</h3>
-<p>Выделяется внутри каждого Backend Process для обработки текущего запроса. Высвобождается (free) по завершении запроса или сессии.</p>
+<p>Вся оперативная память экземпляра PostgreSQL строго разделена на две изолированные категории: <strong>Локальная память процессов</strong> и <strong>Разделяемая память инсталляции</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+graph TD
+subgraph HostRAM [&quot;Оперативная память сервера (RAM)&quot;]
+subgraph SharedMem [&quot;Shared Memory (Разделяемая память)&quot;]
+SB[&quot;shared_buffers (~25% RAM)&quot;]
+WB[&quot;wal_buffers (обычно 16MB)&quot;]
+LGT[&quot;Lock Space &amp; Global State&quot;]
+end
+
+subgraph LinuxCache [&quot;Linux OS Cache (~50-70% RAM)&quot;]
+PC[&quot;Page Cache (Файловый кэш ядра Linux)&quot;]
+end
+
+subgraph LocalMem [&quot;Backend Process Local Memory (на каждый процесс)&quot;]
+WM[&quot;work_mem (сортировки, Hash JOIN, GROUP BY)&quot;]
+MWM[&quot;maintenance_work_mem (VACUUM, CREATE INDEX)&quot;]
+TM[&quot;temp_buffers (временные таблицы)&quot;]
+end
+end
+  </pre>
+</div>
+
+
+<h3 id="1-lokalnaya-pamyat-protsessa-local-memory">1. Локальная память процесса (Local Memory)</h3>
+<p>Локальная память динамически выделяется внутри адресного пространства конкретного Backend-процесса при выполнении текущего запроса и мгновенно возвращается системе после завершения операции.</p>
 <ul>
-<li><strong><code>work_mem</code></strong>: Важнейший параметр для бэкендера. Это память для операций сортировки (<code>ORDER BY</code>), агрегации (<code>GROUP BY</code>) и хеш-джоинов (<code>Hash JOIN</code>). <ul>
-<li><em>Mechanical Sympathy</em>: Если данных больше, чем <code>work_mem</code>, Postgres не падает с OOM. Он начинает <strong>сбрасывать данные на диск (spill to disk)</strong> во временные файлы. Запрос резко деградирует по скорости из-за дискового IO. Если ваш сложный <a href="../04-indeksy-i-proizvoditelnost/15-optimizatsiya-select.html" class="wikilink">15. Оптимизация SELECT</a> тормозит, проверьте в <code>EXPLAIN ANALYZE</code> наличие слов <code>external merge disk</code>.</li>
+<li><strong><code>work_mem</code></strong>: Критически важный параметр настройки. Это объем памяти, выделяемый для внутренних операций сортировки (<code>ORDER BY</code>), построения хэш-таблиц для соединений (<code>Hash JOIN</code>) и группировок (<code>GROUP BY</code>).<ul>
+<li><em>Mechanical Sympathy:</em> Обратите внимание: <code>work_mem</code> выделяется <strong>не на запрос, а на каждый отдельный узел плана выполнения</strong>! Запрос с тремя сложными JOIN и двумя <code>ORDER BY</code> может затребовать <code>5 * work_mem</code>.</li>
+<li>Если размер промежуточных данных превышает лимит <code>work_mem</code>, PostgreSQL не падает с ошибкой памяти. Он незаметно переключается на <strong>сброс данных во временные файлы на диске (spill to disk)</strong>. В результате производительность запроса драматически обваливается на порядки из-за дискового ввода-вывода. При анализе медленных запросов через <code>EXPLAIN ANALYZE</code> ищите ключевую фразу: <code>external merge Disk: ...kB</code>.</li>
 </ul>
 </li>
-<li><strong><code>maintenance_work_mem</code></strong>: Память для сервисных задач: создания индексов, команд <code>ALTER TABLE</code> и операций сборки мусора (о ней подробнее в <a href="10-vacuum-analyze.html" class="wikilink">10. VACUUM, ANALYZE</a>).</li>
+<li><strong><code>maintenance_work_mem</code></strong>: Память для сервисных административных процедур: построения индексов (<code>CREATE INDEX</code>), изменения схем (<code>ALTER TABLE</code>) и фоновой сборки мусора (механизма очистки мертвых версий строк, подробно разобранного в <a href="10-vacuum-analyze.html" class="wikilink">10. VACUUM, ANALYZE</a>).</li>
+<li><strong><code>temp_buffers</code></strong>: Локальный кэш страниц для временных пользовательских таблиц (<code>CREATE TEMP TABLE</code>), не требующих координации с другими процессами.</li>
 </ul>
 <h3 id="2-razdelyaemaya-pamyat-shared-memory">2. Разделяемая память (Shared Memory)</h3>
-<p>Выделяется Postmaster-ом при старте (через <code>shmget</code> или <code>mmap</code>) и доступна всем дочерним процессам.</p>
+<p>Единый сегмент физической памяти, выделяемый Postmaster'ом на этапе инициализации СУБД (через POSIX <code>mmap</code> или System V <code>shmget</code>) и разделяемый между всеми дочерними бэкендами и фоновыми демонами.</p>
 <ul>
-<li><strong><code>shared_buffers</code></strong>: Сердце базы данных. Это кэш страниц с данными (обычно по 8 КБ). PostgreSQL не читает данные напрямую с диска при запросе. Он просит ОС прочитать блок с диска в <code>shared_buffers</code>, и только оттуда отдает данные клиенту. Обычно устанавливается в размере 25% от всей RAM сервера.</li>
-<li><strong><code>wal_buffers</code></strong>: Буфер для записей журнала транзакций (<a href="../05-tranzaktsii-i-vnutrennosti/8-wal-write-ahead-log.html" class="wikilink">8. WAL. Write Ahead Log</a>). Жизненно важен для обеспечения свойства Durability (буква D в ACID). Данные сначала пишутся сюда, а потом сбрасываются на диск.</li>
+<li><strong><code>shared_buffers</code></strong>: Ключевой кэш страниц с данными (стандартный размер страницы — 8 КБ). PostgreSQL принципиально не читает данные напрямую с блочного устройства при обработке запросов. Сервер запрашивает блок с диска, помещает его в <code>shared_buffers</code>, и лишь оттуда отдает строки клиентскому запросу. Рекомендуемое значение для большинства серверов — около <strong>25% от общего объема RAM</strong>.</li>
+<li><strong><code>wal_buffers</code></strong>: Буфер страниц журнала предзаписи (<a href="../05-tranzaktsii-i-vnutrennosti/8-wal-write-ahead-log.html" class="wikilink">8. WAL. Write Ahead Log</a>). Именно сюда помещаются дельты изменений перед тем, как они будут сброшены на постоянный носитель для обеспечения свойства Durability (буква D в гарантиях ACID).</li>
 </ul>
 <div class="callout callout-warning">
   <div class="callout-header">
@@ -2273,21 +2321,25 @@ WB--&gt;|&quot;fsync&quot;|WALW
     <span class="callout-title">Ловушка / Gotcha: Двойное буферизирование (Double Buffering)</span>
   </div>
   <div class="callout-body">
-    <p>Выделять под <code>shared_buffers</code> 90% памяти сервера (как это делают в MySQL для <code>InnoDB Buffer Pool</code>) — <strong>ошибка</strong>. <br />
-В отличие от многих других СУБД, PostgreSQL не использует <code>O_DIRECT</code> (прямой ввод/вывод в обход кэша ОС). Он полностью полагается на <strong>Linux Page Cache</strong>. <br />
-То есть данные, прочитанные с диска, ложатся сначала в кэш файловой системы Linux, а оттуда копируются в <code>shared_buffers</code>. Это называется двойным буферизированием. Остаток RAM (те самые 70-75%) нужен операционной системе, чтобы кэшировать файлы базы данных!</p>
+    <p>Попытка выделить под <code>shared_buffers</code> 80–90% всей доступной памяти машины (по аналогии с MySQL и его <code>InnoDB Buffer Pool</code>) — <strong>катастрофическая ошибка</strong> конфигурации PostgreSQL.<br />
+В отличие от многих энтерпрайз-СУБД, PostgreSQL исторически не открывает файлы данных с флагом <code>O_DIRECT</code> (прямой ввод/вывод в обход кэша ОС). Он всецело полагается на <strong>Page Cache ядра Linux</strong>.<br />
+При чтении блок данных с диска сначала попадает в файловый кэш Linux, а затем копируется ядром в <code>shared_buffers</code> PostgreSQL. Это и называется <em>двойным буферизированием</em>. Оставшиеся 70–75% оперативной памяти жизненно необходимы операционной системе, чтобы кэшировать файлы базы данных!</p>
   </div>
 </div>
 
 <hr />
-<h2 id="fonovye-protsessy-background-worker-processes">Фоновые процессы (Background Worker Processes)</h2>
+<h2 id="fonovye-protsessy-background-workers">Фоновые процессы (Background Workers)</h2>
 
-<p>Если бы Backend-процессы сами сбрасывали измененные страницы памяти на диск, запросы клиентов блокировались бы на долгий срок из-за IO-операций. Поэтому в PostgreSQL работают фоновые демоны:</p>
+<p>Чтобы пользовательские Backend-процессы не простаивали в ожидании завершения медленных дисковых операций записи, в ядре PostgreSQL функционирует пул специализированных фоновых демонов:</p>
 <ol>
-<li><strong>Background Writer (BgWriter)</strong>: Постепенно и аккуратно ищет "грязные" (измененные) страницы в <code>shared_buffers</code> и записывает их на диск. Его цель — чтобы Backend-процесс, которому нужно подгрузить новые данные с диска, всегда находил свободное место в <code>shared_buffers</code> и не ждал очистки.</li>
-<li><strong>WAL Writer</strong>: Сбрасывает данные из <code>wal_buffers</code> на диск в файлы WAL. Выполняет системный вызов <code>fsync()</code>, гарантируя, что даже при выключении питания транзакция не потеряется. Вызов синхронный и дорогой, поэтому WAL Writer группирует коммиты.</li>
-<li><strong>Checkpointer</strong>: Раз в определенное время (или по достижении лимита WAL-файлов) сбрасывает <em>все</em> грязные страницы на диск и делает отметку в логе. Это гарантирует, что при сбое нам не придется проигрывать лог WAL с самого начала времен. Подробнее разберем в <a href="../05-tranzaktsii-i-vnutrennosti/9-checkpointing.html" class="wikilink">9. Checkpointing</a>.</li>
-<li><strong>Autovacuum Launcher / Workers</strong>: Демоны, которые в фоновом режиме сканируют таблицы на наличие "мертвых" строк (оставшихся после <code>UPDATE</code> или <code>DELETE</code>) и возвращают место системе. Это фундаментальная часть архитектуры <a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>.</li>
+<li><strong>Background Writer (BgWriter):</strong><br />
+   Непрерывно и плавно сканирует <code>shared_buffers</code> по кольцевому алгоритму, выявляя "грязные" (измененные) страницы и асинхронно записывая их на накопитель. Главная цель BgWriter — сделать так, чтобы новый серверный процесс, которому потребовалось загрузить страницу с диска, всегда находил готовый чистый слот в <code>shared_buffers</code> и не тратил время на вытеснение чужих грязных страниц.</li>
+<li><strong>WAL Writer:</strong><br />
+   Периодически сбрасывает накопившиеся дельты из <code>wal_buffers</code> на диск, инициируя системный вызов <code>fsync()</code>. Гарантирует, что даже при внезапном обесточивании стойки с серверами зафиксированные транзакции не будут утеряны. Для оптимизации пропускной способности WAL Writer объединяет коммиты разных транзакций в группы (Group Commit).</li>
+<li><strong>Checkpointer:</strong><br />
+   Выполняет процедуру контрольной точки (Checkpoint): раз в заданный период времени (или по накоплению объема WAL) сбрасывает на накопитель <em>абсолютно все</em> грязные страницы из <code>shared_buffers</code> и ставит в журнале специальную метку согласованности. Это позволяет ограничить время восстановления БД после аварии (Recovery Time Objective): при старте после сбоя рантайму достаточно проиграть WAL только от последней контрольной точки (подробнее в <a href="../05-tranzaktsii-i-vnutrennosti/9-checkpointing.html" class="wikilink">9. Checkpointing</a>).</li>
+<li><strong>Autovacuum Launcher &amp; Workers:</strong><br />
+   Координирующий процесс и пул воркеров, которые в фоновом режиме инспектируют таблицы на скопление "мертвых" кортежей (dead tuples), оставшихся после операций <code>UPDATE</code> и <code>DELETE</code>, собирают мусор и актуализируют статистику для оптимизатора. Это жизненно необходимая часть многоверсионного контроля конкурентности (<a href="3-mvcc-v-postgresql.html" class="wikilink">3. MVCC в PostgreSQL</a>).</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2303,35 +2355,62 @@ WB--&gt;|&quot;fsync&quot;|WALW
   </div>
   <pre class="mermaid">
 flowchart LR
-BP[&quot;Backend Process &lt;br&gt; UPDATE users SET...&quot;]--&gt;|&quot;1. Write to WAL buffer&quot;|WB[&quot;WAL Buffers&quot;]
-BP--&gt;|&quot;2. Modify page&quot;|SB[&quot;Shared Buffers &lt;br&gt; Dirty Page&quot;]
+BP[&quot;Backend Process &lt;br&gt; (UPDATE accounts SET...)&quot;] --&gt;|&quot;1. Запись дельты в буфер&quot;| WB[&quot;wal_buffers&quot;]
+BP --&gt;|&quot;2. Модификация страницы (8KB)&quot;| SB[&quot;shared_buffers &lt;br&gt; (Dirty Page)&quot;]
 
-WB--&gt;|&quot;3. fsync on COMMIT&quot;|WALW[&quot;WAL Writer&quot;]
-WALW--&gt;|&quot;syscall write+fsync&quot;|WAL[&quot;WAL Log File &lt;br&gt; SSD&quot;]
+WB --&gt;|&quot;3. fsync() при COMMIT&quot;| WALW[&quot;WAL Writer&quot;]
+WALW --&gt;|&quot;Синхронный сброс&quot;| WAL[&quot;Файлы WAL (pg_wal) &lt;br&gt; NVMe / SSD&quot;]
 
-SB--&gt;|&quot;4. Async flush later&quot;|CHK[&quot;Checkpointer / BgWriter&quot;]
-CHK--&gt;|&quot;syscall pwrite&quot;|DBF[&quot;Data File .heap &lt;br&gt; SSD&quot;]
+SB -.-&gt;|&quot;4. Асинхронный сброс&quot;| CHK[&quot;Checkpointer / BgWriter&quot;]
+CHK --&gt;|&quot;Периодический pwrite()&quot;| DBF[&quot;Файлы таблиц (base/...) &lt;br&gt; NVMe / SSD&quot;]
   </pre>
 </div>
 
 
 <hr />
-<h2 id="zhiznennyy-tsikl-zaprosa">Жизненный цикл запроса</h2>
+<h2 id="zhiznennyy-tsikl-sql-zaprosa">Жизненный цикл SQL-запроса</h2>
 
-<p>Когда вы отправляете строку <code>"SELECT * FROM users WHERE id = 1"</code> в открытое соединение из Go, внутри Backend-процесса запрос проходит конвейер:</p>
+<p>Когда ваше Go-приложение отправляет в соединение байты строки <code>"SELECT * FROM users WHERE id = 1"</code>, внутри обслуживающего Backend-процесса запрос проходит классический многостадийный конвейер:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+SQL[&quot;SQL Текст запроса&quot;] --&gt; Parser[&quot;1. Parser (Синтаксический анализ)&quot;]
+Parser --&gt;|&quot;Parse Tree (Дерево разбора)&quot;| Analyzer[&quot;2. Analyzer &amp; Rewriter (Семантический анализ)&quot;]
+Analyzer --&gt;|&quot;Query Tree (Проверка каталога, правил, View)&quot;| Planner[&quot;3. Planner / Optimizer (Стоимостной оптимизатор)&quot;]
+Planner --&gt;|&quot;Execution Plan (План выполнения)&quot;| Executor[&quot;4. Executor (Исполнитель)&quot;]
+Executor &lt;--&gt;|&quot;Чтение/запись страниц 8KB&quot;| SB[&quot;shared_buffers&quot;]
+Executor --&gt;|&quot;Строки результата (Rows)&quot;| Client[&quot;Go App (Driver)&quot;]
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>Parser (Парсер)</strong>: Проверяет синтаксис SQL и строит абстрактное синтаксическое дерево (Parse Tree).</li>
-<li><strong>Analyzer &amp; Rewriter (Анализатор и Перезаписыватель)</strong>: Проверяет, существуют ли таблицы <code>users</code> и колонка <code>id</code>. Применяет правила (например, подменяет обращения к View на реальные таблицы).</li>
-<li><strong>Planner / Optimizer (Планировщик)</strong>: <em>Самый умный компонент базы</em>. Использует статистику о данных (сколько всего строк в <code>users</code>, есть ли индексы), чтобы построить самый быстрый план выполнения. Перебирает стратегии: сделать Sequential Scan или использовать Index Scan? (подробнее в <a href="../04-indeksy-i-proizvoditelnost/11-cost-based-optimizer.html" class="wikilink">11. Cost based optimizer</a>).</li>
-<li><strong>Executor (Исполнитель)</strong>: Берет план и начинает выкачивать данные, запрашивая страницы из <code>shared_buffers</code>.</li>
+<li><strong>Parser (Парсер):</strong> Проверяет лексику и грамматику SQL-выражения, генерируя абстрактное синтаксическое дерево разбора (Parse Tree).</li>
+<li><strong>Analyzer &amp; Rewriter (Анализатор и модуль перезаписи):</strong> Проверяет схему данных по системному каталогу (существуют ли таблица <code>users</code> и атрибут <code>id</code>, есть ли у пользователя права доступа). Применяет правила перезаписи (подставляет реальные таблицы вместо представлений <code>VIEW</code>).</li>
+<li><strong>Planner / Optimizer (Планировщик / Оптимизатор):</strong> Интеллектуальное ядро базы данных. Опираясь на математическую статистику распределения значений (гистограммы, селективность колонок), оптимизатор вычисляет стоимость сотен альтернативных путей извлечения данных (Sequential Scan, Index Scan, Bitmap Scan) и формирует оптимальный план выполнения с наименьшей оценочной стоимостью (Cost Based Optimizer, подробно в <a href="../04-indeksy-i-proizvoditelnost/11-cost-based-optimizer.html" class="wikilink">11. Cost based optimizer</a>).</li>
+<li><strong>Executor (Исполнитель):</strong> Рекурсивно обходит узлы плана выполнения, запрашивает страницы у подсистемы <code>shared_buffers</code>, применяет предикаты фильтрации и возвращает готовые кортежи в сокет Go-клиенту.</li>
 </ol>
-<h2 id="itog-dlya-go-razrabotchika">Итог для Go-разработчика</h2>
+<hr />
+<h2 id="pamyatka-dlya-go-razrabotchika">Памятка для Go-разработчика</h2>
 
-<p>Понимание процессной архитектуры PostgreSQL заставляет нас придерживаться строгих правил:<br />
-1. <strong>Жестко ограничиваем <code>SetMaxOpenConns</code></strong> в Go, чтобы не устроить шторм <code>fork()</code> на сервере БД.<br />
-2. При микросервисной архитектуре, когда каждый из 50 инстансов вашего Go-сервиса держит пул из 20 соединений к БД (в сумме 1000), необходимо ставить транзакционный пулер вроде <strong>PgBouncer</strong> или <strong>Odyssey</strong> между приложением и базой.<br />
-3. <strong>Тщательно работаем с памятью</strong>: если видим долгие запросы при джоинах, возможно дело не в нехватке индексов, а в маленьком <code>work_mem</code> и сбросе данных на жесткий диск.</p>
-<p>Теперь, когда мы понимаем, как процессы PostgreSQL живут в операционной системе и как они делят память, мы можем заглянуть глубже и посмотреть, как именно хранятся данные на жестком диске. Об этом — в следующей статье: <a href="2-storage-engine-postgresql.html" class="wikilink">2. Storage engine PostgreSQL</a>.</p>
+<p>Понимание процессной природы и архитектуры памяти PostgreSQL формирует зрелый инженерный подход к интеграции:</p>
+<ol>
+<li><strong>Управление пулом соединений:</strong> Всегда явно конфигурируйте <code>db.SetMaxOpenConns()</code>, <code>db.SetMaxIdleConns()</code> и <code>db.SetConnMaxLifetime()</code>. Допущение бесконечного роста пула подключений превратит сервер БД в полигон борьбы за процессорные кванты и память.</li>
+<li><strong>Внешний пул при микросервисах:</strong> Если ваш кластер масштабируется на 50 подов Kubernetes, и каждый под по умолчанию открывает пул из 20 соединений (в сумме 1 000 коннектов к БД), прямое подключение противопоказано. Обязательно внедряйте транзакционный пулер (<strong>PgBouncer</strong> или <strong>Odyssey</strong>), который будет мультиплексировать тысячи клиентских сессий в десятки реальных Backend-процессов PostgreSQL.</li>
+<li><strong>Диагностика памяти запросов:</strong> Если сложный аналитический запрос с сортировкой или хэш-соединением неожиданно проседает по времени отклика, проверьте <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Обнаружение <code>Sort Method: external merge  Disk</code> свидетельствует о том, что процессу не хватило <code>work_mem</code> и запрос начал бомбардировать диск временными файлами.</li>
+</ol>
+<p>Поняв, как процессы PostgreSQL взаимодействуют с операционной системой и распределяют оперативную память, мы готовы спуститься на уровень хранения и разобрать, как устроены страницы данных на диске. Об этом — в следующей лекции: <a href="2-storage-engine-postgresql.html" class="wikilink">2. Storage engine PostgreSQL</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2359,7 +2438,7 @@ CHK--&gt;|&quot;syscall pwrite&quot;|DBF[&quot;Data File .heap &lt;br&gt; SSD&qu
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#process-per-connection-anatomiya-zapuska">Process-Per-Connection: Анатомия запуска</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-pamyati-postgresql">Архитектура памяти PostgreSQL</a></li><li class="toc-item toc-h3"><a href="#1-lokalnaya-pamyat-local-memory">1. Локальная память (Local Memory)</a></li><li class="toc-item toc-h3"><a href="#2-razdelyaemaya-pamyat-shared-memory">2. Разделяемая память (Shared Memory)</a></li><li class="toc-item toc-h2"><a href="#fonovye-protsessy-background-worker-processes">Фоновые процессы (Background Worker Processes)</a></li><li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-zaprosa">Жизненный цикл запроса</a></li><li class="toc-item toc-h2"><a href="#itog-dlya-go-razrabotchika">Итог для Go-разработчика</a></li>
+    <li class="toc-item toc-h2"><a href="#process-per-connection-anatomiya-zapuska-i-izolyatsiya">Process-Per-Connection: Анатомия запуска и изоляция</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-pamyati-postgresql">Архитектура памяти PostgreSQL</a></li><li class="toc-item toc-h3"><a href="#1-lokalnaya-pamyat-protsessa-local-memory">1. Локальная память процесса (Local Memory)</a></li><li class="toc-item toc-h3"><a href="#2-razdelyaemaya-pamyat-shared-memory">2. Разделяемая память (Shared Memory)</a></li><li class="toc-item toc-h2"><a href="#fonovye-protsessy-background-workers">Фоновые процессы (Background Workers)</a></li><li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-sql-zaprosa">Жизненный цикл SQL-запроса</a></li><li class="toc-item toc-h2"><a href="#pamyatka-dlya-go-razrabotchika">Памятка для Go-разработчика</a></li>
   </ul>
 </aside>
 
