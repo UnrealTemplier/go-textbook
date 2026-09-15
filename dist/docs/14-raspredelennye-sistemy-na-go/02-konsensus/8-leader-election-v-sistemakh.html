@@ -2168,31 +2168,38 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Leader election в системах</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы погружались в алгоритмы консенсуса (Raft и Paxos) и разбирались, как базы данных (например, etcd) выбирают "главного" для обеспечения строгой консистентности. </p>
-<p>Но что, если ты пишешь не базу данных, а обычный stateless микросервис на Go (например, обработчик биллинга), который развернут в Kubernetes в 10 репликах (подах)? Тебе нужно, чтобы <strong>только один</strong> из этих подов выполнял фоновую задачу — например, списывал абонентскую плату по cron-расписанию или отправлял push-уведомления. Если два пода начнут делать это одновременно, бизнес потеряет деньги.</p>
-<p>Здесь нам на помощь приходит паттерн <strong>Leader Election (Выборы лидера в приложении)</strong>. </p>
-<p>Важное уточнение: мы не будем писать алгоритм Raft внутри нашего бизнес-кода. Мы будем <strong>использовать</strong> внешнюю систему консенсуса (обычно etcd, Consul или Kubernetes API), чтобы наши Go-процессы договорились между собой.</p>
+            <p>В предыдущих статьях мы глубоко погружались в анатомию и математику распределенного консенсуса: детально изучили три столпа Raft и отдали дань уважения классическому Paxos. Мы разобрались, как системы хранения данных (вроде <code>etcd</code> или <code>CockroachDB</code>) выбирают вожака, чтобы обеспечить строгую консистентность записей.</p>
+<p>Но в реальной жизни большинству бэкенд-инженеров редко приходится писать собственную распределенную базу данных с нуля. Куда чаще перед нами стоит совершенно иная практическая задача: </p>
+<blockquote>
+<p>Мы разрабатываем обычный stateless-микросервис на Go (например, биллинговый шлюз или процессинг заказов), который ради надежности развернут в Kubernetes в 10 параллельных подах (репликах). </p>
+<p>Нам требуется, чтобы <strong>ровно один</strong> из этих десяти подов выполнял эксклюзивную системную работу: например, раз в сутки запускал списание абонентской платы по cron-расписанию, агрегировал метрики или координировал очередь. Если два пода начнут делать это одновременно — с клиентов спишут двойную оплату. А если единственный под упадет — другой обязан мгновенно подхватить эстафету.</p>
+</blockquote>
+<p>Здесь нам на помощь приходит архитектурный паттерн <strong>Leader Election в прикладных системах (Выборы лидера в микросервисах)</strong>.</p>
+<p>Важнейший инженерный принцип: <strong>не нужно заново изобретать Raft внутри бизнес-кода вашего сервиса!</strong> Мы просто воспользуемся готовым авторитетом внешней системы консенсуса (<code>etcd</code>, Consul или штатный Kubernetes API), чтобы наши Go-процессы элегантно договорились между собой.</p>
+<hr />
 <h2 id="zachem-stateless-mikroservisam-lider">Зачем stateless-микросервисам Лидер?</h2>
 
-<p>Чаще всего Leader Election применяется в следующих сценариях:<br />
-1. <strong>Singleton-воркеры:</strong> Запуск периодических задач (CronJobs), которые нельзя распараллелить.<br />
-2. <strong>Sequential Processing:</strong> Чтение из очереди (например, партиции Kafka), где важен строгий порядок обработки событий одним консьюмером.<br />
-3. <strong>External Rate Limiting:</strong> Взаимодействие с внешним Legacy API, которое допускает строго одно активное соединение.</p>
+<p>Казалось бы, философия микросервисов проповедует идеал Share-Nothing и взаимозаменяемость реплик. Зачем же выделять среди них «главного»?</p>
+<p>В практике высоконагруженных бэкендов Leader Election необходим в трех ключевых сценариях:<br />
+1. <strong>Singleton-воркеры (Периодические фоновые задачи):</strong> Регулярные тяжелые расчеты (генерация счетов, очистка устаревших сессий, отправка ночных push-уведомлений), которые категорически нельзя распараллеливать.<br />
+2. <strong>Sequential Processing (Последовательная обработка потоков):</strong> Вычитывание партиционированных очередей сообщений (например, топиков Apache Kafka), где порядок обработки событий критичен и гарантируется только при одном активном консьюмере.<br />
+3. <strong>External Rate Limiting (Узкие интеграционные горлышки):</strong> Взаимодействие со старыми банковскими шлюзами или сторонними Legacy API, допускающими строго одно активное TCP-соединение на организацию.</p>
+<hr />
 <h2 id="kak-eto-rabotaet-pod-kapotom-mekhanika-arendy">Как это работает под капотом (Механика аренды)</h2>
 
-<p>Принцип выборов лидера в приложении строится поверх механизма распределенных блокировок (о которых мы говорили в статье <a href="7-distributed-locks.html" class="wikilink">7. Distributed locks</a>).</p>
-<p>Система консенсуса (например, <code>etcd</code>) предоставляет нам абстракцию <strong>Lease (Аренда)</strong>. <br />
-1. Все инстансы твоего Go-сервиса одновременно пытаются создать уникальный ключ (Lock) в <code>etcd</code> с привязкой к Lease (например, на 15 секунд).<br />
-2. Только один инстанс преуспевает благодаря атомарной операции <code>Compare-And-Swap</code>. Он становится Лидером.<br />
-3. Остальные получают ошибку <code>Key already exists</code> и переходят в режим наблюдения (Watch), ожидая, когда ключ будет удален.<br />
-4. Инстанс-Лидер запускает фоновую горутину, которая регулярно (например, каждые 5 секунд) отправляет запросы <code>KeepAlive</code>, продлевая свою аренду.</p>
+<p>Механизм выборов прикладного лидера базируется на фундаменте распределенных блокировок, который мы исследовали в статье <a href="7-distributed-locks.html" class="wikilink">7. Distributed locks</a>.</p>
+<p>Платформа координации (например, <code>etcd</code>) предоставляет примитив <strong>Lease (Аренда)</strong> с установленным сроком жизни:<br />
+1. При старте все поды вашего сервиса одновременно пытаются атомарно создать в <code>etcd</code> один и тот же ключ (Lock) с привязкой к Lease (например, со сроком жизни в 15 секунд).<br />
+2. Благодаря атомарной операции <code>Compare-And-Swap</code> (CAS) в кворуме консенсуса <strong>только один под</strong> добивается успеха. Он получает статус Лидера и запускает эксклюзивную бизнес-логику.<br />
+3. Остальные девять подов получают отказ <code>Key already exists</code> и переходят в режим бдительного ожидания (Watch), подписываясь на события изменения этого ключа.<br />
+4. Под-Лидер запускает фоновую горутину, которая с высокой периодичностью (например, каждые 5 секунд) отправляет запросы <code>KeepAlive</code>, продлевая свою аренду в кластере.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2207,48 +2214,54 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant Pod1 as Pod 1 -Go-
-participant K8s as etcd / K8s API
-participant Pod2 as Pod 2 -Go-
+autonumber
+participant Pod1 as Pod 1 (Go)
+participant K8s as etcd / K8s Coordination API
+participant Pod2 as Pod 2 (Go)
 
-Pod1-&gt;&gt;K8s: Захват ключа -Lease 15s-
-K8s--&gt;&gt;Pod1: Успех
-Note over Pod1: Становится Лидером!
+Note over Pod1,Pod2: Старт сервиса (10 реплик)
+Pod1-&gt;&gt;K8s: CAS Create /leader-lock (Lease 15s)
+K8s--&gt;&gt;Pod1: 201 Created (Успех!)
+Note over Pod1: Pod 1 провозглашен Лидером!&lt;br/&gt;Запуск фонового воркера
 
-Pod2-&gt;&gt;K8s: Захват ключа -Lease 15s-
-K8s--&gt;&gt;Pod2: Ошибка -Уже занято-
-Note over Pod2: Ждет освобождения ключа
+Pod2-&gt;&gt;K8s: CAS Create /leader-lock (Lease 15s)
+K8s--&gt;&gt;Pod2: 409 Conflict (Key already exists)
+Note over Pod2: Режим Standby (Watch /leader-lock)
 
-loop Фоновая горутина
-Pod1-&gt;&gt;K8s: Renew -Продление аренды-
+loop Фоновый Heartbeat
+Pod1-&gt;&gt;K8s: KeepAlive / Renew Lease (+15s)
 end
 
-Note over Pod1: Процесс упал -OOM-
-Note over K8s: Lease истекает через 15s
+Note over Pod1: Внезапный сбой (Kernel panic / OOM-kill)
+Note over K8s: Пульс прекратился...&lt;br/&gt;Lease истекает через 15 секунд.
+Note over K8s: Ключ /leader-lock удален!
 
-K8s--&gt;&gt;Pod2: Событие -Ключ удален-
-Pod2-&gt;&gt;K8s: Захват ключа -Lease 15s-
-K8s--&gt;&gt;Pod2: Успех
-Note over Pod2: Новый Лидер!
+K8s--&gt;&gt;Pod2: Watch Event: DELETE /leader-lock
+Pod2-&gt;&gt;K8s: CAS Create /leader-lock (Lease 15s)
+K8s--&gt;&gt;Pod2: 201 Created (Успех!)
+Note over Pod2: Pod 2 стал новым Лидером!
   </pre>
 </div>
 
 
+<hr />
 <h2 id="leader-election-v-kubernetes-client-go">Leader Election в Kubernetes (client-go)</h2>
 
-<p>Если твой сервис крутится в Kubernetes, тебе не нужно напрямую ходить в <code>etcd</code> или тащить в проект Redis. Kubernetes API предоставляет готовый механизм <code>LeaderElection</code> из коробки, используя ресурс <code>Lease</code> (группа <code>coordination.k8s.io</code>).</p>
-<p>Это абсолютный индустриальный стандарт для Go-бэкенда в K8s.</p>
+<p>Если ваш микросервис развернут в инфраструктуре Kubernetes, вам даже не нужно поднимать отдельный кластер <code>etcd</code> или городить интеграции с Redis. Сам Kubernetes API предоставляет готовый, промышленный механизм <code>LeaderElection</code> из коробки.</p>
+<p>В современном Kubernetes для этого используется специализированный ресурс <strong><code>Lease</code></strong> из API-группы <code>coordination.k8s.io</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: K8s Lease</span>
+    <span class="callout-title">Под капотом: Эволюция блокировок в K8s</span>
   </div>
   <div class="callout-body">
-    <p>Ресурс <code>Lease</code> — это легковесный объект в Kubernetes, созданный специально для heartbeat-механизмов. Ранее для этого абьюзили <code>ConfigMap</code> или <code>Endpoints</code>, что сильно нагружало API Server и контроллеры (каждое обновление конфигмапы триггерило тысячи event-ов по кластеру). <code>Lease</code> обновляется без лишнего шума.</p>
+    <p>На заре развития Kubernetes разработчики часто реализовывали выборы лидеров через объекты <code>ConfigMap</code> или <code>Endpoints</code>, постоянно обновляя их аннотации. </p>
+<p>Это порождало тяжелейшие проблемы: каждое обновление <code>ConfigMap</code> приводило к лавине событий (watch-events) по всему кластеру, перегружая <code>kube-apiserver</code> и контроллеры узлов. </p>
+<p>Начиная с Kubernetes 1.14 был представлен легковесный ресурс <code>Lease</code> в группе <code>coordination.k8s.io</code>. Он специально спроектирован для частых heartbeats и минимизирует накладные расходы на etcd кластера.</p>
   </div>
 </div>
 
-<p>Давай посмотрим на идиоматичный production-ready код с использованием библиотеки <code>k8s.io/client-go</code>.</p>
+<p>Взглянем на идиоматичный продакшен-код на Go с использованием официальной библиотеки <code>k8s.io/client-go</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2273,54 +2286,63 @@ import (
     &quot;k8s.io/client-go/tools/leaderelection/resourcelock&quot;
 )
 
-func runLeaderElection(ctx context.Context) {
-    // 1. Создаем клиент Kubernetes из In-Cluster конфигурации
-    config, _ := rest.InClusterConfig()
-    client := kubernetes.NewForConfigOrDie(config)
+func main() {
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
 
-    // Уникальный ID текущего пода
+    // 1. Получаем конфигурацию доступа к API-серверу изнутри пода K8s
+    config, err := rest.InClusterConfig()
+    if err != nil {
+        log.Fatalf(&quot;Ошибка получения in-cluster config: %v&quot;, err)
+    }
+    clientset := kubernetes.NewForConfigOrDie(config)
+
+    // Идентификатором пода обычно выступает его имя из переменной окружения HOSTNAME
     podID := os.Getenv(&quot;HOSTNAME&quot;)
-    lockName := &quot;my-billing-worker-lock&quot;
-    namespace := &quot;production&quot;
+    if podID == &quot;&quot; {
+        podID = &quot;local-dev-instance&quot;
+    }
 
-    // 2. Настраиваем объект блокировки (Lease)
+    lockName := &quot;billing-cron-lock&quot;
+    lockNamespace := &quot;default&quot;
+
+    // 2. Создаем блокировку на базе ресурса Lease из coordination.k8s.io
     lock := &amp;resourcelock.LeaseLock{
         LeaseMeta: metav1.ObjectMeta{
             Name:      lockName,
-            Namespace: namespace,
+            Namespace: lockNamespace,
         },
-        Client: client.CoordinationV1(),
+        Client: clientset.CoordinationV1(),
         LockConfig: resourcelock.ResourceLockConfig{
             Identity: podID,
         },
     }
 
-    // 3. Запускаем машину состояний
+    // 3. Запускаем конечный автомат выборов
     leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
         Lock:            lock,
         ReleaseOnCancel: true,
-        LeaseDuration:   15 * time.Second, // На сколько выдается лок
-        RenewDeadline:   10 * time.Second, // Как часто Лидер пытается продлить лок
-        RetryPeriod:     2 * time.Second,  // Как часто Фолловеры пытаются захватить лок
+        LeaseDuration:   15 * time.Second, // Время удержания лидерства без продления
+        RenewDeadline:   10 * time.Second, // Окно, за которое Лидер обязан продлить аренду
+        RetryPeriod:     2 * time.Second,  // Интервал между попытками захвата для кандидатов
 
         Callbacks: leaderelection.LeaderCallbacks{
             OnStartedLeading: func(ctx context.Context) {
-                log.Printf(&quot;Я стал лидером: %s&quot;, podID)
-                // ВАЖНО: Запускаем бизнес-логику здесь. 
-                // Передаем внутрь ctx!
+                log.Printf(&quot;&gt;&gt;&gt; Узел %s успешно избран Лидером! Запуск задач...&quot;, podID)
+                // ВАЖНО: передаем внутрь функции переданный ctx!
                 doBusinessLogic(ctx)
             },
             OnStoppedLeading: func() {
-                // Этот код выполнится, если мы потеряем лидерство 
-                // (например, K8s API недоступен, и RenewDeadline просрочен).
-                log.Printf(&quot;Я потерял лидерство: %s&quot;, podID)
-                os.Exit(0) // Идиоматично просто убить под и дать K8s перезапустить его
+                // Вызывается, если узел потерял связь с API-сервером или уступил лидерство
+                log.Printf(&quot;&lt;&lt;&lt; Узел %s утратил лидерство! Немедленная остановка.&quot;, podID)
+                // В продакшене идиоматично завершить процесс, чтобы K8s перезапустил под
+                os.Exit(0)
             },
             OnNewLeader: func(identity string) {
                 if identity == podID {
                     return
                 }
-                log.Printf(&quot;Текущий лидер - %s. Ждем своей очереди...&quot;, identity)
+                log.Printf(&quot;Действующий лидер кластера: %s. Ожидание в горячем резерве...&quot;, identity)
             },
         },
     })
@@ -2328,33 +2350,36 @@ func runLeaderElection(ctx context.Context) {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="glavnaya-lovushka-prizrachnyy-lider-split-brain">Главная ловушка: Призрачный Лидер (Split-Brain)</h2>
 
-<p>В коде выше кроется самая опасная проблема выборов лидера в приложении.</p>
-<p>Представь ситуацию: твой под (<code>Pod 1</code>) стал Лидером. Запустилась функция <code>doBusinessLogic(ctx)</code>. <br />
-Она делает тяжелый запрос в базу данных или дергает внешнее API, что занимает 12 секунд.</p>
-<p>В этот момент рантайм Go уходит в жесткую паузу (Stop-The-World) или планировщик ОС (CPU Throttling в Kubernetes) замораживает твой процесс на 15 секунд.<br />
-Фоновая горутина <code>client-go</code>, которая должна обновлять <code>Lease</code>, тоже заморожена.</p>
-<ol>
-<li>Kubernetes видит, что <code>LeaseDuration</code> (15s) истек.</li>
-<li><code>Pod 2</code> замечает, что лок свободен, захватывает его и становится Лидером.</li>
-<li><code>Pod 2</code> начинает выполнять свою функцию <code>doBusinessLogic</code>.</li>
-<li>В этот момент <code>Pod 1</code> "размораживается". </li>
-</ol>
+<p>В приведенной выше архитектуре таится коварнейшая ловушка распределенных систем.</p>
+<p>Давайте смоделируем ситуацию:<br />
+1. <code>Pod 1</code> триумфально захватил аренду <code>Lease</code> и начал выполнение функции <code>doBusinessLogic(ctx)</code>.<br />
+2. Функция отправляет тяжелый сетевой запрос или уходит в цикл обработки 100 000 записей.<br />
+3. В этот момент процесс попадает под жесткий <strong>CPU Throttling</strong> со стороны Linux CFS (Completely Fair Scheduler) из-за превышения <code>cpu limits</code> в Kubernetes, либо рантайм Go замирает в длительной паузе сборщика мусора.<br />
+4. Фоновая горутина <code>client-go</code>, обязанная вызывать продление аренды до истечения <code>RenewDeadline</code>, тоже оказывается замороженной!<br />
+5. Время <code>LeaseDuration</code> (15 секунд) истекает. С точки зрения Kubernetes, <code>Pod 1</code> погиб.<br />
+6. <code>Pod 2</code> в горячем резерве видит освобождение ресурса, захватывает <code>Lease</code> и запускает свою функцию <code>doBusinessLogic</code>.<br />
+7. <strong>Внезапно <code>Pod 1</code> размораживается!</strong> </p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Раздвоение личности в кластере</span>
   </div>
   <div class="callout-body">
-    <p>Что произойдет с <code>Pod 1</code>? Функция <code>doBusinessLogic</code> продолжит выполнение с того места, где остановилась! В системе появится <strong>два активных Лидера одновременно</strong>. Это классический Split-Brain.</p>
+    <p>Что произойдет с <code>Pod 1</code>?<br />
+Процессор просто продолжит выполнение функции <code>doBusinessLogic</code> со следующей инструкции в памяти! </p>
+<p>В системе одновременно работают <strong>два активных Лидера</strong>: <code>Pod 1</code> и <code>Pod 2</code>. Оба отправляют команды записи, оба считают себя единственными вожаками. Кластер развалился на конкурирующие куски — произошел <strong>Split-Brain</strong> на прикладном уровне!</p>
   </div>
 </div>
 
-<h3 id="mechanical-sympathy-kak-zashchititsya-ot-prizrakov">Mechanical Sympathy: Как защититься от призраков?</h3>
+<hr />
+<h2 id="mechanical-sympathy-kak-zashchititsya-ot-prizrakov">Mechanical Sympathy: Как защититься от призраков?</h2>
 
-<p>Ты не можешь отменить уже отправленный сетевой пакет или выполняющийся SQL-запрос. Но ты можешь минимизировать окно уязвимости.</p>
-<p>Библиотека <code>client-go</code> при потере лидерства <strong>отменяет (cancel)</strong> переданный в <code>OnStartedLeading</code> контекст (<code>ctx</code>). Твоя бизнес-логика обязана маниакально проверять этот контекст на каждом шаге!</p>
+<p>Вы не можете физически остановить TCP-пакет, который уже отправлен сетевой картой в коммутатор. Но вы обязаны свести к минимуму окно уязвимости.</p>
+<p>Библиотека <code>client-go</code> при потере лидерства <strong>отменяет (cancel)</strong> контекст <code>ctx</code>, переданный в колбэк <code>OnStartedLeading</code>. </p>
+<p>Ваша бизнес-логика обязана маниакально проверять этот контекст перед каждым действием:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2364,26 +2389,35 @@ func runLeaderElection(ctx context.Context) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПРАВИЛЬНЫЙ ПОДХОД
-func doBusinessLogic(ctx context.Context) {
+  <pre class="language-go"><code class="language-go">func doBusinessLogic(ctx context.Context) {
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+
     for {
         select {
         case &lt;-ctx.Done():
-            // Мы потеряли лидерство! Немедленно прекращаем работу.
-            log.Println(&quot;Контекст отменен, останавливаем воркер&quot;)
+            // Лидерство потеряно! Немедленно гасим все горутины и выходим
+            log.Println(&quot;Контекст аннулирован: немедленный аборт работы!&quot;)
             return
-        default:
-            // Безопасная проверка контекста перед критичным действием
-        }
 
-        // Передаем ctx во ВСЕ сетевые и I/O вызовы
-        err := db.ExecContext(ctx, &quot;UPDATE billing SET status = 'processed'&quot;)
-        if err != nil {
-            // Обработка
-        }
+        case &lt;-ticker.C:
+            // Перед КАЖДЫМ критическим шагом проверяем отмену
+            if err := ctx.Err(); err != nil {
+                return
+            }
 
-        time.Sleep(1 * time.Second) // Имитация работы
+            // Передаем ctx абсолютно во все сетевые и SQL-вызовы!
+            if err := executeCriticalStep(ctx); err != nil {
+                log.Printf(&quot;Ошибка шага: %v&quot;, err)
+            }
+        }
     }
+}
+
+func executeCriticalStep(ctx context.Context) error {
+    // База данных прервет выполнение, если ctx отменится до завершения транзакции
+    _, err := db.ExecContext(ctx, &quot;UPDATE billing_tasks SET status = 'IN_PROGRESS' WHERE id = 1&quot;)
+    return err
 }
 </code></pre>
 </div>
@@ -2394,22 +2428,31 @@ func doBusinessLogic(ctx context.Context) {
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Спасет ли отмена контекста (<code>ctx.Done()</code>) от Split-Brain на 100%?<br />
-<strong>Ответ:</strong> Нет. Между проверкой контекста и моментом, когда TCP-пакет физически покинет сетевую карту сервера, может пройти время, в течение которого произойдет пауза GC. Контекст в Go — это кооперативная (мягкая) отмена. <br />
-Абсолютную 100% защиту гарантируют только <strong>Fencing Tokens</strong> (Токены ограждения), проверяемые на стороне самой базы данных. О них мы подробно говорили в статье <a href="7-distributed-locks.html" class="wikilink">7. Distributed locks</a>. Выборы Лидера в приложении — это оптимизация для снижения конкуренции (нагрузки), но финальная консистентность всегда должна обеспечиваться на уровне хранилища данных.</p>
+    <p><strong>Вопрос:</strong> Гарантирует ли проверка <code>&lt;-ctx.Done()</code> стопроцентную защиту от состояния Split-Brain при потере лидерства?</p>
+<p><strong>Ответ:</strong> Нет! Это классический вопрос на понимание физики распределенных систем. </p>
+<p>Контекст в Go — это механизм <strong>кооперативной (мягкой)</strong> отмены. Между моментом, когда ваш код проверил <code>if err := ctx.Err()</code>, и моментом, когда сформированный SQL-запрос физически применится ядром СУБД, может произойти внезапная пауза GC или задержка сетевого оборудования. В этот промежуток времени новый Лидер уже мог успеть изменить состояние.</p>
+<p>Leader Election на уровне приложения — это архитектурная оптимизация для исключения избыточной нагрузки. Но абсолютная, математическая защита от Split-Brain достигается <strong>исключительно на стороне самой базы данных с помощью Fencing Tokens (Токенов ограждения)</strong>, о которых мы говорили в статье <a href="7-distributed-locks.html" class="wikilink">7. Distributed locks</a>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog-razdela-konsensus">Итог раздела "Консенсус"</h2>
 
-<ol start="9">
-<li><strong>Выборы Лидера в приложении</strong> — это паттерн выделения одного Worker-а из пула реплик для выполнения эксклюзивных задач.</li>
-<li><strong>Инфраструктура:</strong> Идиоматично делегировать эту задачу проверенным CP-системам (Kubernetes Lease API, etcd, Consul). Не используй Redis для критичного Leader Election.</li>
-<li><strong>Жизненный цикл:</strong> Лидерство удерживается механизмом Heartbeat (KeepAlive). Если сеть или процесс тормозят, лок будет передан другому.</li>
-<li><strong>Контекст:</strong> Бизнес-логика лидера обязана жестко реагировать на отмену контекста (<code>&lt;-ctx.Done()</code>), чтобы минимизировать риск состояния Split-Brain.</li>
-</ol>
-<p>Мы закончили огромный и сложный раздел про Консенсус. Мы поняли, как узлы договариваются между собой и как выбирают главных. Но консенсус (строгая консистентность) — это медленно. </p>
-<p>В реальном мире микросервисов мы часто не можем позволить себе платить задержкой (Latency) за каждый запрос. Мы начинаем ослаблять гарантии согласованности ради скорости. Какие модели консистентности существуют и как найти баланс между скоростью и целостностью данных? Переходим к новому разделу: <a href="../03-dannye-i-soglasovannost/1-consistency-modeli.html" class="wikilink">1. Consistency модели</a>.</p>
+<p>Мы завершили фундаментальное исследование распределенного консенсуса — самого сложного и математически изощренного раздела распределенных систем.</p>
+<p>Давайте окинем взглядом пройденный путь:<br />
+1. <strong>Зачем нужен консенсус (<a href="1-zachem-nuzhen-consensus.html" class="wikilink">1. Зачем нужен consensus</a>):</strong> Физические сети ненадежны, узлы подвержены падениям, а наивные решения неизбежно приводят к Split-Brain. Единственное спасение — математика кворумов большинства.<br />
+2. <strong>Raft (<a href="2-raft-osnovy.html" class="wikilink">2. Raft. Основы</a> – <a href="5-raft-safety-i-garantii.html" class="wikilink">5. Raft. Safety и гарантии</a>):</strong> Алгоритм, декомпозировавший проблему на три понятные части:<br />
+   * <strong>Leader Election:</strong> Случайные таймауты разрушают Livelock, а ограничение выборов (<code>Election Restriction</code>) сохраняет историю.<br />
+   * <strong>Log Replication:</strong> Линейный журнал команд гарантирует, что детерминированные конечные автоматы (State Machines) придут к идентичному состоянию.<br />
+   * <strong>Safety &amp; ReadIndex:</strong> Защита от затирания старых эпох (Figure 8) и исключение "грязных чтений" устаревшими лидерами.<br />
+3. <strong>Paxos (<a href="6-paxos-obzorno.html" class="wikilink">6. Paxos обзорно</a>):</strong> Академический прародитель консенсуса, чья гибкость без лидера порождает риск Livelock, требуя возврата к концепции выделенного лидера (Multi-Paxos).<br />
+4. <strong>Практика бэкенда (<a href="7-distributed-locks.html" class="wikilink">7. Distributed locks</a> и <a href="8-leader-election-v-sistemakh.html" class="wikilink">8. Leader election в системах</a>):</strong> <br />
+   * Распределенные мьютексы требуют использования Fencing Tokens для нейтрализации пауз Garbage Collector-а.<br />
+   * Выборы лидеров в микросервисах элегантно решаются штатными инструментами Kubernetes (<code>coordination.k8s.io/Lease</code>) и жесткой связкой с <code>context.Context</code>.</p>
+<p>Однако строгий распределенный консенсус требует сетевых раундтрипов и синхронных дисковых сбросов (<code>fsync</code>). Он медлителен.</p>
+<p>В реальных высоконагруженных системах мы часто не можем позволить себе платить задержкой (Latency) в десятки миллисекунд за каждый запрос. Архитекторы вынуждены идти на компромисс и <strong>ослаблять гарантии согласованности ради скорости и доступности</strong>.</p>
+<p>Какие модели консистентности существуют в природе, что такое причинная (Causal) и монотонная согласованность, и как найти идеальный баланс между скоростью и надежностью? </p>
+<p>Ответы ждут нас в следующем модуле: <a href="../03-dannye-i-soglasovannost/1-consistency-modeli.html" class="wikilink">1. Consistency модели</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2437,7 +2480,7 @@ func doBusinessLogic(ctx context.Context) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#zachem-stateless-mikroservisam-lider">Зачем stateless-микросервисам Лидер?</a></li><li class="toc-item toc-h2"><a href="#kak-eto-rabotaet-pod-kapotom-mekhanika-arendy">Как это работает под капотом (Механика аренды)</a></li><li class="toc-item toc-h2"><a href="#leader-election-v-kubernetes-client-go">Leader Election в Kubernetes (client-go)</a></li><li class="toc-item toc-h2"><a href="#glavnaya-lovushka-prizrachnyy-lider-split-brain">Главная ловушка: Призрачный Лидер (Split-Brain)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-kak-zashchititsya-ot-prizrakov">Mechanical Sympathy: Как защититься от призраков?</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-konsensus">Итог раздела &quot;Консенсус&quot;</a></li>
+    <li class="toc-item toc-h2"><a href="#zachem-stateless-mikroservisam-lider">Зачем stateless-микросервисам Лидер?</a></li><li class="toc-item toc-h2"><a href="#kak-eto-rabotaet-pod-kapotom-mekhanika-arendy">Как это работает под капотом (Механика аренды)</a></li><li class="toc-item toc-h2"><a href="#leader-election-v-kubernetes-client-go">Leader Election в Kubernetes (client-go)</a></li><li class="toc-item toc-h2"><a href="#glavnaya-lovushka-prizrachnyy-lider-split-brain">Главная ловушка: Призрачный Лидер (Split-Brain)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-zashchititsya-ot-prizrakov">Mechanical Sympathy: Как защититься от призраков?</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-konsensus">Итог раздела &quot;Консенсус&quot;</a></li>
   </ul>
 </aside>
 

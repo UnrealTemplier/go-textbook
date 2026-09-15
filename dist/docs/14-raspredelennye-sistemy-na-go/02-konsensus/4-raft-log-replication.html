@@ -2168,34 +2168,51 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Raft. Log replication</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="3-raft-leader-election.html" class="wikilink">3. Raft. Leader election</a> мы разобрались, как кластер выбирает Лидера. Теперь у нас есть единый легитимный правитель. Его главная и единственная задача — принимать запросы от клиентов и надежно фиксировать их в системе, чтобы ни один байт данных не был потерян даже при массовых сбоях оборудования.</p>
-<p>Этот процесс называется <strong>Репликация лога (Log Replication)</strong>. </p>
-<p>В основе Raft лежит фундаментальная концепция информатики — <strong>State Machine Replication (Репликация конечного автомата)</strong>. Идея проста: если два сервера (автомата) начинают с одинакового начального состояния и применяют один и тот же набор команд в строго одинаковом порядке, они придут к одному и тому же конечному состоянию. </p>
-<p>Лог в Raft — это и есть тот самый упорядоченный набор команд.</p>
+            <p>В прошлой статье <a href="3-raft-leader-election.html" class="wikilink">3. Raft. Leader election</a> мы разобрались, как группа изолированных серверов через случайные таймауты и строгое правило большинства выбирает единого Лидера. Теперь кластер обрел полномочного правителя.</p>
+<p>С этого момента вся власть сосредоточена в одних руках. Главная и непреложная обязанность Лидера — принимать команды от внешних клиентов, гарантированно сохранять их на дисках большинства узлов и реплицировать так, чтобы ни единый байт пользовательских данных не исчез даже при внезапном обесточивании дата-центра.</p>
+<p>Этот процесс называется <strong>Репликацией лога (Log Replication)</strong>.</p>
+<p>В основе современной отказоустойчивой архитектуры лежит классическая концепция компьютерных наук — <strong>State Machine Replication (SMR, Репликация конечного автомата)</strong>, сформулированная Фредом Шнайдером еще в 1990 году. Принцип поразительно прост и математически безупречен:</p>
+<blockquote>
+<p>Если два детерминированных конечных автомата (сервера) стартуют из одного и того же начального состояния $S_0$ и применяют абсолютно идентичную последовательность входных команд $[C_1, C_2, \dots, C_n]$ в строго одинаковом порядке, они гарантированно окажутся в абсолютно идентичном конечном состоянии $S_n$.</p>
+</blockquote>
+<p>Лог в Raft — это и есть тот самый священный упорядоченный свиток команд, диктующий эволюцию стейт-машины (базы данных).</p>
+<hr />
 <h2 id="anatomiya-zhurnala-the-log">Анатомия Журнала (The Log)</h2>
 
-<p>Каждый узел в кластере хранит на диске свой локальный Журнал (Log). Журнал состоит из записей (Entries). Каждая запись содержит:<br />
-1. <strong>Index (Индекс):</strong> Порядковый номер записи (монотонно возрастает).<br />
-2. <strong>Term (Эпоха):</strong> Логическое время, когда эта запись была создана Лидером.<br />
-3. <strong>Command (Команда):</strong> Полезная нагрузка для бизнес-логики (например, <code>SET x = 5</code>).</p>
+<p>Каждый узел в кластере ведет на диске собственный локальный журнал (Append-Only Log). Журнал представляет собой непрерывный массив записей (Log Entries). </p>
+<p>Каждая отдельная запись содержит три обязательных поля:<br />
+1. <strong>Index (Индекс):</strong> Монотонно возрастающее 64-битное целое число (<code>1, 2, 3...</code>), фиксирующее строгое физическое положение команды в общей очереди.<br />
+2. <strong>Term (Эпоха создания):</strong> Логический номер срока правления Лидера, который создал эту запись.<br />
+3. <strong>Command (Команда):</strong> Произвольная полезная нагрузка бизнес-логики (например, <code>SET balance:100 = 500</code> или SQL-инструкция <code>INSERT INTO orders ...</code>).</p>
+<pre><code>Индекс (Index) :   1       2       3       4       5       6
+               ┌───────┬───────┬───────┬───────┬───────┬───────┐
+Эпоха (Term)   │   1   │   1   │   1   │   2   │   3   │   3   │
+               ├───────┼───────┼───────┼───────┼───────┼───────┤
+Команда (Data) │ x &lt;- 3│ y &lt;- 1│ x &lt;- 7│ z &lt;- 9│ x &lt;- 2│ y &lt;- 8│
+               └───────┴───────┴───────┴───────┴───────┴───────┘
+                                   ▲
+                              CommitIndex (Все записи до этой отметки зафиксированы)
+</code></pre>
+<hr />
 <h2 id="idealnyy-stsenariy-happy-path">Идеальный сценарий (Happy Path)</h2>
 
-<p>Когда клиент (например, твой HTTP-сервис) хочет изменить данные, он отправляет запрос Лидеру. Дальше разворачивается следующий процесс:</p>
+<p>Рассмотрим классический путь выполнения клиентского запроса, когда сеть стабильна и все серверы исправны:</p>
 <ol>
-<li><strong>Append (Добавление):</strong> Лидер принимает команду, создает новую запись (Entry) с текущим Термом и добавляет её в свой локальный лог. <em>Запись пока не считается зафиксированной (uncommitted).</em></li>
-<li><strong>Replicate (Репликация):</strong> Лидер параллельно рассылает эту запись всем Фолловерам через RPC <code>AppendEntries</code>.</li>
-<li><strong>Acknowledge (Подтверждение):</strong> Фолловеры получают <code>AppendEntries</code>, добавляют запись в свои логи и отправляют ответ "Успешно".</li>
-<li><strong>Commit (Фиксация):</strong> Как только Лидер получает "Успешно" от <strong>большинства</strong> узлов (Кворум, включая себя), запись объявляется зафиксированной (Committed).</li>
-<li><strong>Execute (Выполнение):</strong> Лидер передает зафиксированную команду в свою State Machine (базу данных) для выполнения.</li>
-<li><strong>Reply (Ответ):</strong> Лидер возвращает результат выполнения клиенту (HTTP 200 OK).</li>
-<li><strong>Notify (Уведомление):</strong> В следующих пакетах <code>AppendEntries</code> (даже в пустых Heartbeat-сообщениях) Лидер передает Фолловерам обновленный <code>LeaderCommit</code> индекс. Фолловеры видят, что запись зафиксирована, и тоже применяют её к своим базам данных.</li>
+<li><strong>Client Request:</strong> Клиент (например, API-шлюз или микросервис на Go) отправляет запрос на запись (<code>SET x = 5</code>) на узел Лидера.</li>
+<li><strong>Local Append:</strong> Лидер создает новую запись с текущим <code>Term</code> и очередным <code>Index</code>, записывает её в свой локальный журнал (WAL). В этот момент запись помечена как <strong>незафиксированная (uncommitted)</strong>.</li>
+<li><strong>Fan-Out Replicate:</strong> Лидер параллельно рассылает эту запись всем Фолловерам через RPC <code>AppendEntries</code>.</li>
+<li><strong>Follower Append:</strong> Фолловеры получают пакет, валидируют его, дописывают запись в свои локальные журналы на диске и возвращают Лидеру ответ <code>success: true</code>.</li>
+<li><strong>Commit (Кворум):</strong> Как только Лидер получает подтверждения от <strong>строгого большинства</strong> узлов кластера ($\lfloor N/2 \rfloor + 1$, включая себя), запись официально признается <strong>зафиксированной (Committed)</strong>. Лидер продвигает свой внутренний указатель <code>commitIndex</code>.</li>
+<li><strong>Apply to State Machine:</strong> Лидер передает зафиксированную команду в локальную State Machine (базу данных <code>bbolt</code>, LSM-дерево или <code>in-memory map</code>). Значение переменной <code>x</code> становится равным <code>5</code>.</li>
+<li><strong>Client Reply:</strong> Лидер возвращает клиенту долгожданный ответ: <code>HTTP 200 OK</code> (команда надежно сохранена).</li>
+<li><strong>Follower Commit:</strong> В следующем же цикле Heartbeat Лидер сообщает Фолловерам актуальный <code>LeaderCommit</code>. Фолловеры видят, что запись зафиксирована, и тоже накатывают ее на свои локальные базы данных.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2211,26 +2228,32 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant C as Клиент
+autonumber
+actor Client as Клиент
 participant L as Лидер
 participant F1 as Фолловер 1
 participant F2 as Фолловер 2
 
-C-&gt;&gt;L: Запрос SET x=5
-Note over L: Добавляет в свой лог&lt;br&gt;Index 10, Term 2
+Client-&gt;&gt;L: Запрос SET x = 5
+Note over L: Создает Entry (Index=10, Term=2)&lt;br/&gt;Пишет в локальный WAL на диск
 
-L-&gt;&gt;F1: RPC AppendEntries -Index 10-
-L-&gt;&gt;F2: RPC AppendEntries -Index 10-
+par Репликация в параллель
+L-&gt;&gt;F1: RPC AppendEntries (Index=10, Term=2, Cmd: SET x = 5)
+L-&gt;&gt;F2: RPC AppendEntries (Index=10, Term=2, Cmd: SET x = 5)
+end
 
-F1--&gt;&gt;L: Успешно
-Note over L: Собрано большинство -Кворум-!&lt;br&gt;Запись зафиксирована -Committed-
+F1--&gt;&gt;L: Success: true (Записано на диск)
+Note over L: Кворум достигнут (2 из 3)!&lt;br/&gt;Запись Committed (Index 10)
 
-L-&gt;&gt;L: Применяет x=5 в БД
-L--&gt;&gt;C: Ответ OK
+L-&gt;&gt;L: Применяет SET x = 5 к State Machine
+L--&gt;&gt;Client: HTTP 200 OK (Данные сохранены)
 
-F2--&gt;&gt;L: Успешно -пришло позже-
-L-&gt;&gt;F1: Следующий пульс -CommitIndex=10-
-L-&gt;&gt;F2: Следующий пульс -CommitIndex=10-
+F2--&gt;&gt;L: Success: true (Запоздалый ответ)
+
+Note over L,F2: Следующий периодический Heartbeat
+L-&gt;&gt;F1: AppendEntries (LeaderCommit = 10, entries=[])
+L-&gt;&gt;F2: AppendEntries (LeaderCommit = 10, entries=[])
+Note over F1,F2: Фолловеры применяют запись 10 к своим базам данных!
   </pre>
 </div>
 
@@ -2241,23 +2264,26 @@ L-&gt;&gt;F2: Следующий пульс -CommitIndex=10-
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Если клиент получил ответ "Успешно" от Лидера, а через миллисекунду питание всего дата-центра отключилось. Сохранятся ли данные после перезапуска?<br />
-<strong>Ответ:</strong> Да. Гарантия Raft заключается в том, что Лидер отвечает клиенту <strong>только после</strong> того, как Кворум узлов сохранил запись на энергонезависимый носитель (диск). Если кластер перезапустится, данные будут восстановлены из логов большинства узлов.</p>
+    <p><strong>Вопрос:</strong> Если клиент получил успешный ответ <code>HTTP 200 OK</code> от Лидера, а через миллисекунду во всем дата-центре вырубилось электричество — могут ли данные пропасть после перезапуска машин?</p>
+<p><strong>Ответ:</strong> Категорически <strong>нет</strong>. <br />
+Лидер отправляет подтверждение клиенту <strong>строго после</strong> того, как запись была успешно сброшена на энергонезависимый диск большинством узлов кворума. При последующей загрузке любой новый избранный лидер будет содержать эту запись в своем логе благодаря правилу <code>Election Restriction</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-tsena-diskovogo-io">Mechanical Sympathy: Цена дискового I/O</h2>
 
-<p>Здесь мы подходим к важнейшему моменту для понимания производительности распределенных систем. На шагах 1 и 3 узлы должны записать лог. Но мы не можем просто сделать <code>file.Write()</code>. </p>
-<p>Операционные системы (Linux) буферизируют запись в файл (Page Cache). Если ты сделал <code>Write</code> и ОС ответила успехом, байты всё еще лежат в оперативной памяти. Если сервер обесточить, данные исчезнут, и Raft потеряет свою консистентность.</p>
+<p>Здесь инженер обязан вспомнить о физическом устройстве компьютера и операционной системы. </p>
+<p>Когда программа на Go вызывает стандартный метод <code>file.Write()</code>, данные <strong>не попадают на физический диск мгновенно</strong>. Ядро Linux помещает эти байты в системный кэш страниц оперативной памяти — <strong>Page Cache</strong>. Для пользователя функция <code>Write</code> завершается за доли микросекунды, но если сервер в следующую секунду потеряет питание, незаписанные грязные страницы (dirty pages) из Page Cache исчезнут бесследно!</p>
+<p>Если бы Raft полагался на обычный <code>file.Write()</code>, при сбое по питанию кластер восстановился бы с поврежденными или пустыми логами, вызвав фатальный рассинхрон стейт-машин.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: fsync и WAL</span>
+    <span class="callout-title">Под капотом: fsync, fdatasync и WAL</span>
   </div>
   <div class="callout-body">
-    <p>Чтобы гарантировать сохранность, узел Raft <strong>обязан</strong> сделать системный вызов <code>fsync</code> (или <code>fdatasync</code>), который заставляет контроллер диска сбросить кэши на физический носитель. </p>
-<p>В Go это выглядит так:</p>
+    <p>Чтобы превратить запись в энергонезависимую гарантию, узел обязан принудительно заставить дисковый контроллер сбросить кэш на постоянный носитель (flash-ячейки NVMe или пластины HDD). </p>
+<p>В Linux для этого служат системные вызовы <code>fsync</code> и <code>fdatasync</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2267,37 +2293,26 @@ L-&gt;&gt;F2: Следующий пульс -CommitIndex=10-
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">file.Write(data)
-file.Sync() // syscall.Fsync под капотом
+  <pre class="language-go"><code class="language-go">// Идиоматичный сброс буферов ядра на физический диск в Go
+_, err := file.Write(entryBytes)
+if err != nil {
+    return err
+}
+err = file.Sync() // Под капотом вызывает syscall.Fsync(fd)
 </code></pre>
 </div>
 
-<p><code>fsync</code> — это дорогая операция. На обычном SSD она занимает десятки микросекунд, на HDD — миллисекунды. <br />
-Именно поэтому логи в Raft реализуются как <strong>WAL (Write-Ahead Log)</strong>. Записи добавляются в конец файла (Append-only). Последовательная запись (Sequential I/O) — это самый быстрый вид дисковых операций. Диск не тратит время на поиск секторов, он просто льет данные потоком.</p>
+<p>Системный вызов <code>fsync</code> — крайне тяжелая блокирующая операция:<br />
+* Для вращающегося жесткого диска (HDD) <code>fsync</code> требует механического движения головки и занимает <strong>5–15 миллисекунд</strong> (предел: ~100–200 IOPS).<br />
+* Для серверного NVMe SSD сброс занимает <strong>30–100 микросекунд</strong> (предел: ~10 000–30 000 IOPS при синхронных одиночных операциях).</p>
   </div>
 </div>
 
-<p>Чтобы оптимизировать этот процесс и не "убить" диск вызовами <code>fsync</code> на каждый мелкий запрос, высокопроизводительные реализации (как в etcd) используют <strong>Batching (Пакетирование)</strong>:<br />
-1. Запросы от клиентов скапливаются в памяти (в Go-каналах) в течение пары миллисекунд.<br />
-2. Горутина берет весь батч, пишет его в WAL одним <code>Write</code> и делает один <code>Sync()</code>.<br />
-3. Батч целиком отправляется по сети в одном RPC <code>AppendEntries</code>.</p>
-<h2 id="prinuzhdenie-k-soglasiyu-razreshenie-konfliktov">Принуждение к согласию: Разрешение конфликтов</h2>
+<p>Именно поэтому лог консенсуса проектируется как <strong>Write-Ahead Log (WAL)</strong>. В нем нет произвольного доступа: данные всегда пишутся строго последовательно в конец файла (Sequential I/O), что позволяет накопителю задействовать внутренние буферы и DMA на максимальной скорости.</p>
+<h3 id="gruppovoy-kommit-group-commit-batching-v-go">Групповой коммит (Group Commit / Batching) в Go</h3>
 
-<p>Идеальный сценарий работает, когда сеть стабильна. Но что, если предыдущий Лидер упал посередине репликации? У некоторых Фолловеров могут быть лишние записи (которые не успели закоммититься), а у некоторых может не хватать куска лога.</p>
-<p>Главное правило Raft: <strong>Лог Лидера — это абсолютная истина.</strong> Лидер никогда не удаляет и не изменяет свои записи. Он принудительно перезаписывает логи Фолловеров, заставляя их стать точной копией своего лога.</p>
-<h3 id="log-matching-property-svoystvo-sovpadeniya-logov">Log Matching Property (Свойство совпадения логов)</h3>
-
-<p>Чтобы найти место, где логи разошлись, RPC <code>AppendEntries</code> проводит проверку консистентности. Лидер отправляет не только новые записи, но и метаданные <em>предыдущей</em> записи (<code>PrevLogIndex</code>, <code>PrevLogTerm</code>).</p>
-<p>Если Фолловер не находит в своем логе запись с такими <code>PrevLogIndex</code> и <code>PrevLogTerm</code>, он отвергает запрос (<code>success: false</code>).</p>
-<h3 id="kak-lider-dogonyaet-follovera-v-kode-go">Как Лидер "догоняет" Фолловера (в коде Go)</h3>
-
-<p>Лидер хранит в оперативной памяти карту состояния каждого Фолловера. Важнейшая переменная — <code>nextIndex[]</code>. Это массив, где для каждого узла записан индекс следующей записи, которую Лидер планирует ему отправить. Изначально <code>nextIndex</code> равен (Индекс последней записи Лидера + 1).</p>
-<p>Алгоритм исправления лога:<br />
-1. Лидер шлет <code>AppendEntries</code> для <code>nextIndex</code>.<br />
-2. Фолловер возвращает ошибку (несовпадение логов).<br />
-3. Лидер уменьшает <code>nextIndex</code> для этого Фолловера на 1 и пытается снова.<br />
-4. Процесс повторяется, пока они не найдут точку, где их логи полностью совпадают.<br />
-5. Как только точка найдена, Фолловер удаляет все свои конфликтующие записи после этой точки, а Лидер присылает ему правильные записи.</p>
+<p>Если на каждую операцию записи делать отдельный <code>file.Sync()</code>, пропускная способность системы упрется в физический потолок IOPS диска (несколько тысяч транзакций в секунду).</p>
+<p>Для масштабирования в современных движках консенсуса (<code>etcd</code>, CockroachDB) применяется <strong>батчинг (Batching)</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2307,32 +2322,165 @@ file.Sync() // syscall.Fsync под капотом
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Псевдокод горутины Лидера, реплицирующей лог на конкретного Фолловера
-func (l *Leader) replicateToFollower(followerID string) {
+  <pre class="language-go"><code class="language-go">// Концептуальный скелет пакетной записи лога в etcd/raft
+func (n *RaftNode) walWriterLoop(ctx context.Context, batchQueue &lt;-chan []byte) {
+    batch := make([][]byte, 0, 1024)
+
     for {
-        nextIdx := l.nextIndex[followerID]
+        select {
+        case &lt;-ctx.Done():
+            return
+        case entry := &lt;-batchQueue:
+            batch = append(batch, entry)
+
+            // Собираем все готовые записи из буфера канала без блокировки
+        DrainLoop:
+            for len(batch) &lt; cap(batch) {
+                select {
+                case next := &lt;-batchQueue:
+                    batch = append(batch, next)
+                default:
+                    break DrainLoop
+                }
+            }
+
+            // Один системный вызов writev на всю пачку записей
+            for _, item := range batch {
+                n.walFile.Write(item)
+            }
+
+            // ЕДИНСТВЕННЫЙ fsync на сотни клиентских запросов!
+            _ = n.walFile.Sync()
+
+            // Уведомляем горутины клиентов о завершении дискового I/O
+            n.notifyBatchCommitted(len(batch))
+            batch = batch[:0]
+        }
+    }
+}
+</code></pre>
+</div>
+
+<p>Благодаря групповому коммиту один физический вызов <code>fsync</code> фиксирует сразу 50–500 транзакций, увеличивая общую производительность кластера на два порядка.</p>
+<hr />
+<h2 id="prinuzhdenie-k-soglasiyu-razreshenie-konfliktov">Принуждение к согласию: Разрешение конфликтов</h2>
+
+<p>Идеальный мир прекрасен, но в реальности лидеры падают прямо во время рассылки пакетов, а сетевые задержки заставляют сообщения бродить по маршрутизаторам минутами.</p>
+<p>В результате в журналах Фолловеров могут образоваться:<br />
+* <strong>Дыры:</strong> Фолловер пропустил пачку записей от предыдущего Лидера.<br />
+* <strong>Мусорные записи:</strong> Фолловер получил записи от Лидера, который упал до того, как успел собрать кворум и зафиксировать их.</p>
+<p>В Raft действует фундаментальный закон: <strong>Лог действующего Лидера — это истина в последней инстанции.</strong> </p>
+<p>Лидер никогда не подстраивается под Фолловеров, не удаляет и не изменяет свои собственные записи. Он принудительно синхронизирует логи ведомых узлов, заменяя любые расхождения точной копией своей истории.</p>
+<hr />
+<h2 id="log-matching-property-svoystvo-sovpadeniya-logov">Log Matching Property (Свойство совпадения логов)</h2>
+
+<p>Корректность алгоритма держится на строгой математической индукции:<br />
+1. Если две записи в разных журналах имеют одинаковый <code>Index</code> и одинаковый <code>Term</code>, то они содержат <strong>одну и ту же команду</strong>.<br />
+2. Если две записи в разных журналах имеют одинаковый <code>Index</code> и одинаковый <code>Term</code>, то их журналы <strong>абсолютно идентичны во всех предшествующих позициях</strong> (от $1$ до $Index - 1$).</p>
+<p>Чтобы подтвердить этот инвариант, в RPC-запросе <code>AppendEntries</code> Лидер обязательно передает координаты записи, непосредственно предшествующей новым данным:<br />
+* <code>PrevLogIndex</code> — индекс предыдущей записи;<br />
+* <code>PrevLogTerm</code> — эпоха предыдущей записи.</p>
+<p>Когда Фолловер получает пакет, он смотрит в свой журнал по индексу <code>PrevLogIndex</code>. Если в его логе нет записи на этой позиции, или эпоха этой записи не совпадает с <code>PrevLogTerm</code>, Фолловер немедленно отвергает запрос (<code>success: false</code>).</p>
+<hr />
+<h2 id="kak-lider-dogonyaet-follovera-v-kode-go">Как Лидер "догоняет" Фолловера (в коде Go)</h2>
+
+<p>Лидер хранит в оперативной памяти две карты индексов для каждого узла кластера:<br />
+* <code>nextIndex[]</code>: Индекс следующей записи, которую Лидер планирует отправить конкретному Фолловеру. При вступлении Лидера в должность инициализируется значением <code>lastLogIndex + 1</code>.<br />
+* <code>matchIndex[]</code>: Индекс старшей записи, про которую Лидер достоверно знает, что она реплицирована на данный Фолловер (инициализируется нулем <code>0</code>).</p>
+<p>Если лог Фолловера рассинхронизирован, алгоритм выполняет поиск точки пересечения:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+A[&quot;Лидер шлет AppendEntries с PrevLogIndex = nextIndex - 1&quot;] --&gt; B{&quot;Фолловер нашел совпадение по PrevLogIndex и PrevLogTerm?&quot;}
+
+B -- &quot;success: false (Отказ)&quot; --&gt; C[&quot;Лидер уменьшает nextIndex[peer]--&quot;]
+C --&gt; A
+
+B -- &quot;success: true (Успех)&quot; --&gt; D[&quot;Точка расхождения найдена!&quot;]
+D --&gt; E[&quot;Фолловер удаляет все конфликтующие записи после PrevLogIndex&quot;]
+E --&gt; F[&quot;Фолловер дописывает правильные записи Лидера&quot;]
+F --&gt; G[&quot;Лидер обновляет matchIndex и nextIndex&quot;]
+  </pre>
+</div>
+
+
+<p>В коде управляющей горутины Лидера это выглядит следующим образом:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">type AppendEntriesArgs struct {
+    Term         uint64
+    LeaderID     string
+    PrevLogIndex uint64
+    PrevLogTerm  uint64
+    Entries      []LogEntry
+    LeaderCommit uint64
+}
+
+type AppendEntriesReply struct {
+    Term    uint64
+    Success bool
+}
+
+// replicateToPeer синхронизирует лог с конкретным Фолловером
+func (l *Leader) replicateToPeer(peerID string) {
+    for {
+        l.mu.Lock()
+        nextIdx := l.nextIndex[peerID]
         prevIdx := nextIdx - 1
 
-        // Подготавливаем аргументы с записями от nextIdx до конца лога
         args := AppendEntriesArgs{
             Term:         l.currentTerm,
+            LeaderID:     l.id,
             PrevLogIndex: prevIdx,
             PrevLogTerm:  l.log.TermAt(prevIdx),
-            Entries:      l.log.GetEntriesFrom(nextIdx),
+            Entries:      l.log.SliceFrom(nextIdx),
             LeaderCommit: l.commitIndex,
         }
+        l.mu.Unlock()
 
-        reply, _ := l.sendAppendEntries(followerID, args)
+        reply, err := l.rpcClient.SendAppendEntries(peerID, args)
+        if err != nil {
+            return // Сетевая ошибка, повторим по таймеру Heartbeat
+        }
+
+        l.mu.Lock()
+        if reply.Term &gt; l.currentTerm {
+            l.becomeFollower(reply.Term)
+            l.mu.Unlock()
+            return
+        }
 
         if reply.Success {
-            // Успех! Обновляем знания Лидера о Фолловере
-            l.nextIndex[followerID] = nextIdx + len(args.Entries)
-            l.matchIndex[followerID] = prevIdx + len(args.Entries)
-            l.checkQuorumAndCommit() // Проверяем, не набрался ли кворум для коммита
+            // Успешно: продвигаем указатели репликации
+            l.nextIndex[peerID] = nextIdx + uint64(len(args.Entries))
+            l.matchIndex[peerID] = prevIdx + uint64(len(args.Entries))
+            l.checkQuorumAndCommit()
+            l.mu.Unlock()
             return
         } else {
-            // Отказ. Уменьшаем nextIndex и пробуем снова (откатываемся назад по логу)
-            l.nextIndex[followerID]--
+            // Отказ: делаем шаг назад в прошлое, ища точку согласования
+            if l.nextIndex[peerID] &gt; 1 {
+                l.nextIndex[peerID]--
+            }
+            l.mu.Unlock()
         }
     }
 }
@@ -2342,24 +2490,30 @@ func (l *Leader) replicateToFollower(followerID string) {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Пошаговый откат — это медленно</span>
+    <span class="callout-title">Ловушка / Gotcha: Пошаговый откат — это смерть производительности</span>
   </div>
   <div class="callout-body">
-    <p>Базовая имплементация из статьи Raft уменьшает <code>nextIndex</code> на единицу. Если Фолловер был в отключке месяц и отстал на 1 000 000 записей, потребуется миллион сетевых запросов только для того, чтобы найти точку совпадения! <br />
-В production-реализациях (etcd) Фолловер при отказе возвращает не просто <code>false</code>, а подсказку: длину своего лога и Терм конфликтующей записи. Лидер использует эту информацию, чтобы "перепрыгивать" целые эпохи (Terms) за один запрос, сокращая время восстановления до миллисекунд.</p>
+    <p>Наивная реализация с декрементом <code>nextIndex--</code> на каждый отказ прекрасно работает в академических тестах на 10 записей. </p>
+<p>Но представьте сервер, который выпал из кластера на 3 дня и отстал на 2 000 000 транзакций. Если Лидер будет шагать назад по единице (<code>2000000 -&gt; 1999999 -&gt; 1999998</code>), потребуется <strong>два миллиона сетевых раундтрипов</strong> только для того, чтобы нащупать точку расхождения!</p>
+<p>В боевых реализациях (<code>etcd/raft</code>) протокол расширен: при отказе Фолловер возвращает подсказку:<br />
+1. <code>ConflictTerm</code>: эпоха записи на позиции <code>PrevLogIndex</code>.<br />
+2. <code>ConflictIndex</code>: первый индекс, где встретился этот <code>ConflictTerm</code>.</p>
+<p>Лидер использует эти метаданные, чтобы мгновенно "перепрыгивать" назад целыми эпохами (Terms) за 1–2 сетевых запроса!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>State Machine Replication:</strong> Все узлы приходят к консистентности, выполняя одни и те же команды из реплицированного лога.</li>
-<li><strong>Quorum Commit:</strong> Лидер отвечает клиенту только тогда, когда запись надежно сохранена на дисках большинства узлов.</li>
-<li><strong>WAL и fsync:</strong> Безопасность данных стоит денег. Операции сброса кэшей ОС на диск (<code>Sync()</code>) определяют пропускную способность всей системы. Батчинг I/O — жизненно необходим.</li>
-<li><strong>Абсолютная власть:</strong> Лог Лидера — это закон. Конфликты решаются путем удаления записей у Фолловеров и перезаписи их данными от Лидера.</li>
+<li><strong>State Machine Replication:</strong> Консистентность распределенной системы достигается за счет детерминированного выполнения идентичного журнала команд на каждом узле.</li>
+<li><strong>Кворумная фиксация (Quorum Commit):</strong> Запись считается зафиксированной и применяется к стейт-машине только после подтверждения от строгого большинства узлов.</li>
+<li><strong>Физика диска (WAL + fsync):</strong> Запись в лог требует обязательного сброса кэша страниц ядра на диск через системный вызов <code>fsync</code>. Использование батчинга (группового коммита) — единственный способ получить высокую производительность в Go.</li>
+<li><strong>Log Matching:</strong> Свойство индуктивного совпадения гарантирует, что совпадение пары <code>(PrevLogIndex, PrevLogTerm)</code> подтверждает полную идентичность всей предшествующей истории журнала.</li>
+<li><strong>Диктатура Лидера:</strong> В случае конфликтов Лидер перезаписывает чужие логи, безжалостно удаляя незафиксированные хвосты отстающих узлов.</li>
 </ol>
-<p>Но есть один опасный крайний случай (corner case). Что если Лидер успел реплицировать запись на большинство, но упал <em>прямо перед</em> тем, как объявить её зафиксированной? Как новый Лидер поймет, что эта запись важна и её нельзя затирать? </p>
-<p>Это самая сложная математическая часть Raft, без которой система может перезаписать уже подтвержденные клиенту данные. Об этом важнейшем механизме защиты мы поговорим в следующей статье: <a href="5-raft-safety-i-garantii.html" class="wikilink">5. Raft. Safety и гарантии</a>.</p>
+<p>Но что произойдет, если Лидер успел реплицировать запись на большинство узлов, но упал прямо перед тем, как успел ее зафиксировать (закоммитить)? Имеет ли право новый Лидер немедленно объявить ее зафиксированной? </p>
+<p>Этот тончайший краевой случай скрывает в себе знаменитый контрпример Диего Онгаро. О том, как устроен механизм безопасности и почему Лидеру запрещено коммитить чужие эпохи, мы поговорим в следующей статье: <a href="5-raft-safety-i-garantii.html" class="wikilink">5. Raft. Safety и гарантии</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2387,7 +2541,7 @@ func (l *Leader) replicateToFollower(followerID string) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-zhurnala-the-log">Анатомия Журнала (The Log)</a></li><li class="toc-item toc-h2"><a href="#idealnyy-stsenariy-happy-path">Идеальный сценарий (Happy Path)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-diskovogo-io">Mechanical Sympathy: Цена дискового I/O</a></li><li class="toc-item toc-h2"><a href="#prinuzhdenie-k-soglasiyu-razreshenie-konfliktov">Принуждение к согласию: Разрешение конфликтов</a></li><li class="toc-item toc-h3"><a href="#log-matching-property-svoystvo-sovpadeniya-logov">Log Matching Property (Свойство совпадения логов)</a></li><li class="toc-item toc-h3"><a href="#kak-lider-dogonyaet-follovera-v-kode-go">Как Лидер &quot;догоняет&quot; Фолловера (в коде Go)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#anatomiya-zhurnala-the-log">Анатомия Журнала (The Log)</a></li><li class="toc-item toc-h2"><a href="#idealnyy-stsenariy-happy-path">Идеальный сценарий (Happy Path)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-diskovogo-io">Mechanical Sympathy: Цена дискового I/O</a></li><li class="toc-item toc-h3"><a href="#gruppovoy-kommit-group-commit-batching-v-go">Групповой коммит (Group Commit / Batching) в Go</a></li><li class="toc-item toc-h2"><a href="#prinuzhdenie-k-soglasiyu-razreshenie-konfliktov">Принуждение к согласию: Разрешение конфликтов</a></li><li class="toc-item toc-h2"><a href="#log-matching-property-svoystvo-sovpadeniya-logov">Log Matching Property (Свойство совпадения логов)</a></li><li class="toc-item toc-h2"><a href="#kak-lider-dogonyaet-follovera-v-kode-go">Как Лидер &quot;догоняет&quot; Фолловера (в коде Go)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
