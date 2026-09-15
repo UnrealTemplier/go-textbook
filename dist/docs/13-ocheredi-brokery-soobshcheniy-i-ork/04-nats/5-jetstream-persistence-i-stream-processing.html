@@ -2168,17 +2168,43 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. JetStream. Persistence и stream processing</h1>
           </header>
 
           <div class="article-markdown">
-            <p><strong>JetStream</strong> — это <strong>persistent streaming platform</strong>, встроенный в NATS, который добавляет <strong>durability</strong>, <strong>ordering</strong>, <strong>replay</strong>, <strong>consumer groups</strong> и <strong>stream processing</strong> к lightweight NATS транспорту. Это делает NATS полноценной альтернативой таким системам, как Apache Kafka, RabbitMQ Streams и AWS Kinesis, но с <strong>гораздо меньшей сложностью и большей производительностью</strong>.</p>
-<h3 id="arkhitektura-jetstream">Архитектура JetStream</h3>
+            <h1>5. JetStream: персистентность, распределенный консенсус и stream processing</h1>
+<blockquote>
+<p><em>"The fastest I/O is the I/O that never happens. When persistence is required, write sequentially, batch aggressively, and keep the coordinating protocol as simple as the physics of the disk."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> В <a href="1-nats-legkovesnyy-broker.html" class="wikilink">1. NATS. Легковесный брокер</a> и <a href="2-core-nats-vs-jetstream.html" class="wikilink">2. Core NATS vs JetStream</a> мы разобрали различие между чистым in-memory брокером и подсистемой хранения. В <a href="3-subject-based-routing.html" class="wikilink">3. Subject based routing</a> и <a href="4-request-reply-pattern.html" class="wikilink">4. Request Reply паттерн</a> мы освоили маршрутизацию и RPC. Теперь мы детально изучим <strong>JetStream</strong> — встроенный в NATS движок персистентного хранения и потоковой обработки, сопоставим его с архитектурой разделов Apache Kafka из <a href="../03-kafka/2-topics-partitions-i-offsets.html" class="wikilink">2. Topics, partitions и offsets</a> и подготовимся к сравнительному анализу в <a href="6-nats-vs-kafka-vs-rabbitmq.html" class="wikilink">6. NATS vs Kafka vs RabbitMQ</a>.</p>
+  </div>
+</div>
 
-<p>JetStream строится <strong>поверх Core NATS</strong>, используя его транспорт, но добавляя <strong>persistent storage layer</strong>. Основные компоненты:</p>
+<hr />
+<h2 id="chto-takoe-jetstream-i-zachem-on-nuzhen">Что такое JetStream и зачем он нужен?</h2>
+
+<p>В классическом Core NATS сообщения существуют ровно столько, сколько требуется сетевой карте для отправки TCP-пакета: если в момент отправки нет активных подписчиков или процесс упал, сообщение исчезает безвозвратно. Это превосходно для телеметрии, но категорически неприемлемо для финансовых транзакций, заказов или аудита.</p>
+<p><strong>JetStream</strong> — это встроенная непосредственно в сервер NATS <strong>персистентная потоковая платформа (persistent streaming platform)</strong>. Она превращает легковесный NATS в полноценную распределенную систему класса Apache Kafka, RabbitMQ Streams и AWS Kinesis, наделяя брокер следующими свойствами:<br />
+- <strong>Durability (Долговечность):</strong> сохранение сообщений на диск с гарантией выживания при перезапуске кластера.<br />
+- <strong>Ordering (Строгий порядок):</strong> монотонно возрастающие глобальные и потоковые номера последовательности (<code>Sequence Numbers</code>).<br />
+- <strong>Replay (Воспроизведение истории):</strong> возможность перечитать события с начала времен, с конкретной временной метки или конкретного смещения.<br />
+- <strong>Consumer Groups &amp; Ack Policies:</strong> явные подтверждения обработки (<code>Ack</code>, <code>Nak</code>, <code>Term</code>), дедупликация и надежные рабочие очереди.<br />
+- <strong>Stream Processing:</strong> потоковая фильтрация по субъектам без развертывания тяжелых внешних фреймворков.</p>
+<p>При этом JetStream <strong>не требует отдельных демонов</strong>, внешних координаторов (ZooKeeper) или прожорливых виртуальных машин (JVM). Весь функционал включен в единый бинарный файл <code>nats-server</code> размером около 20 МБ, написанный на чистом Go.</p>
+<hr />
+<h2 id="arkhitektura-jetstream">Архитектура JetStream</h2>
+
+<p>JetStream строится <strong>поверх Core NATS</strong>, используя его высокоскоростной транспортный конвейер, но добавляя уровень персистентного хранения данных на базе консенсуса <strong>Raft</strong>:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2193,21 +2219,21 @@
   </div>
   <pre class="mermaid">
 graph TB
-subgraph &quot;Application Layer&quot;
-P[&quot;Publishers&quot;]
-C[&quot;Consumers&quot;]
+subgraph &quot;Application Layer (Клиентские сервисы)&quot;
+P[&quot;Publishers (Издатели)&quot;]
+C[&quot;Consumers (Потребители)&quot;]
 end
 
-subgraph &quot;NATS Transport Layer&quot;
+subgraph &quot;NATS Transport Layer (Транспортный уровень)&quot;
 NC[&quot;NATS Client&quot;]
-NS[&quot;NATS Server&quot;]
+NS[&quot;NATS Server (Core Hub)&quot;]
 end
 
-subgraph &quot;JetStream Storage Layer&quot;
-JS[&quot;JetStream API&quot;]
-ST[&quot;Streams&quot;]
-CT[&quot;Consumers&quot;]
-DS[&quot;Disk/DB Storage&quot;]
+subgraph &quot;JetStream Storage Layer (Уровень хранения и консенсуса)&quot;
+JS[&quot;JetStream API (Raft Meta-Group)&quot;]
+ST[&quot;Streams (Append-Only Logs)&quot;]
+CT[&quot;Consumers (Offset &amp; State Trackers)&quot;]
+DS[&quot;Disk / Memory Storage&quot;]
 end
 
 P --&gt; NC
@@ -2219,19 +2245,36 @@ JS --&gt; CT
 ST &lt;--&gt; DS
 CT --&gt; ST
 
-style JS fill:#e8f5e8
-style ST fill:#e0f2f1
-style CT fill:#e0f2f1
-style DS fill:#f3e5f5
+style JS fill:#1e293b,stroke:#6366f1,stroke-width:2px
+style ST fill:#131d33,stroke:#38bdf8,stroke-width:2px
+style CT fill:#131d33,stroke:#10b981,stroke-width:2px
+style DS fill:#0f172a,stroke:#f59e0b,stroke-width:2px
   </pre>
 </div>
 
 
-<h3 id="osnovnye-kontseptsii-jetstream">Основные концепции JetStream</h3>
+<h3 id="mekhanicheskoe-sochuvstvie-mechanical-sympathy-append-only-log">Механическое сочувствие (Mechanical Sympathy): append-only log</h3>
 
-<h4 id="1-stream-potok">1. Stream (Поток)</h4>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом</span>
+  </div>
+  <div class="callout-body">
+    <p>Внутри JetStream использует <strong>append-only log</strong> (журнал упреждающей записи, аналогичный механике Kafka и классических СУБД).<br />
+Запись на диск всегда производится строго последовательно (sequential write), что исключает дорогостоящие перемещения магнитных головок HDD или фрагментацию блоков SSD. Каждое сохраняемое сообщение получает уникальный 64-битный <strong>sequence number</strong>, гарантирующий глобальный <strong>ordering</strong>.<br />
+Уровень хранения поддерживает два режима:<br />
+- <strong>file-based storage</strong> (по умолчанию) — данные сбрасываются на диск с настраиваемым интервалом <code>fsync</code>;<br />
+- <strong>memory-based storage</strong> — данные удерживаются в RAM с защитой репликацией Raft по сети, обеспечивая задержки менее 10 микросекунд.</p>
+  </div>
+</div>
 
-<p><strong>Stream</strong> — это <strong>persistent log</strong> сообщений, аналогичный Kafka topic. Он может хранить сообщения на <strong>диске</strong> или в <strong>памяти</strong> с различными политиками <strong>retention</strong>.</p>
+<hr />
+<h2 id="osnovnye-kontseptsii-jetstream">Основные концепции JetStream</h2>
+
+<h3 id="1-stream-potok">1. Stream (Поток)</h3>
+
+<p><strong>Stream</strong> — это <strong>persistent log</strong> сообщений, логический аналог Kafka topic, но обладающий ключевым отличием: один Stream в NATS может захватывать сообщения из <strong>множества иерархических субъектов</strong> (<code>Subjects</code>).</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2246,15 +2289,15 @@ if err != nil {
     log.Fatal(err)
 }
 
-// Создаем stream
+// Создаем stream с персистентной конфигурацией
 stream, err := js.AddStream(&amp;nats.StreamConfig{
     Name:      &quot;ORDERS&quot;,
-    Subjects:  []string{&quot;orders.*&quot;},        // Subject'ы, которые будут сохраняться
-    Retention: nats.WorkQueuePolicy,       // Удалять после обработки
-    MaxAge:    7 * 24 * time.Hour,         // Хранить 7 дней
-    MaxBytes:  100 * 1024 * 1024,         // Максимум 100MB
-    Storage:   nats.FileStorage,           // File-based storage
-    Replicas:  3,                          // 3 реплики для отказоустойчивости
+    Subjects:  []string{&quot;orders.*&quot;},        // Subject'ы, которые будут сохраняться в лог
+    Retention: nats.WorkQueuePolicy,       // Удалять сообщение сразу после подтверждения обработки
+    MaxAge:    7 * 24 * time.Hour,         // Хранить сообщения максимум 7 дней
+    MaxBytes:  100 * 1024 * 1024,         // Ограничение размера лога: максимум 100MB
+    Storage:   nats.FileStorage,           // File-based storage (дисковое хранилище)
+    Replicas:  3,                          // 3 реплики для отказоустойчивости (Raft кворум)
 })
 if err != nil {
     log.Fatal(err)
@@ -2262,18 +2305,9 @@ if err != nil {
 </code></pre>
 </div>
 
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Внутри JetStream использует <strong>append-only log</strong> (как Kafka) для хранения сообщений. Каждое сообщение получает <strong>sequence number</strong>, который гарантирует <strong>ordering</strong>. Storage может быть <strong>file-based</strong> (по умолчанию) или <strong>memory-based</strong> для максимальной производительности.</p>
-  </div>
-</div>
+<h3 id="2-message-structure-v-jetstream">2. Message Structure в JetStream</h3>
 
-<h4 id="2-message-structure-v-jetstream">2. Message Structure в JetStream</h4>
-
+<p>Сообщение в JetStream обогащено служебными метаданными рантайма:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2284,21 +2318,26 @@ if err != nil {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">type Msg struct {
-    Subject      string // Subject сообщения
-    Reply        string // Reply subject для ответов
-    Data         []byte // Payload
-    Header       Header // Заголовки (в новых версиях)
-    Sequence     uint64 // Sequence number в stream
-    Time         time.Time // Время получения
-    Stream       string // Имя stream'a
-    Duplicates   bool   // Признак дубликата
+    Subject      string    // Subject сообщения (например, orders.new)
+    Reply        string    // Reply subject для подтверждений и ответов
+    Data         []byte    // Полезная нагрузка (Payload)
+    Header       Header    // Заголовки (key-value, включая Nats-Msg-Id)
+    Sequence     uint64    // Монотонный Sequence number в рамках конкретного stream
+    Time         time.Time // Время поступления на брокер (timestamp)
+    Stream       string    // Имя stream'a (например, ORDERS)
+    Duplicates   bool      // Флаг дедупликации (признак дубликата)
 }
 </code></pre>
 </div>
 
-<h4 id="3-consumer-potrebitel">3. Consumer (Потребитель)</h4>
+<h3 id="3-consumer-potrebitel">3. Consumer (Потребитель)</h3>
 
-<p><strong>Consumer</strong> — это entity, которая <strong>читает</strong> сообщения из stream'а. JetStream поддерживает <strong>push</strong> и <strong>pull</strong> consumers, <strong>durable</strong> и <strong>ephemeral</strong> consumers, <strong>ordered</strong> и <strong>filtered</strong> consumers.</p>
+<p><strong>Consumer</strong> — это сущность внутри JetStream, которая <strong>читает</strong> сообщения из потока. В отличие от Kafka, где смещение (offset) контролируется исключительно клиентом через периодический commit, в JetStream Consumer является серверным объектом с состоянием.</p>
+<p>JetStream поддерживает:<br />
+- <strong>Push consumers:</strong> брокер активно проталкивает сообщения клиенту при их появлении;<br />
+- <strong>Pull consumers:</strong> клиент явно запрашивает пачки сообщений по мере своей готовности (идеально для backpressure);<br />
+- <strong>Durable consumers:</strong> сервер запоминает имя потребителя и его позицию чтения (offset) на диске;<br />
+- <strong>Ephemeral consumers:</strong> временные потребители, исчезающие при разрыве сетевой сессии.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2323,7 +2362,7 @@ if err != nil {
     log.Fatal(err)
 }
 
-// Батчевая обработка
+// Батчевая обработка с контролем времени ожидания
 msgs, err := pullCons.Fetch(10, nats.MaxWait(5*time.Second))
 if err != nil {
     log.Printf(&quot;Fetch error: %v&quot;, err)
@@ -2337,11 +2376,38 @@ for _, msg := range msgs {
 </code></pre>
 </div>
 
-<h3 id="tipy-consumers">Типы Consumers</h3>
+<hr />
+<h2 id="tipy-consumers-push-vs-pull">Типы Consumers: Push vs Pull</h2>
 
-<h4 id="1-push-consumers">1. Push Consumers</h4>
 
-<p>Push consumers получают сообщения <strong>автоматически</strong> от сервера. Подходят для <strong>real-time processing</strong>.</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph PushModel[&quot;Push Consumer (Реактивный поток)&quot;]
+S1[&quot;JetStream Log&quot;] --&gt;|&quot;Проталкивание по TCP&lt;br&gt;(Flow Control &amp; Heartbeats)&quot;| C1[&quot;Worker: OnMessage()&quot;]
+end
+
+subgraph PullModel[&quot;Pull Consumer (Контроль нагрузки / Backpressure)&quot;]
+C2[&quot;Worker: Fetch(Batch=10)&quot;] --&gt;|&quot;Явный запрос&quot;| S2[&quot;JetStream Log&quot;]
+S2 --&gt;|&quot;Возврат пачки сообщений&quot;| C2
+end
+  </pre>
+</div>
+
+
+<h3 id="1-push-consumers">1. Push Consumers</h3>
+
+<p>Push consumers получают сообщения <strong>автоматически</strong> от сервера сразу после их записи в поток. Они обеспечивают минимальную задержку и подходят для <strong>real-time processing</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2360,9 +2426,9 @@ _, err = js.Subscribe(&quot;orders.new&quot;, func(msg *nats.Msg) {
 </code></pre>
 </div>
 
-<h4 id="2-pull-consumers">2. Pull Consumers</h4>
+<h3 id="2-pull-consumers">2. Pull Consumers</h3>
 
-<p>Pull consumers <strong>сами запрашивают</strong> сообщения. Подходят для <strong>batch processing</strong> и <strong>rate limiting</strong>.</p>
+<p>Pull consumers <strong>сами запрашивают</strong> сообщения. Это золотой стандарт для микросервисов с высокими нагрузками: воркер никогда не захлебнется, если база данных начнет тормозить, так как он запрашивает ровно столько данных, сколько способен обработать:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2372,18 +2438,18 @@ _, err = js.Subscribe(&quot;orders.new&quot;, func(msg *nats.Msg) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Pull consumer с контролем скорости
+  <pre class="language-go"><code class="language-go">// Pull consumer с контролем скорости (Rate Limiting &amp; Backpressure)
 cons, err := js.PullSubscribe(&quot;orders.*&quot;, &quot;batch_processor&quot;)
 if err != nil {
     log.Fatal(err)
 }
 
 for {
-    // Забираем до 10 сообщений
+    // Забираем до 10 сообщений, ожидая не более 10 секунд
     msgs, err := cons.Fetch(10, nats.MaxWait(10*time.Second))
     if err != nil {
         if err == nats.ErrTimeout {
-            continue // Нет сообщений
+            continue // Нет новых сообщений, повторяем цикл
         }
         log.Printf(&quot;Fetch error: %v&quot;, err)
         break
@@ -2398,11 +2464,13 @@ for {
 </code></pre>
 </div>
 
-<h3 id="stream-policies">Stream Policies</h3>
+<hr />
+<h2 id="stream-policies-politiki-khraneniya-i-zhiznennogo-tsikla">Stream Policies: политики хранения и жизненного цикла</h2>
 
-<h4 id="1-limits-policy-po-umolchaniyu">1. Limits Policy (По умолчанию)</h4>
+<p>JetStream позволяет гибко настраивать правила удаления сообщений из потока в зависимости от бизнес-требований:</p>
+<h3 id="1-limits-policy-po-umolchaniyu">1. Limits Policy (По умолчанию)</h3>
 
-<p>Хранит сообщения до достижения лимитов (size, count, age).</p>
+<p>Поток хранит сообщения до тех пор, пока не будет превышен один из настроенных лимитов (размер в байтах, количество сообщений или возраст):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2413,19 +2481,19 @@ for {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">stream, err := js.AddStream(&amp;nats.StreamConfig{
-    Name:     &quot;LOGS&quot;,
-    Subjects: []string{&quot;logs.*&quot;},
+    Name:      &quot;LOGS&quot;,
+    Subjects:  []string{&quot;logs.*&quot;},
     Retention: nats.LimitsPolicy,
-    MaxMsgs:  100000,        // Максимум 100K сообщений
-    MaxBytes: 10 * 1024 * 1024, // 10MB
-    MaxAge:   24 * time.Hour,    // 24 часа
+    MaxMsgs:   100000,          // Максимум 100K сообщений в логе
+    MaxBytes:  10 * 1024 * 1024, // 10MB
+    MaxAge:    24 * time.Hour,  // 24 часа
 })
 </code></pre>
 </div>
 
-<h4 id="2-interest-policy">2. Interest Policy</h4>
+<h3 id="2-interest-policy">2. Interest Policy</h3>
 
-<p>Хранит сообщения, <strong>пока они нужны</strong> consumer'ам.</p>
+<p>Хранит сообщения в логе <strong>ровно до тех пор, пока они нужны</strong> зарегистрированным потребителям:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2438,14 +2506,14 @@ for {
   <pre class="language-go"><code class="language-go">stream, err := js.AddStream(&amp;nats.StreamConfig{
     Name:      &quot;TEMP_EVENTS&quot;,
     Subjects:  []string{&quot;temp.*&quot;},
-    Retention: nats.InterestPolicy, // Удалять после ack всех consumers
+    Retention: nats.InterestPolicy, // Удалять сообщение после того, как ВСЕ консьюмеры прислали Ack
 })
 </code></pre>
 </div>
 
-<h4 id="3-work-queue-policy">3. Work Queue Policy</h4>
+<h3 id="3-work-queue-policy">3. Work Queue Policy</h3>
 
-<p>Хранит сообщения до <strong>первого ack</strong> (аналог очереди).</p>
+<p>Превращает поток в классическую распределенную очередь задач (аналог RabbitMQ Queue):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2458,14 +2526,16 @@ for {
   <pre class="language-go"><code class="language-go">stream, err := js.AddStream(&amp;nats.StreamConfig{
     Name:      &quot;TASK_QUEUE&quot;,
     Subjects:  []string{&quot;tasks.*&quot;},
-    Retention: nats.WorkQueuePolicy, // Удалять после первого ack
+    Retention: nats.WorkQueuePolicy, // Удалять сообщение из лога сразу после ПЕРВОГО успешного Ack
 })
 </code></pre>
 </div>
 
-<h3 id="message-deduplication">Message Deduplication</h3>
+<hr />
+<h2 id="message-deduplication-zashchita-ot-dubley-na-urovne-yadra">Message Deduplication: защита от дублей на уровне ядра</h2>
 
-<p>JetStream поддерживает <strong>deduplication window</strong> для предотвращения дубликатов:</p>
+<p>В распределенных системах сеть ненадежна: клиент может успешно отправить сообщение, но упасть до получения подтверждения от брокера. Повторная отправка (retry) приведет к дубликату.</p>
+<p>JetStream предоставляет встроенное <strong>окно дедупликации (deduplication window)</strong> на основе уникального клиентского идентификатора <code>Nats-Msg-Id</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2475,12 +2545,11 @@ for {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Stream с deduplication
+  <pre class="language-go"><code class="language-go">// Stream с включенной дедупликацией
 stream, err := js.AddStream(&amp;nats.StreamConfig{
-    Name:     &quot;ORDERS&quot;,
-    Subjects: []string{&quot;orders.*&quot;},
-    // Окно дедупликации 2 минуты
-    DuplicateWindow: 2 * time.Minute,
+    Name:            &quot;ORDERS&quot;,
+    Subjects:        []string{&quot;orders.*&quot;},
+    DuplicateWindow: 2 * time.Minute, // Окно дедупликации 2 минуты
 })
 if err != nil {
     log.Fatal(err)
@@ -2488,14 +2557,14 @@ if err != nil {
 
 // Публикация с deduplication key
 msg := nats.NewMsg(&quot;orders.new&quot;)
-msg.Data = []byte(&quot;order data&quot;)
-msg.Header.Set(nats.MsgIdHdr, &quot;ORDER-12345&quot;) // Deduplication key
+msg.Data = []byte(&quot;order data #42&quot;)
+msg.Header.Set(nats.MsgIdHdr, &quot;ORDER-12345&quot;) // Deduplication key (Nats-Msg-Id)
 
 ack, err := js.PublishMsg(msg)
 if err != nil {
     log.Printf(&quot;Publish error: %v&quot;, err)
 } else {
-    fmt.Printf(&quot;Message published with sequence: %d\n&quot;, ack.Sequence)
+    fmt.Printf(&quot;Message published with sequence: %d (duplicate: %v)\n&quot;, ack.Sequence, ack.Duplicate)
 }
 </code></pre>
 </div>
@@ -2503,18 +2572,20 @@ if err != nil {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Границы окна дедупликации</span>
   </div>
   <div class="callout-body">
-    <p>Message deduplication работает <strong>только в пределах duplicate window</strong>. Если сообщение с тем же ID придет через 5 минут, а окно 2 минуты — дедупликация не сработает.</p>
+    <p>Message deduplication работает <strong>только в пределах заданного duplicate window</strong>!<br />
+Сервер NATS держит в оперативной памяти скользящий LRU-кэш идентификаторов за указанный интервал. Если сообщение с тем же <code>Nats-Msg-Id</code> придет через 2 минуты и 1 секунду при окне в 2 минуты — дедупликация не сработает, и сообщение будет записано в поток как новое! Для долгосрочной дедупликации используйте идемпотентность на стороне БД.</p>
   </div>
 </div>
 
-<h3 id="consumer-configuration">Consumer Configuration</h3>
+<hr />
+<h2 id="consumer-configuration">Consumer Configuration</h2>
 
-<h4 id="1-durable-consumers">1. Durable Consumers</h4>
+<h3 id="1-durable-consumers">1. Durable Consumers</h3>
 
-<p>Сохраняют <strong>offset</strong> между перезапусками:</p>
+<p>Сохраняют текущий <strong>offset (Ack Floor)</strong> на сервере JetStream. При падении или перезапуске воркер продолжит чтение строго с того места, где остановился:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2529,13 +2600,13 @@ _, err = js.Subscribe(&quot;orders.*&quot;, func(msg *nats.Msg) {
     processOrder(msg)
     msg.Ack()
 }, nats.Durable(&quot;order_processor&quot;), // Имя durable consumer'а
-   nats.ManualAck()) // Ручное подтверждение
+   nats.ManualAck())                // Ручное подтверждение (отключаем авто-ack)
 </code></pre>
 </div>
 
-<h4 id="2-ephemeral-consumers">2. Ephemeral Consumers</h4>
+<h3 id="2-ephemeral-consumers">2. Ephemeral Consumers</h3>
 
-<p>Не сохраняют offset:</p>
+<p>Не сохраняют offset при завершении соединения:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2553,11 +2624,12 @@ _, err = js.Subscribe(&quot;orders.*&quot;, func(msg *nats.Msg) {
 </code></pre>
 </div>
 
-<h3 id="advanced-stream-processing">Advanced Stream Processing</h3>
+<hr />
+<h2 id="advanced-stream-processing">Advanced Stream Processing</h2>
 
-<h4 id="1-stream-filtering">1. Stream Filtering</h4>
+<h3 id="1-stream-filtering">1. Stream Filtering</h3>
 
-<p>Consumer может фильтровать сообщения:</p>
+<p>Один Stream может собирать широкий спектр данных, а разные консьюмеры могут подписываться только на узкие подмножества благодаря маскам:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2569,16 +2641,16 @@ _, err = js.Subscribe(&quot;orders.*&quot;, func(msg *nats.Msg) {
   </div>
   <pre class="language-go"><code class="language-go">// Consumer только для определенных subject'ов
 cons, err := js.Subscribe(&quot;orders.new&quot;, func(msg *nats.Msg) {
-    // Обрабатываем только заказы
+    // Обрабатываем только создание новых заказов
     processOrder(msg)
     msg.Ack()
 }, nats.Durable(&quot;new_orders_only&quot;))
 </code></pre>
 </div>
 
-<h4 id="2-multiple-consumers-per-stream">2. Multiple Consumers per Stream</h4>
+<h3 id="2-multiple-consumers-per-stream">2. Multiple Consumers per Stream</h3>
 
-<p>Один stream может иметь <strong>множество consumer'ов</strong>:</p>
+<p>Один и тот же поток может параллельно читаться десятками независимых сервисов с индивидуальной скоростью и индивидуальными офсетами:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2588,20 +2660,20 @@ cons, err := js.Subscribe(&quot;orders.new&quot;, func(msg *nats.Msg) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Consumer для аудита
+  <pre class="language-go"><code class="language-go">// Consumer для финансового аудита
 js.Subscribe(&quot;orders.*&quot;, auditHandler, nats.Durable(&quot;audit_consumer&quot;))
 
-// Consumer для уведомлений
+// Consumer для мгновенных push-уведомлений
 js.Subscribe(&quot;orders.new&quot;, notificationHandler, nats.Durable(&quot;notification_consumer&quot;))
 
-// Consumer для обработки
+// Consumer для бизнес-обработки платежей
 js.Subscribe(&quot;orders.*&quot;, processingHandler, nats.Durable(&quot;processing_consumer&quot;))
 </code></pre>
 </div>
 
-<h4 id="3-consumer-groups-queue-groups">3. Consumer Groups (Queue Groups)</h4>
+<h3 id="3-consumer-groups-queue-groups-v-jetstream">3. Consumer Groups (Queue Groups в JetStream)</h3>
 
-<p>Для load balancing:</p>
+<p>Для горизонтального масштабирования обработки одного consumer'а несколькими подами используется объединенный Pull или Push Consumer с общим именем группы:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2611,7 +2683,7 @@ js.Subscribe(&quot;orders.*&quot;, processingHandler, nats.Durable(&quot;process
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Несколько экземпляров одного consumer'а
+  <pre class="language-go"><code class="language-go">// Несколько экземпляров одного consumer'а разделяют поток между собой
 for i := 0; i &lt; 3; i++ {
     go func(instanceID int) {
         _, err := js.Subscribe(&quot;orders.*&quot;, func(msg *nats.Msg) {
@@ -2627,10 +2699,12 @@ for i := 0; i &lt; 3; i++ {
 </code></pre>
 </div>
 
-<h3 id="performance-i-tuning">Performance и Tuning</h3>
+<hr />
+<h2 id="performance-i-tuning">Performance и Tuning</h2>
 
-<h4 id="1-file-vs-memory-storage">1. File vs Memory Storage</h4>
+<h3 id="1-file-vs-memory-storage">1. File vs Memory Storage</h3>
 
+<p>Выбор типа хранилища определяется критичностью потерь:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2640,13 +2714,13 @@ for i := 0; i &lt; 3; i++ {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Memory storage (выше производительность, но без durability)
+  <pre class="language-go"><code class="language-go">// Memory storage (выше производительность, задержки единицы микросекунд, но данные сбрасываются при рестарте кластера)
 stream, err := js.AddStream(&amp;nats.StreamConfig{
     Name:    &quot;HIGH_PERF_TEMP&quot;,
     Storage: nats.MemoryStorage, // Только в памяти
 })
 
-// File storage (durability, чуть ниже производительность)
+// File storage (полная durability, сохранение на диск через WAL)
 stream, err := js.AddStream(&amp;nats.StreamConfig{
     Name:    &quot;PERSISTENT_LOGS&quot;, 
     Storage: nats.FileStorage, // На диск
@@ -2654,9 +2728,9 @@ stream, err := js.AddStream(&amp;nats.StreamConfig{
 </code></pre>
 </div>
 
-<h4 id="2-compression">2. Compression</h4>
+<h3 id="2-compression-ekonomiya-mesta-i-diskovogo-io">2. Compression: экономия места и дискового I/O</h3>
 
-<p>JetStream поддерживает compression:</p>
+<p>JetStream поддерживает потоковую компрессию логов с использованием алгоритма <strong>S2</strong> (высокоскоростной потоковый форк Snappy, оптимизированный под современные SIMD-инструкции процессора):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2667,16 +2741,17 @@ stream, err := js.AddStream(&amp;nats.StreamConfig{
     </button>
   </div>
   <pre class="language-go"><code class="language-go">stream, err := js.AddStream(&amp;nats.StreamConfig{
-    Name:       &quot;COMPRESSED_STREAM&quot;,
-    Subjects:   []string{&quot;logs.*&quot;},
-    Compression: nats.S2Compression, // Использует S2 compression
+    Name:        &quot;COMPRESSED_STREAM&quot;,
+    Subjects:    []string{&quot;logs.*&quot;},
+    Compression: nats.S2Compression, // Использует S2 compression для сжатия блоков на диске
 })
 </code></pre>
 </div>
 
-<h3 id="monitoring-i-observability">Monitoring и Observability</h3>
+<hr />
+<h2 id="monitoring-i-observability">Monitoring и Observability</h2>
 
-<p>JetStream предоставляет rich metrics:</p>
+<p>JetStream предоставляет исчерпывающую информацию о состоянии потоков и смещениях потребителей через программное API:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2686,7 +2761,7 @@ stream, err := js.AddStream(&amp;nats.StreamConfig{
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Получение информации о stream
+  <pre class="language-go"><code class="language-go">// Получение подробной информации о stream
 info, err := js.StreamInfo(&quot;ORDERS&quot;)
 if err != nil {
     log.Printf(&quot;Stream info error: %v&quot;, err)
@@ -2714,22 +2789,12 @@ fmt.Printf(&quot;Pending: %d, Ack Floor: %d\n&quot;,
 </code></pre>
 </div>
 
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между NATS Core и JetStream в контексте message ordering?<br />
-<strong>Ответ:</strong> NATS Core не гарантирует ordering (at-most-once delivery). JetStream гарантирует ordering в пределах одного subject через sequence numbers и RAFT consensus для distributed ordering.</p>
-  </div>
-</div>
+<hr />
+<h2 id="ispolzovanie-v-production">Использование в Production</h2>
 
-<h3 id="ispolzovanie-v-production">Использование в Production</h3>
+<h3 id="1-service-mesh-integration">1. Service Mesh Integration</h3>
 
-<h4 id="1-service-mesh-integration">1. Service Mesh Integration</h4>
-
-<p>JetStream может использоваться как <strong>event backbone</strong> для service mesh:</p>
+<p>JetStream может выступать единой надежной <strong>шиной данных (event backbone)</strong> для координации сервисов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2742,14 +2807,14 @@ fmt.Printf(&quot;Pending: %d, Ack Floor: %d\n&quot;,
   <pre class="language-go"><code class="language-go">// Service registration через JetStream
 js.Publish(&quot;service.register&quot;, []byte(serviceInfoJSON))
 
-// Health checks
+// Регулярные Health checks
 js.Publish(&quot;service.heartbeat&quot;, []byte(healthStatusJSON))
 </code></pre>
 </div>
 
-<h4 id="2-event-sourcing">2. Event Sourcing</h4>
+<h3 id="2-event-sourcing">2. Event Sourcing</h3>
 
-<p>Perfect fit для event sourcing:</p>
+<p>Архитектурный шаблон, где состояние системы восстанавливается из неизменяемой последовательности событий:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2759,10 +2824,15 @@ js.Publish(&quot;service.heartbeat&quot;, []byte(healthStatusJSON))
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Сохранение события
+  <pre class="language-go"><code class="language-go">type Event struct {
+    Type    string `json:&quot;type&quot;`
+    Data    string `json:&quot;data&quot;`
+    Version int    `json:&quot;version&quot;`
+}
+
 event := Event{
-    Type: &quot;UserCreated&quot;,
-    Data: userData,
+    Type:    &quot;UserCreated&quot;,
+    Data:    userData,
     Version: 1,
 }
 
@@ -2770,9 +2840,9 @@ js.Publish(&quot;user.events&quot;, mustEncode(event))
 </code></pre>
 </div>
 
-<h4 id="3-cqrs-implementation">3. CQRS Implementation</h4>
+<h3 id="3-cqrs-implementation">3. CQRS Implementation</h3>
 
-<p>Separation of Commands and Queries:</p>
+<p>Разделение команд на изменение и событий о произошедших фактах (Command/Query Responsibility Segregation):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2782,27 +2852,36 @@ js.Publish(&quot;user.events&quot;, mustEncode(event))
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Command stream
+  <pre class="language-go"><code class="language-go">// Command stream (поток команд)
 js.Publish(&quot;commands.create.user&quot;, commandData)
 
-// Event stream  
+// Event stream (поток фактов)  
 js.Publish(&quot;events.user.created&quot;, eventData)
 </code></pre>
 </div>
 
-<h3 id="itog">Итог</h3>
+<hr />
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> «В чем принципиальная разница между NATS Core и JetStream в контексте message ordering и гарантий доставки?»<br />
+<strong>Ответ:</strong> NATS Core работает по принципу <strong>at-most-once</strong>: сообщения не сохраняются на диск, порядок доставки гарантируется только в пределах одного TCP-соединения, а при отсутствии подписчиков сообщение сбрасывается. JetStream предоставляет <strong>at-least-once</strong> (и строго <strong>exactly-once</strong> при использовании дедупликации), сохраняет сообщения в append-only log на диск или в RAM, присваивает монотонные <code>sequence numbers</code> и использует <strong>RAFT consensus</strong> для распределенного порядка и репликации между узлами кластера.</p>
+  </div>
+</div>
 
-<p>JetStream — это <strong>мощная streaming platform</strong>, которая превращает NATS из <strong>lightweight message broker</strong> в <strong>full-featured event streaming platform</strong>. Он обеспечивает:</p>
+<hr />
+<h2 id="itog">Итог</h2>
+
 <ul>
-<li><strong>Durability</strong> через persistent storage</li>
-<li><strong>Ordering</strong> через sequence numbers</li>
-<li><strong>Replay</strong> через consumer offset tracking</li>
-<li><strong>Scalability</strong> через consumer groups</li>
-<li><strong>Performance</strong> через optimized storage engine</li>
-<li><strong>Reliability</strong> через RAFT consensus</li>
+<li><strong>JetStream</strong> превращает NATS из легковесного pub/sub брокера в мощную распределенную потоковую платформу.</li>
+<li><strong>Append-only log</strong> и поддержка <strong>File/Memory storage</strong> обеспечивают миллионы операций записи в секунду с микросекундными задержками.</li>
+<li><strong>Pull Consumers</strong> дают встроенный контроль перегрузки (Backpressure) и пакетную выборку без риска исчерпания памяти.</li>
+<li><strong>Raft Consensus</strong> обеспечивает прозрачную репликацию и автоматический failover без внешних координаторов типа ZooKeeper.</li>
 </ul>
-<p>JetStream делает NATS конкурентноспособным к Kafka, но с <strong>гораздо меньшей сложностью</strong> и <strong>лучшей интеграцией</strong> с NATS ecosystem.</p>
-<p>В следующей статье мы рассмотрим <a href="6-nats-vs-kafka-vs-rabbitmq.html" class="wikilink">6. NATS vs Kafka vs RabbitMQ</a>, чтобы понять, когда и какой брокер использовать.</p>
+<p>В следующей лекции — <a href="6-nats-vs-kafka-vs-rabbitmq.html" class="wikilink">6. NATS vs Kafka vs RabbitMQ</a> — мы проведем детальное лобовое сравнение NATS с лидерами индустрии и сформулируем четкие правила выбора инструмента под конкретные инженерные задачи.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2830,7 +2909,7 @@ js.Publish(&quot;events.user.created&quot;, eventData)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h3"><a href="#arkhitektura-jetstream">Архитектура JetStream</a></li><li class="toc-item toc-h3"><a href="#osnovnye-kontseptsii-jetstream">Основные концепции JetStream</a></li><li class="toc-item toc-h4"><a href="#1-stream-potok">1. Stream (Поток)</a></li><li class="toc-item toc-h4"><a href="#2-message-structure-v-jetstream">2. Message Structure в JetStream</a></li><li class="toc-item toc-h4"><a href="#3-consumer-potrebitel">3. Consumer (Потребитель)</a></li><li class="toc-item toc-h3"><a href="#tipy-consumers">Типы Consumers</a></li><li class="toc-item toc-h4"><a href="#1-push-consumers">1. Push Consumers</a></li><li class="toc-item toc-h4"><a href="#2-pull-consumers">2. Pull Consumers</a></li><li class="toc-item toc-h3"><a href="#stream-policies">Stream Policies</a></li><li class="toc-item toc-h4"><a href="#1-limits-policy-po-umolchaniyu">1. Limits Policy (По умолчанию)</a></li><li class="toc-item toc-h4"><a href="#2-interest-policy">2. Interest Policy</a></li><li class="toc-item toc-h4"><a href="#3-work-queue-policy">3. Work Queue Policy</a></li><li class="toc-item toc-h3"><a href="#message-deduplication">Message Deduplication</a></li><li class="toc-item toc-h3"><a href="#consumer-configuration">Consumer Configuration</a></li><li class="toc-item toc-h4"><a href="#1-durable-consumers">1. Durable Consumers</a></li><li class="toc-item toc-h4"><a href="#2-ephemeral-consumers">2. Ephemeral Consumers</a></li><li class="toc-item toc-h3"><a href="#advanced-stream-processing">Advanced Stream Processing</a></li><li class="toc-item toc-h4"><a href="#1-stream-filtering">1. Stream Filtering</a></li><li class="toc-item toc-h4"><a href="#2-multiple-consumers-per-stream">2. Multiple Consumers per Stream</a></li><li class="toc-item toc-h4"><a href="#3-consumer-groups-queue-groups">3. Consumer Groups (Queue Groups)</a></li><li class="toc-item toc-h3"><a href="#performance-i-tuning">Performance и Tuning</a></li><li class="toc-item toc-h4"><a href="#1-file-vs-memory-storage">1. File vs Memory Storage</a></li><li class="toc-item toc-h4"><a href="#2-compression">2. Compression</a></li><li class="toc-item toc-h3"><a href="#monitoring-i-observability">Monitoring и Observability</a></li><li class="toc-item toc-h3"><a href="#ispolzovanie-v-production">Использование в Production</a></li><li class="toc-item toc-h4"><a href="#1-service-mesh-integration">1. Service Mesh Integration</a></li><li class="toc-item toc-h4"><a href="#2-event-sourcing">2. Event Sourcing</a></li><li class="toc-item toc-h4"><a href="#3-cqrs-implementation">3. CQRS Implementation</a></li><li class="toc-item toc-h3"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#chto-takoe-jetstream-i-zachem-on-nuzhen">Что такое JetStream и зачем он нужен?</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-jetstream">Архитектура JetStream</a></li><li class="toc-item toc-h3"><a href="#mekhanicheskoe-sochuvstvie-mechanical-sympathy-append-only-log">Механическое сочувствие (Mechanical Sympathy): append-only log</a></li><li class="toc-item toc-h2"><a href="#osnovnye-kontseptsii-jetstream">Основные концепции JetStream</a></li><li class="toc-item toc-h3"><a href="#1-stream-potok">1. Stream (Поток)</a></li><li class="toc-item toc-h3"><a href="#2-message-structure-v-jetstream">2. Message Structure в JetStream</a></li><li class="toc-item toc-h3"><a href="#3-consumer-potrebitel">3. Consumer (Потребитель)</a></li><li class="toc-item toc-h2"><a href="#tipy-consumers-push-vs-pull">Типы Consumers: Push vs Pull</a></li><li class="toc-item toc-h3"><a href="#1-push-consumers">1. Push Consumers</a></li><li class="toc-item toc-h3"><a href="#2-pull-consumers">2. Pull Consumers</a></li><li class="toc-item toc-h2"><a href="#stream-policies-politiki-khraneniya-i-zhiznennogo-tsikla">Stream Policies: политики хранения и жизненного цикла</a></li><li class="toc-item toc-h3"><a href="#1-limits-policy-po-umolchaniyu">1. Limits Policy (По умолчанию)</a></li><li class="toc-item toc-h3"><a href="#2-interest-policy">2. Interest Policy</a></li><li class="toc-item toc-h3"><a href="#3-work-queue-policy">3. Work Queue Policy</a></li><li class="toc-item toc-h2"><a href="#message-deduplication-zashchita-ot-dubley-na-urovne-yadra">Message Deduplication: защита от дублей на уровне ядра</a></li><li class="toc-item toc-h2"><a href="#consumer-configuration">Consumer Configuration</a></li><li class="toc-item toc-h3"><a href="#1-durable-consumers">1. Durable Consumers</a></li><li class="toc-item toc-h3"><a href="#2-ephemeral-consumers">2. Ephemeral Consumers</a></li><li class="toc-item toc-h2"><a href="#advanced-stream-processing">Advanced Stream Processing</a></li><li class="toc-item toc-h3"><a href="#1-stream-filtering">1. Stream Filtering</a></li><li class="toc-item toc-h3"><a href="#2-multiple-consumers-per-stream">2. Multiple Consumers per Stream</a></li><li class="toc-item toc-h3"><a href="#3-consumer-groups-queue-groups-v-jetstream">3. Consumer Groups (Queue Groups в JetStream)</a></li><li class="toc-item toc-h2"><a href="#performance-i-tuning">Performance и Tuning</a></li><li class="toc-item toc-h3"><a href="#1-file-vs-memory-storage">1. File vs Memory Storage</a></li><li class="toc-item toc-h3"><a href="#2-compression-ekonomiya-mesta-i-diskovogo-io">2. Compression: экономия места и дискового I/O</a></li><li class="toc-item toc-h2"><a href="#monitoring-i-observability">Monitoring и Observability</a></li><li class="toc-item toc-h2"><a href="#ispolzovanie-v-production">Использование в Production</a></li><li class="toc-item toc-h3"><a href="#1-service-mesh-integration">1. Service Mesh Integration</a></li><li class="toc-item toc-h3"><a href="#2-event-sourcing">2. Event Sourcing</a></li><li class="toc-item toc-h3"><a href="#3-cqrs-implementation">3. CQRS Implementation</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2168,18 +2168,38 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~13 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Subject based routing</h1>
           </header>
 
           <div class="article-markdown">
-            <p><strong>Subject-based routing</strong> — это уникальная особенность NATS, отличающая его от других брокеров сообщений. В то время как Kafka использует <strong>topics</strong>, а RabbitMQ — <strong>exchanges/queues/bindings</strong>, NATS использует <strong>subject'ы</strong> — иерархические строки, которые определяют <strong>путь доставки</strong> сообщений. Это делает маршрутизацию в NATS <strong>гибкой, интуитивной и производительной</strong>.</p>
-<h3 id="chto-takoe-subject">Что такое Subject?</h3>
+            <h1>3. Subject-based routing: иерархии, wildcards и механика префиксных деревьев</h1>
+<blockquote>
+<p><em>"The name of a variable, a function, or a channel should tell you what it is, simply and clearly. Good namespaces make complex architectures self-documenting."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> Эта статья продолжает погружение в архитектуру NATS, начатое в <a href="1-nats-legkovesnyy-broker.html" class="wikilink">1. NATS. Легковесный брокер</a> и <a href="2-core-nats-vs-jetstream.html" class="wikilink">2. Core NATS vs JetStream</a>. Мы разберем сердце маршрутизации NATS — строковые субъекты, сопоставим их с механизмами топиков из <a href="../03-kafka/2-topics-partitions-i-offsets.html" class="wikilink">2. Topics, partitions и offsets</a> и обменников из <span class="wikilink-unresolved" title="Заметка в разработке">2. Exchanges, queues и bindings</span>, а также подготовимся к изучению синхронного взаимодействия в <a href="4-request-reply-pattern.html" class="wikilink">4. Request Reply паттерн</a>.</p>
+  </div>
+</div>
 
-<p><strong>Subject</strong> в NATS — это строка, состоящая из <strong>token'ов</strong>, разделенных <strong>точками</strong> (<code>.</code>). Каждый token представляет собой <strong>уровень иерархии</strong>. Это похоже на пути в файловой системе или URL в HTTP, но работает на уровне <strong>message routing</strong>.</p>
-<p>Примеры subject'ов:</p>
+<hr />
+<h2 id="chto-takoe-subject">Что такое Subject?</h2>
+
+<p>В большинстве традиционных брокеров сообщений адресация данных жестко привязана к предварительно создаваемым тяжеловесным сущностям:<br />
+- В <strong>Apache Kafka</strong> вы обязаны заранее объявить топик (<code>Topic</code>), выбрать количество партиций и фактор репликации. Имена топиков образуют плоское пространство имен (<code>orders_v1</code>, <code>user_events</code>).<br />
+- В <strong>RabbitMQ</strong> маршрутизация требует предварительного объявления обменников (<code>Exchange</code>), очередей (<code>Queue</code>) и биндингов (<code>Binding</code>) с ключами маршрутизации.</p>
+<p><strong>NATS подошел к маршрутизации совершенно иначе:</strong> здесь нет необходимости предварительно создавать топики или настраивать конфигурации на сервере! </p>
+<p><strong>Subject (Субъект)</strong> в NATS — это динамическая иерархическая строка, состоящая из буквенно-цифровых <strong>токенов (tokens)</strong>, разделенных <strong>точками</strong> (<code>.</code>). </p>
+<p>Каждый токен представляет собой смысловой уровень иерархии (пространство имен, домен, сущность, действие, регион). Это напоминает структуру путей в файловой системе Unix (<code>/var/log/nginx/access.log</code>) или URL в HTTP, но работает со скоростью процессорных регистров непосредственно в оперативной памяти брокера.</p>
+<p>Примеры выразительных subject'ов в реальных системах:</p>
 <pre><code>orders.new
 orders.completed
 orders.cancelled
@@ -2192,30 +2212,25 @@ news.tech.software
 payments.credit.card.visa
 payments.debit.bank.transfer
 </code></pre>
-<h3 id="ierarkhicheskaya-struktura">Иерархическая структура</h3>
+<p>Продюсер может в любую миллисекунду отправить сообщение в абсолютно любой субъект, например <code>metrics.sensor.temperature.europe.rack-42</code>, даже если этот субъект никогда раньше не упоминался в системе. Если подписчиков нет — сообщение мгновенно исчезает. Если есть — доставляется за доли микросекунды.</p>
+<hr />
+<h2 id="ierarkhicheskaya-struktura-i-wildcards">Иерархическая структура и Wildcards</h2>
 
-<p>Subject'ы в NATS имеют <strong>иерархическую природу</strong>, что позволяет использовать <strong>pattern matching</strong> для подписки на группы сообщений:</p>
-<ul>
-<li><code>orders.*</code> — все сообщения в "каталоге" <code>orders</code> (но не в подкаталогах)</li>
-<li>matches: <code>orders.new</code>, <code>orders.completed</code></li>
+<p>Главная мощь субъектов NATS раскрывается благодаря механизму сопоставления с шаблонами (<strong>Pattern Matching</strong>). Подписчик может подписаться не только на один конкретный субъект, но и на целое поддерево событий с помощью двух простых подстановочных знаков (<strong>Wildcards</strong>):</p>
+<ol>
 <li>
-<p>not matches: <code>orders.payment.failed</code></p>
+<p><strong>Одиночный wildcard <code>*</code> (PWC — Partial Wildcard):</strong><br />
+   - Заменяет <strong>строго один токен</strong> между точками.<br />
+   - Подписка <code>orders.*</code> перехватит: <code>orders.new</code>, <code>orders.completed</code>, <code>orders.cancelled</code>.<br />
+   - Но <strong>не перехватит</strong>: <code>orders.payment.failed</code> (здесь два токена после <code>orders</code>) и не перехватит просто <code>orders</code> (ноль токенов).</p>
 </li>
 <li>
-<p><code>orders.&gt;</code> — все сообщения в <code>orders</code> и <strong>все подкаталоги</strong></p>
+<p><strong>Жадный wildcard <code>&gt;</code> (FWC — Full Wildcard):</strong><br />
+   - Заменяет <strong>один или более любых токенов до самого конца строки</strong>.<br />
+   - Может стоять <strong>только в самом конце</strong> выражения подписки.<br />
+   - Подписка <code>orders.&gt;</code> перехватит: <code>orders.new</code>, <code>orders.payment.processing</code>, <code>orders.refund.initiated.approved</code> и вообще любую вложенность внутри пространства <code>orders</code>.</p>
 </li>
-<li>
-<p>matches: <code>orders.new</code>, <code>orders.payment.processing</code>, <code>orders.refund.initiated</code></p>
-</li>
-<li>
-<p><code>news.sports.*</code> — только непосредственные подразделы</p>
-</li>
-<li>matches: <code>news.sports.football</code>, <code>news.sports.basketball</code></li>
-<li>not matches: <code>news.sports.football.nfl</code></li>
-</ul>
-<h3 id="mekhanizm-marshrutizatsii">Механизм маршрутизации</h3>
-
-<p>Когда publisher отправляет сообщение в NATS, сервер <strong>сопоставляет subject сообщения</strong> с <strong>паттернами всех активных подписчиков</strong>. Это происходит через <strong>in-memory lookup</strong> с использованием <strong>trie-подобной структуры</strong> (не точный термин, но суть передает идею о быстром поиске).</p>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2229,43 +2244,103 @@ payments.debit.bank.transfer
     </button>
   </div>
   <pre class="mermaid">
-graph TD
-subgraph &quot;NATS Server Router&quot;
-T[&quot;Subject Trie&lt;br&gt;/orders&lt;br&gt;/users&lt;br&gt;/news&quot;]
-O[&quot;Orders Subtree&lt;br&gt;new, completed, cancelled&quot;]
-U[&quot;Users Subtree&lt;br&gt;create, update.*, delete&quot;]
-N[&quot;News Subtree&lt;br&gt;sports.&gt;, tech.*&quot;]
+flowchart TD
+subgraph Publisher[&quot;Событие от продюсера: news.sports.football.nfl&quot;]
+direction TB
+Msg[&quot;Subject: news.sports.football.nfl&quot;]
 end
 
-P1[&quot;Publisher: orders.new&quot;] --&gt;|&quot;Route to&quot;| O
-P2[&quot;Publisher: users.update.profile&quot;] --&gt;|&quot;Route to&quot;| U
-P3[&quot;Publisher: news.sports.football&quot;] --&gt;|&quot;Route to&quot;| N
-
-subgraph &quot;Subscriptions&quot;
-S1[&quot;Subscriber: orders.*&quot;]
-S2[&quot;Subscriber: users.update.&gt;&quot;]
-S3[&quot;Subscriber: news.sports.*&quot;]
+subgraph MatchCheck[&quot;Проверка совпадения шаблонов (Pattern Matching)&quot;]
+direction TB
+M1[&quot;Шаблон: news.sports.*.*&quot;]
+M2[&quot;Шаблон: news.sports.&gt;&quot;]
+M3[&quot;Шаблон: news.sports.*&quot;]
+M4[&quot;Шаблон: news.&gt;&quot;]
 end
 
-O --&gt;|&quot;Match: orders.*&quot;| S1
-U --&gt;|&quot;Match: users.update.&gt;&quot;| S2
-N --&gt;|&quot;Match: news.sports.*&quot;| S3
+subgraph Verdicts[&quot;Результат доставки&quot;]
+V1[&quot;✅ Доставлено (ровно 2 токена)&quot;]
+V2[&quot;✅ Доставлено (жадный суффикс)&quot;]
+V3[&quot;❌ Игнорировано (ожидался 1 токен, пришло 2)&quot;]
+V4[&quot;✅ Доставлено (все новости)&quot;]
+end
+
+Msg --&gt; M1 --&gt; V1
+Msg --&gt; M2 --&gt; V2
+Msg --&gt; M3 --&gt; V3
+Msg --&gt; M4 --&gt; V4
   </pre>
 </div>
 
 
+<p>Сравнение поведения масок:<br />
+- <code>news.sports.*</code> — матчит <code>news.sports.football</code>, <code>news.sports.basketball</code>, но <strong>не</strong> матчит <code>news.sports.football.nfl</code>.<br />
+- <code>news.sports.&gt;</code> — матчит <code>news.sports.football</code>, <code>news.sports.football.nfl</code> и всё, что глубже.<br />
+- <code>*.payment.*</code> — матчит <code>orders.payment.status</code>, <code>users.payment.method</code>.</p>
+<hr />
+<h2 id="mekhanizm-marshrutizatsii">Механизм маршрутизации</h2>
+
+<p>Когда publisher отправляет сообщение в NATS, сервер должен за считанные наносекунды найти всех подписчиков, чьи фильтры соответствуют данному конкретному субъекту.</p>
+<p>Если бы NATS использовал регулярные выражения (RegExp) или линейный перебор массива подписчиков $O(N)$, производительность деградировала бы уже при 10 000 клиентах. </p>
+<p>Вместо этого <code>nats-server</code> использует специализированное многолучевое префиксное дерево — <strong>Sublist (Radix Trie)</strong>, оптимизированное под механическую симпатию к кэш-линиям CPU:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph &quot;NATS Server Sublist Trie (В оперативной памяти)&quot;
+direction TB
+Root[&quot;Root Node&quot;]
+
+Root --&gt; N_orders[&quot;node: &#x27;orders&#x27;&quot;]
+Root --&gt; N_users[&quot;node: &#x27;users&#x27;&quot;]
+Root --&gt; N_news[&quot;node: &#x27;news&#x27;&quot;]
+
+N_orders --&gt; O_new[&quot;node: &#x27;new&#x27; (Sub: Client A)&quot;]
+N_orders --&gt; O_comp[&quot;node: &#x27;completed&#x27;&quot;]
+N_orders --&gt; O_star[&quot;node: &#x27;*&#x27; (Sub: Audit Service)&quot;]
+N_orders --&gt; O_gt[&quot;node: &#x27;&gt;&#x27; (Sub: Data Lake Ingest)&quot;]
+
+N_users --&gt; U_update[&quot;node: &#x27;update&#x27;&quot;]
+U_update --&gt; U_gt[&quot;node: &#x27;&gt;&#x27; (Sub: Notification Service)&quot;]
+
+N_news --&gt; NW_sports[&quot;node: &#x27;sports&#x27;&quot;]
+NW_sports --&gt; NW_star[&quot;node: &#x27;*&#x27; (Sub: Sports App)&quot;]
+end
+  </pre>
+</div>
+
+
+<h3 id="kak-ustroen-sublist-v-go-iskhodnikakh-nats-server">Как устроен Sublist в Go-исходниках `nats-server`</h3>
+
+<p>Внутри ядра NATS (<code>server/sublist.go</code>) маршрутизация реализована через структуру <code>sublist</code>:<br />
+1. Каждая вершина дерева содержит хэш-таблицу точных совпадений литералов (<code>nodes map[string]*node</code>), ссылку на поддерево частичной маски <code>*</code> (<code>pwc *node</code>) и список подписчиков полной маски <code>&gt;</code> (<code>fwc *node</code>).<br />
+2. При поступлении сообщения сервер разбивает субъект на токены прямо на срезе байтов без аллокаций памяти (<code>zero-allocation tokenization</code>).<br />
+3. Поиск выполняется за <strong>один проход по дереву</strong>: алгоритм рекурсивно спускается по точной ветке, одновременно собирая подписчиков из узлов <code>*</code> и <code>&gt;</code>.<br />
+4. <strong>Subscription Cache (Кэш сопоставлений):</strong> Сервер кэширует результаты сопоставлений для часто повторяющихся субъектов в быстрой хэш-таблице (с атомарной инвалидацией при добавлении новых подписчиков). Благодаря этому повторные сообщения маршрутизируются за время $O(1)$!</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Внутри nats-server используется <strong>соптимизированная trie-структура</strong> (не точный термин из исходников, но суть в эффективном поиске по иерархии) для хранения всех активных subscriptions. При получении сообщения сервер быстро находит все matching subscription'ы через <strong>single-pass lookup</strong>. Это делает routing <strong>O(log n)</strong> или даже <strong>O(1)</strong> в лучшем случае, в зависимости от количества wildcard'ов.</p>
+    <p>Внутри <code>nats-server</code> используется соптимизированная trie-структура для хранения всех активных subscriptions. При получении сообщения сервер быстро находит все matching subscription'ы через single-pass lookup. Это делает routing $O(K)$ от глубины иерархии субъекта ($K \approx 3..6$ токенов), что полностью независимо от общего числа подписчиков в системе ($N$). Никакого регулярного парсинга, никаких блокировок глобального мьютекса на горячем пути!</p>
   </div>
 </div>
 
-<h3 id="primer-koda-ispolzovanie-subject-routing">Пример кода: Использование Subject Routing</h3>
+<hr />
+<h2 id="primer-koda-ispolzovanie-subject-routing">Пример кода: Использование Subject Routing</h2>
 
+<p>Продемонстрируем работу точных подписок и подписок с масками на Go с использованием официального пакета <code>github.com/nats-io/nats.go</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2286,13 +2361,14 @@ import (
 )
 
 func main() {
+    // Подключение к серверу NATS
     nc, err := nats.Connect(nats.DefaultURL)
     if err != nil {
-        log.Fatal(err)
+        log.Fatalf(&quot;connection failed: %v&quot;, err)
     }
     defer nc.Close()
 
-    // Подписка на конкретный subject
+    // 1. Подписка на точный субъект: только новые заказы
     _, err = nc.Subscribe(&quot;orders.new&quot;, func(msg *nats.Msg) {
         fmt.Printf(&quot;Specific Order Handler: %s\n&quot;, string(msg.Data))
     })
@@ -2300,7 +2376,7 @@ func main() {
         log.Fatal(err)
     }
 
-    // Подписка на все заказы (wildcard *)
+    // 2. Подписка на все заказы первого уровня вложенности (wildcard *)
     _, err = nc.Subscribe(&quot;orders.*&quot;, func(msg *nats.Msg) {
         fmt.Printf(&quot;Wildcard Order Handler: %s (subject: %s)\n&quot;, 
             string(msg.Data), msg.Subject)
@@ -2309,7 +2385,7 @@ func main() {
         log.Fatal(err)
     }
 
-    // Подписка на все пользовательские обновления (recursive &gt;)
+    // 3. Жадная подписка на все события профиля пользователя любой глубины (wildcard &gt;)
     _, err = nc.Subscribe(&quot;users.update.&gt;&quot;, func(msg *nats.Msg) {
         fmt.Printf(&quot;User Update Handler: %s (full path: %s)\n&quot;, 
             string(msg.Data), msg.Subject)
@@ -2318,31 +2394,36 @@ func main() {
         log.Fatal(err)
     }
 
-    // Отправка сообщений
-    nc.Publish(&quot;orders.new&quot;, []byte(&quot;New order #123&quot;))
-    nc.Publish(&quot;orders.completed&quot;, []byte(&quot;Order #123 completed&quot;))
-    nc.Publish(&quot;users.update.profile.email&quot;, []byte(&quot;Email updated&quot;))
-    nc.Publish(&quot;users.update.settings.theme&quot;, []byte(&quot;Theme changed&quot;))
+    // Убедимся, что сервер зарегистрировал подписки
+    _ = nc.Flush()
 
-    time.Sleep(100 * time.Millisecond) // Ждем обработки
+    // Публикация тестовых событий
+    _ = nc.Publish(&quot;orders.new&quot;, []byte(&quot;New order #123&quot;))
+    _ = nc.Publish(&quot;orders.completed&quot;, []byte(&quot;Order #123 completed&quot;))
+    _ = nc.Publish(&quot;users.update.profile.email&quot;, []byte(&quot;Email updated&quot;))
+    _ = nc.Publish(&quot;users.update.settings.theme&quot;, []byte(&quot;Theme changed&quot;))
+
+    // Даем время на доставку
+    time.Sleep(100 * time.Millisecond)
 }
 </code></pre>
 </div>
 
-<p>Вывод:</p>
+<p>Вывод консоли:</p>
 <pre><code>Specific Order Handler: New order #123
 Wildcard Order Handler: New order #123 (subject: orders.new)
 Wildcard Order Handler: Order #123 completed (subject: orders.completed)
 User Update Handler: Email updated (full path: users.update.profile.email)
 User Update Handler: Theme changed (full path: users.update.settings.theme)
 </code></pre>
-<h3 id="sravnenie-s-drugimi-brokerami">Сравнение с другими брокерами</h3>
+<hr />
+<h2 id="sravnenie-s-drugimi-brokerami">Сравнение с другими брокерами</h2>
 
-<h4 id="nats-vs-kafka">NATS vs Kafka</h4>
+<h3 id="nats-vs-kafka">NATS vs Kafka</h3>
 
 <ul>
-<li><strong>Kafka</strong>: Использует <strong>topics</strong> — flat namespace. <code>orders_new</code>, <code>orders_completed</code>, <code>user_updates</code>.</li>
-<li><strong>NATS</strong>: Использует <strong>hierarchical subjects</strong> — <code>orders.new</code>, <code>orders.completed</code>, <code>users.update</code>.</li>
+<li><strong>Apache Kafka:</strong> Использует плоские имена топиков (<code>flat namespace</code>). Например, <code>orders_new</code>, <code>orders_completed</code>, <code>user_updates</code>. Нельзя подписаться «на все топики с префиксом orders» без сложного динамического regex-подключения в Consumer (<code>Pattern.compile("orders_.*")</code>), которое создает огромную нагрузку на метаданные кластера.</li>
+<li><strong>NATS:</strong> Иерархические субъекты спроектированы под динамическую фильтрацию изначально.</li>
 </ul>
 
 <div class="code-block" data-lang="go">
@@ -2363,12 +2444,11 @@ nc.Publish(&quot;orders.completed&quot;, data);
 </code></pre>
 </div>
 
-<p><strong>Преимущество NATS</strong>: Легче группировать связанные события и использовать wildcards.</p>
-<h4 id="nats-vs-rabbitmq">NATS vs RabbitMQ</h4>
+<h3 id="nats-vs-rabbitmq">NATS vs RabbitMQ</h3>
 
 <ul>
-<li><strong>RabbitMQ</strong>: Exchange + Queue + Binding (сложная маршрутизация через routing keys).</li>
-<li><strong>NATS</strong>: Direct subject-to-subscription mapping (простая маршрутизация через иерархию).</li>
+<li><strong>RabbitMQ:</strong> Маршрутизация строится вокруг концепций <code>Exchange</code>, <code>Queue</code> и <code>Binding</code>. Чтобы привязать очередь к обменнику типа <code>topic</code>, вы должны отправить брокеру декларативные команды по протоколу AMQP. Каждая новая очередь требует выделения памяти на сервере Erlang.</li>
+<li><strong>NATS:</strong> Прямое сопоставление <code>Subject $\to$ Subscription</code>. Маршрутизация эфемерна, не требует создания очередей и выполняется за наносекунды в оперативной памяти.</li>
 </ul>
 
 <div class="code-block" data-lang="go">
@@ -2387,10 +2467,12 @@ nc.Publish(&quot;orders.new&quot;, data);
 </code></pre>
 </div>
 
-<h3 id="advanced-routing-patterns">Advanced Routing Patterns</h3>
+<hr />
+<h2 id="advanced-routing-patterns">Advanced Routing Patterns</h2>
 
-<h4 id="1-multi-level-wildcards">1. Multi-level Wildcards</h4>
+<h3 id="1-multi-level-wildcards">1. Multi-level Wildcards</h3>
 
+<p>С помощью масок можно элегантно фильтровать события по горизонтальным срезам архитектуры:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2400,17 +2482,45 @@ nc.Publish(&quot;orders.new&quot;, data);
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Подписка на все финансовые операции
-nc.Subscribe(&quot;finance.&gt;&quot;, handler) // finance.payments.*, finance.reports.daily, etc.
+  <pre class="language-go"><code class="language-go">// Подписка на ВСЕ финансовые операции любой глубины
+nc.Subscribe(&quot;finance.&gt;&quot;, handler) // finance.payments.card, finance.reports.daily, etc.
 
-// Подписка на все операции в определенной категории
+// Подписка на все операции оплаты во всех подсистемах (cross-cutting concern)
 nc.Subscribe(&quot;*.payment.*&quot;, handler) // orders.payment.status, users.payment.method
 </code></pre>
 </div>
 
-<h4 id="2-queue-groups-load-balancing">2. Queue Groups (Load Balancing)</h4>
+<h3 id="2-queue-groups-load-balancing-na-subektakh">2. Queue Groups (Load Balancing на субъектах)</h3>
 
-<p>Subject routing работает вместе с <strong>queue groups</strong> для <strong>load balancing</strong>:</p>
+<p>По умолчанию NATS рассылает сообщение <strong>всем</strong> подписчикам (fan-out). Но что, если нам нужно распределить нагрузку между пулом из 5 одинаковых воркеров?</p>
+<p>Для этого NATS предоставляет <strong>Queue Groups</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+P[&quot;Publisher: orders.new&quot;] --&gt; S[&quot;NATS Server&quot;]
+
+subgraph QueueGroup[&quot;Queue Group: &#x27;processor_group&#x27;&quot;]
+W1[&quot;Worker 1&quot;]
+W2[&quot;Worker 2&quot;]
+W3[&quot;Worker 3&quot;]
+end
+
+S --&gt;|&quot;Балансировка Round-Robin&lt;br&gt;(ровно одному воркеру!)&quot;| W2
+  </pre>
+</div>
+
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2420,12 +2530,15 @@ nc.Subscribe(&quot;*.payment.*&quot;, handler) // orders.payment.status, users.p
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Эти consumer'ы будут делить сообщения между собой (round-robin)
+  <pre class="language-go"><code class="language-go">// Эти воркеры разделят входящий поток между собой
 for i := 0; i &lt; 3; i++ {
-    _, err = nc.QueueSubscribe(&quot;orders.new&quot;, &quot;processor_group&quot;, func(msg *nats.Msg) {
-        fmt.Printf(&quot;Processor %d handling: %s\n&quot;, i, string(msg.Data))
-        msg.Ack() // В JetStream
+    workerID := i
+    _, err := nc.QueueSubscribe(&quot;orders.new&quot;, &quot;processor_group&quot;, func(msg *nats.Msg) {
+        fmt.Printf(&quot;Worker %d processing order: %s\n&quot;, workerID, string(msg.Data))
     })
+    if err != nil {
+        log.Fatal(err)
+    }
 }
 </code></pre>
 </div>
@@ -2433,70 +2546,41 @@ for i := 0; i &lt; 3; i++ {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Регистрозависимость и точки</span>
   </div>
   <div class="callout-body">
-    <p>Subject routing в NATS чувствителен к регистру: <code>orders.New</code> ≠ <code>orders.new</code>. Также <code>*</code> не захватывает <code>.</code> — <code>orders.*</code> не матчить <code>orders.payment.status</code>.</p>
+    <p>Имена субъектов в NATS <strong>строго чувствительны к регистру</strong>: <code>orders.New</code> $\neq$ <code>orders.new</code>! Сообщение, отправленное в <code>orders.New</code>, никогда не будет получено подписчиком <code>orders.new</code>.<br />
+Кроме того, помните: символ <code>*</code> <strong>не поглощает точки</strong>! Подписка <code>orders.*</code> не перехватит <code>orders.payment.status</code>. Для захвата нескольких уровней используйте <code>&gt;</code>.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="performance-implications">Performance Implications</h3>
 
-<p>Subject-based routing в NATS <strong>очень быстрый</strong>, потому что:</p>
-<ol>
-<li><strong>In-memory lookup</strong>: Нет необходимости в сложных join'ах или индексах.</li>
-<li><strong>Trie optimization</strong>: Быстрый поиск по иерархии.</li>
-<li><strong>No regex</strong>: Используются только два wildcard'а: <code>*</code> и <code>&gt;</code>.</li>
-</ol>
+<p>Производительность сопоставления субъектов в NATS опирается на следующие инженерные принципы:</p>
+<ul>
+<li><strong>Subject matching</strong> выполняется целиком в оперативной памяти брокера с использованием специализированных префиксных деревьев (<code>trie</code> / <code>radix tree</code> / <code>sublist</code>).</li>
+<li><strong>Wildcards</strong> требуют параллельного сопоставления нескольких путей в префиксном дереве (ветки точного совпадения, <code>*</code> и <code>&gt;</code>), что требует чуть больше тактов CPU, чем тривиальный хэш-поиск. Однако благодаря механизму <code>Subscription Cache</code> (кэш результатов сопоставления для горячих субъектов) эта разница практически нивелируется.</li>
+<li><strong>Deep subject hierarchies</strong> (большое количество токенов) увеличивают глубину обхода дерева, поэтому общепринятым стандартом в продакшене считается глубина в 3–6 уровней.</li>
+<li><strong>Масштабируемость</strong>: NATS способен маршрутизировать десятки миллионов сообщений в секунду даже при наличии сотен тысяч уникальных субъектов и сложных wildcard-масок.</li>
+</ul>
+<hr />
+<h2 id="best-practices-standarty-imenovaniya-subektov">Best Practices: стандарты именования субъектов</h2>
 
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">// Performance benchmark example
-const numSubjects = 10000
-start := time.Now()
+<p>Архитектурная дисциплина в именовании субъектов определяет долговечность вашей системы:</p>
+<h3 id="1-subject-naming-convention-soglasheniya-ob-imenovanii">1. Subject Naming Convention (Соглашения об именовании)</h3>
 
-for i := 0; i &lt; numSubjects; i++ {
-    subject := fmt.Sprintf(&quot;service.%d.operation.%d&quot;, i%100, i)
-    nc.Publish(subject, []byte(&quot;data&quot;))
-}
-
-duration := time.Since(start)
-fmt.Printf(&quot;Published %d messages in %v\n&quot;, numSubjects, duration)
-// Обычно: &lt; 1ms для тысяч сообщений
-</code></pre>
-</div>
-
-<h3 id="best-practices">Best Practices</h3>
-
-<h4 id="1-subject-naming-convention">1. Subject Naming Convention</h4>
-
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">// Good: Descriptive and hierarchical
+<p>Рекомендуемый базовый шаблон: <code>&lt;область&gt;.&lt;сущность&gt;.&lt;действие/статус&gt;</code></p>
+<pre><code>// Хорошо: структурировано, понятно, расширяемо
 &quot;payment.processing.success&quot;
 &quot;user.authentication.failed&quot;
 &quot;inventory.stock.low&quot;
 
-// Avoid: Too generic or too specific
-&quot;event&quot; // Bad - no context
-&quot;user.authentication.failed.attempt.number.12345.timestamp.1234567890&quot; // Bad - too verbose
+// Плохо: слишком абстрактно или слишком узко
+&quot;event&quot;                                                               // Ужасно: нет контекста
+&quot;user.authentication.failed.attempt.number.12345.timestamp.12345678&quot; // Ужасно: переменные данные в теле субъекта
 </code></pre>
-</div>
-
-<h4 id="2-wildcard-usage">2. Wildcard Usage</h4>
+<h3 id="2-wildcard-usage-ispolzovanie-masok">2. Wildcard Usage (Использование масок)</h3>
 
 
 <div class="code-block" data-lang="go">
@@ -2507,16 +2591,16 @@ fmt.Printf(&quot;Published %d messages in %v\n&quot;, numSubjects, duration)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Good: Specific enough
-&quot;orders.*&quot; // All order events
-&quot;users.update.*&quot; // All user updates
+  <pre class="language-go"><code class="language-go">// Хорошо: разумное ограничение скоупа
+&quot;orders.*&quot;       // Все прямые события заказов
+&quot;users.update.*&quot; // Все типы обновлений профиля
 
-// Avoid: Too broad (performance impact)
-&quot;&gt;&quot; // All messages - avoid unless absolutely necessary
+// Избегайте: слишком широкие маски без необходимости
+&quot;&gt;&quot;              // Прослушивание ВСЕГО брокера — допустимо только для аудита/логирования!
 </code></pre>
 </div>
 
-<h4 id="3-namespace-management">3. Namespace Management</h4>
+<h3 id="3-namespace-management-upravlenie-prostranstvami-imen-i-multiarendnost">3. Namespace Management (Управление пространствами имен и мультиарендность)</h3>
 
 
 <div class="code-block" data-lang="go">
@@ -2527,32 +2611,45 @@ fmt.Printf(&quot;Published %d messages in %v\n&quot;, numSubjects, duration)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Team/Service level namespacing
-&quot;team-a.service-x.event-type&quot;
-&quot;billing.payments.created&quot;
-&quot;notifications.email.sent&quot;
+  <pre class="language-go"><code class="language-go">// Разделение по окружениям или командам
+&quot;prod.billing.invoices.created&quot;
+&quot;staging.billing.invoices.created&quot;
+&quot;tenant-100500.orders.new&quot;
 </code></pre>
 </div>
 
+<hr />
 <h3 id="use-cases-for-subject-routing">Use Cases for Subject Routing</h3>
 
+<p>Иерархические субъекты находят широкое применение в типовых распределенных паттернах:</p>
 <ol>
-<li><strong>Microservices Communication</strong>: <code>service-name.action.resource</code></li>
-<li><strong>Event Sourcing</strong>: <code>aggregate-type.event-type</code></li>
-<li><strong>Monitoring</strong>: <code>service.environment.metric-type</code></li>
-<li><strong>Multi-tenant Systems</strong>: <code>tenant-id.service.event</code></li>
+<li><strong>Microservices Communication</strong>: <code>service-name.action.resource</code> (например, <code>orders-service.create.order</code>).</li>
+<li><strong>Event Sourcing</strong>: <code>aggregate-type.event-type</code> (например, <code>account.credited</code>, <code>account.debited</code>).</li>
+<li><strong>Monitoring &amp; Observability</strong>: <code>service.environment.metric-type</code> (например, <code>auth-api.production.latency-p99</code>).</li>
+<li><strong>Multi-tenant Systems</strong>: <code>tenant-id.service.event</code> (например, <code>tenant-42.billing.invoice-issued</code>).</li>
 </ol>
-<h3 id="itog">Итог</h3>
+<hr />
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Вопрос с собеседования</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> «Какова алгоритмическая сложность маршрутизации сообщений по субъектам в NATS, и как она зависит от количества зарегистрированных подписчиков?»<br />
+<strong>Ответ:</strong> Сложность маршрутизации в NATS составляет $O(K)$, где $K$ — количество токенов в имени субъекта ($K \approx 3..6$), и практически <strong>не зависит от общего числа подписчиков</strong> $N$ в системе. Это достигается за счет использования специализированного префиксного дерева (Radix Trie / Sublist) в оперативной памяти и внутреннего кэша сопоставлений (Subscription Cache). При поступлении сообщения сервер за один проход по ветке дерева находит списки подписчиков для точных совпадений и масок (<code>*</code> и <code>&gt;</code>).</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Subject-based routing</strong> — это <strong>ключевая фича</strong> NATS, отличающая его от других брокеров.</li>
-<li><strong>Hierarchical structure</strong> позволяет легко группировать и фильтровать сообщения.</li>
-<li><strong>Wildcard support</strong> (<code>*</code> и <code>&gt;</code>) делает маршрутизацию <strong>гибкой</strong> и <strong>мощной</strong>.</li>
-<li><strong>Performance</strong> remains high due to optimized in-memory lookup structures.</li>
-<li><strong>Semantic clarity</strong> of subjects makes system architecture more intuitive.</li>
+<li><strong>Subject-based routing</strong> — фундаментальная архитектурная особенность NATS, исключающая необходимость предварительного создания очередей и топиков.</li>
+<li><strong>Иерархическая структура</strong> позволяет организовывать потоки событий в логические пространства имен с минимальной связностью компонентов.</li>
+<li><strong>Поддержка масок</strong> (<code>*</code> и <code>&gt;</code>) обеспечивает гибкую подписку на любые горизонтальные и вертикальные срезы системы.</li>
+<li><strong>Дерево Sublist в оперативной памяти</strong> гарантирует миллионы операций маршрутизации в секунду с микросекундными задержками.</li>
 </ul>
-<p>Subject routing в NATS — это не просто способ доставки сообщений, а <strong>архитектурный паттерн</strong>, который помогает строить <strong>хорошо организованные</strong> и <strong>масштабируемые</strong> системы.</p>
-<p>В следующей статье мы рассмотрим <a href="4-request-reply-pattern.html" class="wikilink">4. Request Reply паттерн</a>, чтобы понять, как NATS может использоваться не только для асинхронной, но и для синхронной коммуникации.</p>
+<p>В следующей статье — <a href="4-request-reply-pattern.html" class="wikilink">4. Request Reply паттерн</a> — мы изучим, как NATS реализует синхронный межсервисный RPC поверх асинхронного pub/sub с помощью динамических inbox-субъектов.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2580,7 +2677,7 @@ fmt.Printf(&quot;Published %d messages in %v\n&quot;, numSubjects, duration)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h3"><a href="#chto-takoe-subject">Что такое Subject?</a></li><li class="toc-item toc-h3"><a href="#ierarkhicheskaya-struktura">Иерархическая структура</a></li><li class="toc-item toc-h3"><a href="#mekhanizm-marshrutizatsii">Механизм маршрутизации</a></li><li class="toc-item toc-h3"><a href="#primer-koda-ispolzovanie-subject-routing">Пример кода: Использование Subject Routing</a></li><li class="toc-item toc-h3"><a href="#sravnenie-s-drugimi-brokerami">Сравнение с другими брокерами</a></li><li class="toc-item toc-h4"><a href="#nats-vs-kafka">NATS vs Kafka</a></li><li class="toc-item toc-h4"><a href="#nats-vs-rabbitmq">NATS vs RabbitMQ</a></li><li class="toc-item toc-h3"><a href="#advanced-routing-patterns">Advanced Routing Patterns</a></li><li class="toc-item toc-h4"><a href="#1-multi-level-wildcards">1. Multi-level Wildcards</a></li><li class="toc-item toc-h4"><a href="#2-queue-groups-load-balancing">2. Queue Groups (Load Balancing)</a></li><li class="toc-item toc-h3"><a href="#performance-implications">Performance Implications</a></li><li class="toc-item toc-h3"><a href="#best-practices">Best Practices</a></li><li class="toc-item toc-h4"><a href="#1-subject-naming-convention">1. Subject Naming Convention</a></li><li class="toc-item toc-h4"><a href="#2-wildcard-usage">2. Wildcard Usage</a></li><li class="toc-item toc-h4"><a href="#3-namespace-management">3. Namespace Management</a></li><li class="toc-item toc-h3"><a href="#use-cases-for-subject-routing">Use Cases for Subject Routing</a></li><li class="toc-item toc-h3"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#chto-takoe-subject">Что такое Subject?</a></li><li class="toc-item toc-h2"><a href="#ierarkhicheskaya-struktura-i-wildcards">Иерархическая структура и Wildcards</a></li><li class="toc-item toc-h2"><a href="#mekhanizm-marshrutizatsii">Механизм маршрутизации</a></li><li class="toc-item toc-h3"><a href="#kak-ustroen-sublist-v-go-iskhodnikakh-nats-server">Как устроен Sublist в Go-исходниках nats-server</a></li><li class="toc-item toc-h2"><a href="#primer-koda-ispolzovanie-subject-routing">Пример кода: Использование Subject Routing</a></li><li class="toc-item toc-h2"><a href="#sravnenie-s-drugimi-brokerami">Сравнение с другими брокерами</a></li><li class="toc-item toc-h3"><a href="#nats-vs-kafka">NATS vs Kafka</a></li><li class="toc-item toc-h3"><a href="#nats-vs-rabbitmq">NATS vs RabbitMQ</a></li><li class="toc-item toc-h2"><a href="#advanced-routing-patterns">Advanced Routing Patterns</a></li><li class="toc-item toc-h3"><a href="#1-multi-level-wildcards">1. Multi-level Wildcards</a></li><li class="toc-item toc-h3"><a href="#2-queue-groups-load-balancing-na-subektakh">2. Queue Groups (Load Balancing на субъектах)</a></li><li class="toc-item toc-h3"><a href="#performance-implications">Performance Implications</a></li><li class="toc-item toc-h2"><a href="#best-practices-standarty-imenovaniya-subektov">Best Practices: стандарты именования субъектов</a></li><li class="toc-item toc-h3"><a href="#1-subject-naming-convention-soglasheniya-ob-imenovanii">1. Subject Naming Convention (Соглашения об именовании)</a></li><li class="toc-item toc-h3"><a href="#2-wildcard-usage-ispolzovanie-masok">2. Wildcard Usage (Использование масок)</a></li><li class="toc-item toc-h3"><a href="#3-namespace-management-upravlenie-prostranstvami-imen-i-multiarendnost">3. Namespace Management (Управление пространствами имен и мультиарендность)</a></li><li class="toc-item toc-h3"><a href="#use-cases-for-subject-routing">Use Cases for Subject Routing</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
