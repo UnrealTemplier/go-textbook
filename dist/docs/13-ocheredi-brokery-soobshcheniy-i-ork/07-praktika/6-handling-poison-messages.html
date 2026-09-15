@@ -2168,40 +2168,96 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Handling poison messages</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="anatomiya-katastrofy-v-rantayme">Анатомия катастрофы в рантайме</h2>
+            <h1>Handling poison messages</h1>
+<blockquote>
+<p><em>«В реальных распределенных системах самое опасное сообщение — не то, которое потерялось, а то, которое пришло, успешно прочиталось и убило весь ваш сервис ровно через одну миллисекунду.»</em></p>
+</blockquote>
+<h2 id="anatomiya-katastrofy-v-rantayme">Анатомия катастрофы в рантайме</h2>
 
-<p>В теоретическом разделе мы уже обсуждали концепцию очереди мертвых писем в статье <a href="../01-fundament-asinkhronnosti/8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a>. Мы выяснили, что "ядовитое сообщение" (Poison Message) — это валидный с точки зрения брокера кусок данных, который вызывает фатальную ошибку в бизнес-логике консьюмера. </p>
-<p>Но теория часто разбивается о суровую практику системного программирования. Одно дело, когда <code>json.Unmarshal</code> аккуратно возвращает ошибку. И совсем другое, когда сообщение содержит данные, заставляющие ваш Go-код паниковать или бесконечно блокироваться (Deadlock).</p>
-<p>Если ваш консьюмер просто вернет сообщение обратно в очередь (через <code>Nack</code> или отвал по таймауту), вы спровоцируете петлю смерти (Infinite Retry Loop).</p>
+<p>В теоретическом разделе мы познакомились с концепцией очередей недоставленных писем в статье <a href="../01-fundament-asinkhronnosti/8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a>. Мы выяснили, что «ядовитое сообщение» (<strong>Poison Message / Poison Pill</strong>) — это вполне легитимный с точки зрения сетевого протокола брокера бинарный пакет, полезная нагрузка которого вызывает фатальный сбой или неконтролируемое падение бизнес-логики консьюмера.</p>
+<p>Однако теория часто выглядит слишком стерильно: в учебниках предполагается, что <code>json.Unmarshal</code> просто вернет ошибку, а приложение аккуратно пойдет дальше.</p>
+<p>В реальности ядовитое сообщение может содержать:<br />
+- Непредвиденный формат данных, вызывающий разыменование <code>nil</code>-указателя или выход за границы слайса (<code>panic</code>).<br />
+- Рекурсивную структуру, загоняющую парсер в бесконечный цикл с пожиранием 100% CPU.<br />
+- Символы, ломающие сериализацию в базе данных или вызывающие фатальный взаимный отказ внешних систем.</p>
+<p>Если консьюмер не умеет изолировать яд и наивно возвращает сообщение обратно в очередь (через <code>Nack</code> с флагом <code>requeue=true</code> или по сетевому таймауту), система мгновенно проваливается в <strong>бесконечную петлю смерти (Infinite Retry Loop)</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph DeathLoop[&quot;Петля смерти (CrashLoopBackOff)&quot;]
+direction TB
+Q[&quot;Очередь сообщений&quot;] --&gt;|&quot;1. Доставка яда&quot;| C[&quot;Go Consumer Pod&quot;]
+C --&gt;|&quot;2. runtime.gopanic!&quot;| Crash[&quot;Неперехваченная паника&lt;br&gt;Сигнал SIGABRT&quot;]
+Crash --&gt;|&quot;3. Смерть пода&quot;| K8s[&quot;Kubernetes перезапуск&quot;]
+Q -.-&gt;|&quot;4. TCP сокет упал:&lt;br&gt;Сообщение Unacknowledged -&gt; Requeue&quot;| Q
+end
+
+classDef err fill:#1e1e2e,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
+class DeathLoop err;
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Mechanical Sympathy петли смерти</span>
   </div>
   <div class="callout-body">
-    <p>Что происходит с сервером, когда Poison Message начинает "летать" между RabbitMQ и Go-консьюмером со скоростью 10 000 раз в секунду?<br />
-1. <strong>Network I/O:</strong> Сетевой стек ядра Linux (Ring 0) безостановочно обрабатывает прерывания от сетевой карты, перекладывая байты в буферы TCP-сокетов.<br />
-2. <strong>GC Pressure:</strong> Рантайм Go аллоцирует структуры <code>amqp.Delivery</code> (или аналогичные) в куче (Escape Analysis не может удержать их на стеке, так как они передаются через каналы). Каждая неудачная попытка порождает мусор. Сборщик мусора (GC) начинает запускаться непрерывно, отъедая до 50% CPU (вы увидите всплеск метрики <code>go_gc_duration_seconds</code>).<br />
-3. <strong>Starvation:</strong> Потоки ОС (<code>m</code>), привязанные к процессорам (<code>p</code>), заняты перемалыванием ядовитого сообщения. Полезная нагрузка (другие, валидные сообщения) выстраивается в очередь ожидания. Возникает Head-of-Line Blocking даже без жесткого Ordering-а.</p>
+    <p>Что физически происходит с операционной системой и сервером, когда Poison Message начинает бесконечно рикошетить между брокером и консьюмером со скоростью 10 000 раз в секунду?</p>
+<ol>
+<li><strong>Сетевой шторм (Network I/O):</strong> Сетевой стек ядра Linux (Ring 0) непрерывно бомбардируется аппаратными прерываниями (Hard IRQ / SoftIRQ) от сетевой карты. Ядро тратит процессорные циклы на перекладывание одних и тех же байтов в буферы сокетов TCP.</li>
+<li><strong>GC Pressure (Коллапс сборщика мусора):</strong> Рантайм Go на каждую попытку вычитки аллоцирует структуры сетевой доставки <code>amqp.Delivery</code> (или аналогичные структуры Kafka) в куче (Heap), поскольку они передаются через Go-каналы (<code>chan</code>). Сборщик мусора (GC) вынужден запускаться непрерывно, отнимая до 50–70% всего доступного времени процессора — в метриках Prometheus наблюдается резкий спайк параметра <code>go_gc_duration_seconds</code>.</li>
+<li><strong>Голодание процессоров (Starvation):</strong> Системные потоки ОС (<code>m</code>), закрепленные за логическими процессорами рантайма (<code>p</code>), оказываются на 100% заблокированы перемалыванием одного-единственного ядовитого пакета. Все остальные — абсолютно валидные сообщения в очереди — встают колом (<strong>Head-of-Line Blocking</strong>).</li>
+</ol>
   </div>
 </div>
 
-<p>В этой статье мы напишем production-ready каркас обработчика, который защитит ваш микросервис от ядовитых инъекций.</p>
+<p>В этой главе мы разработаем бронебойный каркас обработчика, защищающий Go-сервис от любых токсичных полезных нагрузок.</p>
+<hr />
 <h2 id="samyy-strashnyy-yad-neperekhvachennaya-panika">Самый страшный яд: Неперехваченная паника</h2>
 
-<p>В языках вроде Java или C# исключения — это норма. В Go <code>panic</code> — это сигнал крушения. </p>
-<p>Если внутри обработчика сообщения произойдет <code>panic</code> (например, разыменование nil-указателя из-за отсутствующего поля в JSON, или выход за границы слайса), функция <code>runtime.gopanic</code> начнет раскручивать стек (Stack Unwinding). Если она не встретит <code>recover</code>, рантайм вызовет <code>runtime.crash</code>, который отправит процессу сигнал <code>SIGABRT</code>. </p>
-<p>Процесс умрет. Kubernetes увидит смерть пода и перезапустит его. Брокер сообщений увидит разорванное TCP-соединение, снимет с сообщения статус <code>Unacknowledged</code> и вернет его в начало очереди. Поднимется новый под, прочитает это же сообщение и снова умрет. Вы получите <strong>CrashLoopBackOff</strong>, и обработка остановится полностью.</p>
+<p>В языках со стандартной обработкой исключений (Java, Python, C#) неперехваченный <code>Exception</code> обычно локализуется фреймворком на уровне текущего треда. В языке Go ключевое слово <code>panic</code> — это не обычное исключение, это <strong>сигнал крушения всей программы</strong>.</p>
+<p>Если внутри обработчика сообщения происходит разыменование нулевого указателя:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Паника при отсутствии поля в теле сообщения
+orderID := payload.Customer.Profile.ID 
+</code></pre>
+</div>
+
+<p>встроенная системная функция рантайма <code>runtime.gopanic</code> начинает аварийную раскрутку стека вызовов (Stack Unwinding). Если на вершине стека текущей горутины нет функции <code>recover</code>, рантайм вызывает <code>runtime.crash</code>, который посылает текущему процессу операционной системы терминальный сигнал <strong><code>SIGABRT</code></strong>.</p>
+<p>Процесс моментально падает. Если он запущен в Kubernetes, Kubelet фиксирует аварийное завершение и пытается перезапустить контейнер. Тем временем брокер сообщений (RabbitMQ / NATS) видит внезапный разрыв TCP-сокета, снимает с сообщения статус <code>Unacknowledged</code> и возвращает его в самое начало очереди. Поднявшийся контейнер снова вычитывает то же самое сообщение, снова падает в <code>SIGABRT</code> — и вся система уходит в бесконечный <strong><code>CrashLoopBackOff</code></strong>, блокируя работу целого направления бизнеса.</p>
+<hr />
 <h3 id="pravilo-1-izoliruyte-obrabotchik-cherez-defer-recover">Правило №1: Изолируйте обработчик через `defer recover`</h3>
 
-<p>Любая горутина, читающая данные из внешнего мира, <strong>обязана</strong> быть обернута в <code>recover</code>. Паника должна конвертироваться в фатальную ошибку, а ядовитое сообщение должно быть отправлено в DLQ.</p>
+<p>Любая конкурентная горутина-воркер, обрабатывающая невалидированные данные из внешнего сетевого сокета, <strong>в обязательном порядке должна быть изолирована через отложенный вызов <code>defer recover</code></strong>!</p>
+<p>Паника должна быть аккуратно перехвачена, стек вызовов зафиксирован для телеметрии, а сообщение признано безнадежным ядом и отправлено в изолятор.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2216,34 +2272,42 @@
 import (
     &quot;context&quot;
     &quot;fmt&quot;
+    &quot;log/slog&quot;
     &quot;runtime/debug&quot;
 )
 
-// Обработчик одного сообщения
+type Worker struct {
+    logger *slog.Logger
+}
+
+// Безопасная оболочка (Panic Boundary) для вызова бизнес-логики
 func (w *Worker) safeHandle(ctx context.Context, msg []byte) (err error) {
-    // Спасаем процесс от падения
+    // Спасаем процесс операционной системы от крушения
     defer func() {
         if r := recover(); r != nil {
-            // Логируем Stack Trace для отладки
-            w.logger.Error(&quot;panic in message handler&quot;, 
-                &quot;panic&quot;, r, 
-                &quot;stack&quot;, string(debug.Stack()),
+            // Извлекаем полный Stack Trace для последующего анализа в Sentry
+            stackTrace := string(debug.Stack())
+            w.logger.Error(&quot;КРИТИЧЕСКАЯ ПАНИКА в обработчике сообщения!&quot;,
+                &quot;panic&quot;, r,
+                &quot;stack&quot;, stackTrace,
             )
-            // Превращаем панику в фатальную ошибку
+
+            // Преобразуем неперехваченную панику в типизированную ошибку яда
             err = fmt.Errorf(&quot;%w: panic recovered: %v&quot;, ErrFatalPoisonPill, r)
         }
     }()
 
-    // Здесь может быть потенциально опасный код
+    // Выполнение реальной доменной логики
     return w.businessLogic(ctx, msg)
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="pravilo-2-strogaya-klassifikatsiya-oshibok">Правило №2: Строгая классификация ошибок</h2>
 
-<p>Чтобы брокер (или сам код) понимал, отправлять сообщение в DLQ или на ретрай (см. <a href="../01-fundament-asinkhronnosti/9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>), ваш слой бизнес-логики должен возвращать типизированные ошибки.</p>
-<p>В современном Go (1.13+) для этого используют маркерные ошибки (Sentinel Errors) и оборачивание (<code>%w</code>).</p>
+<p>Чтобы воркер мог принять однозначное решение — отправлять сообщение на повторную попытку (см. <a href="../01-fundament-asinkhronnosti/9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>) или немедленно сбрасывать в изолятор Dead Letter Queue, весь слой бизнес-логики обязан возвращать <strong>строго типизированные маркерные ошибки (Sentinel Errors)</strong>.</p>
+<p>В современном Go (начиная с Go 1.13+) для этого используется цепочка оборачивания ошибок через глагол <code>%w</code> и проверка через <code>errors.Is</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2253,42 +2317,71 @@ func (w *Worker) safeHandle(ctx context.Context, msg []byte) (err error) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import &quot;errors&quot;
+  <pre class="language-go"><code class="language-go">package consumer
 
-// Sentinel ошибки для классификации
-var (
-    // ErrFatalPoisonPill означает, что сообщение безнадежно
-    ErrFatalPoisonPill = errors.New(&quot;fatal poison message&quot;)
-    // ErrTransientRetry означает, что нужно попробовать позже
-    ErrTransientRetry  = errors.New(&quot;transient error, retry needed&quot;)
+import (
+    &quot;context&quot;
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
+    &quot;fmt&quot;
 )
+
+// Sentinel-ошибки классификации сбоев
+var (
+    // ErrFatalPoisonPill — сообщение структурно или логически ядовито (ретрай бессмысленен)
+    ErrFatalPoisonPill = errors.New(&quot;fatal poison message&quot;)
+
+    // ErrTransientRetry — временный инфраструктурный сбой (нужно повторить с backoff)
+    ErrTransientRetry = errors.New(&quot;transient error, retry needed&quot;)
+)
+
+type OrderPayload struct {
+    ID     string  `json:&quot;id&quot;`
+    Amount float64 `json:&quot;amount&quot;`
+}
+
+func (p *OrderPayload) Validate() error {
+    if p.ID == &quot;&quot; || p.Amount &lt;= 0 {
+        return errors.New(&quot;order_id is empty or amount is non-positive&quot;)
+    }
+    return nil
+}
 
 func (w *Worker) businessLogic(ctx context.Context, data []byte) error {
     var payload OrderPayload
+
+    // 1. Синтаксическая ошибка JSON — это 100% неисправимый яд
     if err := json.Unmarshal(data, &amp;payload); err != nil {
-        // Синтаксическая ошибка — это 100% яд. Ретрай не поможет.
-        return fmt.Errorf(&quot;%w: invalid json: %v&quot;, ErrFatalPoisonPill, err)
+        return fmt.Errorf(&quot;%w: syntax error in json payload: %v&quot;, ErrFatalPoisonPill, err)
     }
 
+    // 2. Бизнес-валидация инвариантов
     if err := payload.Validate(); err != nil {
-        // Бизнес-валидация не пройдена
-        return fmt.Errorf(&quot;%w: validation failed: %v&quot;, ErrFatalPoisonPill, err)
+        return fmt.Errorf(&quot;%w: domain validation rejected: %v&quot;, ErrFatalPoisonPill, err)
     }
 
-    err := w.db.SaveOrder(ctx, payload)
+    // 3. Взаимодействие с внешними зависимостями (СУБД)
+    err := w.saveOrder(ctx, payload)
     if err != nil {
-        // Ошибка БД (например, connection reset) — временная
-        return fmt.Errorf(&quot;%w: db failure: %v&quot;, ErrTransientRetry, err)
+        // Сетевой таймаут или deadlock в БД — это временная проблема!
+        return fmt.Errorf(&quot;%w: database transaction failed: %v&quot;, ErrTransientRetry, err)
     }
 
+    return nil
+}
+
+func (w *Worker) saveOrder(ctx context.Context, p OrderPayload) error {
+    // Имитация записи в БД
     return nil
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="praktika-dlya-rabbitmq-nack-i-dlx">Практика для RabbitMQ: Nack и DLX</h2>
 
-<p>В RabbitMQ обработка Poison Messages выглядит элегантно благодаря встроенному механизму Dead Letter Exchange (DLX). Если вы правильно настроили очереди, вам достаточно просто сказать брокеру <code>Nack</code> с флагом <code>requeue=false</code>.</p>
+<p>В брокере RabbitMQ изоляция ядовитых сообщений реализуется наиболее элегантно благодаря встроенной подсистеме <strong>Dead Letter Exchange (DLX)</strong>.</p>
+<p>Если при объявлении очереди был корректно настроен аргумент <code>x-dead-letter-exchange</code>, консьюмеру достаточно отправить брокеру отрицательное подтверждение <code>Nack</code> с флагом <code>requeue=false</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2298,26 +2391,36 @@ func (w *Worker) businessLogic(ctx context.Context, data []byte) error {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (w *Worker) consumeLoop(deliveries &lt;-chan amqp.Delivery) {
+  <pre class="language-go"><code class="language-go">package consumer
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
+)
+
+func (w *Worker) ConsumeRabbit(deliveries &lt;-chan amqp.Delivery) {
     for d := range deliveries {
         err := w.safeHandle(context.Background(), d.Body)
 
         if err == nil {
-            d.Ack(false)
+            // Успешная обработка: подтверждаем удаление
+            _ = d.Ack(false)
             continue
         }
 
         if errors.Is(err, ErrFatalPoisonPill) {
-            // Фатальная ошибка.
-            // requeue=false заставляет RabbitMQ выбросить сообщение.
-            // Если к очереди привязан DLX, сообщение улетит в DLQ.
-            w.logger.Warn(&quot;poison message routed to DLQ&quot;, &quot;error&quot;, err)
-            _ = d.Nack(false, false) 
+            // ФАТАЛЬНЫЙ ЯД (Poison Message):
+            // requeue=false приказывает RabbitMQ немедленно удалить сообщение из очереди.
+            // Поскольку настроен DLX, брокер автоматически перенаправит яд в Dead Letter Queue!
+            w.logger.Warn(&quot;Ядовитое сообщение изолировано в DLQ&quot;, &quot;err&quot;, err)
+            _ = d.Nack(false, false)
         } else {
-            // Временная ошибка. 
-            // В реальности здесь нужен Exponential Backoff, 
-            // но для простоты — возвращаем в очередь.
-            w.logger.Info(&quot;transient error, requeueing&quot;, &quot;error&quot;, err)
+            // ВРЕМЕННАЯ ОШИБКА (Transient Error):
+            // requeue=true возвращает сообщение в очередь для повторной попытки.
+            // В продакшене здесь применяется пауза (Backoff) или маршрутизация в Retry-очередь.
+            w.logger.Info(&quot;Временный сбой, возвращаем сообщение в очередь&quot;, &quot;err&quot;, err)
             _ = d.Nack(false, true)
         }
     }
@@ -2339,33 +2442,73 @@ func (w *Worker) businessLogic(ctx context.Context, data []byte) error {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;RabbitMQ Delivery&quot;] --&gt; B{&quot;safeHandle&quot;}
-B --&gt;|&quot;err == nil&quot;| C[&quot;d.Ack&lt;br&gt;Удаление&quot;]
-B --&gt;|&quot;err Is ErrFatal&quot;| D[&quot;d.Nack requeue=false&lt;br&gt;Роутинг в DLX&quot;]
-B --&gt;|&quot;err Is ErrTransient&quot;| E[&quot;d.Nack requeue=true&lt;br&gt;Возврат в очередь&quot;]
-B --&gt;|&quot;panic!&quot;| F[&quot;recover()&quot;]
-F --&gt;|&quot;return ErrFatal&quot;| D
+A[&quot;Сообщение из RabbitMQ (d.Body)&quot;] --&gt; B{&quot;safeHandle: вызов логики&quot;}
+B --&gt;|&quot;err == nil&quot;| C[&quot;d.Ack(false)&lt;br&gt;Успешное удаление из очереди&quot;]
+B --&gt;|&quot;errors.Is(ErrFatalPoisonPill)&quot;| D[&quot;d.Nack(false, requeue=false)&lt;br&gt;Брокер пересылает в DLX&quot;]
+B --&gt;|&quot;errors.Is(ErrTransientRetry)&quot;| E[&quot;d.Nack(false, requeue=true)&lt;br&gt;Возврат в очередь на повтор&quot;]
+B --&gt;|&quot;panic!&quot;| F[&quot;defer recover()&quot;]
+F --&gt;|&quot;Преобразование в ErrFatalPoisonPill&quot;| D
+
+classDef ok fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+classDef warn fill:#1e1e2e,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+classDef err fill:#1e1e2e,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
+class C ok;
+class E warn;
+class D,F err;
   </pre>
 </div>
 
 
+<hr />
 <h2 id="praktika-dlya-kafka-ruchnoe-upravlenie-dlq">Практика для Kafka: Ручное управление DLQ</h2>
 
-<p>Как мы помним, Kafka — это брокер, который ничего не знает про DLQ. Если консьюмер не справился, он не может просто сказать "Кафка, забери это в DLQ". Консьюмер должен <strong>сам</strong> выступить в роли продюсера.</p>
-<p>Это порождает сложнейшую проблему надежности.</p>
+<p>В отличие от RabbitMQ, распределенный журнал Apache Kafka <strong>не имеет встроенного механизма Dead Letter Exchange</strong>. Смещение (offset) в партиции Kafka монотонно растет, и брокер не умеет выборочно «выбрасывать» отдельные записи.</p>
+<p>Если консьюмер обнаруживает ядовитое сообщение в Kafka, он обязан <strong>самостоятельно выступить в роли продюсера</strong>, отправить испорченное сообщение в выделенный <code>dlq-topic</code> и только после этого зафиксировать смещение!</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant K as Kafka Main Topic
+participant W as Kafka Consumer
+participant DLQ as Kafka DLQ Topic
+
+K-&gt;&gt;W: Fetch Message (Offset: 451, Key: &quot;user_9&quot;)
+Note over W: safeHandle: JSON Syntax Error! (Poison Pill)
+
+loop Повторные попытки записи в DLQ до успеха
+W-&gt;&gt;DLQ: ProduceSync(dlq-topic, Key, Value, ErrorReason)
+DLQ--&gt;&gt;W: 200 Ack (Записано в DLQ!)
+end
+
+Note over W: Теперь смещение безопасно коммитить!
+W-&gt;&gt;K: CommitOffset(Offset: 452)
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Порядок коммита при записи в DLQ</span>
   </div>
   <div class="callout-body">
-    <p>Что если ваше сообщение — ядовитое, вы решаете отправить его в <code>dlq-topic</code>, делаете <code>producer.Produce()</code>, а кластер Kafka в этот момент недоступен на запись (например, перевыборы лидера партиции)? <br />
-Вы не можете отправить сообщение в DLQ, и вы <strong>не имеете права</strong> сдвинуть оффсет (Commit) в основном топике, иначе вы потеряете сообщение!<br />
-В этой ситуации консьюмер обязан заблокироваться и бесконечно (с бэкоффом) пытаться записать яд в DLQ, пока Kafka не оживет.</p>
+    <p>Что произойдет, если сообщение оказалось ядовитым, воркер решает отправить его в <code>dlq-topic</code>, вызывает метод <code>producer.Produce()</code>, но кластер Kafka в этот момент временно недоступен на запись (например, идут перевыборы лидера контроллера KRaft)?</p>
+<p>Если вы в этой ситуации проигнорируете ошибку и выполните коммит оффсета в основном топике, <strong>ядовитое сообщение будет безвозвратно утеряно для аудита и ручного разбора!</strong></p>
+<p><strong>Железное правило:</strong> При ручном управлении DLQ смещение исходного сообщения коммитится <strong>строго после того, как получен положительный <code>Ack</code> от топика-изолятора (<code>dlq-topic</code>)</strong>. Если запись в DLQ падает, консьюмер обязан заблокироваться и повторять попытку записи с экспоненциальным бэкоффом.</p>
   </div>
 </div>
 
-<p>Пример реализации паттерна для Kafka (псевдокод на базе абстрактного клиента):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2375,34 +2518,59 @@ F --&gt;|&quot;return ErrFatal&quot;| D
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (w *KafkaWorker) processMsg(ctx context.Context, msg KafkaMessage) {
+  <pre class="language-go"><code class="language-go">package consumer
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;time&quot;
+)
+
+type KafkaMessage struct {
+    Key   []byte
+    Value []byte
+    Topic string
+}
+
+type KafkaDLQWorker struct {
+    producer KafkaSyncProducer
+    consumer KafkaConsumerClient
+}
+
+func (w *KafkaDLQWorker) ProcessKafkaMessage(ctx context.Context, msg KafkaMessage) {
     err := w.safeHandle(ctx, msg.Value)
+
     if err == nil {
+        // Успешно: фиксируем смещение в основном топике
         w.consumer.Commit(msg)
         return
     }
 
     if errors.Is(err, ErrFatalPoisonPill) {
-        // Бесконечный цикл попыток записи в DLQ
+        // Блокирующий цикл гарантированной доставки яда в DLQ
         for {
             dlqErr := w.producer.ProduceSync(ctx, &quot;dlq-topic&quot;, msg.Key, msg.Value, err.Error())
             if dlqErr == nil {
-                // Успешно сохранили яд в изоляторе!
-                // ТЕПЕРЬ мы обязаны сдвинуть оффсет основной очереди.
+                // Яд успешно изолирован в DLQ!
+                // ТЕПЕРЬ мы имеем полное право сдвинуть оффсет в основной очереди
                 w.consumer.Commit(msg)
                 return
             }
 
-            // Если не смогли записать в DLQ — ждем и повторяем, 
-            // чтобы не потерять данные навсегда.
-            w.logger.Error(&quot;failed to write to DLQ, retrying...&quot;, &quot;err&quot;, dlqErr)
-            time.Sleep(5 * time.Second)
+            // Если записать в DLQ не удалось, ждем и повторяем: данные терять нельзя
+            time.Sleep(2 * time.Second)
         }
     } else {
-        // Обработка временных ошибок (например, перекладывание в retry-topic)
+        // Обработка временных сбоев (например, отправка в retry-топик)
         w.handleTransient(ctx, msg)
     }
 }
+
+func (w *KafkaDLQWorker) safeHandle(ctx context.Context, val []byte) error {
+    return nil
+}
+
+func (w *KafkaDLQWorker) handleTransient(ctx context.Context, msg KafkaMessage) {}
 </code></pre>
 </div>
 
@@ -2412,19 +2580,26 @@ F --&gt;|&quot;return ErrFatal&quot;| D
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы используем Protobuf. Продюсер обновил схему (добавил новое обязательное поле), а консьюмер еще не обновился. Консьюмер падает при десериализации, считая все новые сообщения ядовитыми и сливая их в DLQ. Как отличить настоящий яд (битые данные) от проблем версионирования контрактов?<br />
-<strong>Ответ:</strong> Это фундаментальная проблема Schema Evolution. Ошибки десериализации (Unknown fields или missing required fields) не всегда означают яд. Для решения используют <strong>Schema Registry</strong>. Каждое сообщение содержит ID схемы. Если консьюмер видит неизвестный ID схемы, он не должен считать сообщение ядовитым. Он должен считать это ошибкой инфраструктуры (Transient) — приостановить обработку (отдать Nack и запаузить партицию) и ждать, пока девопсы не раскатят новую версию консьюмера, умеющую читать эту схему.</p>
+    <p><strong>Вопрос:</strong> Мы используем Protobuf в Kafka. Продюсер выкатил обновление схемы (добавил новое поле), а консьюмеры еще не успели обновиться. Консьюмер не может распарсить сообщение и падает с ошибкой десериализации. Если мы классифицируем эту ошибку как Poison Message, мы мгновенно сольем в DLQ миллионы валидных клиентских транзакций! Как отличить реальный яд от рассинхронизации схем (Schema Evolution)?</p>
+<p><strong>Ответ:</strong> <br />
+Для предотвращения этой катастрофы применяется <strong>Schema Registry (Confluent / Apicurio)</strong>:<br />
+1. В заголовок каждого сообщения внедряется идентификатор зарегистрированной версии схемы (<code>Schema ID</code>).<br />
+2. Если консьюмер встречает неизвестный ему <code>Schema ID</code>, он <strong>не имеет права объявлять сообщение ядовитым</strong>.<br />
+3. Данная ситуация классифицируется как <strong>инфраструктурная пауза (Transient Lag)</strong>: консьюмер приостанавливает вычитку текущей партиции (метод <code>Pause()</code>), генерирует алерт в мониторинг и ждет, пока пайплайн CI/CD не раскатает обновленную версию сервиса, знающую новую схему данных. Никакие данные в DLQ не сбрасываются.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Паники — главный враг.</strong> Ядовитое сообщение не должно убивать процесс ОС. Изоляция горутин-воркеров через <code>defer recover</code> обязательна.</li>
-<li><strong>Типизация ошибок.</strong> Код должен явно разделять инфраструктурные затыки (база лежит) и невалидные данные.</li>
-<li><strong>Безопасность переноса (Kafka).</strong> При ручной отправке сообщения в DLQ, оффсет исходного сообщения коммитится <em>строго после</em> получения <code>Ack</code> от DLQ-топика.</li>
+<li><strong>Паники недопустимы в рантайме:</strong> Неперехваченная паника в горутине-обработчике убивает весь процесс ОС (<code>SIGABRT</code>), вызывая бесконечный <code>CrashLoopBackOff</code>. Оборачивание в <code>defer recover</code> — непреложный закон.</li>
+<li><strong>Маркерная типизация ошибок:</strong> Четко разделяйте детерминированный яд (<code>ErrFatalPoisonPill</code>) и временные инфраструктурные затыки (<code>ErrTransientRetry</code>).</li>
+<li><strong>RabbitMQ:</strong> Использует нативный <code>d.Nack(false, false)</code> для сброса яда в настроенный Dead Letter Exchange.</li>
+<li><strong>Kafka:</strong> Требует ручной отправки в <code>dlq-topic</code>. Оффсет исходного сообщения коммитится <strong>строго после подтверждения записи в DLQ</strong>.</li>
+<li><strong>Schema Registry</strong> защищает от ложной квалификации обновленных сообщений как ядовитых при эволюции контрактов.</li>
 </ol>
-<p>Построение отказоустойчивых воркеров требует учета множества краевых случаев. Мы защитились от паник и ядовитых данных, но как нам доказать, что вся эта сложная асинхронная механика работает корректно? Интеграционное тестирование таких систем — нетривиальная задача. В следующей статье мы разберем подходы к проверке: <a href="7-testirovanie-async-sistem.html" class="wikilink">7. Тестирование async систем</a>.</p>
+<p>Мы надежно защитили систему от отравления и паник. Но как на практике доказать, что наш асинхронный код корректно обрабатывает гонки, таймауты и сбои? В следующей лекции мы погрузимся в практики верификации: <a href="7-testirovanie-async-sistem.html" class="wikilink">7. Тестирование async систем</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~51 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Тестирование async систем</h1>
           </header>
@@ -2185,12 +2185,63 @@
   </div>
 </div>
 
+<p>Тестирование синхронного веб-сервиса — занятие линейное и психологически комфортное: отправил HTTP-запрос, дождался ответа в той же нити исполнения, проверил статус и тело ответа. Процедура детерминирована, время подчинено вашему контрольному таймеру.</p>
+<p>Но как только в архитектуру входит брокер сообщений, детерминизм испаряется. Вы отправляете сообщение в шину, а реакция на него размазана во времени, распределена по узлам кластера и скрыта за буферами сокетов и сетевыми задержками. Когда именно консьюмер прочитает пакет? Что произойдет, если в момент коммита смещения упадет сеть? Не возникнет ли гонка за общую запись в базу при параллельной вычитке соседних партиций?</p>
+<p>В этой лекции мы разберем инженерную методологию тестирования асинхронных систем в Go: от мгновенных изолированных unit-тестов с моками и фаззингом до полномасштабных интеграционных стендов на базе Testcontainers, проверкой утечек горутин и анализом поведения подсиcompiler-санитайзера <code>-race</code>.</p>
+<hr />
 <h2 id="pochemu-testirovat-asinkhronnyy-kod-slozhno">Почему тестировать асинхронный код сложно</h2>
 
-<p>В синхронном HTTP-обработчике мы дёргаем ручку, получаем ответ и проверяем статус. Тест линеен и предсказуем. Асинхронная обработка сообщений вносит недетерминизм: время, порядок доставки, конкурентность, ретраи, ребалансировки, сбои брокера. Тест, который прошёл сегодня, завтра может упасть из-за таймаута, потому что CI-машина чуть медленнее. Поэтому тестирование очередей и брокеров не сводится к отправке и проверке — это комплексная дисциплина, охватывающая изоляцию бизнес-логики, проверку конкурентных инвариантов и контроль инфраструктуры.</p>
-<p>Главный принцип: <strong>разделяйте логику обработки и транспорт</strong>. Транспорт (подтверждения, реконнекты, управление оффсетами) тестируется отдельно и по возможности интеграционно; бизнес-логика — изолированно и быстро.</p>
+<p>Главный источник боли инженера при тестировании очередей — <strong>рассинхронизация во времени и пространстве (Temporal and Spatial Decoupling)</strong>. Продюсер и консьюмер не знают друг о друге, они общаются через разделяемый лог или память брокера.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph &quot;Синхронный мир (Детерминизм)&quot;
+T1[&quot;Test Worker&quot;] --&gt;|&quot;HTTP POST /order&quot;| H1[&quot;Handler&quot;]
+H1 --&gt;|&quot;DB Write&quot;| DB1[(&quot;PostgreSQL&quot;)]
+H1 --&gt;|&quot;200 OK&quot;| T1
+end
+
+subgraph &quot;Асинхронный мир (Временной разрыв)&quot;
+T2[&quot;Test Producer&quot;] --&gt;|&quot;Publish(msg)&quot;| B[(&quot;Broker Queue&quot;)]
+B -.-&gt;|&quot;Неопределенная задержка (lag)&quot;| C[&quot;Consumer Worker&quot;]
+C --&gt;|&quot;DB Write&quot;| DB2[(&quot;PostgreSQL&quot;)]
+T2 -.-&gt;|&quot;Как узнать, что обработка завершена?&quot;| Q{&quot;assert.Eventually?&quot;}
+Q -.-&gt;|&quot;Poll state&quot;| DB2
+end
+  </pre>
+</div>
+
+
+<p>Типичные проблемы, делающие асинхронные тесты нестабильными (flaky):<br />
+1. <strong>Flaky-таймауты:</strong> Использование наивных <code>time.Sleep(100 * time.Millisecond)</code> в надежде, что консьюмер успеет. На машине разработчика тест проходит за 20 мс, а на перегруженном раннере CI процессор переключает квант планировщика на соседний контейнер — и тест падает по таймауту.<br />
+2. <strong>Утечки фоновых горутин (Goroutine Leaks):</strong> Консьюмер запущен в фоне, тест завершил утверждения и вышел, а горутина продолжает долбиться в закрытые каналы или сокеты, загрязняя контекст следующих тестов пакета.<br />
+3. <strong>Неконтролируемое состояние брокера:</strong> Предыдущий упавший тест оставил в тестовой очереди недочитанные сообщения (unacknowledged messages), которые внезапно перехватываются консьюмером из следующего теста.<br />
+4. <strong>Гонки данных при агрегации:</strong> Попытка проверить результат обработки пачки сообщений через общую переменную в тесте без применения примитивов синхронизации (<code>sync/atomic</code> или <code>sync.Mutex</code>).</p>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Важно</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Золотое правило тестирования:</strong> Разделяйте транспорт и логику обработки. Транспорт (протоколы AMQP, Kafka wire protocol, NATS conn, управление ACK/NACK и коммитами) тестируется интеграционно. Бизнес-логика обработчика обязана быть чистой функцией или структурой, принимающей доменный контекст и сообщение, и тестироваться изолированно на микросекундных скоростях.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="tri-urovnya-testirovaniya-asinkhronnykh-sistem">Три уровня тестирования асинхронных систем</h2>
 
+<p>Для надежного тестирования выстраивается пирамида испытаний, где каждый уровень решает строго свою задачу.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2205,28 +2256,26 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph &quot;Уровень 1: Unit&quot;
-U1[&quot;Изолированный обработчик&lt;br&gt;без брокера&quot;] --&gt; U2[&quot;Моки MessageReceiver и Publisher&quot;]
+subgraph &quot;Пирамида тестирования очередей&quot;
+L1[&quot;Уровень 1: Unit &amp; Fuzzing&lt;br&gt;• Чистые обработчики бизнес-логики&lt;br&gt;• Мокирование репозиториев и шины&lt;br&gt;• Скорость: микросекунды | 100% покрытие веток&quot;]
+L2[&quot;Уровень 2: Integration (Testcontainers)&lt;br&gt;• Реальный Docker-контейнер (Kafka / RabbitMQ)&lt;br&gt;• Проверка сериализации, ACK/NACK, ретраев, DLQ&lt;br&gt;• Проверка graceful shutdown и ребалансировки&quot;]
+L3[&quot;Уровень 3: Chaos &amp; End-to-End&lt;br&gt;• Стенд Staging / Docker Compose&lt;br&gt;• Внедрение сбоев сети (Toxiproxy), kill -9 брокера&lt;br&gt;• Валидация метрик Consumer Lag и алертинга&quot;]
 end
-subgraph &quot;Уровень 2: Integration&quot;
-I1[&quot;Реальный брокер&lt;br&gt;в контейнере&quot;] --&gt; I2[&quot;Проверка контрактов&lt;br&gt;сериализации и ретраев&quot;]
-end
-subgraph &quot;Уровень 3: E2E / Chaos&quot;
-E1[&quot;Кластер брокеров&lt;br&gt;с сетью и диском&quot;] --&gt; E2[&quot;Ребалансировка&lt;br&gt;сбои, потеря ACK&quot;]
-end
-U1 --&gt; I1 --&gt; E1
+L1 --&gt; L2 --&gt; L3
   </pre>
 </div>
 
 
 <ol>
-<li><strong>Unit</strong> — проверка чистых функций-обработчиков с моками транспорта. Сотни тестов за секунды.</li>
-<li><strong>Integration</strong> — реальный брокер в Docker (Testcontainers) или встроенный сервер. Проверка сериализации, ретраев, graceful shutdown.</li>
-<li><strong>End-to-end / Chaos</strong> — полный кластер в staging, проверка устойчивости к разделению сети и падению узлов. Обычно вне CI, здесь не рассматриваем.</li>
+<li><strong>Unit-тесты:</strong> Проверяют инварианты логики, ветвление при ошибках, идемпотентность и расчет backoff без запуска сетевого стека. Занимают доли секунды на весь проект.</li>
+<li><strong>Интеграционные тесты:</strong> Запускают изолированный брокер через <code>testcontainers-go</code>, проверяют совместимость сетевых протоколов, настройки сериализации JSON/Protobuf/Avro, поведение при заполнении буферов и реакцию на сигналы завершения.</li>
+<li><strong>Chaos / E2E тесты:</strong> Проверяют систему на устойчивость к разделению сети (network partition), внезапной потере кворума и корректность восстановления смещений.</li>
 </ol>
+<hr />
 <h2 id="unit-testirovanie-obrabotchikov-soobshcheniy">Unit-тестирование обработчиков сообщений</h2>
 
-<p>Бизнес-логика не должна знать, откуда пришло сообщение и куда уйдёт результат. Определяем интерфейсы:</p>
+<p>Чтобы сделать обработчик легко тестируемым, избавьте его от прямой зависимости от конкретной клиентской библиотеки (<code>*amqp.Channel</code> или <code>*kgo.Client</code>). Бизнес-сервис должен зависеть исключительно от доменных интерфейсов.</p>
+<p>Рассмотрим обработчик платежей:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2236,21 +2285,68 @@ U1 --&gt; I1 --&gt; E1
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type OrderService struct {
+  <pre class="language-go"><code class="language-go">package service
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;fmt&quot;
+)
+
+// PaymentMessage представляет входящее событие из очереди
+type PaymentMessage struct {
+    EventID string  `json:&quot;event_id&quot;`
+    UserID  string  `json:&quot;user_id&quot;`
+    Amount  float64 `json:&quot;amount&quot;`
+}
+
+// OrderRepository — интерфейс хранилища, легко подменяемый моком
+type OrderRepository interface {
+    UpdateBalance(ctx context.Context, userID string, delta float64) error
+    RecordEvent(ctx context.Context, eventID string) error
+    HasEvent(ctx context.Context, eventID string) (bool, error)
+}
+
+type PaymentHandler struct {
     repo OrderRepository
 }
 
-func (s *OrderService) ProcessPayment(ctx context.Context, msg PaymentMessage) error {
-    // бизнес-логика
-    if msg.Amount &lt;= 0 {
-        return fmt.Errorf(&quot;invalid amount&quot;)
+func NewPaymentHandler(repo OrderRepository) *PaymentHandler {
+    return &amp;PaymentHandler{repo: repo}
+}
+
+func (h *PaymentHandler) HandlePayment(ctx context.Context, msg PaymentMessage) error {
+    if msg.EventID == &quot;&quot; {
+        return errors.New(&quot;missing event_id&quot;)
     }
-    return s.repo.UpdateBalance(ctx, msg.UserID, msg.Amount)
+    if msg.Amount &lt;= 0 {
+        return fmt.Errorf(&quot;invalid payment amount: %.2f&quot;, msg.Amount)
+    }
+
+    // Проверка идемпотентности
+    alreadyProcessed, err := h.repo.HasEvent(ctx, msg.EventID)
+    if err != nil {
+        return fmt.Errorf(&quot;idempotency check failed: %w&quot;, err)
+    }
+    if alreadyProcessed {
+        // Повторное сообщение — подтверждаем без выполнения побочных эффектов
+        return nil
+    }
+
+    // Списание и фиксация события
+    if err := h.repo.UpdateBalance(ctx, msg.UserID, -msg.Amount); err != nil {
+        return fmt.Errorf(&quot;balance update failed: %w&quot;, err)
+    }
+    if err := h.repo.RecordEvent(ctx, msg.EventID); err != nil {
+        return fmt.Errorf(&quot;record event failed: %w&quot;, err)
+    }
+
+    return nil
 }
 </code></pre>
 </div>
 
-<p>Интерфейс <code>OrderRepository</code> легко мокировать. Сама структура не зависит от брокера. В тестах используем табличные тесты:</p>
+<p>Табличный unit-тест покрывает все краевые случаи за миллисекунды, используя самописный <code>mock</code> или сгенерированный через <code>mockgen</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2260,27 +2356,116 @@ func (s *OrderService) ProcessPayment(ctx context.Context, msg PaymentMessage) e
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func TestOrderService_ProcessPayment(t *testing.T) {
-    tests := []struct {
-        name    string
-        msg     PaymentMessage
-        repoOut error
-        wantErr string
-    }{
-        {&quot;success&quot;, PaymentMessage{UserID: &quot;u1&quot;, Amount: 100}, nil, &quot;&quot;},
-        {&quot;invalid amount&quot;, PaymentMessage{UserID: &quot;u1&quot;, Amount: 0}, nil, &quot;invalid amount&quot;},
-        {&quot;db error&quot;, PaymentMessage{UserID: &quot;u1&quot;, Amount: 50}, errors.New(&quot;db down&quot;), &quot;db down&quot;},
+  <pre class="language-go"><code class="language-go">package service_test
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;strings&quot;
+    &quot;sync&quot;
+    &quot;testing&quot;
+
+    &quot;github.com/stretchr/testify/assert&quot;
+    &quot;github.com/stretchr/testify/require&quot;
+)
+
+type mockOrderRepo struct {
+    mu           sync.Mutex
+    events       map[string]bool
+    balances     map[string]float64
+    updateErr    error
+    hasEventErr  error
+}
+
+func newMockOrderRepo() *mockOrderRepo {
+    return &amp;mockOrderRepo{
+        events:   make(map[string]bool),
+        balances: make(map[string]float64),
     }
+}
+
+func (m *mockOrderRepo) UpdateBalance(ctx context.Context, userID string, delta float64) error {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    if m.updateErr != nil {
+        return m.updateErr
+    }
+    m.balances[userID] += delta
+    return nil
+}
+
+func (m *mockOrderRepo) RecordEvent(ctx context.Context, eventID string) error {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    m.events[eventID] = true
+    return nil
+}
+
+func (m *mockOrderRepo) HasEvent(ctx context.Context, eventID string) (bool, error) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    if m.hasEventErr != nil {
+        return false, m.hasEventErr
+    }
+    return m.events[eventID], nil
+}
+
+func TestPaymentHandler_Table(t *testing.T) {
+    t.Parallel()
+
+    tests := []struct {
+        name        string
+        msg         PaymentMessage
+        setupMock   func(m *mockOrderRepo)
+        wantErr     string
+        checkExpect func(t *testing.T, m *mockOrderRepo)
+    }{
+        {
+            name: &quot;Success: New payment processed&quot;,
+            msg:  PaymentMessage{EventID: &quot;evt-1&quot;, UserID: &quot;usr-100&quot;, Amount: 50.0},
+            setupMock: func(m *mockOrderRepo) {
+                m.balances[&quot;usr-100&quot;] = 200.0
+            },
+            wantErr: &quot;&quot;,
+            checkExpect: func(t *testing.T, m *mockOrderRepo) {
+                assert.Equal(t, 150.0, m.balances[&quot;usr-100&quot;])
+                assert.True(t, m.events[&quot;evt-1&quot;])
+            },
+        },
+        {
+            name:      &quot;Error: Zero or negative amount&quot;,
+            msg:       PaymentMessage{EventID: &quot;evt-2&quot;, UserID: &quot;usr-100&quot;, Amount: -10.0},
+            setupMock: func(m *mockOrderRepo) {},
+            wantErr:   &quot;invalid payment amount&quot;,
+        },
+        {
+            name: &quot;Error: Database update balance failure&quot;,
+            msg:  PaymentMessage{EventID: &quot;evt-3&quot;, UserID: &quot;usr-100&quot;, Amount: 30.0},
+            setupMock: func(m *mockOrderRepo) {
+                m.updateErr = errors.New(&quot;connection reset by peer&quot;)
+            },
+            wantErr: &quot;balance update failed&quot;,
+        },
+    }
+
     for _, tt := range tests {
+        tt := tt
         t.Run(tt.name, func(t *testing.T) {
-            repo := &amp;mockRepo{updateBalanceErr: tt.repoOut}
-            svc := &amp;OrderService{repo: repo}
-            err := svc.ProcessPayment(context.Background(), tt.msg)
-            if tt.wantErr == &quot;&quot; &amp;&amp; err != nil {
-                t.Errorf(&quot;unexpected error: %v&quot;, err)
-            }
-            if tt.wantErr != &quot;&quot; &amp;&amp; (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
-                t.Errorf(&quot;expected error containing %q, got %v&quot;, tt.wantErr, err)
+            t.Parallel()
+            mockRepo := newMockOrderRepo()
+            tt.setupMock(mockRepo)
+
+            h := NewPaymentHandler(mockRepo)
+            err := h.HandlePayment(context.Background(), tt.msg)
+
+            if tt.wantErr != &quot;&quot; {
+                require.Error(t, err)
+                assert.Contains(t, err.Error(), tt.wantErr)
+            } else {
+                require.NoError(t, err)
+                if tt.checkExpect != nil {
+                    tt.checkExpect(t, mockRepo)
+                }
             }
         })
     }
@@ -2288,10 +2473,14 @@ func (s *OrderService) ProcessPayment(ctx context.Context, msg PaymentMessage) e
 </code></pre>
 </div>
 
-<p>Это изолирует обработку от транспорта, позволяет проверять краевые случаи, панику и тайм-ауты без реального брокера.</p>
+<hr />
 <h2 id="testirovanie-idempotentnosti-obrabotchika">Тестирование идемпотентности обработчика</h2>
 
-<p>Idempotent handler (<a href="4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>) должен при повторной доставке того же сообщения дать тот же результат, не создав побочных эффектов дважды. Тест должен эмулировать дубликат. Обычно обработчик запоминает обработанные идентификаторы (idempotency key). Пишем тест с конкурентными вызовами:</p>
+<p>Согласно правилам <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>, обработчик обязан выдавать одинаковый бизнес-результат при повторном получении дубликата. Тестирование идемпотентности делится на два обязательных сценария:</p>
+<ol>
+<li><strong>Последовательный дубликат:</strong> Первое сообщение обработано успешно, следом приходит копия того же сообщения. Тест проверяет, что баланс не изменился повторно, а хранилище вызывалось безопасным образом.</li>
+<li><strong>Конкурентный дубликат (Race condition):</strong> Брокер (например, RabbitMQ при <code>redeliver</code> или Kafka при параллельной перебалансировке) доставил копии одного и того же <code>EventID</code> сразу двум параллельным горутинам-консьюмерам.</li>
+</ol>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2301,45 +2490,39 @@ func (s *OrderService) ProcessPayment(ctx context.Context, msg PaymentMessage) e
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func TestIdempotentHandler_Duplicate(t *testing.T) {
-    repo := &amp;inMemoryRepo{}
-    handler := NewIdempotentHandler(repo, time.Minute)
+  <pre class="language-go"><code class="language-go">func TestPaymentHandler_Idempotency_Concurrent(t *testing.T) {
+    mockRepo := newMockOrderRepo()
+    mockRepo.balances[&quot;usr-vip&quot;] = 1000.0
 
-    msg := Message{Key: &quot;evt-123&quot;, Body: &quot;data&quot;}
-    // Первый вызов
-    err := handler.Handle(context.Background(), msg)
-    require.NoError(t, err)
-    // Повторный вызов с тем же ключом
-    err = handler.Handle(context.Background(), msg)
-    require.NoError(t, err)
+    h := NewPaymentHandler(mockRepo)
+    msg := PaymentMessage{
+        EventID: &quot;tx-duplicate-999&quot;,
+        UserID:  &quot;usr-vip&quot;,
+        Amount:  100.0,
+    }
 
-    // Проверяем, что бизнес-действие выполнено один раз
-    require.Equal(t, 1, repo.CallCount(&quot;evt-123&quot;))
-}
-
-func TestIdempotentHandler_Concurrent(t *testing.T) {
-    repo := &amp;inMemoryRepo{}
-    handler := NewIdempotentHandler(repo, time.Minute)
-    msg := Message{Key: &quot;evt-456&quot;, Body: &quot;data&quot;}
-
+    const goroutines = 10
     var wg sync.WaitGroup
-    for i := 0; i &lt; 10; i++ {
-        wg.Add(1)
+    wg.Add(goroutines)
+
+    // Запускаем 10 параллельных горутин с абсолютно одинаковым сообщением
+    for i := 0; i &lt; goroutines; i++ {
         go func() {
             defer wg.Done()
-            _ = handler.Handle(context.Background(), msg)
+            _ = h.HandlePayment(context.Background(), msg)
         }()
     }
+
     wg.Wait()
-    require.Equal(t, 1, repo.CallCount(&quot;evt-456&quot;), &quot;действие должно выполниться ровно один раз&quot;)
+
+    // Инвариант: списание 100.0 должно произойти строго 1 раз! Баланс обязан стать 900.0, а не 0.0
+    assert.Equal(t, 900.0, mockRepo.balances[&quot;usr-vip&quot;], &quot;Баланс должен быть списан ровно один раз&quot;)
+    assert.True(t, mockRepo.events[&quot;tx-duplicate-999&quot;])
 }
 </code></pre>
 </div>
 
-<p>Этот тест обнаруживает гонки в хранилище ключей идемпотентности, если таковые есть. Для детектирования утечек горутин дополнительно вызывают <code>goleak.VerifyNone(t)</code>.</p>
-<h2 id="testirovanie-retraev-i-exponential-backoff">Тестирование ретраев и exponential backoff</h2>
-
-<p>При ошибках транспорт должен повторить обработку согласно стратегии (<a href="../01-fundament-asinkhronnosti/9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>), а после исчерпания попыток отправить сообщение в Dead Letter Queue (<a href="../01-fundament-asinkhronnosti/8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a>). Для unit-теста мокируем брокер так, чтобы он возвращал ошибки заданное число раз, после чего успех.</p>
+<p>Для надежного отлова скрытых гонок и утечек всегда проверяйте тесты с детектором утечек горутин <code>uber-go/goleak</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2349,42 +2532,164 @@ func TestIdempotentHandler_Concurrent(t *testing.T) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type mockBroker struct {
-    mu       sync.Mutex
-    attempts int
-    failFor  int
+  <pre class="language-go"><code class="language-go">import &quot;go.uber.org/goleak&quot;
+
+func TestMain(m *testing.M) {
+    // Проверяет, что после завершения пакета тестов в рантайме не осталось забытых горутин
+    goleak.VerifyTestMain(m)
+}
+</code></pre>
+</div>
+
+<p>А в локальных тестах отдельных функций можно вызывать прямо внутри теста:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func TestHandlerLifecycle(t *testing.T) {
+    defer goleak.VerifyNone(t)
+    // Тело теста с запуском и остановкой воркеров
+}
+</code></pre>
+</div>
+
+<hr />
+<h2 id="testirovanie-retraev-i-exponential-backoff">Тестирование ретраев и exponential backoff</h2>
+
+<p>При временных инфраструктурных сбоях публикация или обработка должны повторяться по правилам <a href="../01-fundament-asinkhronnosti/9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>, а при исчерпании попыток — перенаправляться в Dead Letter Queue (<a href="../01-fundament-asinkhronnosti/8-dead-letter-queue.html" class="wikilink">8. Dead Letter Queue</a>).</p>
+<p>Для проверки логики ретраев создается мок брокера с программируемым количеством сбоев:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package service_test
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;sync&quot;
+    &quot;sync/atomic&quot;
+    &quot;testing&quot;
+    &quot;time&quot;
+
+    &quot;github.com/stretchr/testify/assert&quot;
+    &quot;github.com/stretchr/testify/require&quot;
+)
+
+type mockBroker struct {
+    mu           sync.Mutex
+    attempts     int
+    failuresLeft int
 }
 
-func (m *mockBroker) Publish(ctx context.Context, msg Message) error {
+func (m *mockBroker) Publish(ctx context.Context, topic string, payload []byte) error {
     m.mu.Lock()
     defer m.mu.Unlock()
     m.attempts++
-    if m.attempts &lt;= m.failFor {
-        return errors.New(&quot;transient error&quot;)
+    if m.failuresLeft &gt; 0 {
+        m.failuresLeft--
+        return errors.New(&quot;network io timeout&quot;)
     }
     return nil
 }
 
-func TestRetryMechanism(t *testing.T) {
-    broker := &amp;mockBroker{failFor: 2}
-    dlq := &amp;mockDLQ{}
-    publisher := NewRetryPublisher(broker, dlq, RetryConfig{MaxRetries: 3, Backoff: 10 * time.Millisecond})
-
-    err := publisher.Publish(context.Background(), Message{Key: &quot;test&quot;})
-    require.NoError(t, err)                        // в итоге успешно
-    require.Equal(t, 3, broker.attempts)           // 2 фейла + 1 успех
-    require.Empty(t, dlq.Messages)                 // DLQ не затронута
+type mockDLQ struct {
+    mu       sync.Mutex
+    messages [][]byte
 }
 
-func TestRetryExhausted(t *testing.T) {
-    broker := &amp;mockBroker{failFor: 10}
-    dlq := &amp;mockDLQ{}
-    publisher := NewRetryPublisher(broker, dlq, RetryConfig{MaxRetries: 3, Backoff: 10 * time.Millisecond})
+func (d *mockDLQ) SendToDLQ(ctx context.Context, payload []byte, reason error) error {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.messages = append(d.messages, payload)
+    return nil
+}
 
-    err := publisher.Publish(context.Background(), Message{Key: &quot;test&quot;})
-    require.Error(t, err)                          // попытки исчерпаны
-    require.Equal(t, 4, broker.attempts)           // 4 попытки (начальная + 3 ретрая)
-    require.Len(t, dlq.Messages, 1)                // одно сообщение в DLQ
+type RetryConfig struct {
+    MaxRetries int
+    BaseDelay  time.Duration
+}
+
+type RetryPublisher struct {
+    broker *mockBroker
+    dlq    *mockDLQ
+    cfg    RetryConfig
+}
+
+func (p *RetryPublisher) PublishWithRetry(ctx context.Context, topic string, payload []byte) error {
+    delay := p.cfg.BaseDelay
+    for attempt := 0; attempt &lt;= p.cfg.MaxRetries; attempt++ {
+        err := p.broker.Publish(ctx, topic, payload)
+        if err == nil {
+            return nil
+        }
+        if attempt == p.cfg.MaxRetries {
+            // Попытки исчерпаны — отправляем в DLQ
+            _ = p.dlq.SendToDLQ(ctx, payload, err)
+            return fmt.Errorf(&quot;retries exhausted: %w&quot;, err)
+        }
+        select {
+        case &lt;-ctx.Done():
+            return ctx.Err()
+        case &lt;-time.After(delay):
+            delay *= 2 // exponential backoff
+        }
+    }
+    return nil
+}
+
+func TestRetryPublisher_SuccessAfterRetries(t *testing.T) {
+    broker := &amp;mockBroker{failuresLeft: 2} // Первые 2 вызова упадут, 3-й успешен
+    dlq := &amp;mockDLQ{}
+    pub := &amp;RetryPublisher{
+        broker: broker,
+        dlq:    dlq,
+        cfg:    RetryConfig{MaxRetries: 3, BaseDelay: 2 * time.Millisecond},
+    }
+
+    err := pub.PublishWithRetry(context.Background(), &quot;orders&quot;, []byte(`{&quot;id&quot;: 10}`))
+    require.NoError(t, err)
+
+    broker.mu.Lock()
+    assert.Equal(t, 3, broker.attempts, &quot;Ожидалось ровно 3 попытки (2 сбоя + 1 успех)&quot;)
+    broker.mu.Unlock()
+
+    dlq.mu.Lock()
+    assert.Empty(t, dlq.messages, &quot;DLQ не должна содержать сообщений при успехе&quot;)
+    dlq.mu.Unlock()
+}
+
+func TestRetryPublisher_ExhaustedToDLQ(t *testing.T) {
+    broker := &amp;mockBroker{failuresLeft: 10} // Все попытки завершатся сбоем
+    dlq := &amp;mockDLQ{}
+    pub := &amp;RetryPublisher{
+        broker: broker,
+        dlq:    dlq,
+        cfg:    RetryConfig{MaxRetries: 3, BaseDelay: 2 * time.Millisecond},
+    }
+
+    err := pub.PublishWithRetry(context.Background(), &quot;orders&quot;, []byte(`{&quot;id&quot;: 99}`))
+    require.Error(t, err)
+
+    broker.mu.Lock()
+    // 1 исходная попытка + 3 ретрая = 4 вызова
+    assert.Equal(t, 4, broker.attempts)
+    broker.mu.Unlock()
+
+    dlq.mu.Lock()
+    require.Len(t, dlq.messages, 1, &quot;Сообщение обязано поступить в DLQ&quot;)
+    assert.JSONEq(t, `{&quot;id&quot;: 99}`, string(dlq.messages[0]))
+    dlq.mu.Unlock()
 }
 </code></pre>
 </div>
@@ -2392,18 +2697,11 @@ func TestRetryExhausted(t *testing.T) {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Смертоносный `time.Sleep`</span>
   </div>
   <div class="callout-body">
-    <p>Не используйте <code>time.Sleep</code> в циклах ожидания. Применяйте <code>assert.Eventually</code> из testify с малым интервалом опроса, чтобы тест не был хрупким к задержкам CI.</p>
-  </div>
-</div>
-
-<h2 id="integratsionnoe-testirovanie-s-realnym-brokerom">Интеграционное тестирование с реальным брокером</h2>
-
-<p>Unit-тестов недостаточно, когда нужно проверить сериализацию, партиционирование, работу Consumer Group, graceful shutdown или exactly-once гарантии. Здесь вступает в игру <strong>Testcontainers for Go</strong> — библиотека, запускающая Docker-контейнеры прямо из тестов.</p>
-<h3 id="podgotovka-konteynera-kafka">Подготовка контейнера Kafka</h3>
-
+    <p>Никогда не используйте фиксированный <code>time.Sleep</code> для ожидания асинхронного события в тестах! Если вы напишете <code>time.Sleep(200 * time.Millisecond)</code>, тест замедлится на 200 мс, даже если событие наступило через 2 мс. При 1000 тестах ваш билд будет идти 3 минуты вместо 2 секунд.</p>
+<p>Вместо этого всегда используйте функцию поллинга условий <code>assert.Eventually</code> или <code>require.Eventually</code> из библиотеки <code>testify</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2413,69 +2711,173 @@ func TestRetryExhausted(t *testing.T) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import (
+  <pre class="language-go"><code class="language-go">assert.Eventually(t, func() bool {
+    return atomic.LoadInt64(&amp;processedCount) == 100
+}, 2*time.Second, 10*time.Millisecond, &quot;Ожидалась обработка 100 сообщений&quot;)
+</code></pre>
+</div>
+
+<p><code>assert.Eventually</code> проверяет условие каждые 10 мс и выходит мгновенно, как только предикат возвращает <code>true</code>.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="integratsionnoe-testirovanie-s-realnym-brokerom">Интеграционное тестирование с реальным брокером</h2>
+
+<p>Ни один мок не воспроизведет реальное поведение партиций Kafka, семантику RabbitMQ dead-letter exchange, сброс сокетов по таймауту heartbeat или ребалансировку Consumer Group. Для таких проверок используются официальные модули <strong>Testcontainers for Go</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Test as go test (Runner)
+participant Docker as Docker Engine
+participant Kafka as Kafka Container
+participant Consumer as App Consumer Goroutine
+
+Test-&gt;&gt;Docker: Start Container (confluentinc/confluent-local:7.5.0)
+Docker--&gt;&gt;Test: Port Mappings &amp; Seed Brokers
+Test-&gt;&gt;Kafka: AdminClient: Create Topic &quot;orders.v1&quot; (1 Partition)
+Test-&gt;&gt;Consumer: Start Consumer Loop (Context ctx)
+Test-&gt;&gt;Kafka: Producer.ProduceSync(&quot;hello&quot;)
+Kafka--&gt;&gt;Consumer: PollFetches() returns Record(&quot;hello&quot;)
+Consumer-&gt;&gt;Test: Notify via Channel / Store
+Test-&gt;&gt;Test: Cancel Context (SIGTERM simulation)
+Consumer-&gt;&gt;Kafka: CommitRecord &amp; Close Client
+Test-&gt;&gt;Docker: Terminate Container
+  </pre>
+</div>
+
+
+<p>Интеграционные тесты обычно выделяются в отдельный набор с помощью build-тегов:<br />
+<code>//go:build integration</code><br />
+Благодаря этому обычный запуск <code>go test ./...</code> отрабатывает мгновенно, а тяжелые тесты с Docker запускаются только при передаче флага:<br />
+<code>go test -tags=integration -v ./...</code></p>
+<h3 id="podgotovka-konteynera-kafka">Подготовка контейнера Kafka</h3>
+
+<p>Ниже представлен полноценный боевой интеграционный тест взаимодействия продюсера и консьюмера с использованием современной библиотеки <code>twmb/franz-go</code> и модуля <code>testcontainers-go/modules/kafka</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">//go:build integration
+// +build integration
+
+package integration_test
+
+import (
     &quot;context&quot;
     &quot;testing&quot;
     &quot;time&quot;
 
+    &quot;github.com/stretchr/testify/require&quot;
     &quot;github.com/testcontainers/testcontainers-go&quot;
     tckafka &quot;github.com/testcontainers/testcontainers-go/modules/kafka&quot;
     &quot;github.com/twmb/franz-go/pkg/kgo&quot;
 )
 
 func TestKafkaProduceConsume(t *testing.T) {
-    ctx := context.Background()
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+
+    // 1. Поднимаем легковесный одиночный контейнер Kafka в Docker
     kafkaContainer, err := tckafka.RunContainer(ctx,
         tckafka.WithClusterID(&quot;test-cluster&quot;),
         testcontainers.WithImage(&quot;confluentinc/confluent-local:7.5.0&quot;),
     )
     require.NoError(t, err)
-    defer kafkaContainer.Terminate(ctx)
+    defer func() {
+        _ = kafkaContainer.Terminate(context.Background())
+    }()
 
+    // 2. Извлекаем реальные хост и порт, выставленные наружу Docker-демоном
     brokers, err := kafkaContainer.Brokers(ctx)
     require.NoError(t, err)
     require.NotEmpty(t, brokers)
 
-    // Создаём топик
-    adminCl := kgo.NewClient(kgo.SeedBrokers(brokers...))
+    topicName := &quot;test-topic&quot;
+
+    // 3. Создаем топик через Kafka Admin API
+    adminCl, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
+    require.NoError(t, err)
+    defer adminCl.Close()
+
     _, err = adminCl.CreateTopics(ctx, &amp;kgo.CreateTopicsRequest{
         Topics: []kgo.CreateTopicsRequestTopic{{
-            Topic:             &quot;test-topic&quot;,
+            Topic:             topicName,
             NumPartitions:     1,
             ReplicationFactor: 1,
         }},
     })
     require.NoError(t, err)
 
-    // Продюсер
-    produceCl := kgo.NewClient(kgo.SeedBrokers(brokers...), kgo.DefaultProduceTopic(&quot;test-topic&quot;))
-    produceCl.ProduceSync(ctx, &amp;kgo.Record{Value: []byte(&quot;hello&quot;)})
+    // 4. Инициализируем продюсер и отправляем контрольное сообщение
+    produceCl, err := kgo.NewClient(
+        kgo.SeedBrokers(brokers...),
+        kgo.DefaultProduceTopic(topicName),
+    )
+    require.NoError(t, err)
+
+    record := &amp;kgo.Record{Value: []byte(&quot;hello-async-world&quot;)}
+    results := produceCl.ProduceSync(ctx, record)
+    require.NoError(t, results.FirstErr())
     produceCl.Close()
 
-    // Консьюмер
-    consumeCl := kgo.NewClient(kgo.SeedBrokers(brokers...), kgo.ConsumeTopics(&quot;test-topic&quot;))
-    ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-    defer cancel()
+    // 5. Запускаем консьюмер и проверяем получение
+    consumeCl, err := kgo.NewClient(
+        kgo.SeedBrokers(brokers...),
+        kgo.ConsumeTopics(topicName),
+        kgo.ConsumerGroup(&quot;test-group&quot;),
+    )
+    require.NoError(t, err)
+    defer consumeCl.Close()
+
+    pollCtx, pollCancel := context.WithTimeout(ctx, 15*time.Second)
+    defer pollCancel()
 
     var received []string
     for {
-        fetches := consumeCl.PollFetches(ctx)
-        if fetches.IsClientClosed() || ctx.Err() != nil {
+        fetches := consumeCl.PollFetches(pollCtx)
+        if fetches.IsClientClosed() || pollCtx.Err() != nil {
             break
         }
         fetches.EachRecord(func(r *kgo.Record) {
             received = append(received, string(r.Value))
         })
+        if len(received) &gt;= 1 {
+            break
+        }
     }
-    require.Equal(t, []string{&quot;hello&quot;}, received)
+
+    require.Equal(t, []string{&quot;hello-async-world&quot;}, received)
 }
 </code></pre>
 </div>
 
-<p>Этот тест проверяет сквозной путь: продюсер → брокер в контейнере → консьюмер. Testcontainers поднимает свежий экземпляр Kafka для каждого теста, гарантируя изоляцию. Аналогично тестируются RabbitMQ (через <code>testcontainers/modules/rabbitmq</code>) и NATS (можно встроенный сервер).</p>
+<p>Аналогичным образом модуль <code>testcontainers/modules/rabbitmq</code> позволяет поднять изолированный RabbitMQ с преднастроенными очередями и плагинами управления (Management UI) за пару строк кода.</p>
 <h3 id="proverka-graceful-shutdown">Проверка graceful shutdown</h3>
 
-<p>Комбинируем контейнер с отправкой сигнала. Консьюмер запускается в горутине, получает несколько сообщений, затем контекст отменяется (эмулируя SIGTERM). Проверяем, что все извлечённые до отмены сообщения обработаны, а коммит offset-а в Kafka произведён.</p>
+<p>В соответствии с принципами <a href="2-konsyumery-i-graceful-shutdown.html" class="wikilink">2. Консьюмеры и graceful shutdown</a>, при получении сигнала завершения консьюмер обязан:<br />
+1. Прекратить чтение новых сообщений из брокера.<br />
+2. Завершить обработку тех сообщений, которые уже находятся в локальных буферах горутин.<br />
+3. Зафиксировать (ACK/Commit) их смещения в брокере.<br />
+4. Корректно закрыть сетевое соединение.</p>
+<p>Проверка graceful shutdown строится на моделировании отмены контекста:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2487,40 +2889,56 @@ func TestKafkaProduceConsume(t *testing.T) {
   </div>
   <pre class="language-go"><code class="language-go">func TestGracefulShutdown(t *testing.T) {
     ctx, cancel := context.WithCancel(context.Background())
-    client := kgo.NewClient(kgo.SeedBrokers(brokers...), kgo.ConsumeTopics(&quot;test-topic&quot;))
-    processed := make(chan string, 10)
+    defer cancel()
+
+    client, err := kgo.NewClient(kgo.SeedBrokers(brokers...), kgo.ConsumeTopics(&quot;shutdown-topic&quot;))
+    require.NoError(t, err)
+    defer client.Close()
+
+    processed := make(chan string, 100)
+    consumerDone := make(chan struct{})
+
+    // Фоновый цикл вычитки
     go func() {
+        defer close(consumerDone)
         for {
             fetches := client.PollFetches(ctx)
-            if fetches.IsClientClosed() {
+            if fetches.IsClientClosed() || ctx.Err() != nil {
+                // Контекст отменен — выходим из цикла вычитки
                 break
             }
             fetches.EachRecord(func(r *kgo.Record) {
                 processed &lt;- string(r.Value)
             })
         }
-        close(processed)
     }()
-    // Ждём обработки хотя бы одного сообщения, потом отменяем
-    &lt;-processed
+
+    // Ждем, пока консьюмер гарантированно начнет работу и обработает хотя бы одно сообщение
+    require.Eventually(t, func() bool {
+        return len(processed) &gt; 0
+    }, 5*time.Second, 50*time.Millisecond)
+
+    // Имитируем приход сигнала SIGTERM в микросервис
     cancel()
-    var all []string
-    for v := range processed {
-        all = append(all, v)
+
+    // Убеждаемся, что горутина консьюмера штатно завершилась без зависания
+    select {
+    case &lt;-consumerDone:
+        // Успешный выход
+    case &lt;-time.After(3 * time.Second):
+        t.Fatal(&quot;Consumer failed to shutdown gracefully within 3 seconds&quot;)
     }
-    // Проверяем, что оставшиеся сообщения обработаны, а новые не поступают
-    // ... более точные ассерты с количеством отправленных
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="testirovanie-konkurentnoy-obrabotki">Тестирование конкурентной обработки</h2>
 
-<p>Множественные горутины-обработчики могут нарушить порядок сообщений одной партиции, если не соблюдается последовательная обработка. Тест должен отправить сообщения с одним ключом, обработать их в нескольких горутинах и проверить, что порядок сохранён (или наоборот, что агрегация всё равно корректна при нарушении порядка).</p>
-<p>Для этого используют каналы и <code>atomic</code> счётчики. Такой тест может обнаружить состояние гонки, если общий кэш обновляется без синхронизации. Гонка детектируется флагом <code>-race</code>.</p>
-<h2 id="testirovanie-s-fazzingom">Тестирование с фаззингом</h2>
-
-<p>Начиная с Go 1.18 доступен нативный фаззер. Для обработчика сообщений это мощный инструмент: подаём на вход случайные байтовые последовательности и проверяем, что обработчик не паникует и не зависает.</p>
+<p>Когда консьюмер распределяет входящие сообщения между пулом рабочих горутин (Worker Pool из лекции <a href="3-parallelizm-obrabotki-soobshcheniy.html" class="wikilink">3. Параллелизм обработки сообщений</a>), высок риск нарушить строгий порядок или получить гонку за разделяемое состояние.</p>
+<p>При тестировании конкурентного консьюмера применяются:<br />
+1. <strong>Счетчики на базе <code>sync/atomic</code>:</strong> Никаких <code>count++</code> без мьютекса или атомиков, иначе тест упадет под детектором гонок.<br />
+2. <strong>Флаг <code>-race</code>:</strong> Команда <code>go test -race ./...</code> обязана выполняться на каждом шаге CI-пайплайна. Инструментация рантайма Go отслеживает все несинхронизированные чтения и записи в память размером в 8 байт.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2530,48 +2948,224 @@ func TestKafkaProduceConsume(t *testing.T) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func FuzzOrderHandler(f *testing.F) {
-    f.Fuzz(func(t *testing.T, userID string, amount float64) {
-        msg := PaymentMessage{UserID: userID, Amount: amount}
-        // Вызываем обработчик и убеждаемся, что нет паники
-        handler.ProcessPayment(context.Background(), msg)
+  <pre class="language-go"><code class="language-go">func TestConcurrentProcessing_OrderAndRaces(t *testing.T) {
+    const totalMessages = 500
+    var processedCount int64
+
+    var mu sync.Mutex
+    orderPerKey := make(map[string][]int)
+
+    // Симулируем конкурентный воркер-пул
+    jobs := make(chan struct {
+        key string
+        seq int
+    }, totalMessages)
+
+    var wg sync.WaitGroup
+    const workers = 8
+    for w := 0; w &lt; workers; w++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for j := range jobs {
+                // Имитируем работу
+                atomic.AddInt64(&amp;processedCount, 1)
+
+                mu.Lock()
+                orderPerKey[j.key] = append(orderPerKey[j.key], j.seq)
+                mu.muUnlock := func() { mu.Unlock() }
+                mu.muUnlock()
+            }
+        }()
+    }
+
+    // Отправляем сообщения с тремя разными ключами
+    for i := 0; i &lt; totalMessages; i++ {
+        key := fmt.Sprintf(&quot;partition-%d&quot;, i%3)
+        jobs &lt;- struct {
+            key string
+            seq int
+        }{key: key, seq: i}
+    }
+    close(jobs)
+    wg.Wait()
+
+    assert.Equal(t, int64(totalMessages), atomic.LoadInt64(&amp;processedCount))
+}
+</code></pre>
+</div>
+
+<hr />
+<h2 id="testirovanie-s-fazzingom">Тестирование с фаззингом</h2>
+
+<p>Начиная с Go 1.18, компилятор включает нативный фаззинг (Fuzzing). В асинхронных системах брокер доставляет не структуры Go, а сырые байты (<code>[]byte</code>), полученные из сети.</p>
+<p>Если в продюсер внедрили несовместимую схему, хакер прислал некорректный JSON, или сжатие Snappy повредило пару байт в заголовке, обработчик обязан аккуратно вернуть ошибку, а не упасть в панику с завершением всего процесса.</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func FuzzPaymentMessageHandler(f *testing.F) {
+    // Добавляем начальный корпус валидных семян (Seed Corpus)
+    f.Add([]byte(`{&quot;event_id&quot;:&quot;evt-1&quot;,&quot;user_id&quot;:&quot;u-10&quot;,&quot;amount&quot;:100.5}`))
+    f.Add([]byte(`{&quot;event_id&quot;:&quot;&quot;,&quot;user_id&quot;:&quot;&quot;,&quot;amount&quot;:0}`))
+    f.Add([]byte(`{}`))
+    f.Add([]byte(`null`))
+
+    repo := newMockOrderRepo()
+    handler := NewPaymentHandler(repo)
+
+    f.Fuzz(func(t *testing.T, data []byte) {
+        var msg PaymentMessage
+        // 1. Проверяем парсинг — он не должен вызывать панику
+        if err := json.Unmarshal(data, &amp;msg); err != nil {
+            // Невалидный JSON — штатная ситуация, игнорируем
+            return
+        }
+
+        // 2. Проверяем доменную валидацию — любые крайние значения float64 (NaN, +Inf, -Inf, Overflow)
+        // не должны ломать внутренние инварианты
+        _ = handler.HandlePayment(context.Background(), msg)
     })
 }
 </code></pre>
 </div>
 
-<p>Фаззер быстро находит краевые случаи: пустые строки, NaN, отрицательные значения, огромные размеры. Это особенно ценно при десериализации JSON/Avro, где может быть неожиданная структура.</p>
-<h2 id="instrumenty-i-luchshie-praktiki">Инструменты и лучшие практики</h2>
+<p>Запуск фаззера в CI на короткий интервал:</p>
 
-<ul>
-<li><strong>testify</strong> — <code>assert</code>, <code>require</code>, <code>mock</code>, <code>Eventually</code>.</li>
-<li><strong>testcontainers-go</strong> — управление Docker-контейнерами из Go-тестов, поддержка Kafka, RabbitMQ, PostgreSQL.</li>
-<li><strong>mockgen</strong> (gomock) — кодогенерация моков для интерфейсов.</li>
-<li><strong>goleak</strong> — обнаружение утечек горутин после тестов.</li>
-<li><strong>go test -race</strong> — обязателен в CI для любого кода с горутинами и каналами.</li>
-</ul>
-<p>Рекомендуемая структура тестов:<br />
-- Быстрые unit-тесты обработчиков и моков (миллисекунды).<br />
-- Интеграционные тесты с контейнерами, помеченные build-тегом <code>integration</code>, чтобы не замедлять обычный <code>go test</code>.<br />
-- E2E сценарии на staging.</p>
-<div class="callout callout-interview">
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -fuzz=FuzzPaymentMessageHandler -fuzztime=30s ./service/...
+</code></pre>
+</div>
+
+<p>Фаззер молниеносно находит краевые случаи, о которых разработчик даже не подозревал: невалидные UTF-8 последовательности в строках, отрицательный баланс, NaN в числах с плавающей точкой и переполнение стека рекурсивными структурами.</p>
+<hr />
+<div class="callout callout-info">
   <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Mechanical Sympathy виртуального времени и планировщика</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как протестировать, что ваш сервис обеспечивает exactly-once обработку в Kafka?<br />
-<strong>Ответ:</strong> Надо проверить три составляющие:<br />
-1. Идемпотентность обработчика — unit-тест с дубликатами сообщений.<br />
-2. Транзакционная запись (продюсер) и read_committed (консьюмер) — интеграционный тест с Testcontainers, где моделируем потерю ACK и повтор отправки, затем проверяем отсутствие дубликатов в выходном топике.<br />
-3. Атомарность коммита offset-а и результата обработки — интеграционный тест с принудительным падением консьюмера между Poll и коммитом и проверкой, что после перезапуска дубликатов не возникло.</p>
+    <p>Почему <code>time.Sleep</code> настолько токсичен для тестов?</p>
+<p>Когда горутина вызывает <code>time.Sleep(d)</code>, планировщик рантайма Go переводит ее состояние из <code>_Grunning</code> в <code>_Gwaiting</code> и регистрирует таймер в четырехлучевой куче таймеров текущего процессора <code>P</code> (<code>runtime.timer</code>). После этого поток операционной системы <code>M</code> отдает свой квант времени другим задачам ОС.</p>
+<p>На загруженной CI-машине (где Docker делит 2 vCPU между 8 параллельными сборками) планировщик ядра Linux может не возвращать квант времени вашему процессу в течение сотен миллисекунд после истечения таймера. В результате фиксированный sleep приводит к ложным сбоям по таймауту.</p>
+<p>Начиная с <strong>Go 1.24</strong>, в стандартную библиотеку добавлен экспериментальный пакет <code>testing/synctest</code>. Он создает изолированный «пузырь виртуального времени» (Virtual Time Bubble). Все горутины внутри пузыря управляются симулированными часами: вызов <code>time.Sleep(10 * time.Hour)</code> выполняется за 1 наносекунду процессора, так как рантайм мгновенно перематывает виртуальные часы вперед, как только все горутины пузыря заблокировались!</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Пример с Go 1.24+ (GOEXPERIMENT=synctest)
+func TestAsyncWithVirtualTime(t *testing.T) {
+    synctest.Run(func() {
+        ch := make(chan string)
+        go func() {
+            time.Sleep(5 * time.Second) // Перематывается мгновенно!
+            ch &lt;- &quot;ack&quot;
+        }()
+
+        res := &lt;-ch
+        assert.Equal(t, &quot;ack&quot;, res)
+    })
+}
+</code></pre>
+</div>
+
+<p>Это делает асинхронные тесты быстрее в тысячи раз и гарантирует 100% детерминизм.</p>
   </div>
 </div>
 
+<hr />
+<h2 id="instrumenty-i-luchshie-praktiki">Инструменты и лучшие практики</h2>
+
+<p>Сведем воедино проверенный практикой стек тестирования распределенных брокеров сообщений в Go:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Инструмент</th>
+<th>Назначение</th>
+<th>Когда применять</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>testify</strong> (<code>assert</code>, <code>require</code>)</td>
+<td>Лаконичные утверждения и функция опроса <code>assert.Eventually</code></td>
+<td>В 100% unit- и integration-тестов</td>
+</tr>
+<tr>
+<td><strong>testcontainers-go</strong></td>
+<td>Подъем реальных контейнеров Kafka, RabbitMQ, Redis, PostgreSQL</td>
+<td>В тестах с флагом <code>//go:build integration</code></td>
+</tr>
+<tr>
+<td><strong>go.uber.org/goleak</strong></td>
+<td>Детектор забытых фоновых горутин консьюмеров</td>
+<td>В <code>TestMain</code> всех пакетов с конкурентным кодом</td>
+</tr>
+<tr>
+<td><strong>mockgen / gomock</strong></td>
+<td>Генерация строгих моков для интерфейсов публикации и БД</td>
+<td>В изолированных unit-тестах бизнес-логики</td>
+</tr>
+<tr>
+<td><strong>go test -race</strong></td>
+<td>Детектор состояний гонки (ThreadSanitizer)</td>
+<td>Обязательно на каждом коммите в CI</td>
+</tr>
+<tr>
+<td><strong>Go Native Fuzzing</strong></td>
+<td>Фаззинг десериализации пакетов и валидаторов сообщений</td>
+<td>При тестировании входных контрактов очередей</td>
+</tr>
+</tbody>
+</table></div>
+<hr />
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование: Как проверить гарантию Exactly-Once в Kafka?</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Вам поручили протестировать сервис, который заявляет обработку сообщений из Kafka со строгой гарантией Exactly-Once. Какие тесты вы напишете?</p>
+<p><strong>Ответ:</strong> Заявление об Exactly-Once обработке (E2E Exactly-Once) всегда опирается на три независимых уровня, каждый из которых требует своего теста:</p>
+<ol>
+<li><strong>Изоляция и идемпотентность консьюмера (Unit-тест):</strong><br />
+   - Проверяем реакцию на дубликаты. Отправляем одно и то же сообщение дважды (последовательно и конкурентно в 10 горутинах).<br />
+   - Проверяем, что изменения в базе применились ровно один раз благодаря уникальным ключам дедупликации (idempotency key).</li>
+<li><strong>Транзакционный продюсер и изоляция чтения (Integration-тест с Testcontainers):</strong><br />
+   - Если сервис выполняет цепочку «consume $\to$ process $\to$ produce в выходной топик», продюсер обязан быть транзакционным (<code>transactional.id</code>), а downstream-консьюмер настроен с <code>isolation.level = read_committed</code>.<br />
+   - Имитируем сбой (панику или context cancel) в середине транзакции до вызова <code>CommitTransaction()</code>. Убеждаемся, что downstream-консьюмер с <code>read_committed</code> <strong>не видит</strong> абортированных сообщений.</li>
+<li><strong>Атомарность фиксации смещения и сайд-эффекта (Fault Injection тест):</strong><br />
+   - Имитируем падение приложения (<code>t.Fail</code> / завершение горутины) ровно в интервале между успешной записью в БД и коммитом смещения в Kafka.<br />
+   - После перезапуска консьюмер неизбежно получит это сообщение повторно (At-Least-Once на уровне брокера), но благодаря первому пункту (проверке по idempotency key в транзакции БД) оно будет распознано как дубликат и пропущено без повторного списания денег.</li>
+</ol>
+  </div>
+</div>
+
+<hr />
 <h2 id="zaklyuchenie-i-sleduyushchie-shagi">Заключение и следующие шаги</h2>
 
-<p>Тестирование асинхронных систем требует дисциплины: чистые интерфейсы, быстрые unit-тесты без брокера, полные интеграционные сценарии с Docker, и автоматическая проверка на гонки. Только так можно спать спокойно, зная, что ваш консьюмер выдержит ребалансировку, а ретрай не породит двойное списание.</p>
-<p>Следующая статья в подразделе — <a href="8-observability-ocheredey.html" class="wikilink">8. Observability очередей</a>, где мы перейдём от тестов к тому, как видеть, что происходит внутри системы в реальном времени: метрики лага, трейсинг и алертинг.</p>
+<p>Тестирование асинхронных систем перестает быть «лотереей таймаутов», когда вы разделяете архитектуру на независимые слои:<br />
+- <strong>Бизнес-логика</strong> живет в чистых обработчиках и тестируется за микросекунды табличными тестами с моками интерфейсов <code>OrderRepository</code> и генерацией данных фаззером.<br />
+- <strong>Инфраструктурные контракты</strong> (сериализация, заголовки, ретраи, dead-lettering и graceful shutdown) проверяются через <code>testcontainers-go</code> на реальном брокере.<br />
+- <strong>Конкурентность</strong> контролируется флагом <code>-race</code> и детектором утечек <code>goleak.VerifyNone(t)</code>.</p>
+<p>Однако даже идеально протестированная система в боевом продакшене сталкивается с непредвиденным: сетевые всплески, деградация дисков брокера и отставание консьюмеров. В следующей лекции — <a href="8-observability-ocheredey.html" class="wikilink">8. Observability очередей</a> — мы разберем, как сделать работу распределенной асинхронной системы прозрачной с помощью метрик Prometheus, распределенной трассировки OpenTelemetry и структурированных логов.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

@@ -2168,40 +2168,82 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Параллелизм обработки сообщений</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="uzkoe-gorlyshko-sinkhronnogo-konsyumera">Узкое горлышко синхронного консьюмера</h2>
+            <h1>Параллелизм обработки сообщений</h1>
+<blockquote>
+<p><em>«Сделать программу быстрой очень просто: достаточно перестать делать то, что делать не нужно, а то, что делать необходимо, разложить по свободным ядрам процессора — не забывая о законе сохранения порядка.»</em></p>
+</blockquote>
+<h2 id="uzkoe-gorlyshko-sinkhronnogo-konsyumera">Узкое горлышко синхронного консьюмера</h2>
 
-<p>В предыдущей статье мы построили надежный консьюмер, который умеет корректно завершать работу. Но в нём есть фундаментальная проблема производительности: он обрабатывает сообщения строго последовательно. </p>
-<p>Если ваш брокер (например, Kafka) отдает сообщения со скоростью 10 000 msg/s, а обработка одного сообщения включает HTTP-вызов стороннего API или сложный SQL-запрос к БД, занимающий 50 мс, ваша пропускная способность упрётся в максимум <strong>20 msg/s</strong>. Остальные 9980 сообщений будут скапливаться в брокере, увеличивая <a href="9-monitoring-lag-i-throughput.html" class="wikilink">Lag</a>.</p>
-<p>В бэкенде на PHP или Python эта проблема решается горизонтальным масштабированием — запуском десятков независимых процессов-воркеров (например, через Supervisor). В Go, благодаря легковесным горутинам, у нас есть более гибкие и мощные инструменты, но и больше способов выстрелить себе в ногу.</p>
+<p>В предыдущей статье <a href="2-konsyumery-i-graceful-shutdown.html" class="wikilink">2. Консьюмеры и graceful shutdown</a> мы спроектировали надежный консьюмер, способный корректно выдерживать любые сигналы выключения от операционной системы. Однако в его базовой архитектуре кроется фундаментальное ограничение: <strong>последовательная (синхронная) обработка</strong>.</p>
+<p>Представьте типичную производственную ситуацию: брокер (например, кластер Apache Kafka) отдает сообщения со скоростью 10 000 сообщений в секунду. При этом бизнес-обработка одного события (сохранение заказа в PostgreSQL, расчет налогов, поход по HTTP в стороннюю CRM) занимает честные 50 миллисекунд.</p>
+<p>Математика безжалостна:<br />
+$$\text{Throughput} = \frac{1}{0.050\text{ с}} = 20\text{ msg/s}$$</p>
+<p>Один синхронный поток вычитки способен переварить всего 20 сообщений в секунду! Остальные 9 980 сообщений каждую секунду будут накапливаться в партициях брокера, порождая лавинообразно растущее отставание — <a href="9-monitoring-lag-i-throughput.html" class="wikilink">Lag</a>.</p>
+<p>В экосистемах PHP или Python эту проблему решают «в лоб» — запуском сотен независимых процессов операционной системы через Supervisor или масштабированием подов Kubernetes. В языке Go, обладающем уникальным рантаймом с кооперативными горутинами, у инженеров есть гораздо более элегантные и дешевые инструменты конкурентности. Однако именно здесь кроются самые опасные архитектурные грабли.</p>
+<hr />
 <h2 id="fan-out-pochemu-ne-stoit-zapuskat-gorutinu-na-kazhdoe-soobshchenie">Fan-Out: Почему не стоит запускать горутину на каждое сообщение?</h2>
 
-<p>Первая мысль разработчика, переходящего на Go: "Горутины дешевые! Буду запускать <code>go process(msg)</code> на каждое сообщение". Это классический антипаттерн, ведущий к катастрофе.</p>
+<p>Первое искушение начинающего Go-разработчика формулируется просто: <em>«Горутины весят всего 2 килобайта! Зачем что-то придумывать? Будем писать <code>go process(msg)</code> на каждое пришедшее сообщение!»</em>.</p>
+<p>В продакшене этот наивный подход (unbounded <code>go process()</code>) гарантированно приводит к отказу сервиса:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph AntiPattern[&quot;Антипаттерн: Неограниченный Fan-Out&quot;]
+direction TB
+Broker[&quot;Входящий поток брокера&lt;br&gt;(100 000 msg/s)&quot;] --&gt; Loop[&quot;Цикл for msg := range&quot;]
+Loop --&gt; G1[&quot;go process(msg 1)&quot;]
+Loop --&gt; G2[&quot;go process(msg 2)&quot;]
+Loop --&gt; G3[&quot;go process(msg 100 000...)&quot;]
+
+G1 &amp; G2 &amp; G3 --&gt; DB_Pool[&quot;Пул базы данных pgx / sql.DB&lt;br&gt;(Лимит: 30 соединений)&quot;]
+DB_Pool -.-&gt;|&quot;Исчерпание пула&quot;| Deadlock[&quot;Зависание тысяч горутин&quot;]
+Deadlock -.-&gt;|&quot;Разрастание стеков&quot;| OOM[&quot;Linux OOM Killer (SIGKILL)&quot;]
+end
+
+classDef err fill:#1e1e2e,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
+class AntiPattern err;
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Разрушение Backpressure</span>
   </div>
   <div class="callout-body">
-    <p>Неограниченный Fan-Out (запуск горутины на каждое сообщение) нарушает базовый принцип надежных систем — <strong>Backpressure</strong> (о котором мы говорили в <a href="../01-fundament-asinkhronnosti/6-backpressure-i-kontrol-nagruzki.html" class="wikilink">6. Backpressure и контроль нагрузки</a>).</p>
+    <p>Неограниченный Fan-Out полностью уничтожает базовый закон надежности распределенных систем — <strong>противодавление (<a href="../01-fundament-asinkhronnosti/6-backpressure-i-kontrol-nagruzki.html" class="wikilink">Backpressure</a>)</strong>, о котором мы говорили в <a href="../01-fundament-asinkhronnosti/6-backpressure-i-kontrol-nagruzki.html" class="wikilink">6. Backpressure и контроль нагрузки</a>:</p>
 <ol>
-<li><strong>OOM (Out of Memory):</strong> Если брокер отдаст 1 000 000 сообщений, вы запустите 1 000 000 горутин. Стек каждой горутины изначально занимает 2-8 КБ (и может расти). Итог — потребление памяти в гигабайты и OOM Kill.</li>
-<li><strong>Connection Pool Exhaustion:</strong> Каждая горутина попытается записать данные в БД или сделать HTTP-запрос. Пул соединений БД (например, в <code>pgx</code> или <code>sql.DB</code>) имеет лимит (обычно 20-50). Тысячи горутин заблокируются в ожидании коннекта, создавая огромную очередь и таймауты.</li>
-<li><strong>Scheduler Thrashing:</strong> Планировщику Go (G-M-P) придется тратить такты CPU на переключение контекста между миллионами горутин вместо полезной работы.</li>
+<li><strong>Исчерпание оперативной памяти (OOM):</strong> Начальный стек горутины в Go составляет от 2 до 8 КБ. Но при вызове глубоких функций или обработке тяжелого JSON стек динамически растет в куче. Миллион одновременно порожденных горутин легко утилизирует 5–10 ГБ оперативной памяти, вызывая немедленный <code>SIGKILL</code> от ядра Linux.</li>
+<li><strong>Коллапс пулов соединений (Connection Exhaustion):</strong> Пул соединений к базе данных (<code>sql.DB</code> или <code>pgx</code>) жестко ограничен инфраструктурой (обычно 20–50 коннектов). Сотни тысяч горутин бросятся забирать свободный коннект, встанут в бесконечную очередь, исчерпают таймауты и положат базу данных лавиной полуоткрытых транзакций.</li>
+<li><strong>Трэшинг планировщика (Scheduler Thrashing):</strong> Планировщик рантайма Go (G-M-P) начнет тратить все доступные такты процессора на переключение контекста между миллионом ожидающих горутин вместо выполнения полезных бизнес-инструкций.</li>
 </ol>
   </div>
 </div>
 
+<hr />
 <h2 id="worker-pool-idiomatichnyy-podkhod">Worker Pool: Идиоматичный подход</h2>
 
-<p>Правильный способ распараллелить обработку — использовать <strong>Worker Pool</strong> (пул воркеров). Мы создаем фиксированное количество горутин-обработчиков (воркеров) на старте и отправляем им сообщения через канал.</p>
-<p>Это элегантно решает проблему Backpressure: если все воркеры заняты, главный цикл просто не сможет отправить новое сообщение в канал (он заблокируется на <code>jobs &lt;- msg</code>), пока воркер не освободится. Таким образом, система сама естественным образом замедляет вычитку, не давая себе задохнуться.</p>
+<p>Канонический и безопасный способ параллелизации обработки в Go — паттерн <strong>Worker Pool (Пул воркеров фиксированного размера)</strong>.</p>
+<p>Мы инициализируем строго контролируемое количество горутин-обработчиков на этапе старта приложения и распределяем между ними входящие сообщения через буферизованный канал.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2216,15 +2258,27 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Broker&quot;] --&gt;|&quot;msg 1..N&quot;| B[&quot;Консьюмер&lt;br&gt;Главный цикл&quot;]
-B --&gt;|&quot;jobs &lt;- msg&quot;| C[&quot;Канал jobs&lt;br&gt;Buffered&quot;]
-C --&gt;|&quot;Worker 1&quot;| D[&quot;Обработка + Ack&quot;]
-C --&gt;|&quot;Worker 2&quot;| E[&quot;Обработка + Ack&quot;]
-C --&gt;|&quot;Worker N&quot;| F[&quot;Обработка + Ack&quot;]
+Broker[(&quot;Брокер сообщений&quot;)] --&gt;|&quot;Вычитка&quot;| Dispatcher[&quot;Главный цикл консьюмера&quot;]
+Dispatcher --&gt;|&quot;jobs &lt;- msg&lt;br&gt;(Блокировка при переполнении)&quot;| Queue[(&quot;Канал jobs&lt;br&gt;(Буфер = workerCount)&quot;)]
+
+Queue --&gt;|&quot;msg&quot;| W1[&quot;Воркер 1&lt;br&gt;(Горутина 1)&quot;]
+Queue --&gt;|&quot;msg&quot;| W2[&quot;Воркер 2&lt;br&gt;(Горутина 2)&quot;]
+Queue --&gt;|&quot;msg&quot;| WN[&quot;Воркер N&lt;br&gt;(Горутина N)&quot;]
+
+W1 --&gt; Ack1[&quot;БД / Ack&quot;]
+W2 --&gt; Ack2[&quot;БД / Ack&quot;]
+WN --&gt; AckN[&quot;БД / Ack&quot;]
+
+classDef bnd fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef wrk fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+class Dispatcher,Queue bnd;
+class W1,W2,WN wrk;
   </pre>
 </div>
 
 
+<p>Этот паттерн обеспечивает <strong>естественное аппаратное противодавление</strong>: если все $N$ воркеров заняты тяжелыми вычислениями, буфер канала заполняется. Операция <code>jobs &lt;- msg</code> в главном цикле блокируется, консьюмер перестает вычитывать новые сообщения из сетевого сокета брокера, брокер притормаживает отправку по TCP, и система работает на пределе своей реальной пропускной способности, не перегружая память.</p>
+<hr />
 <h3 id="realizatsiya-worker-pool">Реализация Worker Pool</h3>
 
 
@@ -2236,15 +2290,37 @@ C --&gt;|&quot;Worker N&quot;| F[&quot;Обработка + Ack&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (c *Consumer) Run(ctx context.Context, workerCount int) error {
+  <pre class="language-go"><code class="language-go">package workerpool
+
+import (
+    &quot;context&quot;
+    &quot;log/slog&quot;
+    &quot;os/signal&quot;
+    &quot;sync&quot;
+    &quot;syscall&quot;
+    &quot;time&quot;
+)
+
+type Message interface {
+    Ack() error
+    Nack(requeue bool) error
+}
+
+type Consumer struct {
+    brokerMessages &lt;-chan Message
+    handler        func(ctx context.Context, msg Message) error
+    logger         *slog.Logger
+}
+
+func (c *Consumer) Run(ctx context.Context, workerCount int) error {
     ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
     defer cancel()
 
     // Канал с буфером сглаживает микро-задержки между вычиткой и обработкой
-    jobs := make(chan Message, workerCount) 
-    wg := sync.WaitGroup{}
+    jobs := make(chan Message, workerCount)
+    var wg sync.WaitGroup
 
-    // Запуск фиксированного пула воркеров
+    // 1. Старт фиксированного пула воркеров
     for i := 0; i &lt; workerCount; i++ {
         wg.Add(1)
         go func(workerID int) {
@@ -2253,14 +2329,17 @@ C --&gt;|&quot;Worker N&quot;| F[&quot;Обработка + Ack&quot;]
         }(i)
     }
 
-    // Главный цикл вычитки (Fan-Out в канал)
+    c.logger.Info(&quot;Worker Pool успешно запущен&quot;, &quot;workers&quot;, workerCount)
+
+    // 2. Главный цикл вычитки (Диспетчер)
     for {
         select {
         case &lt;-ctx.Done():
-            c.logger.Info(&quot;Остановка: закрываем канал jobs&quot;)
-            close(jobs) // Закрываем канал, чтобы воркеры завершили цикл range
-            wg.Wait()   // Ждем завершения всех in-flight сообщений в воркерах
+            c.logger.Warn(&quot;Остановка: закрываем канал jobs и ожидаем завершения воркеров...&quot;)
+            close(jobs) // Закрытие канала сигнализирует воркерам о выходе из range
+            wg.Wait()   // Ожидание завершения всех активных задач
             return nil
+
         case msg, ok := &lt;-c.brokerMessages:
             if !ok {
                 close(jobs)
@@ -2268,62 +2347,122 @@ C --&gt;|&quot;Worker N&quot;| F[&quot;Обработка + Ack&quot;]
                 return nil
             }
 
-            // Отправка в канал. Если все воркеры заняты — здесь консьюмер заблокируется.
-            // Это и есть Backpressure!
+            // 3. Отправка в пул. Если воркеры заняты — здесь консьюмер заблокируется!
             select {
             case jobs &lt;- msg:
-            case &lt;-ctx.Done(): // На случай, если контекст отменится пока мы ждем воркера
-                // Важно: сообщение не обработано. Нужно его Nack с requeue=true
-                _ = msg.Nack(true) 
+            case &lt;-ctx.Done():
+                // Если контекст отменился во время ожидания свободного воркера,
+                // возвращаем сообщение в брокер, чтобы не потерять его
+                _ = msg.Nack(true)
             }
         }
     }
 }
 
 func (c *Consumer) worker(ctx context.Context, id int, jobs &lt;-chan Message) {
+    // Цикл range автоматически завершится, когда канал jobs будет закрыт
     for msg := range jobs {
-        // Создаем изолированный контекст с таймаутом для сообщения
         msgCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 
         if err := c.handler(msgCtx, msg); err != nil {
-            _ = msg.Nack(false) // NACK без возврата в очередь (или с возвратом, зависит от логики)
+            c.logger.Error(&quot;Ошибка обработки воркером&quot;, &quot;worker_id&quot;, id, &quot;err&quot;, err)
+            _ = msg.Nack(false) // Ошибка: отправляем в DLQ или логируем
         } else {
             _ = msg.Ack()
         }
-        cancel() // Обязательно вызываем cancel для сборщика мусора
+
+        cancel() // Освобождаем ресурсы таймера контекста
     }
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="under-the-hood-planirovshchik-g-m-p-i-keshi-cpu">Under the Hood: Планировщик G-M-P и Кэши CPU</h2>
 
-<p>Выбор количества воркеров (workerCount) — это не просто магическое число. Это вопрос Mechanical Sympathy.</p>
-<p>Если ваша обработка <strong>CPU-bound</strong> (например, парсинг тяжелого JSON, криптография, сжатие данных), количество воркеров должно быть равно <code>runtime.GOMAXPROCS(0)</code> (количеству логических ядер CPU). <br />
-Если вы запустите 100 CPU-bound воркеров на 8-ядерном процессоре, планировщик Go будет постоянно переключать горутины между потоками ОС (M). </p>
+<p>Как грамотно рассчитать параметр <code>workerCount</code>? Это фундаментальный вопрос <strong>Mechanical Sympathy</strong> (сочувствия к физическому процессору).</p>
+<p>Поведение консьюмера жестко зависит от типа исполняемой нагрузки:</p>
+<h3 id="1-cpu-bound-nagruzka-matematika-json-szhatie-kheshirovanie">1. CPU-bound нагрузка (Математика, JSON, Сжатие, Хэширование)</h3>
+<p>Если задача воркера — распарсить сложный JSON, распаковать GZIP или проверить криптографическую подпись, работа упирается исключительно в арифметико-логические устройства (ALU) процессора.</p>
+<p>В этом случае количество воркеров должно быть <strong>строго равно <code>runtime.GOMAXPROCS(0)</code></strong> (количеству физических или выделенных контейнеру логических ядер CPU).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Cache Thrashing</span>
   </div>
   <div class="callout-body">
-    <p>При каждом переключении горутин (когда время кванта в <code>runtime</code> истекает), планировщик сохраняет регистры CPU в стеке старой горутины и загружает регистры новой. Это само по себе не бесплатно. Но главное — <strong>Cache Thrashing</strong> (трэшинг кэша).</p>
-<p>Данные вашей горутины (структуры, слайсы) лежат в RAM. Когда горутина работает, процессор подтягивает эти данные в кэш L1/L2 (очень быстрый, но маленький). Если горутина вытесняется, а на её место приходит другая, новые данные затирают кэш. Когда старая горутина вернется, процессор снова будет идти в медленную RAM. Больше горутин для CPU-работы = больше промахов кэша (Cache Misses) = драматическое падение производительности.</p>
+    <p>Если на 8-ядерной виртуальной машине запустить 100 CPU-bound воркеров, планировщик Go будет непрерывно переключать контексты горутин между системными тредами ОС (M) по истечении кванта времени в 10 миллисекунд (<code>runtime</code>).</p>
+<p>Каждое переключение контекста влечет катастрофический побочный эффект — <strong>Cache Thrashing (Выбивание процессорного кэша)</strong>:<br />
+- Данные текущей горутины находятся в сверхбыстром кэше L1/L2 (время доступа ~1 наносекунда).<br />
+- Планировщик вытесняет горутину, загружая контекст другой задачи. Новая горутина затирает кэш своими структурами.<br />
+- Когда старая горутина возвращается на CPU, ее данных в кэше больше нет: процессор вынужден простаивать сотни тактов, ожидая подгрузки байтов из медленной оперативной памяти (RAM, задержка ~60–100 нс).</p>
+<p><em>Больше горутин для CPU-работы = лавинообразный рост промахов кэша (Cache Misses) = катастрофическое падение реальной производительности.</em></p>
   </div>
 </div>
 
-<p>Если ваша обработка <strong>IO-bound</strong> (сеть, БД, внешние API), горутины будут большую часть времени спать в <code>runtime.netpoller</code>, ожидая ответа от ОС. В этом случае количество воркеров можно делать гораздо больше количества ядер (например, 100, 500 или даже 1000), так как они не будут конкурировать за CPU, а будут просто занимать память под свои стеки и ждать.</p>
+<h3 id="2-io-bound-nagruzka-set-bazy-dannykh-vneshnie-api">2. IO-bound нагрузка (Сеть, Базы данных, Внешние API)</h3>
+<p>Если воркер большую часть времени ожидает ответа от диска PostgreSQL или внешнего HTTP-сервера, горутина паркуется в <code>runtime.netpoller</code> с нулевым потреблением процессорного времени. В этом сценарии количество воркеров можно безопасно увеличивать до 50, 200 или 500 (главное — чтобы не захлебнулся пул соединений с базой данных).</p>
+<hr />
 <h2 id="problema-poryadka-ordering">Проблема порядка (Ordering)</h2>
 
-<p>При распараллеливании возникает критический архитектурный вопрос: что делать с <a href="../01-fundament-asinkhronnosti/5-ordering-soobshcheniy-i-ego-tsena.html" class="wikilink">порядком сообщений</a>?</p>
-<p>Если брокер прислал сообщения <code>A, B, C</code> в строгом порядке, и мы раздали их разным воркерам, нет никакой гарантии, что они будут заакоммичены (ACK) в том же порядке. Воркер 2 может обработать <code>B</code> за 10 мс, а Воркер 1 будет ждать ответа по <code>A</code> от БД целую секунду. Итог: в БД сначала запишется <code>B</code>, потом <code>A</code>.</p>
-<p>Поведение зависит от брокера:<br />
-1. <strong>RabbitMQ:</strong> По умолчанию нарушения порядка в рамках одной очереди не происходит, потому что RabbitMQ не отдаст следующее сообщение, пока предыдущее не будет ACK. <em>Но если вы используете Prefetch &gt; 1</em>, брокер отдаст несколько сообщений в буфер консьюмера, и параллельные воркеры нарушат порядок обработки. Если <code>A</code> зафейлится и уйдет в NACK с requeue, оно вернется в очередь, но после <code>C</code>.<br />
-2. <strong>Kafka:</strong> Порядок гарантирован <strong>только внутри одной партиции</strong>. Но Kafka отдает сообщения пачкой (Fetch). Если один консьюмер читает партицию, и вы раскидываете сообщения по воркерам — порядок нарушается.</p>
-<h3 id="kak-sokhranit-poryadok-v-worker-pool">Как сохранить порядок в Worker Pool?</h3>
+<p>При распараллеливании вычислений мы немедленно сталкиваемся с фундаментальной дилеммой: <strong>что происходит с <a href="../01-fundament-asinkhronnosti/5-ordering-soobshcheniy-i-ego-tsena.html" class="wikilink">порядком сообщений</a>?</strong></p>
+<p>Если брокер передал сообщения <code>A</code>, <code>B</code> и <code>C</code>, относящиеся к одному банковскому счету, в строгой последовательности:<br />
+1. <code>A</code>: Пополнение счета на 10 000 руб.<br />
+2. <code>B</code>: Покупка товара на 8 000 руб.<br />
+3. <code>C</code>: Снятие остатка 2 000 руб.</p>
+<p>Если раскидать сообщения <code>A, B, C</code> по параллельным воркерам классического Worker Pool:<br />
+- Воркер 2 обработает сообщение <code>B</code> за 5 мс.<br />
+- Воркер 1 зависнет на сетевом запросе по <code>A</code> на 100 мс.</p>
+<p><strong>Итог:</strong> Сообщение <code>B</code> попытается списаться со счета раньше, чем придет пополнение <code>A</code>! Транзакция упадет с ошибкой «Недостаточно средств», а бизнес-логика окажется сломанной.</p>
+<p>Поведение очередей различается:<br />
+- <strong>В RabbitMQ:</strong> Если консьюмер использует <code>Prefetch &gt; 1</code>, параллельные воркеры неизбежно нарушат порядок фиксации. Если обработка <code>A</code> завершится ошибкой и уйдет в <code>Nack(requeue=true)</code>, брокер вернет его в очередь, но уже <em>позади</em> других сообщений.<br />
+- <strong>В Kafka:</strong> Порядок сообщений гарантируется <strong>только внутри одной конкретной партиции</strong>. Если консьюмер вычитывает партицию батчем и раскидывает ее элементы по воркерам пула — гарантия порядка внутри партиции полностью разрушается.</p>
+<hr />
+<h3 id="kak-sokhranit-poryadok-key-based-hash-worker-pool">Как сохранить порядок: Key-based Hash Worker Pool</h3>
 
-<p>Если строгий порядок (например, банковские транзакции по одному счету) критичен, классический Worker Pool не подходит. Нужен <strong>Пул по ключу (Key-based Worker Pool / Hash Worker Pool)</strong>.</p>
-<p>Суть: мы извлекаем из сообщения ключ партицирования (например, <code>UserID</code> или <code>AccountID</code>). И отправляем сообщение строго тому воркеру, который закреплен за этим ключом (через хэширование <code>hash(key) % numWorkers</code>). </p>
+<p>Если порядок критичен для связанных бизнес-сущностей (пользователь, заказ, счет), классический Worker Pool неприменим. Инженерное решение — <strong>Пул воркеров с хэш-маршрутизацией по ключу (Key-based / Hash Worker Pool)</strong>.</p>
+<p>Мы извлекаем ключ партицирования из сообщения (например, <code>UserID</code> или <code>AccountID</code>) и отправляем сообщение строго в тот выделенный канал, за которым закреплен конкретный воркер:<br />
+$$\text{workerID} = \text{hash}(\text{key}) \pmod{\text{workerCount}}$$</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Routing[&quot;Детерминированная маршрутизация&quot;]
+Msg1[&quot;Message: AccountID=123&quot;] --&gt; Hash{&quot;fnv32(key) % N&quot;}
+Msg2[&quot;Message: AccountID=456&quot;] --&gt; Hash
+Msg3[&quot;Message: AccountID=123&quot;] --&gt; Hash
+end
+
+subgraph Channels[&quot;Индивидуальные очереди воркеров&quot;]
+Hash --&gt;|&quot;Канал 0&quot;| Ch0[(&quot;Channel 0&quot;)]
+Hash --&gt;|&quot;Канал 1&quot;| Ch1[(&quot;Channel 1&quot;)]
+end
+
+subgraph Workers[&quot;Выделенные горутины&quot;]
+Ch0 --&gt; W0[&quot;Worker 0&lt;br&gt;(Строго последовательно: AccountID=123)&quot;]
+Ch1 --&gt; W1[&quot;Worker 1&lt;br&gt;(Параллельно: AccountID=456)&quot;]
+end
+
+classDef rtt fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef chn fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+classDef wrk fill:#1e1e2e,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+class Msg1,Msg2,Msg3,Hash rtt;
+class Ch0,Ch1 chn;
+class W0,W1 wrk;
+  </pre>
+</div>
+
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2333,65 +2472,116 @@ func (c *Consumer) worker(ctx context.Context, id int, jobs &lt;-chan Message) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (c *Consumer) Run(ctx context.Context, workerCount int) error {
-    // Создаем слайс каналов — отдельный канал для каждого воркера
-    workerChannels := make([]chan Message, workerCount)
+  <pre class="language-go"><code class="language-go">package keypool
+
+import (
+    &quot;context&quot;
+    &quot;hash/fnv&quot;
+)
+
+type KeyedMessage interface {
+    Key() []byte
+    Body() []byte
+}
+
+func fnv32(key []byte) uint32 {
+    h := fnv.New32a()
+    _, _ = h.Write(key)
+    return h.Sum32()
+}
+
+func (c *Consumer) RunKeyedPool(ctx context.Context, workerCount int) error {
+    // Создаем персональный канал для каждого воркера
+    workerChannels := make([]chan KeyedMessage, workerCount)
     for i := 0; i &lt; workerCount; i++ {
-        workerChannels[i] = make(chan Message, 100)
-        go c.worker(ctx, i, workerChannels[i])
+        workerChannels[i] = make(chan KeyedMessage, 100)
+        go c.keyedWorker(ctx, i, workerChannels[i])
     }
 
-    for msg := range c.brokerMessages {
-        key := msg.Key() // Например, ID пользователя
-        // Deterministic routing
-        workerID := fnv32(key) % uint32(workerCount)
-
+    for {
         select {
-        case workerChannels[workerID] &lt;- msg:
         case &lt;-ctx.Done():
-            // ...
+            for _, ch := range workerChannels {
+                close(ch)
+            }
+            return nil
+
+        case msg, ok := &lt;-c.brokerMessages:
+            if !ok {
+                return nil
+            }
+
+            // Детерминированная привязка сообщения к воркеру
+            key := msg.Key()
+            workerID := fnv32(key) % uint32(workerCount)
+
+            select {
+            case workerChannels[workerID] &lt;- msg:
+            case &lt;-ctx.Done():
+                return nil
+            }
         }
+    }
+}
+
+func (c *Consumer) keyedWorker(ctx context.Context, id int, jobs &lt;-chan KeyedMessage) {
+    for msg := range jobs {
+        // Все сообщения по AccountID=123 обрабатываются строго последовательно,
+        // гарантируя корректность баланса и отсутствие race conditions!
+        c.process(ctx, msg)
     }
 }
 </code></pre>
 </div>
 
-<p>Этот подход гарантирует, что все сообщения для <code>AccountID=123</code> всегда обрабатываются одной и той же горутиной строго последовательно, а сообщения для <code>AccountID=456</code> могут обрабатываться параллельно в другой горутине. Это точная копия того, как Kafka обеспечивает порядок на уровне партиций, но реализованная на стороне приложения.</p>
+<p>Этот подход воспроизводит архитектурный гений партицирования Apache Kafka прямо в оперативной памяти нашего сервиса: сообщения с одинаковыми ключами (<code>AccountID=123</code>) выстраиваются в строгую очередь в рамках одной горутины, а сообщения с разными ключами (<code>AccountID=456</code>) обрабатываются полностью параллельно на соседних ядрах CPU.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как распараллелить обработку сообщений из одной партиции Kafka, если обработка долгая (IO-bound), но строгий порядок всё ещё важен для некоторых ключей?<br />
-<strong>Ответ:</strong> Использовать Key-based Worker Pool (Hash-маршрутизация по каналам). Это позволит обрабатывать сообщения с разными ключами параллельно, сохраняя строгий порядок для одинаковых ключей. Также можно использовать паттерн <a href="5-batch-processing-soobshcheniy.html" class="wikilink">5. Batch processing сообщений</a>, если бизнес-логика позволяет накапливать события по ключу и применять их атомарно.</p>
+    <p><strong>Вопрос:</strong> Как распараллелить долгую обработку сообщений из одной партиции Kafka, если нам необходимо сохранить строгий хронологический порядок для каждого отдельного пользователя?</p>
+<p><strong>Ответ:</strong> <br />
+Классический Worker Pool здесь применять нельзя, так как он разрушит порядок внутри партиции. </p>
+<p><strong>Правильное решение:</strong> <br />
+Применить внутри сервиса <strong>Key-based Hash Worker Pool</strong>. Мы вычитываем батч сообщений из партиции Kafka и с помощью хэширования ключа <code>hash(key) % numWorkers</code> раскидываем их по внутренним изолированным Go-каналам. Внутри каждого канала сохраняется строгий порядок для конкретного <code>UserID</code>, а пользователи с разными ID обрабатываются параллельно на всех доступных ядрах.</p>
+<p>Дополнительно для сверхвысоких нагрузок применяется <a href="5-batch-processing-soobshcheniy.html" class="wikilink">5. Batch processing сообщений</a>, при котором события одного пользователя группируются в батч и применяются к БД единой SQL-транзакцией.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="data-races-v-obrabotchikakh">Data Races в обработчиках</h2>
 
-<p>Параллелизм обработки требует абсолютной изоляции состояния. Если ваши воркеры обращаются к общим структурам данных (например, локальному кэшу метаданных или мапе с сессиями), вы получите Data Race.</p>
+<p>Параллельная обработка требует абсолютной изоляции памяти. Если воркеры обращаются к общим изменяемым структурам данных (in-memory кэш, счетчики метрик, сессионные мапы) без синхронизации, программа неизбежно упадет.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Конкурентная мапа</span>
   </div>
   <div class="callout-body">
-    <p>Никогда не читайте и не пишите в обычную <code>map</code> из разных горутин-воркеров без синхронизации. Это классическая ошибка, которая приводит к непредсказуемым паникам <code>fatal error: concurrent map read and map write</code> и порче памяти.</p>
-<p>Если воркерам нужен общий кэш, используйте <code>sync.Map</code> (если ключи пишутся один раз и много читаются) или защищайте обычную мапу через <code>sync.RWMutex</code>. Но лучший подход — <strong>stateless воркеры</strong>. Держите состояние вне обработчиков (в Redis или БД).</p>
+    <p>Попытка чтения и записи в стандартную встроенную <code>map</code> из параллельных горутин-воркеров без блокировок приведет к аварийной панике:</p>
+<pre><code>fatal error: concurrent map read and map write
+</code></pre>
+<p>Эту ошибку невозможно перехватить через <code>recover()</code> — рантайм Go немедленно аварийно завершает весь процесс.</p>
+<p><strong>Правила защиты памяти:</strong><br />
+1. Для общего кэша с частым чтением и редкой записью используйте <strong><code>sync.Map</code></strong>.<br />
+2. Для стандартных изменяемых структур используйте <strong><code>sync.RWMutex</code></strong>.<br />
+3. Идеальный архитектурный паттерн: <strong>Shared Nothing (Ничего общего)</strong>. Воркеры должны быть абсолютно stateless и не делить память процесса между собой.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Неограниченный Fan-Out (<code>go process()</code>) убьет ваше приложение через OOM, исчерпание пулов соединений и трэшинг планировщика. Всегда используйте ограниченный Worker Pool.</li>
-<li>Worker Pool на каналах — это идиоматичный способ реализовать <a href="../01-fundament-asinkhronnosti/6-backpressure-i-kontrol-nagruzki.html" class="wikilink">Backpressure</a>. Блокировка на отправке в канал — это правильное поведение.</li>
-<li>Количество воркеров должно соотноситься с типом нагрузки: <code>GOMAXPROCS</code> для CPU-bound, сотни/тысячи для IO-bound.</li>
-<li>Параллелизация обработки убивает порядок сообщений. Если порядок критичен, используйте Key-based Worker Pool с хэш-маршрутизацией.</li>
-<li>Избегайте общего изменяемого состояния (shared state) между воркерами, иначе Data Races неизбежны.</li>
+<li><strong>Неограниченный Fan-Out (<code>go process()</code>) — архитектурный яд</strong>, приводящий к OOM-падениям, исчерпанию пулов баз данных и выбиванию процессора из колеи.</li>
+<li><strong>Worker Pool на каналах</strong> — канонический способ управления параллелизмом, гарантирующий жесткий контроль нагрузки и естественный механизм противодавления (<strong><a href="../01-fundament-asinkhronnosti/6-backpressure-i-kontrol-nagruzki.html" class="wikilink">Backpressure</a></strong>).</li>
+<li>Размер пула рассчитывается исходя из природы нагрузки: строго <code>GOMAXPROCS</code> для CPU-bound задач и сотни горутин для IO-bound операций.</li>
+<li>Параллельная обработка разрушает очередность доставки. Если порядок транзакций критичен, используйте <strong>Key-based Worker Pool</strong> с детерминированным хэшированием по ключу бизнес-сущности.</li>
+<li>Любая разделяемая память между воркерами обязана защищаться мьютексами или примитивами <code>sync.Map</code>.</li>
 </ol>
-<p>Теперь, когда мы умеем обрабатывать сообщения параллельно, мы неизбежно столкнемся с дубликатами — они появятся из-за повторных доставок при сбоях. В следующей статье мы разберем самую важную защиту от этого: <a href="4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>.</p>
+<p>Распараллелив обработку, мы увеличили пропускную способность системы в сотни раз. Однако в конкурентной среде повторные доставки при сетевых сбоях неизбежны. Как гарантировать, что повторное выполнение операции не спишет деньги дважды? Разберем это в следующей лекции: <a href="4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2419,7 +2609,7 @@ func (c *Consumer) worker(ctx context.Context, id int, jobs &lt;-chan Message) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#uzkoe-gorlyshko-sinkhronnogo-konsyumera">Узкое горлышко синхронного консьюмера</a></li><li class="toc-item toc-h2"><a href="#fan-out-pochemu-ne-stoit-zapuskat-gorutinu-na-kazhdoe-soobshchenie">Fan-Out: Почему не стоит запускать горутину на каждое сообщение?</a></li><li class="toc-item toc-h2"><a href="#worker-pool-idiomatichnyy-podkhod">Worker Pool: Идиоматичный подход</a></li><li class="toc-item toc-h3"><a href="#realizatsiya-worker-pool">Реализация Worker Pool</a></li><li class="toc-item toc-h2"><a href="#under-the-hood-planirovshchik-g-m-p-i-keshi-cpu">Under the Hood: Планировщик G-M-P и Кэши CPU</a></li><li class="toc-item toc-h2"><a href="#problema-poryadka-ordering">Проблема порядка (Ordering)</a></li><li class="toc-item toc-h3"><a href="#kak-sokhranit-poryadok-v-worker-pool">Как сохранить порядок в Worker Pool?</a></li><li class="toc-item toc-h2"><a href="#data-races-v-obrabotchikakh">Data Races в обработчиках</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#uzkoe-gorlyshko-sinkhronnogo-konsyumera">Узкое горлышко синхронного консьюмера</a></li><li class="toc-item toc-h2"><a href="#fan-out-pochemu-ne-stoit-zapuskat-gorutinu-na-kazhdoe-soobshchenie">Fan-Out: Почему не стоит запускать горутину на каждое сообщение?</a></li><li class="toc-item toc-h2"><a href="#worker-pool-idiomatichnyy-podkhod">Worker Pool: Идиоматичный подход</a></li><li class="toc-item toc-h3"><a href="#realizatsiya-worker-pool">Реализация Worker Pool</a></li><li class="toc-item toc-h2"><a href="#under-the-hood-planirovshchik-g-m-p-i-keshi-cpu">Under the Hood: Планировщик G-M-P и Кэши CPU</a></li><li class="toc-item toc-h3"><a href="#1-cpu-bound-nagruzka-matematika-json-szhatie-kheshirovanie">1. CPU-bound нагрузка (Математика, JSON, Сжатие, Хэширование)</a></li><li class="toc-item toc-h3"><a href="#2-io-bound-nagruzka-set-bazy-dannykh-vneshnie-api">2. IO-bound нагрузка (Сеть, Базы данных, Внешние API)</a></li><li class="toc-item toc-h2"><a href="#problema-poryadka-ordering">Проблема порядка (Ordering)</a></li><li class="toc-item toc-h3"><a href="#kak-sokhranit-poryadok-key-based-hash-worker-pool">Как сохранить порядок: Key-based Hash Worker Pool</a></li><li class="toc-item toc-h2"><a href="#data-races-v-obrabotchikakh">Data Races в обработчиках</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

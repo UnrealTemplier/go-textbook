@@ -2168,44 +2168,94 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Idempotent handlers</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="illyuziya-exactly-once-i-neizbezhnost-dublikatov">Иллюзия Exactly-Once и неизбежность дубликатов</h2>
+            <h1>Idempotent handlers</h1>
+<blockquote>
+<p><em>«В распределенных системах нет вопроса "случится ли дублирование?". Вопрос лишь в том, спишет ли ваш обработчик деньги у клиента дважды, когда дубликат неизбежно прилетит.»</em></p>
+</blockquote>
+<h2 id="illyuziya-exactly-once-i-neizbezhnost-dublikatov">Иллюзия Exactly-Once и неизбежность дубликатов</h2>
 
-<p>В статье <a href="../01-fundament-asinkhronnosti/4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a> мы выяснили суровую правду распределенных систем: доставка <code>Exactly-Once</code> в чистом виде невозможна. Большинство брокеров (Kafka, RabbitMQ) гарантируют <code>At-Least-Once</code>. Это значит, что дубликаты сообщений — это не баг, а нормальная часть жизни системы. </p>
-<p>Если консьюмер упал после обработки сообщения, но перед отправкой ACK (как мы видели в <a href="2-konsyumery-i-graceful-shutdown.html" class="wikilink">2. Консьюмеры и graceful shutdown</a>), или если сеть моргнула, а таймаут репликации в Kafka истек, брокер отправит сообщение повторно. </p>
-<p>Если ваш обработчик не является <strong>идемпотентным</strong>, один и тот же платеж спишется дважды, один и тот же email улетит клиенту два раза, а счетчик лайков увеличится на 2 вместо 1.</p>
-<p><strong>Идемпотентность</strong> — свойство операции, при котором многократное ее выполнение приводит к тому же результату, что и однократное. В_terms_ обработки сообщений это означает: <em>если я получу сообщение с <code>message_id=123</code> десять раз, состояние системы изменится ровно так же, как если бы я получил его один раз</em>.</p>
+<p>В фундаментальной лекции <a href="../01-fundament-asinkhronnosti/4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a> мы сформулировали суровую правду компьютерных сетей: идеальная физическая доставка <strong><code>Exactly-Once</code></strong> (ровно один раз) в распределенной среде невозможна из-за проблемы двух генералов и неизбежности сетевых сбоев.</p>
+<p>Практически все современные брокеры сообщений (Apache Kafka, RabbitMQ, NATS JetStream) работают с семантикой <strong><code>At-Least-Once</code></strong> (как минимум один раз). </p>
+<p>Это означает, что появление дубликатов в очереди — не редкий баг, а <strong>штатное повседневное состояние системы</strong>:<br />
+- Сервер-консьюмер успешно выполнил списание средств, но процесс был вытеснен Kubernetes прямо перед отправкой подтверждения <code>Ack</code> (как мы разбирали в <a href="2-konsyumery-i-graceful-shutdown.html" class="wikilink">2. Консьюмеры и graceful shutdown</a>).<br />
+- Сетевой шлюз словил микропаузу, TCP-таймаут брокера истек, и брокер решил, что консьюмер погиб, отправив то же самое сообщение другому воркеру.<br />
+- Продюсер переотправил пачку из-за таймаута репликации в Kafka.</p>
+<p>Если ваш обработчик (Handler) не обладает свойством <strong>идемпотентности</strong>, система мгновенно деградирует: с клиента спишутся лишние средства, на складе заблокируется двойной объем товара, а пользователю придет десяток одинаковых SMS-уведомлений.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Broker as Брокер (Kafka / RabbitMQ)
+participant Worker as Go Consumer
+participant DB as PostgreSQL
+
+Broker-&gt;&gt;Worker: Сообщение (Заказ #991, списать $50)
+Worker-&gt;&gt;DB: UPDATE accounts SET balance = balance - 50
+DB--&gt;&gt;Worker: OK (Баланс уменьшен)
+Note over Worker: Сетевой сбой или OOM до отправки Ack!
+Worker--xBroker: Соединение разорвано (Ack потерян)
+
+Note over Broker: Ределивери (Requeue) по At-Least-Once
+Broker-&gt;&gt;Worker: ПОВТОР: Сообщение (Заказ #991, списать $50)
+Note over Worker: Без идемпотентности: повторное списание!
+Worker-&gt;&gt;DB: UPDATE accounts SET balance = balance - 50 (ОШИБКА ДУБЛЯ!)
+  </pre>
+</div>
+
+
+<blockquote>
+<p><strong>Идемпотентность</strong> — математическое свойство операции:<br />
+$$f(f(x)) = f(x)$$<br />
+В контексте асинхронного бэкенда это означает: <em>если обработчик получит сообщение с <code>message_id=123</code> десять раз подряд, финальное состояние системы изменится ровно так же, как если бы оно было получено строго один раз, а все последующие ответы будут идентичны первому.</em></p>
+</blockquote>
+<hr />
 <h2 id="otkuda-beretsya-klyuch-producer-vs-broker">Откуда берется ключ: Producer vs Broker</h2>
 
-<p>Чтобы отбросить дубликат, нам нужно его опознать. Откуда взять уникальный идентификатор?</p>
+<p>Чтобы отбросить повторное сообщение, консьюмер обязан однозначно опознать его. Откуда взять надежный уникальный идентификатор?</p>
 <ol>
-<li><strong>Брокер (Kafka, RabbitMQ):</strong> Брокер присваивает сообщениям внутренние ID (например, <code>DeliveryTag</code> в RabbitMQ или связка <code>Topic-Partition-Offset</code> в Kafka). Но использовать их для идемпотентности <strong>нельзя</strong>. При репликации или пересылке сообщения в Dead Letter Queue внутренний ID меняется.</li>
-<li><strong>Producer (Правильный подход):</strong> Продюсер генерирует <code>Idempotency Key</code> (часто UUIDv7) на своей стороне и кладет его в заголовок сообщения (Headers) или в тело. Этот ключ должен быть глобально уникальным и неизменным на протяжении всего жизненного цикла сообщения.</li>
+<li><strong>Внутренние идентификаторы брокера:</strong><br />
+   У брокеров всегда есть внутренние метки (например, <code>DeliveryTag</code> в RabbitMQ или связка <code>Topic-Partition-Offset</code> в Kafka). <strong>Использовать их в качестве ключа идемпотентности категорически запрещено!</strong> При пересылке сообщения в Dead Letter Exchange (DLQ), при повторной публикации продюсером или при переносе очередей эти технические идентификаторы меняются.</li>
+<li><strong>Идентификатор продюсера (<code>Idempotency Key</code> — единственный верный подход):</strong><br />
+   Продюсер обязан сгенерировать детерминированный или уникальный <code>Idempotency Key</code> на своей стороне в момент зарождения намерения (например, UUIDv7 или хэш бизнес-параметров <code>order_id + user_id</code>) и внедрить его в заголовки (Headers) либо в тело сообщения. Этот ключ сопровождает полезную нагрузку на протяжении всей ее жизни.</li>
 </ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Почему UUIDv7, а не UUIDv4?</span>
   </div>
   <div class="callout-body">
-    <p>Почему UUIDv7, а не UUIDv4? В высоконагруженных БД (PostgreSQL) первичные ключи используются для кластерных индексов (B-Tree). UUIDv4 абсолютно случаен, что приводит к случайным вставкам в разные страницы индекса (Page Splits). Это вызывает трэшинг кэша CPU (Cache Misses на уровне L1/L2) и деградацию IOPS диска.<br />
-UUIDv7 содержит префикс временной метки (millisecond unix timestamp). Такие ключи монотонно возрастают, поэтому вставки идут в "горячий" правый край B-Tree. Это обеспечивает локальность данных (Data Locality) и потрясающую производительность на запись.</p>
+    <p>В реляционных базах данных (PostgreSQL, MySQL) ключи идемпотентности индексируются через B-Tree структуры. </p>
+<p>Традиционный <code>UUIDv4</code> генерируется абсолютно случайно. Вставка случайных значений в B-Tree индекс приводит к постоянным расщеплениям страниц (<strong>Page Splits</strong>), размытию данных по диску, выбиванию горячего кэша CPU (L1/L2 Cache Misses) и деградации производительности дискового I/O.</p>
+<p><strong><code>UUIDv7</code></strong> содержит в старших 48 битах монотонно возрастающую временную метку (Unix Timestamp в миллисекундах). Новые ключи всегда вставляются в самый правый, горячий край B-Tree дерева, обеспечивая идеальную локальность данных (<strong>Data Locality</strong>) и исключая фрагментацию страниц памяти.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="patterny-idempotentnosti-v-go">Паттерны идемпотентности в Go</h2>
 
-<p>Существует три фундаментальных подхода к обеспечению идемпотентности, от простых к сложным.</p>
+<p>В промышленной разработке применяются три фундаментальных инженерных паттерна обеспечения идемпотентности.</p>
+<hr />
 <h3 id="1-optimistic-locking-cherez-bd-estestvennaya-idempotentnost">1. Optimistic Locking через БД (Естественная идемпотентность)</h3>
 
-<p>Самый надежный способ — положиться на ограничения целостности данных в вашей БД (PostgreSQL). Если бизнес-логика позволяет, мы используем <code>UNIQUE CONSTRAINT</code> на идемпотентный ключ или бизнес-поле.</p>
-<p><strong>Пример:</strong> Обработка транзакции пополнения баланса.</p>
+<p>Наиболее надежный и транзакционно строгий метод — делегировать проверку уникальности персистентному движку базы данных с помощью ограничения уникальности (<strong><code>UNIQUE CONSTRAINT</code></strong>).</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2215,17 +2265,19 @@ UUIDv7 содержит префикс временной метки (millisecon
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-sql"><code class="language-sql">-- Схема БД
+  <pre class="language-sql"><code class="language-sql">-- Таблица транзакций в PostgreSQL
 CREATE TABLE transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    idempotency_key VARCHAR(255) UNIQUE NOT NULL, -- Ключ от продюсера
+    idempotency_key VARCHAR(255) NOT NULL,
     user_id BIGINT NOT NULL,
-    amount DECIMAL(19,2) NOT NULL
+    amount DECIMAL(19, 4) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_transactions_idempotency_key UNIQUE (idempotency_key)
 );
 </code></pre>
 </div>
 
-<p>В Go мы делаем <code>INSERT</code>. Если мы получим дубликат, БД выбросит ошибку нарушения уникального ограничения (в <code>pgx</code> это <code>pgerrcode.UniqueViolation</code>).</p>
+<p>В Go-коде мы выполняем операцию <code>INSERT</code>. Если сообщение дублируется, PostgreSQL откатит вставку и вернет ошибку нарушения ограничения уникальности (код <code>23505</code> в драйвере <code>pgx</code> — <code>pgerrcode.UniqueViolation</code>).</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2235,32 +2287,59 @@ CREATE TABLE transactions (
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (h *Handler) HandleTopUp(ctx context.Context, msg Message) error {
+  <pre class="language-go"><code class="language-go">package handler
+
+import (
+    &quot;context&quot;
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
+    &quot;fmt&quot;
+    &quot;log/slog&quot;
+
+    &quot;github.com/jackc/pgerrcode&quot;
+    &quot;github.com/jackc/pgx/v5/pgconn&quot;
+    &quot;github.com/jackc/pgx/v5/pgxpool&quot;
+)
+
+type TopUpEvent struct {
+    IdempotencyKey string  `json:&quot;idempotency_key&quot;`
+    UserID         int64   `json:&quot;user_id&quot;`
+    Amount         float64 `json:&quot;amount&quot;`
+}
+
+type PaymentHandler struct {
+    db     *pgxpool.Pool
+    logger *slog.Logger
+}
+
+func (h *PaymentHandler) HandleTopUp(ctx context.Context, body []byte) error {
     var event TopUpEvent
-    if err := json.Unmarshal(msg.Body, &amp;event); err != nil {
-        return fmt.Errorf(&quot;unmarshal: %w&quot;, err)
+    if err := json.Unmarshal(body, &amp;event); err != nil {
+        return fmt.Errorf(&quot;unmarshal event: %w&quot;, err)
     }
 
     _, err := h.db.Exec(ctx, `
-        INSERT INTO transactions (idempotency_key, user_id, amount) 
-        VALUES ($1, $2, $3)`, 
-        event.IdempotencyKey, event.UserID, event.Amount,
-    )
+        INSERT INTO transactions (idempotency_key, user_id, amount)
+        VALUES ($1, $2, $3)
+    `, event.IdempotencyKey, event.UserID, event.Amount)
 
     if err != nil {
         var pgErr *pgconn.PgError
-        // Проверяем, что ошибка - это нарушение UNIQUE CONSTRAINT (код 23505)
+        // Проверяем, является ли ошибка нарушением уникального ключа (код 23505)
         if errors.As(err, &amp;pgErr) &amp;&amp; pgErr.Code == pgerrcode.UniqueViolation {
-            // Дубликат! Операция уже была выполнена ранее.
-            // Мы НЕ возвращаем ошибку, чтобы консьюмер мог сделать ACK.
-            h.logger.Warn(&quot;Дубликат транзакции, пропускаем&quot;, &quot;key&quot;, event.IdempotencyKey)
-            return nil 
+            // ДУБЛИКАТ: Транзакция уже была успешно применена ранее!
+            // КРИТИЧЕСКИ ВАЖНО: возвращаем nil, чтобы консьюмер отправил брокеру Ack
+            h.logger.Warn(&quot;Обнаружен дубликат сообщения, пропускаем&quot;, 
+                &quot;idempotency_key&quot;, event.IdempotencyKey)
+            return nil
         }
-        // Другая ошибка БД (нет соединения, диск отвалился) - возвращаем ошибку
-        return fmt.Errorf(&quot;db exec: %w&quot;, err)
+
+        // Реальная ошибка базы данных (разрыв сети, таймаут диска)
+        return fmt.Errorf(&quot;db insert failed: %w&quot;, err)
     }
 
-    // Успешная вставка (первая обработка)
+    // Успешная первая обработка
+    h.logger.Info(&quot;Транзакция успешно зафиксирована&quot;, &quot;idempotency_key&quot;, event.IdempotencyKey)
     return nil
 }
 </code></pre>
@@ -2269,20 +2348,27 @@ CREATE TABLE transactions (
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ошибка вместо nil</span>
   </div>
   <div class="callout-body">
-    <p>Важнейший момент в коде выше: при обнаружении дубликата мы возвращаем <code>nil</code>! Если вы вернете ошибку, консьюмер посчитает, что сообщение не обработано, и попытается обработать его снова (NACK + Retry). Это создаст бесконечный цикл (Poison Message) из-за того, что БД всегда будет отказывать в INSERT, а консьюмер всегда будет ретраить.</p>
+    <p>Обратите внимание на возврат <code>nil</code> при перехвате <code>pgerrcode.UniqueViolation</code>.</p>
+<p>Если вы в панике вернете ошибку наружу консьюмеру, он посчитает, что обработка провалилась, и выполнит <code>Nack(requeue=true)</code>. Брокер вернет сообщение в очередь, консьюмер снова попытается сделать <code>INSERT</code>, снова получит <code>UniqueViolation</code>, и сервис войдет в бесконечный цикл пожирания CPU (<strong>Poison Message Loop</strong>). </p>
+<p>Дубликат сообщения — это не ошибка программы, это успешно обработанное в прошлом событие. Его необходимо подтверждать брокеру (<code>Ack</code>).</p>
   </div>
 </div>
 
+<hr />
 <h3 id="2-otdelnoe-khranilishche-idempotentnosti-redis-memcached">2. Отдельное хранилище идемпотентности (Redis / Memcached)</h3>
 
-<p>Подход выше идеален, если сама суть операции — это запись в БД. Но что, если обработка сообщения — это вызов стороннего API (например, отправка SMS через Twilio)? Мы не можем сделать <code>UNIQUE CONSTRAINT</code> в API провайдера. Нам нужно состояние <em>до</em> вызова API.</p>
-<p>Паттерн: сохраняем ключ в распределенном кэше (Redis) с TTL.<br />
-1. Пытаемся записать ключ в Redis через <code>SET key value NX EX 3600</code>.<br />
-2. Если <code>NX</code> вернул <code>OK</code> — ключа не было, выполняем работу.<br />
-3. Если <code>NX</code> вернул <code>nil</code> — дубликат, пропускаем.</p>
+<p>Метод с <code>UNIQUE CONSTRAINT</code> безупречен, если целевым действием является запись в реляционную базу данных. Но что, если обработка сообщения — это внешний побочный эффект: вызов API платежного шлюза Stripe, генерация фискального чека или отправка SMS?</p>
+<p>В этом случае мы не можем повесить <code>UNIQUE CONSTRAINT</code> на чужой HTTP-сервер. Нам необходимо атомарно захватить распределенную блокировку <strong>до</strong> вызова внешнего API.</p>
+<p>Для этого используется распределенный кэш (Redis) с атомарной операцией:</p>
+<pre><code>SET key value NX EX 3600
+</code></pre>
+<ul>
+<li>Флаг <code>NX</code> (Not Exists) гарантирует, что ключ запишется только в том случае, если его еще нет в памяти.</li>
+<li>Флаг <code>EX</code> (Expire) задает время жизни (TTL), защищая от вечной блокировки.</li>
+</ul>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2292,29 +2378,46 @@ CREATE TABLE transactions (
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (h *Handler) HandleSendSMS(ctx context.Context, msg Message) error {
-    var event SMSEvent
-    // ...
+  <pre class="language-go"><code class="language-go">package handler
 
-    // Пытаемся захватить блокировку по ключу идемпотентности
-    set, err := h.redis.SetNX(ctx, &quot;idemp:&quot;+event.IdempotencyKey, 1, 1*time.Hour).Result()
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;time&quot;
+
+    &quot;github.com/redis/go-redis/v9&quot;
+)
+
+type SMSHandler struct {
+    redisClient *redis.Client
+    smsGateway  SMSGatewayClient
+}
+
+func (h *SMSHandler) HandleSendSMS(ctx context.Context, idempKey string, phone, text string) error {
+    redisKey := &quot;idemp:&quot; + idempKey
+
+    // 1. Атомарная попытка захвата ключа
+    set, err := h.redisClient.SetNX(ctx, redisKey, &quot;processing&quot;, 1*time.Hour).Result()
     if err != nil {
-        return fmt.Errorf(&quot;redis setnx: %w&quot;, err) // Ошибка связи с Redis -&gt; NACK
+        return fmt.Errorf(&quot;redis setnx error: %w&quot;, err) // Сетевой сбой Redis -&gt; Nack
     }
     if !set {
-        // Ключ уже существует -&gt; Дубликат
-        return nil 
+        // Ключ уже существует: операция либо выполняется параллельно, либо уже завершена
+        return nil // Пропускаем дубликат
     }
 
-    // Вызов стороннего API
-    _, err = h.twilioClient.SendMessage(ctx, event.Phone, event.Text)
+    // 2. Вызов внешнего стороннего API
+    err = h.smsGateway.Send(ctx, phone, text)
     if err != nil {
-        // ВНИМАНИЕ: Если API упало, мы должны УДАЛИТЬ ключ из Redis!
-        // Иначе при следующем ретрае мы сочтем сообщение дубликатом и SMS никогда не отправится.
-        h.redis.Del(ctx, &quot;idemp:&quot;+event.IdempotencyKey)
-        return fmt.Errorf(&quot;twilio send: %w&quot;, err)
+        // ВНИМАНИЕ: Если внешний вызов упал, мы ОБЯЗАНЫ удалить ключ из Redis!
+        // Иначе при повторной доставке система сочтет сообщение дубликатом,
+        // и пользователь никогда не получит важное SMS.
+        _ = h.redisClient.Del(ctx, redisKey).Err()
+        return fmt.Errorf(&quot;sms gateway failed: %w&quot;, err)
     }
 
+    // 3. Помечаем как успешно завершенное
+    _ = h.redisClient.Set(ctx, redisKey, &quot;done&quot;, 24*time.Hour).Err()
     return nil
 }
 </code></pre>
@@ -2323,18 +2426,21 @@ CREATE TABLE transactions (
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Серая зона Redis</span>
   </div>
   <div class="callout-body">
-    <p>Подход с Redis имеет уязвимое окно (Race Condition): что, если наше приложение успешно записало ключ в Redis, вызвало API, но упало <em>до</em> отправки ACK в брокер? Брокер пришлет сообщение снова. Redis скажет "Ключ занят", и мы проигнорируем сообщение. По сути, мы свели гарантию доставки к <code>At-Most-Once</code>. <br />
+    <p>Паттерн с Redis содержит опасную гонку состояний (Race Condition). Что произойдет, если воркер успешно отправил SMS, но упал по OOM ровно за миллисекунду до того, как отправил <code>Ack</code> брокеру?</p>
+<p>Брокер переотправит сообщение. Новый воркер обратится в Redis, увидит ключ в статусе <code>done</code> и решит, что сообщение обработано, проигнорировав его. В данном сценарии это приемлемо (SMS отправлено, дубля нет). </p>
+<p>Но если воркер упал посреди длинного внешнего вызова, ключ зависнет в статусе <code>processing</code> до истечения TTL.<br />
+По сути, мы деградировали гарантию доставки до хрупкого <code>At-Most-Once</code>. <br />
 Если вам нужна строгая идемпотентность с внешними сайд-эффектами, Redis не подходит. Нужен паттерн <a href="../05-patterny-i-arkhitektura/6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a> или <a href="../05-patterny-i-arkhitektura/7-inbox-pattern.html" class="wikilink">7. Inbox pattern</a>.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="3-konechnye-avtomaty-state-machines">3. Конечные автоматы (State Machines)</h3>
 
-<p>Этот паттерн применяется, когда сущность уже существует в БД и переходит из состояния в состояние (например, заказ: <code>Created</code> -&gt; <code>Paid</code> -&gt; <code>Shipped</code>).</p>
-<p>Вместо отдельной таблицы для ключей, мы используем статус самой сущности. Запрос в БД выглядит так:</p>
+<p>Если бизнес-сущность уже сохранена в базе данных и имеет жизненный цикл (например, сущность <code>Order</code> со статусами <code>Created</code> $\to$ <code>Paid</code> $\to$ <code>Shipped</code>), мы можем превратить сам запрос <code>UPDATE</code> в естественный атомарный фильтр дубликатов:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2350,7 +2456,34 @@ WHERE id = $1 AND status = 'CREATED';
 </code></pre>
 </div>
 
-<p>Если консьюмер получит сообщение об оплате дважды, первый <code>UPDATE</code> изменит статус на <code>PAID</code> и вернет 1 затронутую строку. Второй <code>UPDATE</code> не найдет заказ со статусом <code>CREATED</code> и вернет 0 строк. В Go мы анализируем <code>RowsAffected()</code>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+stateDiagram-v2
+[*] --&gt; CREATED: Инициализация заказа
+CREATED --&gt; PAID: Событие оплаты (Первый прогон)
+PAID --&gt; SHIPPED: Отгрузка со склада
+
+note right of PAID
+Повторный UPDATE:
+WHERE status = &#x27;CREATED&#x27;
+вернет 0 строк! Дубликат отфильтрован.
+end note
+  </pre>
+</div>
+
+
+<p>В Go мы анализируем количество модифицированных строк с помощью метода <code>RowsAffected()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2360,34 +2493,74 @@ WHERE id = $1 AND status = 'CREATED';
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">    tag, err := h.db.Exec(ctx, sqlUpdateOrder, orderID)
+  <pre class="language-go"><code class="language-go">func (h *OrderHandler) HandleOrderPaid(ctx context.Context, orderID string) error {
+    tag, err := h.db.Exec(ctx, `
+        UPDATE orders 
+        SET status = 'PAID', paid_at = NOW() 
+        WHERE id = $1 AND status = 'CREATED'
+    `, orderID)
     if err != nil {
-        return err
+        return fmt.Errorf(&quot;update order error: %w&quot;, err)
     }
+
     if tag.RowsAffected() == 0 {
-        // Либо заказ не существует, либо он уже в статусе PAID (дубликат)
-        return nil 
+        // Ни одной строки не изменено: заказ либо не существует,
+        // либо УЖЕ находится в статусе PAID или SHIPPED (дубликат!).
+        h.logger.Warn(&quot;Повторный статус оплаты или невалидное состояние, пропускаем&quot;, 
+            &quot;order_id&quot;, orderID)
+        return nil // Отправляем Ack брокеру
     }
+
+    // Успешный первичный переход конечного автомата
+    return nil
+}
 </code></pre>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-tsena-idempotentnosti">Mechanical Sympathy: Цена идемпотентности</h2>
 
-<p>Идемпотентность не бесплатна. Каждый паттерн требует дополнительного I/O:<br />
-1. <strong>БД CONSTRAINT:</strong> Требует поиска по индексу на каждой вставке. Используйте UUIDv7 или ULID, чтобы B-Tree индекс не фрагментировался и поиск происходил в горячем кэше.<br />
-2. <strong>Redis/Memcached:</strong> Добавляет сетевой хоп (round-trip) на каждую операцию. Если вы обрабатываете 50 000 msg/s, это 50 000 запросов в Redis в секунду. Это может стать узким местом сети.<br />
-3. <strong>Кросс-системная консистентность:</strong> Если вы пишете данные в PostgreSQL, а ключи идемпотентности проверяете в Redis, у вас нет транзакционной связи. Ошибка между коммитом в PG и удалением ключа в Redis приведет к неконсистентности.</p>
-<p>Единственный способ обеспечить строгую идемпотентность без потери скорости на сетевых хопах в сторонние системы — это <strong>Inbox Pattern</strong>, где мы записываем сообщение в локальную БД приложения в рамках той же транзакции, что и бизнес-данные, элиминируя сетевые прыжки.</p>
+<p>Закон сохранения сложности в распределенных системах напоминает: <strong>за надежность и защиту от дублей приходится платить аппаратными ресурсами (I/O и задержками)</strong>.</p>
+<ol>
+<li><strong>Дисковые накладные расходы индексов:</strong><br />
+   Каждое ограничение <code>UNIQUE CONSTRAINT</code> — это дополнительное дерево B-Tree на диске. На каждый <code>INSERT</code> СУБД обязана выполнить обход дерева и удерживать страницы индекса в буферном пуле памяти (Shared Buffers). Использование невыровненных ключей приводит к постоянным промахам кэша.</li>
+<li><strong>Сетевые задержки Redis:</strong><br />
+   Проверка <code>SetNX</code> в Redis добавляет сетевой round-trip (1–3 миллисекунды) на каждое сообщение. При потоке в 50 000 msg/s это создаст 50 000 дополнительных сетевых вызовов в секунду, утилизируя сетевой стек ядра и сокеты Linux.</li>
+<li><strong>Отсутствие распределенных транзакций:</strong><br />
+   Если вы обновляете баланс в PostgreSQL, а флаг идемпотентности проверяете в Redis, между ними всегда существует зазор для аварии.</li>
+</ol>
+<p>Наиболее совершенное решение для высоконагруженных систем — <strong>Inbox Pattern (<a href="../05-patterny-i-arkhitektura/7-inbox-pattern.html" class="wikilink">7. Inbox pattern</a>)</strong>, где таблица входящих ключей идемпотентности (<code>inbox</code>) находится в той же базе данных PostgreSQL, что и бизнес-данные, и обновляется строго в рамках единой локальной ACID-транзакции.</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Мы пишем HTTP-хэндлер приема вебхуков от платежного шлюза (Stripe/PayPal). Как спроектировать идемпотентный обработчик на Go, исключающий двойное зачисление баланса при повторных запросах шлюза?</p>
+<p><strong>Ответ:</strong><br />
+1. Платежный шлюз всегда передает уникальный <code>event_id</code> в теле или заголовках вебхука.<br />
+2. В локальной СУБД создается таблица <code>processed_events (event_id VARCHAR PRIMARY KEY, processed_at TIMESTAMPTZ)</code>.<br />
+3. В единой транзакции базы данных:<br />
+<code>sql
+   BEGIN;
+   INSERT INTO processed_events (event_id) VALUES ($1);
+   UPDATE accounts SET balance = balance + $amount WHERE user_id = $uid;
+   COMMIT;</code><br />
+4. Если приходит повторный вебхук с тем же <code>event_id</code>, СУБД возвращает ошибку нарушения первичного ключа (<code>23505</code>). Хэндлер перехватывает ее, возвращает шлюзу статус <code>200 OK</code> (чтобы шлюз перестал спамить повторами), но баланс пользователя остается в неприкосновенности.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Дубликаты в асинхронных системах — это норма. Обработчики <strong>обязаны</strong> быть идемпотентными.</li>
-<li>Генерируйте <code>Idempotency Key</code> на стороне Продюсера. Встраивайте в ключ монотонно возрастающие компоненты (UUIDv7) для блага B-Tree индексов БД.</li>
-<li>Используйте <code>UNIQUE CONSTRAINT</code> в БД как самый надежный и транзакционно-целостный метод.</li>
-<li>При использовании Redis для идемпотентности не забывайте удалять ключ в случае падения сайд-эффекта, иначе вы потеряете сообщения.</li>
-<li>Если бизнес-логика позволяет, используйте конечные автоматы (State Machines) через <code>UPDATE ... WHERE status = ...</code>.</li>
+<li><strong>Дубликаты неизбежны:</strong> Семантика <code>At-Least-Once</code> обязывает все консьюмеры быть строго идемпотентными.</li>
+<li><strong>Ключ генерирует продюсер:</strong> Внутренние метки брокеров (<code>DeliveryTag</code>, <code>Offset</code>) нестабильны. Используйте монотонно возрастающие бизнес-идентификаторы или <code>UUIDv7</code>.</li>
+<li><strong><code>UNIQUE CONSTRAINT</code> в СУБД</strong> — золотой стандарт надежности. При перехвате <code>UniqueViolation</code> обязательно возвращайте <code>nil</code>, подтверждая сообщение брокеру.</li>
+<li><strong>Внешние API защищаются через Redis (<code>SET NX</code>)</strong>: но помните про обязательное удаление ключа в блоке обработки ошибок при авариях вызова.</li>
+<li><strong>Конечные автоматы (State Machines)</strong> позволяют реализовывать идемпотентность естественным образом через <code>UPDATE ... WHERE status = ...</code> и проверку <code>RowsAffected()</code>.</li>
 </ol>
-<p>Идемпотентные обработчики дают нам уверенность в том, что ретраи (о которых мы говорили в <a href="../01-fundament-asinkhronnosti/9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>) не сломают бизнес-логику. Но что если мы хотим обрабатывать сообщения не по одному, а пачками, чтобы сэкономить на сетевых round-trips до БД? В следующей статье мы разберем: <a href="5-batch-processing-soobshcheniy.html" class="wikilink">5. Batch processing сообщений</a>.</p>
+<p>Идемпотентность защитила нас от дублей при повторных попытках (<a href="../01-fundament-asinkhronnosti/9-retry-strategii-i-exponential-backoff.html" class="wikilink">9. Retry стратегии и exponential backoff</a>). Но что делать, если обработка единичных сообщений перегружает базу данных тысячами мелких транзакций в секунду? Как научить консьюмер обрабатывать данные пачками? Разберем в следующей лекции: <a href="5-batch-processing-soobshcheniy.html" class="wikilink">5. Batch processing сообщений</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

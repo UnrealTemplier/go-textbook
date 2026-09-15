@@ -2168,25 +2168,35 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Консьюмеры и graceful shutdown</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="preryvaya-beskonechnyy-tsikl">Прерывая бесконечный цикл</h2>
+            <h1>Консьюмеры и graceful shutdown</h1>
+<blockquote>
+<p><em>«Любая программа умеет запускаться. Истинное мастерство инженера проверяется тем, как красиво его программа умеет умирать.»</em></p>
+</blockquote>
+<h2 id="preryvaya-beskonechnyy-tsikl">Прерывая бесконечный цикл</h2>
 
-<p>В классических PHP или Python-приложениях生命周期 управления процессом прост: пришел запрос, отработал скрипт, процесс умер. Если вы перезапускаете PHP-FPM или UWSGI, мастер-процесс просто убивает воркеры. ОС очищает ресурсы, а соединения с БД и брокерами обрываются. В лучшем случае подключится супервизор и перезапустит процесс.</p>
-<p>В Go мы пишем долгоживущие (long-lived) демоны. Консьюмер (потребитель сообщений) — это обычно набор горутин, которые крутятся в бесконечном цикле <code>for</code>, вычитывая сообщения из брокера (RabbitMQ, Kafka, NATS). Когда приходит время деплоя или подморозки (OOM), поду нужно завершиться. </p>
-<p>Но если просто убить процесс (<code>SIGKILL</code>), мы потеряем сообщения, которые уже вычитаны из брокера, но еще не обработаны, или (что еще хуже) обработаны, но не закоммичены (ACK/NACK). Это прямой путь к нарушению гарантий доставки, описанных в <a href="../01-fundament-asinkhronnosti/4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a>, и появлению дубликатов.</p>
+<p>В классических веб-приложениях старой школы (PHP-FPM, CGI, Python WSGI) жизненный цикл процесса был предельно прямолинеен: пришел HTTP-запрос, скрипт выделил память, отдал HTML и немедленно завершил работу. Если оператор перезапускал сервер, мастер-процесс просто принудительно гасил воркеры — операционная система забирала память, а открытые TCP-сокеты закрывались ядром.</p>
+<p>В мире Go мы создаем принципиально иные сущности — <strong>долгоживущие распределенные демоны (Long-Lived Daemons)</strong>. </p>
+<p>Консьюмер (потребитель сообщений) в Go — это пул легковесных горутин, непрерывно крутящихся в бесконечном цикле <code>for</code>, вычитывающих бинарные полезные нагрузки из брокеров (RabbitMQ, Kafka, NATS) и мутирующих состояние распределенной базы данных.</p>
+<p>Рано или поздно наступает неизбежный момент: деплой новой версии сервиса, вытеснение пода планировщиком Kubernetes или аварийная перезагрузка ноды из-за нехватки памяти (OOM). </p>
+<p>Если процесс завершить грубо (отправив сигнал <code>SIGKILL</code>), система окажется в неопределенном состоянии:<br />
+1. Сообщения, которые уже вычитаны из брокера в буфер User Space Go-приложения, но еще не успели обработаться, <strong>испарятся безвозвратно</strong>.<br />
+2. Сообщения, которые уже записали данные в PostgreSQL, но упали за миллисекунду до отправки подтверждения брокеру (<code>Ack</code>), вернутся в очередь и при перезапуске будут обработаны повторно, порождая дубликаты и нарушая гарантии доставки, подробно описанные в <a href="../01-fundament-asinkhronnosti/4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a>.</p>
+<p>Единственный способ избежать катастрофы данных — спроектировать безупречный механизм <strong>плавной остановки (Graceful Shutdown)</strong>.</p>
+<hr />
 <h2 id="arkhitektura-graceful-shutdown-v-go">Архитектура Graceful Shutdown в Go</h2>
 
-<p>Graceful Shutdown (плавная остановка) — это не просто вызов <code>os.Exit(0)</code>. Это строгая последовательность действий, которая должна гарантировать, что ни одно сообщение не останется в неопределенном состоянии.</p>
-<p>Типичный паттерн в Go состоит из трех этапов:<br />
-1. <strong>Перехват сигнала ОС</strong> (SIGINT, SIGTERM).<br />
-2. <strong>Остановка приема новых сообщений</strong> (мы говорим брокеру: "Больше не слай мне данные").<br />
-3. <strong>Ожидание завершения текущих обработчиков</strong> (In-flight сообщения должны быть обработаны и закоммичены).</p>
+<p>Graceful Shutdown — это не наивный вызов <code>os.Exit(0)</code>. Это строго детерминированный протокол остановки распределенного узла, гарантирующий, что ни один байт данных не зависнет в неопределенности.</p>
+<p>Канонический алгоритм плавной остановки состоит из трех последовательных фаз:<br />
+1. <strong>Перехват сигналов операционной системы</strong> (POSIX-сигналы <code>SIGINT</code>, <code>SIGTERM</code>).<br />
+2. <strong>Остановка приема новых сообщений (Drain Phase):</strong> Сервис закрывает подписки и объявляет брокеру: <em>«Больше не отдавай мне входящие задачи»</em>.<br />
+3. <strong>Ожидание завершения текущих задач (In-flight Processing):</strong> Сервис терпеливо дожидается, пока все уже взятые в работу сообщения завершат бизнес-транзакции и отправят брокеру итоговые <code>Ack</code> / <code>Nack</code>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2201,40 +2211,29 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;OS отправляет SIGTERM&quot;] --&gt; B[&quot;signal.NotifyContext отменяет ctx&quot;]
-B --&gt; C[&quot;Основной цикл выходит по ctx.Done&quot;]
-C --&gt; D[&quot;Консьюмер закрывает Channel/Consumer&quot;]
-D --&gt; E[&quot;sync.WaitGroup.Wait&quot;]
-E --&gt; F{&quot;Все In-flight обработчики завершились?&quot;}
-F --&gt;|&quot;Да&quot;| G[&quot;Закрытие соединения с брокером&quot;]
-F --&gt;|&quot;Нет - Timeout&quot;| H[&quot;Принудительный выход - сообщения вернутся в брокер&quot;]
+A[&quot;Ядро ОС / Kubelet посылает SIGTERM&quot;] --&gt; B[&quot;signal.NotifyContext отменяет ctx&quot;]
+B --&gt; C[&quot;Главный цикл вычитки выходит по ctx.Done()&quot;]
+C --&gt; D[&quot;Остановка подписки:&lt;br&gt;Закрытие Channel / Unsubscribe&quot;]
+D --&gt; E[&quot;Ожидание in-flight горутин:&lt;br&gt;sync.WaitGroup.Wait()&quot;]
+E --&gt; F{&quot;Все обработчики&lt;br&gt;завершились вовремя?&quot;}
+F --&gt;|&quot;Да&quot;| G[&quot;Закрытие физического TCP-соединения&lt;br&gt;Чистый выход exit 0&quot;]
+F --&gt;|&quot;Нет (Истек Hard Timeout)&quot;| H[&quot;Логирование аварии / Алерты&lt;br&gt;Неподтвержденные сообщения вернутся в брокер&quot;]
+
+classDef ok fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+classDef warn fill:#1e1e2e,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+classDef err fill:#1e1e2e,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
+class G ok;
+class F,H warn;
+class A err;
   </pre>
 </div>
 
 
+<hr />
 <h2 id="pod-kapotom-signaly-kontekst-i-planirovshchik">Под капотом: Сигналы, Контекст и Планировщик</h2>
 
-<p>Давай разберем, как магия <code>signal.NotifyContext</code> работает на уровне рантайма Go и ОС.</p>
-<p>Когда вы создаете контекст через <code>signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)</code>, рантайм Go регистрирует обработчик через системный вызов <code>sigaction</code> (в Linux). Когда ядро отправляет процессу сигнал (например, при <code>kubectl delete pod</code>), происходит программное прерывание.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>В Go сигналы обрабатываются специальной горутиной <code>signal.recv</code>. Когда приходит сигнал, runtime не прерывает вашу бизнес-логику посреди строки кода. Вместо этого он записывает сигнал в внутренний канал обработчика. Когда <code>signal.recv</code> просыпается, он закрывает канал <code>ctx.Done()</code> для вашего контекста.</p>
-<p>Закрытие канала в Go — это <em>broadcast</em> событие. Это значит, что все горутины, слушающие <code>ctx.Done()</code>, получат уведомление практически одновременно (в рамках планировщика G-M-P).</p>
-  </div>
-</div>
-
-<h3 id="pochemu-context-a-ne-channels">Почему Context, а не Channels?</h3>
-
-<p>Многие разработчики, приходящие из других языков, пытаются сделать отдельный <code>stopChan chan struct{}</code> для сигнала остановки. В Go использование <code>context.Context</code> — это <strong>идиома и абсолютный стандарт</strong>. <br />
-Во-первых, контекст можно передавать вглубь стека вызовов (например, в HTTP-клиенты или драйверы БД), и они тоже корректно оборвут таймаутные запросы. Во-вторых, это безопаснее с точки зрения конкурентности (закрытие канала можно пропустить, если читатель не слушает канал в данный момент, но <code>ctx.Err()</code> всегда вернет состояние).</p>
-<h2 id="pattern-waitgroup-schitaem-v-polete">Паттерн WaitGroup: Считаем в полете</h2>
-
-<p>Самая частая ошибка при написании консьюмера — использовать <code>sync.WaitGroup</code> неправильно. </p>
-<p>Рассмотрим классический пример обработки сообщений из Kafka:</p>
+<p>Разберем, как механизм <code>signal.NotifyContext</code> взаимодействует с ядром Linux и рантаймом Go на уровне машинных инструкций.</p>
+<p>Когда приложение вызывает:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2244,29 +2243,68 @@ F --&gt;|&quot;Нет - Timeout&quot;| H[&quot;Принудительный вы
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (c *Consumer) Start(ctx context.Context) error {
-    // Подписываемся на контекст отмены
+  <pre class="language-go"><code class="language-go">ctx, stop := signal.NotifyContext(parentCtx, syscall.SIGTERM, syscall.SIGINT)
+</code></pre>
+</div>
+
+<p>рантайм Go выполняет системный вызов ядра <strong><code>sigaction</code></strong>. В таблице дескрипторов сигналов процесса ядро прописывает указатель на системную функцию обработки прерываний рантайма Go.</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом</span>
+  </div>
+  <div class="callout-body">
+    <p>При отправке сигнала (например, командой <code>kubectl delete pod</code> или <code>kill &lt;pid&gt;</code>) ядро Linux совершает программное прерывание. Однако рантайм Go устроен так, что он <strong>никогда не прерывает стек горутины посреди произвольной ассемблерной инструкции</strong>.</p>
+<p>Сигнал перехватывается внутренней системной горутиной рантайма <code>signal.recv</code>. Она просыпается, читает битовую маску поступившего сигнала и пишет уведомление во внутренний буферизованный канал.</p>
+<p>Обработчик <code>signal.NotifyContext</code> получает это событие и закрывает канал <code>ctx.Done()</code>.<br />
+В рантайме Go операция закрытия канала (<code>close(ch)</code>) является <strong>широковещательной (Broadcast)</strong>. Это означает, что абсолютно все горутины, находящиеся в состоянии блокировки на селекторе <code>case &lt;-ctx.Done():</code>, мгновенно переводятся планировщиком Go (модель G-M-P) в статус <code>_Grunnable</code> и одновременно получают сигнал на пробуждение.</p>
+  </div>
+</div>
+
+<hr />
+<h3 id="pochemu-context-a-ne-channels">Почему Context, а не Channels?</h3>
+
+<p>В коде инженеров, переходящих на Go с других языков, часто можно встретить рукописные каналы остановки: <code>stopChan chan struct{}</code>. </p>
+<p>В современном Go использование <strong><code>context.Context</code> — это абсолютный и безальтернативный стандарт</strong>:<br />
+1. <strong>Иерархическая отмена:</strong> Контекст каскадно передается вниз по всему стеку вызовов (в драйверы баз данных <code>database/sql</code>, в HTTP-клиенты, во внутренние очереди). При отмене корневого контекста все вложенные тайм-ауты и селекторы отменяются автоматически.<br />
+2. <strong>Безопасность состояния:</strong> Закрытие канала <code>close(stopChan)</code> может вызвать панику при повторном вызове (<code>panic: close of closed channel</code>). Контекст же идемпотентен: метод <code>ctx.Err()</code> всегда возвращает детерминированную ошибку <code>context.Canceled</code>, независимо от того, сколько раз к нему обращаются параллельные горутины.</p>
+<hr />
+<h2 id="pattern-waitgroup-schitaem-v-polete">Паттерн WaitGroup: Считаем в полете</h2>
+
+<p>Самая опасная и трудноуловимая ошибка при создании конкурентного консьюмера — некорректное использование примитива синхронизации <code>sync.WaitGroup</code>.</p>
+<p>Рассмотрим хрестоматийный пример кода с состоянием гонки (Data Race):</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func (c *Consumer) BrokenStart(ctx context.Context) error {
     ctx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
     defer cancel()
 
-    wg := sync.WaitGroup{}
+    var wg sync.WaitGroup
 
     for {
         select {
         case &lt;-ctx.Done():
-            // Поймали сигнал остановки
-            c.logger.Info(&quot;Получен сигнал остановки, ожидаем завершения обработчиков...&quot;)
-            wg.Wait() // Ждем, пока все wg.Done() будут вызваны
+            c.logger.Info(&quot;Остановка: ожидаем завершения горутин...&quot;)
+            wg.Wait() // Ожидание счетчика
             return nil
         case msg, ok := &lt;-c.messagesCh:
             if !ok {
-                return nil // Брокер закрыл канал
+                return nil
             }
 
-            // ОШИБКА: wg.Add(1) здесь!
-            // Между получением msg и wg.Add может произойти ctx.Done(),
-            // и wg.Wait() выйдет раньше, чем мы успеем добавить 1.
-            go c.processMessage(ctx, msg, &amp;wg) 
+            // КАТАСТРОФИЧЕСКАЯ ОШИБКА: wg.Add(1) внутри горутины!
+            go func() {
+                wg.Add(1)
+                defer wg.Done()
+                c.processMessage(ctx, msg)
+            }()
         }
     }
 }
@@ -2276,14 +2314,16 @@ F --&gt;|&quot;Нет - Timeout&quot;| H[&quot;Принудительный вы
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Состояние гонки в `wg.Add(1)`</span>
   </div>
   <div class="callout-body">
-    <p>Вызов <code>wg.Add(1)</code> <em>внутри</em> горутины обработчика или после <code>select</code> — это data race и потенциальный дедлок. Если контекст отменится сразу после того, как сообщение попало в кейс <code>msg</code>, основная горутина может дойти до <code>wg.Wait()</code>, в то время как <code>wg.Add(1)</code> еще не выполнился. <code>Wait()</code> вернет ноль, приложение упадет, а сообщение потеряется.</p>
+    <p>Если вызов <code>wg.Add(1)</code> поместить внутрь тела создаваемой горутины <code>go func()</code>, возникает состояние гонки. </p>
+<p>После того как сообщение вычитано из канала <code>msg</code>, планировщик операционной системы может переключить контекст CPU обратно на главный цикл. Если в этот микросекундный интервал прилетает сигнал остановки, главный цикл пойдет в ветку <code>&lt;-ctx.Done()</code> и выполнит <code>wg.Wait()</code>. </p>
+<p>Так как новая горутина еще не успела запуститься и инкрементировать счетчик, <code>wg.Wait()</code> увидит нулевое значение счетчика и <strong>мгновенно завершит процесс</strong>! Приложение умрет, а сообщение, которое уже было извлечено из брокера, будет грубо оборвано на полуслове.</p>
+<p><strong>Железный закон Go:</strong> Инкремент <code>wg.Add(1)</code> обязан выполняться <strong>строго синхронно ДО ключевого слова <code>go func()</code></strong> в родительской горутине, а декремент <code>wg.Done()</code> — строго через <code>defer</code> на первой строчке внутри дочерней горутины!</p>
   </div>
 </div>
 
-<p><strong>Правильный подход:</strong> Инкрементировать <code>WaitGroup</code> строго <em>до</em> запуска горутины.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2293,69 +2333,82 @@ F --&gt;|&quot;Нет - Timeout&quot;| H[&quot;Принудительный вы
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">        case msg, ok := &lt;-c.messagesCh:
-            if !ok {
-                return nil
-            }
-
-            wg.Add(1) // Инкремент ДО go-рутины
-            go func() {
-                defer wg.Done() // Гарантированный декремент
-                c.processMessage(ctx, msg)
-            }()
+  <pre class="language-go"><code class="language-go">// ПРАВИЛЬНЫЙ ШАБЛОН:
+wg.Add(1) // Инкремент в родительском потоке ДО запуска
+go func() {
+    defer wg.Done() // Гарантированный декремент при любом исходе
+    c.processMessage(ctx, msg)
+}()
 </code></pre>
 </div>
 
+<hr />
 <h2 id="hard-timeout-zashchita-ot-zavisaniy">Hard Timeout: Защита от зависаний</h2>
 
-<p>Даже если вы реализовали WaitGroup, ваше приложение обязано иметь <strong>Hard Timeout</strong>. </p>
-<p>Представьте, что <code>processMessage</code> делает HTTP-запрос к стороннему API, а оно зависло. Или вы пытаетесь записать данные в PostgreSQL, но мастер-нода сейчас недоступна, и соединение повисло в ожидании TCP-таймаута. </p>
-<p>В Kubernetes по умолчанию на завершение пода дается 30 секунд (<code>terminationGracePeriodSeconds</code>). Если ваше приложение не завершится за это время, kubelet пришлет <code>SIGKILL</code>. Процесс умрет жестко, дампнет корку, а обработанные, но не закоммиченные сообщения пропадут (если у вас <code>auto-commit</code> или вы не успели вызвать <code>msg.Ack()</code>).</p>
-<p>Поэтому мы обязаны дать обработчикам ограниченное время на завершение:</p>
+<p>Даже если вы безупречно расставили <code>sync.WaitGroup</code>, ваша система остается уязвимой перед внешними зависимостями.</p>
+<p>Представьте ситуацию: функция <code>processMessage</code> совершает HTTP-вызов к сторонней платежной системе или выполняет SQL-запрос в PostgreSQL. Но прямо во время деплоя сетевой шлюз зависает, сокет не отдает данные, а TCP Keepalive не настроен. Горутина зависает намертво.</p>
+<p>Что произойдет, если вызвать бесконечный <code>wg.Wait()</code>? Сервис зависнет в фазе выключения. </p>
+<p>В оркестраторе Kubernetes на выключение пода по умолчанию выделяется ровно 30 секунд:</p>
 
-<div class="code-block" data-lang="go">
+<div class="code-block" data-lang="yaml">
   <div class="code-header">
-    <span class="code-lang-tag">Go</span>
+    <span class="code-lang-tag">YAML</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">case &lt;-ctx.Done():
-    c.logger.Info(&quot;Останавливаем консьюмер...&quot;)
-
-    // Даем время на доработку, но не бесконечно
-    done := make(chan struct{})
-    go func() {
-        wg.Wait()
-        close(done)
-    }()
-
-    select {
-    case &lt;-done:
-        c.logger.Info(&quot;Все обработчики завершились успешно&quot;)
-    case &lt;-time.After(15 * time.Second):
-        c.logger.Error(&quot;Таймаут завершения! Принудительный выход. Возможна потеря данных!&quot;)
-    }
-
-    return nil
+  <pre class="language-yaml"><code class="language-yaml">terminationGracePeriodSeconds: 30
 </code></pre>
 </div>
 
+<p>Если по истечении этого времени контейнер не завершил работу самостоятельно, Kubelet безжалостно присылает сигнал <strong><code>SIGKILL</code></strong>. Процесс будет уничтожен операционной системой в случайной точке памяти, сокеты разорвутся, а временные таблицы не очистятся.</p>
+<p>Поэтому зрелый production-консьюмер обязан реализовывать <strong>двухуровневую защиту с жестким таймаутом (Hard Timeout)</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+StartShutdown[&quot;Сигнал SIGTERM&quot;] --&gt; WaitGroupWait[&quot;Запуск wg.Wait() в фоне&quot;]
+WaitGroupWait --&gt; Select{&quot;select: кто быстрее?&quot;}
+Select --&gt;|&quot;wg.Wait() завершился&quot;| CleanExit[&quot;Чистый выход (Clean Exit 0)&quot;]
+Select --&gt;|&quot;time.After(15s) истек&quot;| HardExit[&quot;Принудительный выход (Timeout Error)&quot;]
+
+classDef ok fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+classDef err fill:#1e1e2e,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
+class CleanExit ok;
+class HardExit err;
+  </pre>
+</div>
+
+
+<p>Если горутины не укладываются в отведенный коридор безопасности (например, 15 секунд при 30 секундах в K8s), консьюмер принудительно обрывает работу, логирует критический инцидент и освобождает ресурсы.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдет с сообщением в RabbitMQ, если горутина обработала бизнес-логику, но перед отправкой <code>msg.Ack()</code> приложение убили по таймауту?<br />
-<strong>Ответ:</strong> Сообщение не будет подтверждено. Брокер (RabbitMQ) увидит обрыв TCP-соединения и вернет сообщение в очередь (requeue). Это приведет к повторной обработке (дублированию). Именно поэтому важен <a href="4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a> и именно поэтому <code>Ack</code> должен следовать <em>сразу</em> после сохранения результата в БД (в идеале — в одной транзакции/транзакционном outbox).</p>
+    <p><strong>Вопрос:</strong> Что произойдет с сообщением в RabbitMQ или Kafka, если горутина успешно обновила запись в БД, но в момент отправки <code>msg.Ack()</code> процесс был принудительно убит по таймауту?</p>
+<p><strong>Ответ:</strong><br />
+Брокер не получит <code>Ack</code>. В RabbitMQ при разрыве TCP-сокета брокер переведет сообщение обратно в очередь (Requeue). В Kafka смещение (offset) не будет зафиксировано в системном топике <code>__consumer_offsets</code>.</p>
+<p>При следующем старте сервиса сообщение <strong>будет вычитано повторно</strong>. Именно поэтому консьюмеры обязаны строиться по принципу идемпотентности, о котором мы детально поговорим в статье <a href="4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>. <code>Ack</code> должен отправляться строго после фиксации транзакции в БД, а бизнес-логика должна быть устойчива к повторным прогонам.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="production-ready-skelet-konsyumera">Production-ready скелет Консьюмера</h2>
 
-<p>Соберем все воедино. Вот как должен выглядеть надежный консьюмер на Go (на примере абстрактного брокера), учитывающий механику рантайма и требования отказоустойчивости:</p>
+<p>Соберем все инженерные принципы в законченную архитектурную конструкцию:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2369,6 +2422,8 @@ F --&gt;|&quot;Нет - Timeout&quot;| H[&quot;Принудительный вы
 
 import (
     &quot;context&quot;
+    &quot;errors&quot;
+    &quot;fmt&quot;
     &quot;log/slog&quot;
     &quot;os/signal&quot;
     &quot;sync&quot;
@@ -2377,126 +2432,145 @@ import (
 )
 
 type Message struct {
+    ID   string
     Body []byte
     Ack  func() error
     Nack func() error
 }
 
 type BrokerClient interface {
-    Consume(ctx context.Context) &lt;-chan Message
+    Consume(ctx context.Context) (&lt;-chan Message, error)
     Close() error
 }
 
 type Handler func(ctx context.Context, msg Message) error
 
 type Consumer struct {
-    broker  BrokerClient
-    handler Handler
-    logger  *slog.Logger
+    broker      BrokerClient
+    handler     Handler
+    logger      *slog.Logger
+    stopTimeout time.Duration
 }
 
 func New(broker BrokerClient, handler Handler, logger *slog.Logger) *Consumer {
     return &amp;Consumer{
-        broker:  broker,
-        handler: handler,
-        logger:  logger,
+        broker:      broker,
+        handler:     handler,
+        logger:      logger,
+        stopTimeout: 15 * time.Second, // Запас времени до Kubernetes SIGKILL
     }
 }
 
 func (c *Consumer) Run(parentCtx context.Context) error {
-    // 1. Перехватываем сигналы ОС на уровне контекста
+    // 1. Привязываем контекст приложения к сигналам ядра ОС
     ctx, stop := signal.NotifyContext(parentCtx, syscall.SIGINT, syscall.SIGTERM)
     defer stop()
 
-    messages := c.broker.Consume(ctx)
-    wg := sync.WaitGroup{}
+    messagesCh, err := c.broker.Consume(ctx)
+    if err != nil {
+        return fmt.Errorf(&quot;subscribe failed: %w&quot;, err)
+    }
 
-    // 2. Основной цикл вычитки
+    var wg sync.WaitGroup
+
+    c.logger.Info(&quot;Консьюмер успешно запущен, ожидание сообщений...&quot;)
+
+    // 2. Главный цикл диспетчеризации
     for {
         select {
         case &lt;-ctx.Done():
-            c.logger.Info(&quot;Получен сигнал остановки&quot;)
-            return c.shutdown(ctx, &amp;wg)
-        case msg, ok := &lt;-messages:
+            c.logger.Warn(&quot;Получен сигнал завершения. Переход в режим Drain...&quot;)
+            return c.gracefulShutdown(&amp;wg)
+
+        case msg, ok := &lt;-messagesCh:
             if !ok {
-                // Брокер закрыл канал (сетевая ошибка)
-                c.logger.Error(&quot;Канал сообщений закрыт брокером&quot;)
-                return c.shutdown(ctx, &amp;wg)
+                c.logger.Error(&quot;Канал брокера закрыт со стороны сервера&quot;)
+                return c.gracefulShutdown(&amp;wg)
             }
 
-            // 3. Правильный инкремент WG
+            // 3. Синхронный инкремент ДО старта горутины
             wg.Add(1)
-            go func() {
+            go func(m Message) {
                 defer wg.Done()
 
-                // ВАЖНО: Создаем дочерний контекст с таймаутом для конкретной обработки.
-                // Если глобальный ctx отменен, обработка тоже прервется.
-                // Но лучше дать ей шанс доработать, пока не истек жесткий таймаут.
+                // Изолированный контекст с локальным дедлайном на обработку
+                // Не используем ctx сигнала, иначе при SIGTERM обработка мгновенно оборвется
                 msgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
                 defer cancel()
 
-                if err := c.handler(msgCtx, msg); err != nil {
-                    c.logger.Error(&quot;Ошибка обработки сообщения&quot;, &quot;error&quot;, err)
-                    // Если обработка упала, возвращаем в очередь или в DLQ
-                    if nackErr := msg.Nack(); nackErr != nil {
-                        c.logger.Error(&quot;Ошибка NACK&quot;, &quot;error&quot;, nackErr)
-                    }
-                    return
-                }
-
-                // Успешная обработка
-                if ackErr := msg.Ack(); ackErr != nil {
-                    c.logger.Error(&quot;Ошибка ACK&quot;, &quot;error&quot;, ackErr)
-                    // Критическая ситуация: обработано, но не заакано. 
-                    // Возможно стоит запаниковать или отправить алерт.
-                }
-            }()
+                c.handleSingleMessage(msgCtx, m)
+            }(msg)
         }
     }
 }
 
-func (c *Consumer) shutdown(ctx context.Context, wg *sync.WaitGroup) error {
-    // Ожидаем завершения с жестким таймаутом
+func (c *Consumer) handleSingleMessage(ctx context.Context, msg Message) {
+    if err := c.handler(ctx, msg); err != nil {
+        c.logger.Error(&quot;Ошибка бизнес-логики обработки сообщения&quot;, &quot;id&quot;, msg.ID, &quot;err&quot;, err)
+        if nackErr := msg.Nack(); nackErr != nil {
+            c.logger.Error(&quot;Ошибка отправки Nack брокеру&quot;, &quot;id&quot;, msg.ID, &quot;err&quot;, nackErr)
+        }
+        return
+    }
+
+    if ackErr := msg.Ack(); ackErr != nil {
+        c.logger.Error(&quot;Ошибка отправки Ack брокеру&quot;, &quot;id&quot;, msg.ID, &quot;err&quot;, ackErr)
+    }
+}
+
+func (c *Consumer) gracefulShutdown(wg *sync.WaitGroup) error {
+    // Создаем канал-сигнализатор завершения всех in-flight горутин
     done := make(chan struct{})
     go func() {
         wg.Wait()
         close(done)
     }()
 
+    // Ожидание с жестким дедлайном (Hard Timeout)
     select {
     case &lt;-done:
-        c.logger.Info(&quot;Все in-flight сообщения обработаны&quot;)
-    case &lt;-time.After(15 * time.Second):
-        c.logger.Warn(&quot;Превышен таймаут graceful shutdown, принудительное завершение&quot;)
+        c.logger.Info(&quot;Все in-flight сообщения успешно завершены&quot;)
+    case &lt;-time.After(c.stopTimeout):
+        c.logger.Error(&quot;ТАЙМАУТ: часть горутин не успела завершиться до дедлайна!&quot;, 
+            &quot;timeout&quot;, c.stopTimeout)
     }
 
-    // Закрываем соединение с брокером
+    // Закрываем физическое сетевое соединение с кластером брокера
+    c.logger.Info(&quot;Закрытие сетевых сокетов брокера...&quot;)
     if err := c.broker.Close(); err != nil {
-        c.logger.Error(&quot;Ошибка закрытия соединения с брокером&quot;, &quot;error&quot;, err)
+        c.logger.Error(&quot;Ошибка при закрытии клиента брокера&quot;, &quot;err&quot;, err)
         return err
     }
 
+    c.logger.Info(&quot;Graceful Shutdown успешно завершен&quot;)
     return nil
 }
 </code></pre>
 </div>
 
+<hr />
 <h3 id="analiz-koda-i-mekhanika-pamyati">Анализ кода и механика памяти</h3>
+
 <ol>
-<li><strong>Отсутствие аллокаций в главном цикле:</strong> Мы не создаем новые объекты в <code>select</code>, кроме замыкания для горутины. Go эффективно аллоцирует замыкания в куче (Escape Analysis унесет туда переменные <code>msg</code> и <code>wg</code>), но это неизбежная цена за конкурентность.</li>
-<li><strong><code>context.Background()</code> в обработчике:</strong> Обратите внимание, что внутри горутины мы делаем <code>context.WithTimeout(context.Background(), ...)</code>. Почему не <code>ctx</code>? Потому что если мы передадим отмененный <code>ctx</code> в HTTP-клиент или БД внутри обработчика, они мгновенно оборвут соединения, и мы не сможем корректно завершить транзакцию, даже если у нас есть время до жесткого таймаута shutdown.</li>
-<li><strong>Сложность ACK:</strong> Вызов <code>msg.Ack()</code> — это часто сетевой системный вызов (отправка TCP-пакета обратно в брокер). Если сеть лагает, <code>Ack</code> может висеть дольше, чем сама бизнес-логика. Если вы упретесь в Hard Timeout на этапе <code>Ack</code>, сообщение будет потеряно/задублировано.</li>
+<li><strong>Изоляция контекста в <code>handleSingleMessage</code>:</strong><br />
+   Обратите внимание: мы вызываем <code>context.WithTimeout(context.Background(), 10*time.Second)</code>, а не оборачиваем родительский <code>ctx</code>.<br />
+   Почему? Если передать отмененный родительский <code>ctx</code> в драйвер базы данных или HTTP-клиент, они моментально оборвут активные сетевые вызовы с ошибкой <code>context canceled</code>. В результате полезная работа, которая могла успешно завершиться за 200 миллисекунд в фазе graceful shutdown, будет насильственно прервана. Воркер должен иметь шанс спокойно довести транзакцию до коммита в рамках отведенного запаса времени.</li>
+<li><strong>Передача <code>msg</code> по значению в замыкание:</strong><br />
+   В цикле <code>for</code> мы явно передаем <code>msg</code> как аргумент <code>go func(m Message)</code>: это защищает от классической ошибки разделения переменной цикла (хотя в Go 1.22+ семантика переменных цикла изменена на per-iteration, явная передача параметров остается лучшей практикой для чистоты интерфейса).</li>
+<li><strong>Отказ от <code>auto-commit</code>:</strong><br />
+   В надежных системах автоматическая фиксация смещений (<code>auto-commit: true</code> в Kafka) категорически запрещена. Коммит должен происходить строго вручную через <code>msg.Ack()</code> только после того, как сайд-эффекты сохранены в локальную базу данных.</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Graceful shutdown консьюмера — это не опция, это жесткое требование для сохранения <a href="../01-fundament-asinkhronnosti/4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a>. </li>
-<li>Используйте <code>signal.NotifyContext</code> — это идиоматичный способ связать сигналы ОС (Ring 0) с планировщиком горутин Go (User Space).</li>
-<li><code>sync.WaitGroup</code> требует строгой дисциплины: <code>wg.Add(1)</code> строго <em>до</em> <code>go func()</code>, а <code>wg.Done()</code> — через <code>defer</code>.</li>
-<li>Всегда реализуйте Hard Timeout. Не надейтесь, что бизнес-логика доработает быстро. Защищайтесь от зависших TCP-соединений.</li>
-<li>Помните, что отмена контекста в Go — это широковещательное событие, которое мгновенно прерывает все вложенные <code>select</code> и HTTP-вызовы, что может мешать корректному завершению (commit/ack) транзакций.</li>
+<li><strong>Graceful Shutdown</strong> — обязательный компонент любого распределенного консьюмера, предотвращающий потерю сообщений и повреждение данных.</li>
+<li><strong><code>signal.NotifyContext</code></strong> связывает прерывания POSIX-ядра операционной системы (<code>sigaction</code>) с планировщиком горутин Go через широковещательное закрытие канала <code>ctx.Done()</code>.</li>
+<li>Примитив <strong><code>sync.WaitGroup</code></strong> требует строжайшего соблюдения порядка: <code>wg.Add(1)</code> вызывается синхронно в главном цикле <em>до</em> вызова <code>go func()</code>, а <code>wg.Done()</code> — через <code>defer</code> внутри воркера.</li>
+<li>Консьюмер обязан иметь <strong>двухуровневую защиту (Hard Timeout)</strong>, чтобы зависшие внешние соединения не привели к внезапному убийству процесса по <code>SIGKILL</code> от оркестратора Kubernetes.</li>
+<li><code>Ack</code> брокеру должен отправляться синхронно после завершения локальной транзакции в БД, а бизнес-логика должна проектироваться с расчетом на повторные доставки.</li>
 </ol>
-<p>Теперь, когда мы понимаем, как безопасно остановить консьюмер, в следующей статье мы разберем, как ускорить его работу, распараллелив обработку сообщений, не сломав при этом порядок (ordering) и не создав гонку данных: <a href="3-parallelizm-obrabotki-soobshcheniy.html" class="wikilink">3. Параллелизм обработки сообщений</a>.</p>
+<p>Мы научились корректно останавливать консьюмер. Но как разогнать его производительность, когда одного потока вычитки недостаточно, а порядок сообщений критически важен? В следующей статье мы разберем паттерны параллельной обработки: <a href="3-parallelizm-obrabotki-soobshcheniy.html" class="wikilink">3. Параллелизм обработки сообщений</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

@@ -2168,22 +2168,41 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Observability очередей</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В синхронной архитектуре (например, микросервисы, общающиеся по HTTP/gRPC) отследить путь запроса относительно просто: запрос пришел, мы вызвали другой сервис, дождались ответа, вернули результат. Если произошла ошибка, мы видим всю цепочку в логах. </p>
-<p>В асинхронных Event-Driven системах (EDA) эта связь разрывается. Отправитель (Publisher) кладет сообщение в брокер и забывает о нем (Fire-and-forget). Получатель (Consumer) может забрать это сообщение через миллисекунду, а может через неделю (если оно лежало в DLQ). </p>
-<p>Если пользователь нажал кнопку на фронтенде, и через 5 минут где-то в недрах бэкенда упала горутина при обработке фоновой задачи, как понять, <strong>какой именно</strong> HTTP-запрос привел к этой ошибке? Для этого нам нужна <strong>Observability (Наблюдаемость)</strong>, которая в контексте очередей строится на трех столпах: Distributed Tracing, Metrics и Contextual Logging.</p>
+            <div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> Эта статья завершает цикл практической надежности консьюмеров и опирается на материалы: <a href="1-rabota-s-ocheredyami-v-go.html" class="wikilink">1. Работа с очередями в Go</a>, <a href="2-konsyumery-i-graceful-shutdown.html" class="wikilink">2. Консьюмеры и graceful shutdown</a>, <a href="4-idempotent-handlers.html" class="wikilink">4. Idempotent handlers</a>, <a href="6-handling-poison-messages.html" class="wikilink">6. Handling poison messages</a> и <a href="7-testirovanie-async-sistem.html" class="wikilink">7. Тестирование async систем</a>. В ней закладывается базис для следующей лекции: <a href="9-monitoring-lag-i-throughput.html" class="wikilink">9. Мониторинг lag и throughput</a>.</p>
+  </div>
+</div>
+
+<p>В классической синхронной веб-архитектуре отследить путь пользовательского запроса относительно просто: запрос поступил в API Gateway, ушел в <code>net/http</code> хэндлер, сделал пару RPC-вызовов по gRPC и вернул ответ. Если что-то сломалось, разработчик открывает логгер, фильтрует записи по единому <code>request_id</code> и видит связный стек вызовов.</p>
+<p>Но в Event-Driven архитектурах (EDA) эта причинно-следственная связь грубо разрывается брокером сообщений. Отправитель (Publisher) формирует событие, отправляет его в брокер по принципу Fire-and-Forget и немедленно отвечает пользователю HTTP-статусом 202 Accepted. Консьюмер на другом конце мира может вычитать этот пакет через пару миллисекунд, а может через двое суток — если сообщение отлежалось в DLQ после сетевого шторма.</p>
+<p>Если пользователь нажал кнопку оформления заказа, а через 15 минут горутина консьюмера в глубинах биллингового сервиса упала с ошибкой, как понять, <strong>какой конкретно</strong> HTTP-запрос запустил эту цепочку катастрофических событий?</p>
+<p>Ответом служит <strong>Observability (Наблюдаемость)</strong>. В асинхронных системах на Go она опирается на три фундаментальных кита:<br />
+1. <strong>Distributed Tracing (Распределенная трассировка):</strong> Сквозной контекст через заголовки брокера.<br />
+2. <strong>Application Metrics (Метрики приложения):</strong> RED-паттерн и гистограммы Prometheus.<br />
+3. <strong>Structured Contextual Logging (Структурированное контекстное логирование):</strong> Сквозная привязка <code>log/slog</code> к идентификаторам трассировки.</p>
+<hr />
 <h2 id="1-raspredelennaya-trassirovka-distributed-tracing">1. Распределенная трассировка (Distributed Tracing)</h2>
 
-<p>Единственный способ связать HTTP-запрос и фоновую обработку сообщения — это пробросить <strong>Trace Context</strong> через брокер сообщений. Де-факто стандартом сегодня является <strong>OpenTelemetry (OTel)</strong> и спецификация W3C Trace Context.</p>
+<p>Единственный способ не потерять нить выполнения между изолированными процессами — передавать <strong>Trace Context</strong> через шину данных. Общепринятым мировым стандартом стал <strong>OpenTelemetry (OTel)</strong> и спецификация W3C Trace Context.</p>
 <h3 id="mekhanika-raboty-propagation">Механика работы (Propagation)</h3>
 
-<p>Когда сообщение отправляется в брокер, мы не меняем его тело (Payload). Метаданные трассировки (TraceID, SpanID) всегда передаются в <strong>Заголовках (Headers)</strong> протокола. В RabbitMQ это <code>amqp.Table</code> (Headers Exchange), в Kafka — <code>Headers</code> внутри <code>Record</code>.</p>
+<p>Тело сообщения (Payload — будь то JSON, Protobuf или Avro) предназначено для доменной логики. Смешивать транспортные метаданные с бизнес-полями — грубое нарушение принципа разделения ответственности (Separation of Concerns).</p>
+<p>Поэтому метаданные трассировки (<code>TraceID</code>, <code>SpanID</code>) всегда упаковываются в <strong>Заголовки (Headers)</strong> транспортного протокола:<br />
+- В <strong>RabbitMQ</strong> это таблица атрибутов <code>amqp.Table</code> внутри структуры публикации.<br />
+- В <strong>Apache Kafka</strong> это массив ключ-значение <code>Headers</code> внутри структуры <code>Record</code>.<br />
+- В <strong>NATS</strong> это стандартные заголовки <code>nats.Header</code>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2198,19 +2217,26 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant API as HTTP Gateway
-participant P as Go Publisher
-participant B as Message Broker
-participant C as Go Consumer
+autonumber
+participant Client as Web / Mobile Client
+participant API as HTTP Ingress (Go)
+participant Broker as Message Broker (Kafka / RabbitMQ)
+participant Worker as Background Consumer (Go)
+participant DB as Postgres / Payment Gateway
 
-API-&gt;&gt;P: POST /checkout
-Note over P: Создание Span 1&lt;br&gt;TraceID: abc-123
-P-&gt;&gt;P: Inject Trace Context
-P-&gt;&gt;B: Publish&lt;br&gt;Headers: traceparent=abc-123...
-B-&gt;&gt;C: Deliver Message
-Note over C: Extract Trace Context
-C-&gt;&gt;C: Создание Span 2&lt;br&gt;Parent=Span 1, TraceID=abc-123
-Note over C: Обработка заказа
+Client-&gt;&gt;API: POST /checkout (traceparent: 00-4bf92f...-01)
+Note over API: Start Span &quot;http_checkout&quot;&lt;br&gt;TraceID: 4bf92f35...
+API-&gt;&gt;API: OTel Inject: сериализация Trace Context в заголовки
+API-&gt;&gt;Broker: Publish Message (Headers: traceparent=00-4bf92f...)
+API--&gt;&gt;Client: 202 Accepted (async processing)
+
+Note over Broker: Сообщение ожидает в очереди / партиции
+
+Broker-&gt;&gt;Worker: Deliver Message (с сохраненными Headers)
+Note over Worker: OTel Extract: десериализация Context&lt;br&gt;Start Span &quot;consume_order&quot;&lt;br&gt;ParentSpanID = HTTP Span
+Worker-&gt;&gt;DB: Execute Transaction
+Worker-&gt;&gt;Worker: Log with trace_id
+Worker--&gt;&gt;Broker: Ack / Commit Offset
   </pre>
 </div>
 
@@ -2221,15 +2247,34 @@ Note over C: Обработка заказа
     <span class="callout-title">Под капотом: W3C Trace Context</span>
   </div>
   <div class="callout-body">
-    <p>В заголовки брокера внедряется ключ <code>traceparent</code>. Его значение выглядит примерно так:<br />
-<code>00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01</code><br />
-Здесь зашифрованы: версия спецификации (00), TraceID (глобальный идентификатор бизнес-процесса), SpanID (идентификатор текущего шага) и флаги (например, сэмплируется ли этот трейс). Размер этого заголовка всего 55 байт, что не создает серьезного оверхеда на сеть или память брокера (Erlang VM).</p>
+    <p>В заголовки брокера внедряется стандартизированный бинарный или текстовый ключ <code>traceparent</code>.<br />
+Его канонический формат выглядит следующим образом:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+│  │                                │                │
+│  └─ 16-байтный TraceID (128 бит)  └─ 8-байт SpanID └─ Флаги сэмплирования (01 = sampled)
+└─ Версия стандарта W3C (00)
+</code></pre>
+</div>
+
+<p>Размер заголовка составляет всего 55 байт. Он не создает заметной нагрузки на сетевой стек ядра Linux и память брокера (например, BEAM-процессы Erlang VM в RabbitMQ). Зато он превращает россыпь разрозненных логов в упорядоченное дерево графа вызовов.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="idiomatichnyy-go-inject-i-extract">Идиоматичный Go: Inject и Extract</h3>
 
-<p>Библиотека <code>amqp091-go</code> не умеет работать с OpenTelemetry "из коробки" (в отличие от стандартного <code>net/http</code>). Нам нужно написать адаптер (Propagator), который научит OTel читать и писать в заголовки RabbitMQ.</p>
+<p>Клиентская библиотека RabbitMQ <code>amqp091-go</code> не имеет встроенной поддержки OpenTelemetry (в отличие от <code>net/http</code>, где OTel поставляется с готовыми middleware). Чтобы подружить OTel с брокером, мы реализуем стандартный интерфейс <code>propagation.TextMapCarrier</code>.</p>
+<h4 id="1-realizatsiya-textmapcarrier-dlya-rabbitmq">1. Реализация TextMapCarrier для RabbitMQ</h4>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2242,13 +2287,14 @@ Note over C: Обработка заказа
   <pre class="language-go"><code class="language-go">package tracing
 
 import (
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
     &quot;go.opentelemetry.io/otel/propagation&quot;
 )
 
 // AMQPHeadersCarrier адаптирует amqp.Table к интерфейсу TextMapCarrier
 type AMQPHeadersCarrier amqp.Table
 
+// Get извлекает значение строкового заголовка
 func (c AMQPHeadersCarrier) Get(key string) string {
     val, ok := c[key]
     if !ok {
@@ -2261,10 +2307,12 @@ func (c AMQPHeadersCarrier) Get(key string) string {
     return strVal
 }
 
+// Set сохраняет заголовок в amqp.Table
 func (c AMQPHeadersCarrier) Set(key string, value string) {
     c[key] = value
 }
 
+// Keys возвращает список всех ключей заголовков
 func (c AMQPHeadersCarrier) Keys() []string {
     keys := make([]string, 0, len(c))
     for k := range c {
@@ -2275,7 +2323,8 @@ func (c AMQPHeadersCarrier) Keys() []string {
 </code></pre>
 </div>
 
-<p><strong>Сторона отправителя (Publisher):</strong></p>
+<h4 id="2-inektsiya-konteksta-na-storone-publisher">2. Инъекция контекста на стороне Publisher</h4>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2285,25 +2334,68 @@ func (c AMQPHeadersCarrier) Keys() []string {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Предполагаем, что ctx уже содержит TraceID от HTTP-запроса
-func PublishEvent(ctx context.Context, ch *amqp.Channel, body []byte) error {
-    ctx, span := tracer.Start(ctx, &quot;publish_event&quot;)
+  <pre class="language-go"><code class="language-go">package producer
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
+    &quot;go.opentelemetry.io/otel&quot;
+    &quot;go.opentelemetry.io/otel/trace&quot;
+)
+
+type EventPublisher struct {
+    channel *amqp.Channel
+    tracer  trace.Tracer
+}
+
+func NewEventPublisher(ch *amqp.Channel, tracer trace.Tracer) *EventPublisher {
+    return &amp;EventPublisher{channel: ch, tracer: tracer}
+}
+
+func (p *EventPublisher) PublishOrderCreated(ctx context.Context, orderID string, body []byte) error {
+    // Создаем дочерний Span операции отправки в брокер
+    ctx, span := p.tracer.Start(ctx, &quot;orders.publish&quot;,
+        trace.WithSpanKind(trace.SpanKindProducer),
+    )
     defer span.End()
 
     headers := make(amqp.Table)
-    // Внедряем контекст (traceparent) в amqp.Table
+
+    // Внедряем W3C Trace Context (traceparent) в таблицу заголовков
     propagator := otel.GetTextMapPropagator()
     propagator.Inject(ctx, AMQPHeadersCarrier(headers))
 
-    return ch.PublishWithContext(ctx, &quot;exchange&quot;, &quot;routing&quot;, false, false, amqp.Publishing{
-        Headers: headers,
-        Body:    body,
-    })
+    // Добавляем бизнес-идентификатор для быстрой фильтрации в Wireshark / Management UI
+    headers[&quot;MessageID&quot;] = fmt.Sprintf(&quot;msg-%s&quot;, orderID)
+
+    msg := amqp.Publishing{
+        DeliveryMode: amqp.Persistent,
+        ContentType:  &quot;application/json&quot;,
+        Headers:      headers,
+        Body:         body,
+    }
+
+    err := p.channel.PublishWithContext(ctx,
+        &quot;orders.exchange&quot;, // exchange
+        &quot;order.created&quot;,   // routing key
+        false,             // mandatory
+        false,             // immediate
+        msg,
+    )
+    if err != nil {
+        span.RecordError(err)
+        return fmt.Errorf(&quot;failed to publish message: %w&quot;, err)
+    }
+
+    return nil
 }
 </code></pre>
 </div>
 
-<p><strong>Сторона получателя (Consumer):</strong></p>
+<h4 id="3-izvlechenie-konteksta-na-storone-consumer">3. Извлечение контекста на стороне Consumer</h4>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2313,19 +2405,50 @@ func PublishEvent(ctx context.Context, ch *amqp.Channel, body []byte) error {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func ConsumeEvent(d amqp.Delivery) {
-    // Извлекаем контекст трассировки из заголовков сообщения
-    propagator := otel.GetTextMapPropagator()
-    ctx := propagator.Extract(context.Background(), AMQPHeadersCarrier(d.Headers))
+  <pre class="language-go"><code class="language-go">package consumer
 
-    // Начинаем новый Span, который автоматически привяжется к родительскому (Publisher)
-    ctx, span := tracer.Start(ctx, &quot;process_event&quot;)
+import (
+    &quot;context&quot;
+    &quot;log/slog&quot;
+
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
+    &quot;go.opentelemetry.io/otel&quot;
+    &quot;go.opentelemetry.io/otel/trace&quot;
+)
+
+type OrderConsumer struct {
+    tracer trace.Tracer
+    logger *slog.Logger
+}
+
+func (c *OrderConsumer) HandleDelivery(d amqp.Delivery) {
+    // 1. Извлекаем родительский контекст трассировки из Headers брокера
+    propagator := otel.GetTextMapPropagator()
+    parentCtx := propagator.Extract(context.Background(), AMQPHeadersCarrier(d.Headers))
+
+    // 2. Стартуем новый локальный Span, который в OTel UI будет дочерним к Producer Span
+    ctx, span := c.tracer.Start(parentCtx, &quot;orders.consume&quot;,
+        trace.WithSpanKind(trace.SpanKindConsumer),
+    )
     defer span.End()
 
-    // Бизнес-логика с использованием нового ctx...
-    _ = doWork(ctx, d.Body)
+    // 3. Выполняем доменную бизнес-логику
+    if err := c.processOrder(ctx, d.Body); err != nil {
+        span.RecordError(err)
+        c.logger.ErrorContext(ctx, &quot;failed to process message&quot;,
+            slog.String(&quot;error&quot;, err.Error()),
+            slog.Uint64(&quot;delivery_tag&quot;, d.DeliveryTag),
+        )
+        _ = d.Nack(false, false) // Отправляем в DLQ без зацикливания
+        return
+    }
 
-    d.Ack(false)
+    _ = d.Ack(false)
+}
+
+func (c *OrderConsumer) processOrder(ctx context.Context, payload []byte) error {
+    // Вся цепочка downstream-вызовов (SQL, Redis, HTTP) наследует ctx с TraceID!
+    return nil
 }
 </code></pre>
 </div>
@@ -2336,39 +2459,7 @@ func PublishEvent(ctx context.Context, ch *amqp.Channel, body []byte) error {
     <span class="callout-title">Ловушка / Gotcha: Жизненный цикл `context.Context`</span>
   </div>
   <div class="callout-body">
-    <p>Никогда не передавайте <code>context.Context</code> из HTTP-обработчика напрямую в фоновую горутину, которая делает Publish, если горутина переживет HTTP-ответ. Когда HTTP-запрос завершается, HTTP-сервер вызывает <code>cancel()</code> для своего контекста. Ваша фоновая горутина мгновенно упадет с <code>context canceled</code>.</p>
-<p><strong>Решение (Go 1.21+):</strong> Используйте <code>context.WithoutCancel(ctx)</code>. Это отвяжет контекст от отмены родителя, но <strong>сохранит внутри все значения</strong>, включая <code>TraceID</code> от OpenTelemetry.</p>
-  </div>
-</div>
-
-<h2 id="2-metriki-prometheus-urovnya-prilozheniya">2. Метрики (Prometheus) уровня приложения</h2>
-
-<p>Брокер сообщений имеет свои метрики (и мы разберем их в следующей статье). Но ваш Go-сервис <strong>обязан</strong> экспортировать собственные метрики для понимания здоровья консьюмеров и паблишеров.</p>
-<p>Что обязательно нужно покрыть метриками (RED-паттерн для очередей):</p>
-<ol>
-<li><strong>Rate (Частота):</strong> - <code>events_published_total{topic="orders"}</code> (Counter)<br />
-   - <code>events_consumed_total{topic="orders", status="ack|nack"}</code> (Counter)</li>
-<li><strong>Errors (Ошибки):</strong><br />
-   - Количество <code>Nack</code> с разбивкой по типам ошибок (бизнес-ошибка, ошибка сериализации, таймаут БД).</li>
-<li><strong>Duration (Длительность):</strong><br />
-   - <code>event_processing_duration_seconds</code> (Histogram) — сколько времени Go-воркер тратит на выполнение бизнес-логики.</li>
-</ol>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы добавили в метрику <code>events_consumed_total</code> лейбл <code>user_id</code>, чтобы видеть, чьи заказы обрабатываются дольше. Через час Prometheus лег с OOM. Почему?<br />
-<strong>Ответ:</strong> Проблема <strong>High Cardinality (высокой кардинальности)</strong>. В Prometheus каждая уникальная комбинация лейблов создает новый временной ряд (Time Series) в памяти. Уникальных <code>user_id</code> могут быть миллионы, что приведет к взрыву памяти. Лейблы должны иметь конечный, малый набор значений (например, имя очереди, статус <code>success/error</code>, код ошибки). Идентификаторы пользователей нужно писать в <em>логи</em>, а не в метрики.</p>
-  </div>
-</div>
-
-<h2 id="3-kontekstnoe-logirovanie-structured-logging">3. Контекстное логирование (Structured Logging)</h2>
-
-<p>Трассировка и метрики показывают <em>где</em> и <em>как часто</em> происходит проблема. Логи объясняют <em>почему</em>.<br />
-В Go 1.21 появился стандартный пакет структурированного логирования <code>log/slog</code>.</p>
-<p>Идиоматичный подход в микросервисах — писать логи в формате JSON и <strong>всегда</strong> прикреплять к ним <code>TraceID</code> и <code>MessageID</code>. Если ваша система сбора логов (например, ELK, Loki или Datadog) видит поле <code>trace_id</code> в JSON-логе, она автоматически свяжет этот лог с таймлайном трейса из Jaeger/OpenTelemetry.</p>
+    <p>Распространенная ошибка при асинхронной публикации: передача родительского контекста <code>ctx</code> из HTTP-обработчика в фоновую горутину:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2378,40 +2469,285 @@ func PublishEvent(ctx context.Context, ch *amqp.Channel, body []byte) error {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">package logger
+  <pre class="language-go"><code class="language-go">func handleHTTP(w http.ResponseWriter, r *http.Request) {
+    go func() {
+        // ОШИБКА: r.Context() будет отменен, как только завершится HTTP-обработчик!
+        _ = publisher.Publish(r.Context(), data) 
+    }()
+    w.WriteHeader(http.StatusAccepted)
+}
+</code></pre>
+</div>
+
+<p>Как только HTTP-сервер отдает клиенту заголовки ответа, рантайт <code>net/http</code> вызывает <code>cancel()</code> для контекста запроса. Фоновая горутина получает ошибку <code>context canceled</code> при попытке записать данные в сокет брокера.</p>
+<p><strong>Каноническое решение (Go 1.21+):</strong><br />
+Используйте <code>context.WithoutCancel(ctx)</code>. Функция <code>context.WithoutCancel</code> создает новый контекст, который отвязан от каналов отмены родителя и дедлайнов, но <strong>полностью сохраняет все значения</strong> (<code>Value</code>), включая скрытый <code>TraceID</code>, атрибуты OTel и метаданные пользователя!</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="2-metriki-prometheus-urovnya-prilozheniya">2. Метрики (Prometheus) уровня приложения</h2>
+
+<p>Брокер сообщений экспортирует собственные системные метрики (очереди, соединения, память — их мы разберем в лекции <a href="9-monitoring-lag-i-throughput.html" class="wikilink">9. Мониторинг lag и throughput</a>). Однако брокер ничего не знает о том, <em>что именно</em> делает ваш Go-воркер: сколько миллисекунд занимает обработка, где застряли транзакции, и почему растет число отказов.</p>
+<p>Приложение обязано предоставлять собственные метрики по <strong>RED-паттерну (Rate, Errors, Duration)</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph &quot;Go Consumer Application (Prometheus Metrics)&quot;
+R[&quot;Rate (Интенсивность)&lt;br&gt;events_consumed_total&quot;]
+E[&quot;Errors (Ошибки и отказы)&lt;br&gt;events_consumed_total{status=&#x27;nack&#x27;}&quot;]
+D[&quot;Duration (Задержка обработки)&lt;br&gt;event_processing_duration_seconds&quot;]
+end
+R --&gt; TSDB[(&quot;Prometheus TSDB&quot;)]
+E --&gt; TSDB
+D --&gt; TSDB
+  </pre>
+</div>
+
+
+<p>Рекомендуемый набор метрик клиента очередей:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package metrics
+
+import (
+    &quot;github.com/prometheus/client_golang/prometheus&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/promauto&quot;
+)
+
+var (
+    // EventsPublishedTotal считает интенсивность исходящего потока
+    EventsPublishedTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: &quot;events_published_total&quot;,
+            Help: &quot;Общее количество опубликованных сообщений в брокер&quot;,
+        },
+        []string{&quot;topic&quot;, &quot;status&quot;}, // status: success / error
+    )
+
+    // EventsConsumedTotal считает интенсивность вычитки и распределение исходов
+    EventsConsumedTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: &quot;events_consumed_total&quot;,
+            Help: &quot;Общее количество вычитанных сообщений из очереди&quot;,
+        },
+        []string{&quot;topic&quot;, &quot;consumer_group&quot;, &quot;status&quot;}, // status: ack, nack, dlq
+    )
+
+    // EventProcessingDuration измеряет задержку выполнения бизнес-логики консьюмера
+    EventProcessingDuration = promauto.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    &quot;event_processing_duration_seconds&quot;,
+            Help:    &quot;Время обработки одного сообщения консьюмером в секундах&quot;,
+            Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
+        },
+        []string{&quot;topic&quot;, &quot;consumer_group&quot;},
+    )
+)
+</code></pre>
+</div>
+
+<p>Пример использования в консьюмере:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">start := time.Now()
+err := handler.Process(ctx, msg)
+duration := time.Since(start).Seconds()
+
+EventProcessingDuration.WithLabelValues(&quot;orders&quot;, &quot;billing-group&quot;).Observe(duration)
+
+if err != nil {
+    EventsConsumedTotal.WithLabelValues(&quot;orders&quot;, &quot;billing-group&quot;, &quot;nack&quot;).Inc()
+} else {
+    EventsConsumedTotal.WithLabelValues(&quot;orders&quot;, &quot;billing-group&quot;, &quot;ack&quot;).Inc()
+}
+</code></pre>
+</div>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование: Ловушка High Cardinality</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Мы добавили в метрику <code>events_consumed_total</code> лейбл <code>user_id</code>, чтобы в Grafana отслеживать активность конкретных клиентов. Через час сервер Prometheus упал с Out Of Memory (OOM). Что произошло и как это исправить?</p>
+<p><strong>Ответ:</strong> Произошел взрыв размерности — <strong>High Cardinality</strong>.<br />
+В архитектуре Prometheus TSDB (Time Series Database) каждая уникальная комбинация значений лейблов порождает совершенно независимый временной ряд (Time Series). Если в системе 1 миллион пользователей, метрика порождает:<br />
+$$\text{Topics} \times \text{Groups} \times \text{Statuses} \times 1\,000\,000 \approx \text{Миллионы временных рядов в RAM!}$$</p>
+<p>На каждый ряд Prometheus аллоцирует структуры в памяти (Head Chunks, инвертированные индексы). Это мгновенно съедает оперативную память.</p>
+<p><strong>Правило:</strong> Лейблы метрик Prometheus обязаны иметь конечное и малое множество значений (Bounded Cardinality): имена очередей, консьюмер-групп, HTTP/RPC методы, статус <code>success/error</code>. Любые высококардинальные идентификаторы (<code>user_id</code>, <code>order_id</code>, <code>TraceID</code>, <code>MessageID</code>) категорически запрещено передавать в метрики — их место <strong>исключительно в структурированных логах</strong> и спанах OpenTelemetry!</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="3-kontekstnoe-logirovanie-structured-logging">3. Контекстное логирование (Structured Logging)</h2>
+
+<p>Трассировка показывает <em>где</em> в цепочке сервисов возник затор или сбой. Метрики показывают <em>как часто</em> он происходит. Но только структурированные логи объясняют, <em>почему</em> это произошло (какие данные передавались, какая ветка алгоритма сработала, какие переменные привели к ошибке).</p>
+<p>Начиная с <strong>Go 1.21</strong>, стандартная библиотека включает пакет структурированного логирования <code>log/slog</code>. В распределенных брокерах идиоматичный подход — писать логи строго в формате JSON и автоматически насыщать каждую строчку идентификаторами <code>trace_id</code> и <code>span_id</code>.</p>
+<p>Когда централизованный сборщик логов (Grafana Loki, Elasticsearch, ClickHouse, Datadog) парсит JSON, он индексирует поле <code>trace_id</code>. В результате в дашборде Jaeger или Grafana Tempo можно нажать на упавший Span и в один клик увидеть все ассоциированные с ним строки логов.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph &quot;Go Runtime Context&quot;
+Ctx[&quot;context.Context&lt;br&gt;SpanContext(TraceID, SpanID)&quot;]
+end
+Ctx --&gt; Handler[&quot;slog.Handler (Custom / Middleware)&quot;]
+Handler --&gt;|&quot;Format JSON&quot;| Out[&quot;JSON Log Stream&quot;]
+Out --&gt;|&quot;Field trace_id&quot;| Loki[&quot;Grafana Loki / ClickHouse&quot;]
+Loki &lt;--&gt;|&quot;Correlate 1:1&quot;| Tempo[&quot;Grafana Tempo / Jaeger Tracing&quot;]
+  </pre>
+</div>
+
+
+<h3 id="idiomatichnyy-slog-adapter-dlya-trassirovki">Идиоматичный Slog-адаптер для трассировки</h3>
+
+<p>Мы создаем декоратор для <code>slog.Handler</code>, который прозрачно извлекает OTel Trace Context из <code>context.Context</code> без ручного добавления полей в каждом логе:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package logging
 
 import (
     &quot;context&quot;
     &quot;log/slog&quot;
+    &quot;os&quot;
 
     &quot;go.opentelemetry.io/otel/trace&quot;
 )
 
-// LogWithContext достает TraceID из контекста и добавляет его к логу
-func LogWithContext(ctx context.Context, logger *slog.Logger, level slog.Level, msg string, attrs ...slog.Attr) {
-    spanCtx := trace.SpanContextFromContext(ctx)
-    if spanCtx.HasTraceID() {
-        attrs = append(attrs, slog.String(&quot;trace_id&quot;, spanCtx.TraceID().String()))
-        attrs = append(attrs, slog.String(&quot;span_id&quot;, spanCtx.SpanID().String()))
-    }
-
-    logger.LogAttrs(ctx, level, msg, attrs...)
+// TraceContextHandler автоматически внедряет trace_id и span_id в каждую запись лога
+type TraceContextHandler struct {
+    slog.Handler
 }
 
-// Пример использования в Consumer:
-// LogWithContext(ctx, myLogger, slog.LevelError, &quot;failed to process DB transaction&quot;, slog.String(&quot;error&quot;, err.Error()))
+func NewTraceJSONHandler() *TraceContextHandler {
+    baseHandler := slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{
+        Level: slog.LevelInfo,
+    })
+    return &amp;TraceContextHandler{Handler: baseHandler}
+}
+
+func (h *TraceContextHandler) Handle(ctx context.Context, r slog.Record) error {
+    if ctx != nil {
+        span := trace.SpanFromContext(ctx)
+        spanCtx := span.SpanContext()
+        if spanCtx.IsValid() {
+            r.AddAttrs(
+                slog.String(&quot;trace_id&quot;, spanCtx.TraceID().String()),
+                slog.String(&quot;span_id&quot;, spanCtx.SpanID().String()),
+            )
+        }
+    }
+    return h.Handler.Handle(ctx, r)
+}
 </code></pre>
 </div>
 
+<p>Использование в консьюмере:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func init() {
+    handler := NewTraceJSONHandler()
+    slog.SetDefault(slog.New(handler))
+}
+
+func ProcessMessage(ctx context.Context, msg []byte) {
+    // В логе автоматически появятся &quot;trace_id&quot; и &quot;span_id&quot; из переданного ctx!
+    slog.InfoContext(ctx, &quot;starting message processing&quot;,
+        slog.Int(&quot;payload_bytes&quot;, len(msg)),
+    )
+
+    if err := doDB(ctx); err != nil {
+        slog.ErrorContext(ctx, &quot;database update failed&quot;,
+            slog.String(&quot;error&quot;, err.Error()),
+        )
+    }
+}
+</code></pre>
+</div>
+
+<p>Вывод лога в формате JSON:</p>
+
+<div class="code-block" data-lang="json">
+  <div class="code-header">
+    <span class="code-lang-tag">JSON</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-json"><code class="language-json">{
+  &quot;time&quot;: &quot;2026-09-15T11:45:00.123456789Z&quot;,
+  &quot;level&quot;: &quot;ERROR&quot;,
+  &quot;msg&quot;: &quot;database update failed&quot;,
+  &quot;error&quot;: &quot;connection refused&quot;,
+  &quot;trace_id&quot;: &quot;4bf92f3577b34da6a3ce929d0e0e4736&quot;,
+  &quot;span_id&quot;: &quot;00f067aa0ba902b7&quot;
+}
+</code></pre>
+</div>
+
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Трассировка — основа асинхронного мира.</strong> Без OTel и проброса <code>traceparent</code> через заголовки брокера ваша EDA-система превратится в неразрешимый клубок при первом же инциденте.</li>
-<li><strong>Propagators:</strong> Используйте встроенные механизмы OTel для извлечения и внедрения заголовков в <code>amqp.Table</code> или заголовки Kafka.</li>
-<li><strong>Контекст в Go:</strong> Помните про <code>context.WithoutCancel</code> при переходе из синхронного HTTP-мира в асинхронную отправку сообщений, чтобы не потерять TraceID.</li>
-<li><strong>Метрики:</strong> Измеряйте скорость обработки (Duration) и статус подтверждений (Ack/Nack rate) строго без высококардинальных лейблов.</li>
+<li><strong>Трассировка — кровеносная система EDA:</strong> Без OpenTelemetry и проброса заголовка <code>traceparent</code> через заголовки сообщений расследование инцидентов превращается в гадание на кофейной гуще.</li>
+<li><strong>Propagators:</strong> Используйте реализацию интерфейса <code>propagation.TextMapCarrier</code> для прозрачного преобразования OTel-контекста в <code>amqp.Table</code> или Kafka-заголовки <code>Headers</code>.</li>
+<li><strong>Контекст без отмены:</strong> Переходя от синхронного HTTP к фоновым очередям, применяйте <code>context.WithoutCancel(ctx)</code>, чтобы сохранить значения трассировки и не получить ошибку <code>context canceled</code> при закрытии HTTP-ответа.</li>
+<li><strong>Метрики RED:</strong> Контролируйте <code>events_published_total{topic="orders"}</code>, частоту подтверждений <code>events_consumed_total</code>, количество <code>Nack</code> и гистограммы длительности <code>event_processing_duration_seconds</code>.</li>
+<li><strong>Остерегайтесь High Cardinality:</strong> Никогда не добавляйте <code>user_id</code> или <code>MessageID</code> в лейблы метрик Prometheus.</li>
+<li><strong>Структурированный лог:</strong> Пакет <code>log/slog</code> в связке с кастомным обработчиком контекста автоматически связывает JSON-логи с трейсами через атрибуты <code>trace_id</code> и <code>span_id</code>.</li>
 </ol>
-<p>Мы настроили "взгляд изнутри" — наше Go-приложение теперь прозрачно сообщает о своей работе. Но как дела обстоят "снаружи"? Что делать, если наши воркеры работают быстро, но в очереди все равно скапливаются миллионы сообщений? Об инфраструктурном мониторинге и главной метрике асинхронных систем мы поговорим в следующей статье: <a href="9-monitoring-lag-i-throughput.html" class="wikilink">9. Мониторинг lag и throughput</a>.</p>
+<p>Мы научились наблюдать за системой «изнутри» процесса на Go. Но что происходит с брокером «снаружи»? Если воркеры работают без сбоев, но сообщения накапливаются в брокере быстрее, чем консьюмеры успевают их читать, система рискует исчерпать дисковое пространство. Об инфраструктурном мониторинге, лаге консьюмер-групп и пропускной способности мы подробно поговорим в следующей статье: <a href="9-monitoring-lag-i-throughput.html" class="wikilink">9. Мониторинг lag и throughput</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2439,7 +2775,7 @@ func LogWithContext(ctx context.Context, logger *slog.Logger, level slog.Level, 
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-raspredelennaya-trassirovka-distributed-tracing">1. Распределенная трассировка (Distributed Tracing)</a></li><li class="toc-item toc-h3"><a href="#mekhanika-raboty-propagation">Механика работы (Propagation)</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-go-inject-i-extract">Идиоматичный Go: Inject и Extract</a></li><li class="toc-item toc-h2"><a href="#2-metriki-prometheus-urovnya-prilozheniya">2. Метрики (Prometheus) уровня приложения</a></li><li class="toc-item toc-h2"><a href="#3-kontekstnoe-logirovanie-structured-logging">3. Контекстное логирование (Structured Logging)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-raspredelennaya-trassirovka-distributed-tracing">1. Распределенная трассировка (Distributed Tracing)</a></li><li class="toc-item toc-h3"><a href="#mekhanika-raboty-propagation">Механика работы (Propagation)</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-go-inject-i-extract">Идиоматичный Go: Inject и Extract</a></li><li class="toc-item toc-h4"><a href="#1-realizatsiya-textmapcarrier-dlya-rabbitmq">1. Реализация TextMapCarrier для RabbitMQ</a></li><li class="toc-item toc-h4"><a href="#2-inektsiya-konteksta-na-storone-publisher">2. Инъекция контекста на стороне Publisher</a></li><li class="toc-item toc-h4"><a href="#3-izvlechenie-konteksta-na-storone-consumer">3. Извлечение контекста на стороне Consumer</a></li><li class="toc-item toc-h2"><a href="#2-metriki-prometheus-urovnya-prilozheniya">2. Метрики (Prometheus) уровня приложения</a></li><li class="toc-item toc-h2"><a href="#3-kontekstnoe-logirovanie-structured-logging">3. Контекстное логирование (Structured Logging)</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-slog-adapter-dlya-trassirovki">Идиоматичный Slog-адаптер для трассировки</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
