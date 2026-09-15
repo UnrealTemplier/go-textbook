@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~20 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Circuit breaker</h1>
           </header>
@@ -2177,27 +2177,10 @@
           <div class="article-markdown">
             <h2 id="predokhranitel-dlya-vashego-bekenda">Предохранитель для вашего бэкенда</h2>
 
-<p>Когда вы включаете в одну розетку микроволновку, чайник, обогреватель и мощный сервер, что происходит? Пробки выбивает. Электрический автомат (Circuit Breaker) разрывает цепь, чтобы предотвратить пожар. </p>
-<p>В распределенных системах мы сталкиваемся с той же проблемой. Когда один из микросервисов (или база данных) начинает «тормозить» или падать, если мы продолжим отправлять в него запросы, мы не только окончательно добьем его, но и вызовем каскадный отказ (cascading failure) во всей нашей инфраструктуре.</p>
-<p>Паттерн <strong>Circuit Breaker (Предохранитель)</strong> защищает систему от перегрузки, реализуя принцип <strong>Fast Failure (быстрого отказа)</strong>.</p>
-<p>В этой статье мы разберем, как именно отсутствие предохранителя убивает приложения на Go на уровне железа и рантайма, как реализовать этот паттерн и какие подводные камни ждут вас на system design собеседованиях.</p>
-<hr />
-<h2 id="anatomiya-katastrofy-chto-esli-circuit-breaker-net">Анатомия катастрофы: Что если Circuit Breaker нет?</h2>
-
-<p>Представим классический сценарий из статьи <a href="../01-osnovy/4-partial-failure.html" class="wikilink">4. Partial failure</a>: ваш Go-сервис (Service A) ходит по HTTP в другой сервис (Service B). Service B начал деградировать и отвечать не за 50 мс, а за 10 секунд (достигая предела таймаута).</p>
-<p>Если у вас нет Circuit Breaker, происходит следующее:</p>
-<ol>
-<li><strong>Рост числа горутин (Goroutine Leak):</strong> В Go каждый входящий HTTP-запрос обрабатывается в отдельной горутине. Если ответы от Service B задерживаются, горутины в Service A не завершаются. Они встают в очередь ожидания. 10 000 RPS превратятся в 100 000 зависших горутин за 10 секунд.</li>
-<li><strong>Удар по памяти и GC:</strong> Каждая горутина — это минимум 2 КБ стека. 100 000 горутин = ~200 МБ только на стеки, плюс аллокации для структур запросов, контекстов и буферов ответа. Сборщик мусора (GC) начинает тратить львиную долю процессорного времени на сканирование этих зависших объектов (ведь они не мусор, пока запрос жив).</li>
-<li><strong>Истощение сетевых ресурсов (FD Exhaustion):</strong> Каждый исходящий запрос держит открытый TCP-сокет. В Linux количество файловых дескрипторов (File Descriptors) ограничено (обычно 65535 или около того). Вы быстро исчерпаете пул эфемерных портов или лимит FD.</li>
-<li><strong>Смерть Service A:</strong> В итоге Service A падает по OOM (Out Of Memory) или перестает принимать новые соединения, потому что нет свободных файловых дескрипторов. </li>
-</ol>
-<p>Мы убили здоровый сервис просто потому, что ждали ответа от больного. </p>
-<p>Circuit Breaker решает это элегантно: если мы видим, что Service B болен, мы <strong>перестаем к нему ходить</strong> на некоторое время. Все вызовы функции немедленно возвращают ошибку (Fast Fail), горутина завершается за микросекунды, ресурсы освобождаются, GC счастлив.</p>
-<hr />
-<h2 id="mashina-sostoyaniy-circuit-breaker">Машина состояний Circuit Breaker</h2>
-
-<p>В основе паттерна лежит конечный автомат (State Machine) с тремя классическими состояниями.</p>
+<p>Представьте старую квартиру, в которой одновременно включили электрический чайник, микроволновку, масляный радиатор и мощную стиральную машину. Медный провод в стене мгновенно раскаляется, изоляция начинает плавиться, и если бы в щитке не стоял электромагнитный автомат — пожар был бы неизбежен. Автомат с громким щелчком размыкает электрическую цепь, жертвуя сиюминутным комфортом ради спасения всего дома.</p>
+<p>В распределенных системах мы сталкиваемся с абсолютно идентичным физическим феноменом. Когда один из удаленных сервисов или реплика базы данных начинает задыхаться от нагрузки, медленно отвечать или выбрасывать ошибки, слепое продолжение отправки запросов превращается в преступление. Вы не просто окончательно добиваете «лежачего», вы провоцируете каскадный отказ (Cascading Failure), утягивающий на дно всю цепочку вызывающих микросервисов.</p>
+<p>Паттерн <strong>Circuit Breaker (Предохранитель / Автоматический выключатель)</strong> защищает архитектуру от лавинообразных перегрузок, реализуя фундаментальный принцип надежности: <strong>Fast Failure (мгновенный отказ)</strong>.</p>
+<p>В этой статье мы подробно разберем, как именно отсутствие предохранителя разрушает Go-приложения на уровне операционной системы, процессорных кэшей и рантайма, как грамотно реализовать этот механизм и какие коварные ловушки ждут инженера на собеседованиях по System Design.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2211,19 +2194,68 @@
     </button>
   </div>
   <pre class="mermaid">
-flowchart TD
-C[&quot;CLOSED&lt;br&gt;Цепь замкнута&lt;br&gt;Запросы проходят&quot;] --&gt;|&quot;Ошибки превысили порог&quot;| O[&quot;OPEN&lt;br&gt;Цепь разорвана&lt;br&gt;Быстрый отказ&quot;]
-O --&gt;|&quot;Таймаут охлаждения истек&quot;| HO[&quot;HALF-OPEN&lt;br&gt;Частично замкнута&lt;br&gt;Тестовые запросы&quot;]
-HO --&gt;|&quot;Успех тестового запроса&quot;| C
-HO --&gt;|&quot;Ошибка тестового запроса&quot;| O
+flowchart LR
+subgraph WithoutCB[&quot;Без Circuit Breaker (Каскадный коллапс)&quot;]
+direction TB
+A1[&quot;Service A&quot;] --&gt;|&quot;Медленный запрос (10s)&quot;| B1[&quot;Service B (Перегружен)&quot;]
+A1 -.-&gt;|&quot;Утечка горутин + OOM&quot;| Dead[&quot;Падение Service A&quot;]
+end
+
+subgraph WithCB[&quot;С Circuit Breaker (Быстрый отказ)&quot;]
+direction TB
+A2[&quot;Service A&quot;] --&gt;|&quot;Цепь OPEN: Fast Fail (1 мкс)&quot;| CB[&quot;Circuit Breaker&quot;]
+CB -.-&gt;|&quot;Отказ / Fallback кэш&quot;| A2
+B2[&quot;Service B&quot;] -.-&gt;|&quot;Время на остывание&quot;| B2
+end
+  </pre>
+</div>
+
+
+<hr />
+<h2 id="anatomiya-katastrofy-chto-esli-circuit-breaker-net">Анатомия катастрофы: Что если Circuit Breaker нет?</h2>
+
+<p>Представим классический сценарий частичного сбоя, рассмотренный в статье <a href="../01-osnovy/4-partial-failure.html" class="wikilink">4. Partial failure</a>: ваш Go-сервис (Service A) обращается по HTTP/REST или gRPC к внешнему биллингу или сервису отзывов (Service B). Сервис B внезапно деградировал: вместо привычных 50 мс ответы зависают на 10 секунд (вплоть до предельного таймаута сокета).</p>
+<p>Если в кодовой базе нет предохранителя, внутри рантайма Go разворачивается следующая трагедия:</p>
+<ol>
+<li><strong>Лавинообразный рост числа горутин (Goroutine Leak):</strong> В сетевой модели Go каждый входящий запрос обслуживается в собственной легковесной горутине. Если Service B перестал вовремя отвечать, горутины в Service A не могут завершиться и зависают в состоянии ожидания сетевого ввода-вывода. При входящем потоке всего в 10 000 RPS за 10 секунд ожидания в памяти скапливается 100 000 висящих горутин.</li>
+<li><strong>Колоссальное давление на память и сборщик мусора (GC Pressure):</strong> Минимальный размер стека горутины в Go составляет 2 КБ. 100 000 горутин — это минимум 200 МБ чистой памяти только под стеки, не считая аллокаций структур запросов, заголовков, контекстов <code>context.Context</code> и буферов сокетов. Сборщик мусора Go (Garbage Collector) вынужден при каждом цикле STW и фоновом сканировании обходить все эти сотни тысяч «живых» объектов, расходуя львиную долю ядер CPU на бесполезную работу.</li>
+<li><strong>Исчерпание сетевых дескрипторов (FD Exhaustion):</strong> Каждый незавершенный исходящий HTTP-запрос удерживает открытый TCP-сокет в ядре Linux. Лимит файловых дескрипторов процесса (<code>ulimit -n</code>, по умолчанию часто 1024 или 65535) и диапазон эфемерных портов ядра (<code>ip_local_port_range</code>) мгновенно исчерпываются.</li>
+<li><strong>Гибель Service A:</strong> Лишенный ресурсов Service A перестает принимать новые входящие подключения (<code>accept: too many open files</code>), операционная система выбивает процесс через Linux OOM Killer, и здоровый сервис погибает просто потому, что терпеливо ждал ответа от соседа.</li>
+</ol>
+<p>Circuit Breaker решает эту катастрофу радикально: как только количество ошибок или задержек превышает безопасный порог, он <strong>размыкает цепь и полностью прекращает сетевые вызовы</strong>. Все последующие обращения мгновенно завершаются ошибкой (Fast Fail) за доли микросекунды, горутины немедленно завершают работу, сокеты освобождаются, а сборщик мусора остается в зоне комфорта.</p>
+<hr />
+<h2 id="mashina-sostoyaniy-circuit-breaker">Машина состояний Circuit Breaker</h2>
+
+<p>В сердце любого предохранителя заложен строгий конечный автомат (Finite State Machine), оперирующий тремя базовыми состояниями:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+stateDiagram-v2
+[*] --&gt; CLOSED
+CLOSED --&gt; OPEN : Ошибки &gt; Порога (Threshold)
+OPEN --&gt; HALF_OPEN : Таймаут охлаждения (Sleep Window)
+HALF_OPEN --&gt; CLOSED : Пробные запросы успешны
+HALF_OPEN --&gt; OPEN : Пробный запрос упал с ошибкой
   </pre>
 </div>
 
 
 <ol>
-<li><strong>CLOSED (Закрыт):</strong> Нормальное состояние. Ток (запросы) течет. CB пропускает вызовы и считает ошибки.</li>
-<li><strong>OPEN (Открыт):</strong> Аварийное состояние. Порог ошибок превышен. CB мгновенно (не делая реального сетевого вызова) возвращает ошибку (например, <code>ErrCircuitBreakerOpen</code>). Даем больному сервису время на восстановление.</li>
-<li><strong>HALF-OPEN (Полуоткрыт):</strong> Состояние проверки. Спустя заданный таймаут охлаждения (sleep window), CB пропускает <em>один или несколько</em> тестовых запросов. Если они успешны — цепь замыкается (CLOSED). Если снова ошибка — возвращаемся в OPEN.</li>
+<li><strong>CLOSED (Цепь замкнута):</strong> Штатный режим работы. Электрический ток и пользовательские запросы свободно текут через автомат. Предохранитель выполняет реальные вызовы downstream-сервиса, непрерывно замеряя процент ошибок (<code>failure rate</code>) и скользящее окно запросов.</li>
+<li><strong>OPEN (Цепь разомкнута):</strong> Аварийный режим. Процент сбоев или таймаутов превысил критическую планку. Предохранитель блокирует все исходящие запросы на корню: функция-обертка немедленно возвращает клиенту ошибку <code>ErrCircuitBreakerOpen</code> (или <code>ErrOpenState</code>), вообще не обращаясь к сетевому стеку. Больной сервис получает передышку для восстановления.</li>
+<li><strong>HALF-OPEN (Цепь полуоткрыта):</strong> Режим зондирования. По истечении таймера охлаждения (Sleep Window, например 10–30 секунд) автомат осторожно пропускает строго ограниченное число пробных запросов (обычно 1–3 штуки). <br />
+   - Если пробные запросы завершились успехом — сервис выздоровел, цепь переходит в <strong>CLOSED</strong>, счетчики сбрасываются.<br />
+   - Если хотя бы один пробный запрос падает с ошибкой — цепь немедленно возвращается в <strong>OPEN</strong> еще на один цикл ожидания.</li>
 </ol>
 <div class="callout callout-info">
   <div class="callout-header">
@@ -2231,17 +2263,17 @@ HO --&gt;|&quot;Ошибка тестового запроса&quot;| O
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>В состоянии OPEN экономия ресурсов колоссальна. Вместо того чтобы собирать HTTP-запрос, переключать контекст в ядро ОС через <code>syscall</code> для записи в сокет и парковать горутину в <code>netpoll</code>, мы просто возвращаем <code>error</code> из функции-обертки, используя всего пару десятков инструкций процессора.</p>
+    <p>В состоянии OPEN выигрыш в производительности и ресурсах носит фундаментальный характер. Вместо выделения буферов, системного вызова <code>syscall</code> ядра Linux для записи в сокет и переключения контекста с парковкой горутины в сетевом поллере <code>netpoll</code>, процессор выполняет всего несколько инструкций сравнения в оперативной памяти и возвращает ошибку <code>error</code> за 2–5 наносекунд.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="realizatsiya-na-go-idiomy-i-proizvoditelnost">Реализация на Go: Идиомы и производительность</h2>
 
-<p>На практике чаще всего используют готовую библиотеку <code>github.com/sony/gobreaker</code> (или реализацию внутри resilience фреймворков). Но чтобы понять механику, посмотрим, как устроен этот паттерн под капотом, и какие решения по конкурентности там применяются.</p>
+<p>В производственной среде стандартом де-факто для Go является библиотека <code>github.com/sony/gobreaker</code>. Однако, чтобы писать по-настоящему надежные системы, необходимо понимать, как именно синхронизируется состояние автомата в условиях жесточайшего конкурентного доступа тысяч горутин.</p>
 <h3 id="naivnaya-realizatsiya-i-pochemu-ona-plokha">Наивная реализация (и почему она плоха)</h3>
 
-<p>Многие джуниоры пытаются написать CB, оборачивая всё состояние в <code>sync.Mutex</code>.</p>
+<p>Классическая ошибка начинающих инженеров — поместить всю логику подсчета и переключения автомата под обычный взаимный замок <code>sync.Mutex</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2251,7 +2283,7 @@ HO --&gt;|&quot;Ошибка тестового запроса&quot;| O
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Антипаттерн для высоконагруженного CB
+  <pre class="language-go"><code class="language-go">// Антипаттерн: примитивная синхронизация в горячем сетевом пути
 type NaiveCB struct {
     mu       sync.Mutex
     failures int
@@ -2262,20 +2294,30 @@ func (cb *NaiveCB) Execute(req func() error) error {
     cb.mu.Lock()
     if cb.state == StateOpen {
         cb.mu.Unlock()
-        return ErrOpen
+        return errors.New(&quot;circuit breaker is OPEN&quot;)
     }
     cb.mu.Unlock()
 
-    // ... выполнение и обновление стейта ...
+    err := req()
+
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    if err != nil {
+        cb.failures++
+        // смена стейта...
+    }
+    return err
 }
 </code></pre>
 </div>
 
-<p><strong>Проблема (Mechanical Sympathy):</strong> В высоконагруженной системе CB — это горячая точка (hot path). Каждая горутина, делающая внешний вызов, будет бороться за один и тот же мьютекс. Это вызывает Lock Contention. Планировщик Go будет постоянно парковать и будить горутины, а кэш-линии процессора (Cache Lines), хранящие состояние мьютекса, будут инвалидироваться по всем ядрам (Cache Bouncing).</p>
+<p><strong>Проблема механического сочувствия (Mechanical Sympathy):</strong> В высоконагруженном микросервисе Circuit Breaker находится на критическом пути исполнения (Hot Path). Десятки тысяч горутин начинают яростно конкурировать за один-единственный мьютекс. Возникает разрушительный Lock Contention:<br />
+- Ядра процессора тратят такты на спинлоки, а планировщик Go вынужден постоянно парковать (<code>goready</code> / <code>gopark</code>) горутины в системные очереди ожидания.<br />
+- Протокол когерентности кэшей процессора (MESI) раскаляет шину памяти: строка кэша (Cache Line, 64 байта), содержащая счетчик мьютекса, непрерывно инвалидируется между L1/L2 кэшами разных процессорных ядер (Cache Line Bouncing).</p>
 <h3 id="pravilnyy-podkhod-atomarnye-operatsii">Правильный подход: Атомарные операции</h3>
 
-<p>Продакшен-решения (как <code>sony/gobreaker</code>) минимизируют блокировки. Состояние (Closed, Open, Half-Open) и счетчики ошибок часто реализуются через <code>atomic</code>. Если всё же используется мьютекс, критическая секция делается микроскопической, только для чтения состояния, а не на всё время выполнения запроса.</p>
-<p>Пример использования <code>gobreaker</code> в реальном проекте:</p>
+<p>Промышленные решения (включая реализацию <code>sony/gobreaker</code>) стремятся максимально изолировать чтение состояния от блокировок. Состояния автомата (Closed, Open, Half-Open) и счетчики обращений синхронизируются через атомарные инструкции процессора (<code>atomic.LoadInt32</code>, <code>atomic.AddUint64</code>, <code>atomic.CompareAndSwapInt32</code>), а эксклюзивная блокировка захватывается на микроскопические наносекунды исключительно в момент фазового перехода автомата.</p>
+<p>Рассмотрим идиоматичный пример использования библиотеки <code>gobreaker</code> в сетевом клиенте Go:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2294,66 +2336,75 @@ import (
     &quot;net/http&quot;
     &quot;time&quot;
 
-    &quot;[github.com/sony/gobreaker](https://github.com/sony/gobreaker)&quot;
+    &quot;github.com/sony/gobreaker&quot;
 )
 
-var cb *gobreaker.CircuitBreaker
+var breaker *gobreaker.CircuitBreaker
 
 func init() {
-    var st gobreaker.Settings
-    st.Name = &quot;HTTP-Client&quot;
-    st.MaxRequests = 1              // Сколько запросов пропустить в Half-Open
-    st.Interval = time.Minute       // Окно сброса счетчика ошибок в Closed
-    st.Timeout = 10 * time.Second   // Время нахождения в Open перед переходом в Half-Open
-    st.ReadyToTrip = func(counts gobreaker.Counts) bool {
-        // Кастомная логика: открываем цепь, если ошибок &gt; 50% и всего запросов &gt; 10
-        failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
-        return counts.Requests &gt;= 10 &amp;&amp; failureRatio &gt;= 0.5
+    settings := gobreaker.Settings{
+        Name:        &quot;HTTP-Client-Protection&quot;,
+        MaxRequests: 2,                // Сколько запросов пропустить в Half-Open
+        Interval:    30 * time.Second, // Окно сброса счетчиков в состоянии Closed
+        Timeout:     10 * time.Second, // Таймаут нахождения в Open до попытки зондирования
+        ReadyToTrip: func(counts gobreaker.Counts) bool {
+            // Открываем цепь, если сделано не менее 10 запросов и процент ошибок &gt;= 50%
+            failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+            return counts.Requests &gt;= 10 &amp;&amp; failureRatio &gt;= 0.5
+        },
+        OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+            fmt.Printf(&quot;Circuit Breaker [%s] изменил состояние: %s -&gt; %s\n&quot;, name, from, to)
+        },
     }
 
-    cb = gobreaker.NewCircuitBreaker(st)
+    breaker = gobreaker.NewCircuitBreaker(settings)
 }
 
-// DoRequest делает защищенный вызов
-func DoRequest(url string) ([]byte, error) {
-    // Execute оборачивает наш вызов в конечный автомат CB
-    result, err := cb.Execute(func() (interface{}, error) {
+// SafeCall выполняет сетевой запрос под защитой предохранителя
+func SafeCall(url string) ([]byte, error) {
+    // Execute перехватывает управление и контролирует вызов целевой функции
+    body, err := breaker.Execute(func() (interface{}, error) {
         resp, err := http.Get(url)
         if err != nil {
             return nil, err
         }
         defer resp.Body.Close()
 
+        // Классифицируем ошибки: 5xx считаются падением бэкенда
         if resp.StatusCode &gt;= 500 {
-            // Считаем 5xx за ошибку для Circuit Breaker
-            return nil, fmt.Errorf(&quot;server error: %d&quot;, resp.StatusCode)
+            return nil, fmt.Errorf(&quot;downstream 5xx status: %d&quot;, resp.StatusCode)
         }
 
         return io.ReadAll(resp.Body)
     })
 
     if err != nil {
+        // Проверяем, был ли вызов заблокирован самим предохранителем
         if errors.Is(err, gobreaker.ErrOpenState) {
-            // Fast Failure: цепь разорвана! 
-            // Здесь мы можем отдать кэш или дефолтное значение (Fallback)
-            return nil, fmt.Errorf(&quot;circuit breaker is OPEN: fast fail&quot;)
+            // Fast Failure: цепь разомкнута! Мгновенно отдаем запасной вариант
+            return nil, fmt.Errorf(&quot;circuit breaker OPEN: быстрый отказ без сетевого вызова&quot;)
         }
         return nil, err
     }
 
-    return result.([]byte), nil
+    return body.([]byte), nil
 }
 </code></pre>
 </div>
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как вы обрабатываете ситуацию, когда Circuit Breaker возвращает <code>ErrOpenState</code>?<br />
-<strong>Ответ (уровень Senior):</strong> Мы используем паттерн <a href="7-graceful-degradation.html" class="wikilink">7. Graceful degradation</a> (Плавная деградация). Если отвалился сервис рекомендаций, мы не падаем, а ловим ошибку от CB и отдаем пользователю статический список популярных товаров из локального кэша. Система деградировала, но осталась доступной.</p>
+    <p><strong>Вопрос:</strong> Как ваша система должна реагировать, если Circuit Breaker переходит в состояние <code>ErrOpenState</code>?<br />
+<strong>Ответ:</strong> Старший инженер никогда не отвечает «просто возвращаем 500 пользователю». Вызов Circuit Breaker обязан сопрягаться с паттерном <a href="7-graceful-degradation.html" class="wikilink">7. Graceful degradation</a> (Плавная деградация) и механизмами Fallback:<br />
+1. Если упал сервис персональных рекомендаций — отдаем статический топ популярных товаров из Redis или локальной памяти.<br />
+2. Если упал сервис расчетных скидок — считаем заказ по базовой цене без учета бонусов, сохраняя возможность покупки.<br />
+3. Если упала внешняя аналитика — отбрасываем событие в асинхронный локальный лог.<br />
+Система частично деградирует по функциональности, но остается на 100% доступной для выполнения ключевых бизнес-операций.</p>
   </div>
 </div>
 
@@ -2361,29 +2412,65 @@ func DoRequest(url string) ([]byte, error) {
 <h2 id="arkhitekturnye-lovushki-gotchas">Архитектурные ловушки (Gotchas)</h2>
 
 <h3 id="1-circuit-breaker-vs-retry">1. Circuit Breaker vs Retry</h3>
-<p>Паттерн <a href="2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a> (повтор запросов) — это антоним Circuit Breaker-а. Retry бьет сервис запросами, пока не получит ответ. Circuit Breaker — защищает сервис от ударов. <br />
-<strong>Как их совмещать?</strong> Retry должен стоять <strong>внутри</strong> (или за) Circuit Breaker'ом, либо сам инструмент Retry должен знать о состоянии CB. Если Circuit Breaker перешел в состояние <code>OPEN</code>, любые попытки <code>Retry</code> должны быть немедленно прерваны. Нет смысла ретраить то, что заведомо упадет (Fast Fail).</p>
+<p>Паттерн <a href="2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a> (повтор запросов) и Circuit Breaker решают противоположные задачи. Retry целенаправленно бомбардирует сервис повторными запросами при временных сбоях. Circuit Breaker стремится оградить умирающий сервис от любых обращений.</p>
+<p><strong>Как их гармонично подружить?</strong><br />
+Политика повторных попыток (Retry) всегда должна находиться <strong>внутри</strong> контура Circuit Breaker. Если предохранитель зафиксировал состояние <code>OPEN</code>, любые попытки <code>Retry</code> обязаны быть немедленно прерваны. Нет никакого инженерного смысла повторять попытку, которая заведомо обречена на сброс.</p>
 <h3 id="2-ignorirovanie-biznes-oshibok">2. Игнорирование бизнес-ошибок</h3>
-<p>Не все возвращаемые ошибки должны открывать Circuit Breaker!<br />
-Если вы делаете запрос к API оплаты и получаете <code>400 Bad Request</code> или <code>403 Forbidden</code> (неверные данные пользователя), это означает, что целевой сервис работает отлично. Если вы будете инкрементировать счетчик ошибок CB на 4xx статусах, один злоумышленник с кривым запросом "положит" интеграцию для всех пользователей.<br />
-<strong>Правило:</strong> Считаем только технические ошибки: <code>5xx</code>, таймауты, обрывы соединений (network errors), <code>context.DeadlineExceeded</code>. См. также <a href="3-timeout.html" class="wikilink">3. Timeout</a>.</p>
+<p>Самая опасная ошибка конфигурации — считать любую ошибку поводом для размыкания цепи.</p>
+<p>Если удаленный платежный шлюз отвечает статусом <code>400 Bad Request</code> (клиент ввел некорректный CVC) или <code>403 Forbidden</code> (истек срок действия токена пользователя), это означает, что сервис чувствует себя прекрасно и штатно обрабатывает бизнес-валидацию! </p>
+<p>Если вы будете инкрементировать счетчик отказов Circuit Breaker при получении клиентских ошибок 4xx, один ботнет или пользователь с кривым скриптом, спамящий невалидными запросами, легко выбьет предохранитель и отключит платежи для всех легитимных клиентов сервиса.</p>
+<p><strong>Железное правило:</strong> В счетчик предохранителя засчитываются исключительно инфраструктурные сбои: коды ответов <code>5xx</code>, сетевые разрывы соединения (Connection Reset), дедлайны <code>context.DeadlineExceeded</code> и сетевые таймауты (см. <a href="3-timeout.html" class="wikilink">3. Timeout</a>).</p>
 <h3 id="3-lokalnyy-vs-raspredelennyy-circuit-breaker">3. Локальный vs Распределенный Circuit Breaker</h3>
-<p>Частая проблема в Kubernetes: у вас 100 подов вашего микросервиса. Порог открытия CB — 10 ошибок подряд.<br />
-Если целевой сервис умрет, каждый из ваших 100 подов сделает по 10 неудачных запросов, прежде чем <em>свой локальный</em> CB в памяти каждого пода перейдет в <code>OPEN</code>. Целевой сервис получит 1000 запросов по голове, прежде чем защита сработает.</p>
+
+<p>В облачном кластере Kubernetes ваше приложение развернуто в виде 100 независимых подов. Допустим, порог срабатывания предохранителя настроен на 10 ошибок подряд.</p>
+<p>Если внешний сервис ляжет, каждый из 100 подов сделает по 10 неудачных запросов, прежде чем его собственный локальный автомат перейдет в состояние <code>OPEN</code>. В результате лежащий сервис получит 1000 добивающих ударов по сети!</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph LocalCB[&quot;Локальный In-Memory (Go-way)&quot;]
+direction TB
+P1[&quot;Pod 1 (CB local)&quot;]
+P2[&quot;Pod 2 (CB local)&quot;]
+P3[&quot;Pod 3 (CB local)&quot;]
+P1 &amp; P2 &amp; P3 --&gt; Target1[&quot;Downstream&quot;]
+end
+
+subgraph MeshCB[&quot;Service Mesh / Out-of-Process (Envoy)&quot;]
+direction TB
+PodA[&quot;Pod A&quot;] --&gt; SidecarA[&quot;Envoy Sidecar&quot;]
+PodB[&quot;Pod B&quot;] --&gt; SidecarB[&quot;Envoy Sidecar&quot;]
+SidecarA &amp; SidecarB --&gt; Target2[&quot;Downstream (Кластерная защита)&quot;]
+end
+  </pre>
+</div>
+
+
 <ul>
-<li><strong>Локальный CB (в памяти):</strong> Быстрый, нет сетевых задержек на синхронизацию стейта. Идиоматичен для Go. Минус — "размазывание" лимитов по инстансам.</li>
-<li><strong>Распределенный CB (через Redis):</strong> Единое состояние для всех подов. Но добавляет жесткую зависимость от Redis. Если упадет Redis — упадет весь роутинг. Добавляет latency на каждый вызов (чтобы обновить счетчик в Redis).</li>
+<li><strong>Локальный In-Memory CB:</strong> Работает в оперативной памяти каждого процесса на чистых атомиках Go. Нулевой оверхед по сети, максимальная надежность (нет внешних зависимостей). Является стандартным выбором для 95% проектов на Go. Порог настраивается с поправкой на число реплик.</li>
+<li><strong>Распределенный CB (через Redis):</strong> Хранит счетчики глобально. Создает жесткую зависимость от доступности Redis и добавляет 1–2 мс сетевой задержки на каждый чих.</li>
+<li><strong>Service Mesh (Envoy / Istio):</strong> Переносит логику Circuit Breaking на уровень L7-прокси (sidecar), централизованно собирая статистику на уровне кластера и снимая эту заботу с прикладного Go-кода.</li>
 </ul>
-<p>В 95% случаев в мире Go используют <strong>локальные (In-Memory)</strong> Circuit Breakers, просто настраивая порог срабатывания с учетом количества инстансов. Если подов много, делают динамический порог или используют агрегацию метрик через Service Mesh (например, Envoy сам умеет работать как распределенный CB на уровне sidecar-прокси).</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Fast Failure:</strong> Circuit Breaker спасает вашу систему от лавинообразного отказа, мгновенно сбрасывая запросы к умершему downstream-сервису, не забивая горутины и файловые дескрипторы.</li>
-<li><strong>State Machine:</strong> Состояния Closed (норма), Open (авария), Half-Open (проверка).</li>
-<li><strong>Механика Go:</strong> Правильный CB минимизирует Lock Contention, полагаясь на атомики, чтобы не стать узким местом при высоких RPS.</li>
-<li><strong>Комбинаторика:</strong> Обязательно комбинируйте Circuit Breaker с паттернами Fallback/Graceful Degradation для обеспечения непрерывного пользовательского опыта.</li>
+<li><strong>Fast Failure спасает кластер:</strong> Circuit Breaker предотвращает каскадный коллапс инфраструктуры, сбрасывая вызовы к деградирующим сервисам за микросекунды и сберегая горутины, сокеты и процессорное время.</li>
+<li><strong>Три состояния автомата:</strong> CLOSED (нормальный пропуск), OPEN (полная изоляция и быстрый отказ), HALF-OPEN (контрольное зондирование жизнеспособности).</li>
+<li><strong>Механическое сочувствие:</strong> Промышленные реализации опираются на неблокирующие операции <code>atomic</code>, исключая Cache Contention в критическом пути сетевых вызовов.</li>
+<li><strong>Комплексная защита:</strong> Предохранитель обязан дополняться механизмами Graceful Degradation и Fallback, превращая фатальные отказы в незаметное для пользователей снижение функциональности.</li>
 </ol>
-<p>В следующей статье мы разберем другой важнейший инструмент повышения надежности, который мы уже косвенно упоминули: <a href="2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a>, и узнаем, почему неправильно настроенный Retry может убить базу данных быстрее, чем DDOS-атака.</p>
+<p>В следующей статье мы подробно изучим инструмент, неразрывно связанный с вызовами в распределенных системах: <a href="2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a>, и выясним, как случайный разброс времени (Jitter) предотвращает так называемый «шторм повторов», способный уничтожить восстанавливающийся сервис.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

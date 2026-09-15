@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Timeout</h1>
           </header>
@@ -2177,42 +2177,51 @@
           <div class="article-markdown">
             <h2 id="vremya-kak-kriticheskiy-resurs-pochemu-beskonechnoe-ozhidanie-ubivaet">Время как критический ресурс: Почему бесконечное ожидание убивает</h2>
 
-<p>В распределенных системах мы руководствуемся правилом из статьи <a href="../01-osnovy/4-partial-failure.html" class="wikilink">4. Partial failure</a>: <strong>«Медленный ответ хуже, чем отсутствие ответа»</strong>. </p>
-<p>Быстрая ошибка позволяет клиенту отреагировать: показать пользователю кэшированные данные, отправить запрос в резервный дата-центр или попытаться снова (с учетом <a href="2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a>). Медленный ответ заставляет систему зависать в неопределенности, удерживая критические ресурсы (горутины, оперативную память, файловые дескрипторы сокетов), пока они не исчерпаются окончательно.</p>
-<p><strong>Timeout (Таймаут)</strong> — это абсолютная граница времени, которую мы готовы потратить на выполнение операции. Если время вышло, мы принудительно обрываем процесс.</p>
-<p>В Go управление временем ожидания возведено в абсолют и встроено в стандартную библиотеку через пакет <code>context</code> и подсистему <code>net</code>. Разберем, как это работает на уровне рантайма и как правильно защищать свои микросервисы.</p>
+<p>В теории надежности распределенных систем существует жесткое эмпирическое правило, впервые сформулированное в статье <a href="../01-osnovy/4-partial-failure.html" class="wikilink">4. Partial failure</a>:  </p>
+<blockquote>
+<p><em>«Медленный ответ в сотни раз опаснее и разрушительнее, чем мгновенная ошибка».</em></p>
+</blockquote>
+<p>Быстрый отказ позволяет вызывающей стороне немедленно отреагировать: показать пользователю актуальные закэшированные данные, перенаправить запрос в резервный дата-центр или аккуратно повторить операцию (с соблюдением экспоненциального бэкоффа из <a href="2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a>). </p>
+<p>Напротив, медленный ответ подвешивает всю систему в мучительной неопределенности. Горутины застревают в ожидании сетевого ввода-вывода, оперативная память расходуется на удержание структур, сетевые сокеты и файловые дескрипторы блокируются ядром операционной системы. Когда лимиты исчерпываются, сервис падает замертво.</p>
+<p><strong>Timeout (Таймаут)</strong> — это жесткая, бескомпромиссная граница времени, которую система готова отвести на выполнение конкретной операции. Если отведенный интервал истек, вызов принудительно обрывается без каких-либо поблажек.</p>
+<p>В языке Go концепция управления временем возведена в абсолют: стандартная библиотека предоставляет элегантные и глубоко интегрированные механизмы через пакет <code>context</code> и сетевой поллер <code>net</code>. Разберем, как эта магия работает под капотом рантайма и как спроектировать эшелонированную оборону ваших микросервисов.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph ClientFlow[&quot;Жизненный цикл вызова с таймаутом&quot;]
+Start[&quot;Вызов с context.WithTimeout(2s)&quot;] --&gt; Race{&quot;Что наступит раньше?&quot;}
+Race --&gt;|&quot;Данные получены (&lt; 2s)&quot;| Success[&quot;Успешная обработка&quot;]
+Race --&gt;|&quot;Таймаут истек (&gt;= 2s)&quot;| Abort[&quot;sysmon закрывает Done()&lt;br/&gt;Fast Fail: DeadlineExceeded&quot;]
+end
+
+subgraph OSLevel[&quot;Уровень ядра ОС (Netpoll)&quot;]
+Abort -.-&gt;|&quot;Закрытие сокета&quot;| Epoll[&quot;epoll_ctl: удаление дескриптора&quot;]
+end
+  </pre>
+</div>
+
+
 <hr />
 <h2 id="pod-kapotom-context-withtimeout">Под капотом: context.WithTimeout</h2>
 
-<p>Главный инструмент управления временем жизни запроса в Go — это пакет <code>context</code>. Когда вы вызываете <code>ctx, cancel := context.WithTimeout(parent, 5*time.Second)</code>, под капотом происходит сложная оркестрация между рантаймом, планировщиком и кучей таймеров (Timer Heap).</p>
+<p>Главным дирижером жизненного цикла вызовов в Go выступает интерфейс <code>Context</code>. Когда в коде вызывается конструктор <code>ctx, cancel := context.WithTimeout(parent, 5*time.Second)</code>, рантайм Go запускает сложный механизм взаимодействия между планировщиком, кучей таймеров и памятью:</p>
 <ol>
-<li>Go создает структуру <code>timerCtx</code>, которая оборачивает <code>cancelCtx</code>.</li>
-<li>Запускается внутренний таймер через <code>time.AfterFunc</code>. Этот таймер регистрируется в локальной куче таймеров текущего логического процессора (P).</li>
-<li>Когда проходит 5 секунд, системный монитор рантайма (<code>sysmon</code>) или сам P замечают, что таймер истек.</li>
-<li>Вызывается встроенная функция отмены (<code>cancel</code>). Она делает две вещи:<br />
-   - Меняет внутреннее состояние контекста (через атомарные операции).<br />
-   - Закрывает канал <code>done</code> (внутренний <code>chan struct{}</code>).</li>
+<li>Создается внутренняя структура <code>timerCtx</code>, являющаяся оберткой над <code>cancelCtx</code>.</li>
+<li>Функция <code>time.AfterFunc</code> регистрирует таймер в локальной куче таймеров текущего логического процессора рантайма (P).</li>
+<li>Когда системный таймер отсчитывает 5 секунд, фоновый системный монитор рантайма (<code>sysmon</code>) или планировщик процессора P обнаруживают наступление дедлайна.</li>
+<li>Вызывается внутренняя функция <code>cancel</code>, которая атомарно меняет статус контекста и закрывает внутренний канал <code>done</code> (<code>chan struct{}</code>).</li>
 </ol>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Закрытие канала в Go — это механизм широковещательной рассылки (broadcast). Когда канал <code>done</code> закрывается, <strong>все</strong> горутины, которые были заблокированы в ожидании <code>&lt;-ctx.Done()</code>, мгновенно просыпаются. Чтение из закрытого канала возвращает нулевое значение без блокировки. РантаЙм переводит эти горутины из состояния <code>_Gwaiting</code> в <code>_Grunnable</code>, ставит их в локальную очередь (runq), и они продолжают работу, получая ошибку <code>context.DeadlineExceeded</code>.</p>
-  </div>
-</div>
-
-<hr />
-<h2 id="network-timeouts-i-netpoll-vzglyad-so-storony-os">Network Timeouts и Netpoll: Взгляд со стороны ОС</h2>
-
-<p>Контекст — это высокоуровневый паттерн. Но что заставляет сетевой сокет перестать ждать байты от сервера? </p>
-<p>Когда Go открывает TCP-соединение (<code>net.Conn</code>), он переводит файловый дескриптор (FD) сокета в <strong>неблокирующий режим (non-blocking mode)</strong>. </p>
-<p>Если вы вызываете <code>conn.Read()</code>, а данных в буфере ОС нет:<br />
-1. Системный вызов <code>read</code> возвращает ошибку <code>EAGAIN</code> (попробуй позже).<br />
-2. Go не крутит цикл впустую. Он регистрирует этот FD в сетевом поллере (<code>netpoll</code>), который использует <code>epoll</code> (Linux) или <code>kqueue</code> (macOS).<br />
-3. Горутина "паркуется" (<code>gopark</code>), освобождая тред (M) для других горутин.</p>
-<p>Когда мы устанавливаем таймаут через <code>conn.SetReadDeadline(time.Now().Add(time.Second))</code>, рантайм добавляет таймер. </p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2227,25 +2236,71 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Goroutine вызывает&lt;br&gt;conn.Read&quot;] --&gt; B{&quot;Данные есть&lt;br&gt;в буфере ОС?&quot;}
-B --&gt;|Да| C[&quot;Чтение и возврат&quot;]
-B --&gt;|Нет| D[&quot;conn.SetReadDeadline&lt;br&gt;Регистрация таймера&quot;]
-D --&gt; E[&quot;gopark&lt;br&gt;Горутина засыпает&quot;]
-
-E --&gt; F{&quot;Что произойдет&lt;br&gt;раньше?&quot;}
-F --&gt;|epoll: пришли данные| G[&quot;Пробуждение&lt;br&gt;Успешное чтение&quot;]
-F --&gt;|Таймер: время вышло| H[&quot;Пробуждение&lt;br&gt;Возврат i/o timeout&quot;]
+Init[&quot;context.WithTimeout(parent, 5s)&quot;] --&gt; Struct[&quot;timerCtx обертывает cancelCtx&quot;]
+Struct --&gt; Heap[&quot;Регистрация таймера в локальной P timer heap&quot;]
+Heap --&gt; Clock[&quot;Отсчет 5 секунд через nanotime()&quot;]
+Clock --&gt; Trigger[&quot;sysmon / P фиксирует дедлайн&quot;]
+Trigger --&gt; Broadcast[&quot;Закрытие канала done (chan struct{})&quot;]
+Broadcast --&gt; Wake[&quot;Мгновенное пробуждение всех слушателей &lt;-ctx.Done()&quot;]
   </pre>
 </div>
 
 
-<p>Если таймер срабатывает раньше, чем <code>epoll</code> сообщает о новых данных, рантайм будит горутину, а попытка прочитать данные возвращает ошибку <code>os.ErrDeadlineExceeded</code>.</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом</span>
+  </div>
+  <div class="callout-body">
+    <p>Закрытие канала в Go — это мощнейший аппаратный широковещательный механизм (Broadcast). </p>
+<p>Когда сигнальный канал <code>done</code> закрывается, абсолютно <strong>все</strong> горутины, заблокированные в чтении <code>&lt;-ctx.Done()</code>, просыпаются одновременно. Чтение из закрытого канала мгновенно возвращает нулевое значение структуры без каких-либо блокировок. Планировщик рантайма Go переводит эти горутины из спящего состояния <code>_Gwaiting</code> в очередь готовых к исполнению задач <code>_Grunnable</code>. При следующем такте процессора горутина проверяет <code>ctx.Err()</code> и получает каноническую ошибку <code>context.DeadlineExceeded</code>.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="network-timeouts-i-netpoll-vzglyad-so-storony-os">Network Timeouts и Netpoll: Взгляд со стороны ОС</h2>
+
+<p>Контекст задает логическую границу на уровне приложения. Но что физически заставляет сетевой сокет в ядре Linux прекратить ожидание байтов из сетевой карты?</p>
+<p>Когда среда выполнения Go открывает новое сетевое соединение <code>net.Conn</code>, она немедленно переводит системный файловый дескриптор сокета в <strong>неблокирующий режим (Non-blocking I/O)</strong> с помощью флага <code>O_NONBLOCK</code>.</p>
+<p>Если прикладная горутина вызывает <code>conn.Read()</code>, а буфер приема TCP-стека операционной системы пуст:<br />
+1. Системный вызов <code>read</code> возвращает ошибку <code>EAGAIN</code> («ресурс временно недоступен»).<br />
+2. Рантайм Go не крутит процессор в холостом цикле. Он регистрирует файловый дескриптор сокета в системном сетевом поллере (<code>netpoll</code>), работающем через мультиплексор <code>epoll</code> в Linux или <code>kqueue</code> в macOS.<br />
+3. Горутина паркуется с помощью внутреннего вызова <code>gopark</code>, освобождая физический поток операционной системы (M) для других задач.</p>
+<p>Когда разработчик устанавливает дедлайн через <code>conn.SetReadDeadline(time.Now().Add(time.Second))</code>, рантайм связывает сетевой дескриптор с таймером.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Call[&quot;Горутина вызывает conn.Read()&quot;] --&gt; Buffer{&quot;Байты есть в буфере TCP?&quot;}
+Buffer --&gt;|Да| DirectRead[&quot;Мгновенное чтение данных&quot;]
+Buffer --&gt;|Нет| NonBlock[&quot;Системный вызов read -&gt; EAGAIN&quot;]
+NonBlock --&gt; Register[&quot;Регистрация FD в epoll / kqueue (netpoll)&quot;]
+Register --&gt; Park[&quot;gopark: горутина переходит в _Gwaiting&quot;]
+
+Park --&gt; Event{&quot;Какое событие наступит первым?&quot;}
+Event --&gt;|&quot;Сетевой пакет прибыл&quot;| EpollWake[&quot;epoll оповещает рантайм&lt;br/&gt;Успешное чтение байтов&quot;]
+Event --&gt;|&quot;Таймер дедлайна истек&quot;| TimerWake[&quot;sysmon будит горутину&lt;br/&gt;Возврат os.ErrDeadlineExceeded&quot;]
+  </pre>
+</div>
+
+
+<p>Если таймер дедлайна срабатывает раньше, чем сетевой интерфейс получает TCP-пакет, рантайм принудительно пробуждает горутину, а операция чтения завершается системной ошибкой <code>os.ErrDeadlineExceeded</code>.</p>
 <hr />
 <h2 id="lovushki-standartnoy-biblioteki-gotchas">Ловушки стандартной библиотеки (Gotchas)</h2>
 
 <h3 id="1-defoltnyy-http-client-put-k-katastrofe">1. Дефолтный http.Client — путь к катастрофе</h3>
 
-<p>Самая частая ошибка Junior/Middle разработчиков на Go — использование стандартного HTTP клиента.</p>
+<p>Самая распространенная и опасная ошибка начинающих разработчиков на Go — наивное использование стандартного HTTP-клиента или шорткатов пакета <code>http</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2255,23 +2310,24 @@ F --&gt;|Таймер: время вышло| H[&quot;Пробуждение&lt;
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Никогда так не делайте в production!
-resp, err := http.Get(&quot;[http://api.service.com/data](http://api.service.com/data)&quot;) 
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Никогда не используйте в продакшене!
+resp, err := http.Get(&quot;http://api.service.com/data&quot;)
 </code></pre>
 </div>
 
-<p>Дефолтный <code>http.Client</code> имеет таймаут, равный нулю. Это значит — <strong>бесконечность</strong>. Если сервер зависнет и перестанет отправлять данные, не закрывая TCP-соединение, ваша горутина навсегда останется висеть в памяти. Это приведет к утечке ресурсов и смерти сервиса (OOM).</p>
+<p>Дефолтный <code>http.Client</code> инициализируется со значением <code>Timeout: 0</code>, что означает <strong>абсолютную бесконечность</strong>. </p>
+<p>Если удаленный бэкенд завис, сетевой коммутатор дропнул TCP FIN пакеты, а операционная система удерживает сокет в состоянии <code>ESTABLISHED</code>, ваша горутина будет висеть в памяти <strong>вечно</strong>. Через пару часов пиковой нагрузки тысячи горутин исчерпают оперативную память, и процесс будет уничтожен системным OOM Killer.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Вы обязаны явно настраивать таймауты как на уровне всего клиента, так и на уровне транспортного слоя (Transport), если вам нужен гранулярный контроль (например, отдельный таймаут на TLS Handshake).</p>
+    <p>Вы обязаны явно и осознанно конфигурировать таймауты на всех этапах сетевого взаимодействия: от установки TCP-рукопожатия до вычитывания тела ответа <code>Body</code>.</p>
   </div>
 </div>
 
-<p><strong>Production-ready конфигурация HTTP клиента:</strong></p>
+<p><strong>Эталонная конфигурация HTTP-клиента для высоконагруженных систем:</strong></p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2281,32 +2337,46 @@ resp, err := http.Get(&quot;[http://api.service.com/data](http://api.service.com
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Идиоматичный подход к настройке HTTP клиента
-var httpClient = &amp;http.Client{
-    // Общий таймаут на всю операцию (от Dial до чтения Body)
-    Timeout: 10 * time.Second, 
-    Transport: &amp;http.Transport{
-        // Таймаут на установку TCP соединения
-        DialContext: (&amp;net.Dialer{
-            Timeout:   2 * time.Second,
-            KeepAlive: 30 * time.Second,
-        }).DialContext,
-        // Максимальное время ожидания ответа в пуле соединений
-        MaxIdleConns:          100,
-        IdleConnTimeout:       90 * time.Second,
-        // Таймаут на TLS рукопожатие
-        TLSHandshakeTimeout:   3 * time.Second,
-        // Таймаут ожидания заголовков (если сервер медленно отдает ответ)
-        ResponseHeaderTimeout: 5 * time.Second, 
-    },
+  <pre class="language-go"><code class="language-go">package client
+
+import (
+    &quot;net&quot;
+    &quot;net/http&quot;
+    &quot;time&quot;
+)
+
+// NewProductionHTTPClient создает защищенный клиент с эшелонированными таймаутами
+func NewProductionHTTPClient() *http.Client {
+    return &amp;http.Client{
+        // Общий жесткий таймаут на ВСЮ операцию (Dial + TLS + Request + Read Body)
+        Timeout: 10 * time.Second,
+        Transport: &amp;http.Transport{
+            // Таймаут на установку первичного TCP соединения
+            DialContext: (&amp;net.Dialer{
+                Timeout:   2 * time.Second,
+                KeepAlive: 30 * time.Second,
+            }).DialContext,
+            // Лимиты пула постоянных соединений
+            MaxIdleConns:        100,
+            MaxIdleConnsPerHost: 20,
+            IdleConnTimeout:     90 * time.Second,
+            // Таймаут на завершение криптографического TLS-рукопожатия
+            TLSHandshakeTimeout: 3 * time.Second,
+            // Максимальное время ожидания первых байтов заголовков ответа
+            ResponseHeaderTimeout: 5 * time.Second,
+            // Ожидание подтверждения от сервера при передаче заголовка Expect: 100-continue
+            ExpectContinueTimeout: 1 * time.Second,
+        },
+    }
 }
 </code></pre>
 </div>
 
 <h3 id="2-otmena-konteksta-ne-ubivaet-gorutinu-apparatno">2. Отмена контекста не "убивает" горутину аппаратно</h3>
 
-<p>Многие думают, что если мы передали <code>ctx</code> с таймаутом в функцию, и время вышло, то Go принудительно убьет горутину (как <code>kill -9</code> в Linux). Это фатальное заблуждение.</p>
-<p><strong>В Go отмена контекста — это кооперативный механизм.</strong> Контекст просто закрывает канал <code>Done()</code>. Если ваш код выполняет тяжелые вычисления в цикле и не проверяет <code>ctx.Err()</code>, горутина будет работать до победного конца, сжигая CPU, даже если клиент уже давно отвалился по таймауту.</p>
+<p>Многие инженеры ошибочно полагают, что если функция получила <code>ctx</code> с дедлайном, и время вышло, то компилятор или рантайм Go принудительно остановят горутину наподобие системного сигнала <code>kill -9</code> в Linux.</p>
+<p><strong>Это опаснейшее заблуждение.</strong> Отмена контекста в Go носит <strong>исключительно кооперативный характер</strong>.</p>
+<p>Закрытие канала <code>Done()</code> — это лишь вежливая просьба: «Пожалуйста, заверши работу». Если ваш код выполняет тяжелые вычислительные операции (CPU-bound) внутри цикла и явно не опрашивает <code>ctx.Done()</code>, горутина продолжит беспрепятственно работать, сжигая процессорные такты впустую, даже если клиент уже 5 минут назад закрыл браузер!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2316,25 +2386,25 @@ var httpClient = &amp;http.Client{
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХО: Горутина будет работать 10 секунд, игнорируя таймаут контекста в 1 сек
-func HeavyTask(ctx context.Context) {
+  <pre class="language-go"><code class="language-go">// ПЛОХО: Горутина крутится в цикле, намертво игнорируя отмену контекста
+func HeavyProcessingBad(ctx context.Context, data []byte) {
     for i := 0; i &lt; 1_000_000; i++ {
-        doCryptographicHash() // Тяжелая CPU операция
+        computeSHA256(data) // Жжет CPU впустую
     }
 }
 
-// ХОРОШО: Кооперативная проверка отмены
-func HeavyTaskSafe(ctx context.Context) error {
+// ПРАВИЛЬНО: Кооперативная проверка статуса контекста в теле цикла
+func HeavyProcessingSafe(ctx context.Context, data []byte) error {
     for i := 0; i &lt; 1_000_000; i++ {
-        // Проверяем, не отменен ли контекст
         select {
         case &lt;-ctx.Done():
-            return ctx.Err() // Прерываем работу, возвращаем deadline exceeded
+            // Прерываем работу немедленно, возвращаем context.DeadlineExceeded или Canceled
+            return ctx.Err()
         default:
-            // Идем дальше, если канал не закрыт
+            // Канал открыт — продолжаем выполнение следующей итерации
         }
 
-        doCryptographicHash()
+        computeSHA256(data)
     }
     return nil
 }
@@ -2347,16 +2417,18 @@ func HeavyTaskSafe(ctx context.Context) error {
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между настройкой <code>Client.Timeout</code> и передачей <code>context.WithTimeout</code> в HTTP запрос?<br />
-<strong>Ответ:</strong> <code>Client.Timeout</code> жестко ограничивает время <em>всего</em> цикла запроса (включая чтение <code>Body</code>). <code>Context</code> дает больше гибкости: его можно отменить снаружи по другому триггеру (например, пользователь закрыл браузер, и API Gateway прислал отмену), а также пробросить этот же контекст дальше в БД или другие сервисы, чтобы прервать всю цепочку вызовов распределенной транзакции одновременно.</p>
+    <p><strong>Вопрос:</strong> В чем принципиальное отличие между настройкой поля <code>Client.Timeout</code> и передачей <code>context.WithTimeout</code> в HTTP-запрос?<br />
+<strong>Ответ:</strong> Настройка <code>Client.Timeout</code> задает безусловный таймер на весь совокупный цикл жизни запроса (включая установку соединения, редиректы и чтение потока <code>Body</code>).<br />
+Передача <code>context.Context</code> обеспечивает сквозную управляемость: контекст можно отменить снаружи по множеству независимых триггеров (пользователь нажал кнопку отмены, API Gateway прислал сигнал прерывания, соседняя горутина завершилась ошибкой в <code>errgroup</code>). Кроме того, тот же самый <code>ctx</code> можно пробросить дальше в драйвер базы данных или в дочерние gRPC-вызовы, мгновенно останавливая всю цепочку распределенной операции при первом сбое.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="server-side-timeouts-zashchita-ot-medlennykh-klientov">Server-Side Timeouts: Защита от медленных клиентов</h2>
 
-<p>Защищать нужно не только исходящие запросы, но и входящие. Без настроенных таймаутов на сервере вы становитесь жертвой атаки <strong>Slowloris</strong>. Злоумышленник (или просто мобильный клиент с плохим 3G) может открыть соединение и отправлять по одному байту в секунду. Если таких соединений наберется 10 000, ваш сервер исчерпает лимит открытых сокетов и "ляжет".</p>
-<p>В Go сервер настраивается через структуру <code>http.Server</code>:</p>
+<p>Защите подлежат не только исходящие сетевые клиенты, но и сам входящий сервер. Без строго настроенных таймаутов на сервере система становится беззащитной перед атаками класса <strong>Slowloris</strong>.</p>
+<p>Злоумышленник (или мобильный телефон в зоне нестабильного 2G) открывает TCP-сокет и начинает отправлять тело запроса со скоростью один байт в 10 секунд. Если 10 000 таких соединений повиснут одновременно, сервер исчерпает лимит дескрипторов сокетов и перестанет обслуживать легитимный трафик.</p>
+<p>В Go сервер настраивается через поля структуры <code>http.Server</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2366,34 +2438,37 @@ func HeavyTaskSafe(ctx context.Context) error {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">srv := &amp;http.Server{
+  <pre class="language-go"><code class="language-go">server := &amp;http.Server{
     Addr:         &quot;:8080&quot;,
-    Handler:      mux,
-    // Максимальное время на чтение всего запроса (включая body)
+    Handler:      router,
+    // Предельное время на вычитывание ВСЕГО запроса целиком (включая Body)
     ReadTimeout:  5 * time.Second,
-    // Максимальное время на чтение только заголовков (защита от Slowloris)
+    // Предельное время на чтение заголовков (прямая защита от атак Slowloris)
     ReadHeaderTimeout: 2 * time.Second,
-    // Максимальное время на запись ответа клиенту
+    // Предельное время на формирование и запись ответа клиенту
     WriteTimeout: 10 * time.Second,
-    // Время удержания keep-alive соединения пустым
+    // Время удержания открытого Keep-Alive соединения в режиме ожидания
     IdleTimeout:  120 * time.Second,
 }
 </code></pre>
 </div>
 
-<h3 id="bd-i-sql-taymauty">БД и SQL Таймауты</h3>
+<hr />
+<h2 id="bd-i-sql-taymauty">БД и SQL Таймауты</h2>
 
-<p>Таймауты обязательны при работе с базами данных (см. <span class="wikilink-unresolved" title="Заметка в разработке">12. Базы данных</span>). Драйверы, такие как <code>pq</code> или <code>pgx</code> для PostgreSQL, глубоко интегрированы с контекстом.</p>
-<p>Если вы делаете тяжелый <code>SELECT</code> и контекст отменяется по таймауту, драйвер <code>pgx</code> не просто вернет ошибку в Go. Он откроет <em>новое</em> служебное соединение с базой данных и отправит команду <code>pg_cancel_backend()</code>, чтобы СУБД (Postgres) тоже прекратила жечь CPU и прервала выполнение запроса на своей стороне.</p>
+<p>Таймауты жизненно необходимы при взаимодействии с реляционными и NoSQL базами данных (см. <span class="wikilink-unresolved" title="Заметка в разработке">12. Базы данных</span>). Современные драйверы PostgreSQL для Go, такие как <code>pgx</code> и классический <code>pq</code>, глубоко интегрированы с абстракцией контекста.</p>
+<p>Когда при выполнении тяжелого запроса <code>SELECT</code> контекст отменяется по истечении дедлайна, драйвер <code>pgx</code> не просто выбрасывает ошибку в вызывающий Go-код. Он в фоновом режиме открывает отдельное служебное TCP-соединение к СУБД и отправляет низкоуровневую управляющую команду <code>pg_cancel_backend()</code>. </p>
+<p>В результате процесс PostgreSQL немедленно прекращает выполнение дорогостоящего сканирования таблиц и освобождает процессорные ресурсы ядра СУБД, спасая дисковый массив от паразитной нагрузки.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Таймауты должны быть везде:</strong> На HTTP клиентах, на серверах, на запросах к БД и в кэш. Бесконечное ожидание — это гарантированная авария.</li>
-<li><strong>Кооперативность:</strong> В Go отмена — это сигнал, а не расстрел. Ваш код (особенно CPU-bound) должен регулярно проверять <code>ctx.Done()</code>.</li>
-<li><strong>Netpoll:</strong> Сетевые таймауты работают невероятно эффективно благодаря интеграции планировщика горутин и неблокирующего I/O (epoll/kqueue).</li>
-<li><strong>Контекст как стандарт:</strong> Используйте <code>context.Context</code> для проброса дедлайнов сквозь все слои приложения — от HTTP-хендлера до SQL-драйвера.</li>
+<li><strong>Никаких нулевых таймаутов:</strong> Каждый сетевой вызов, HTTP-клиент, входящий сервер и запрос к базе данных обязаны иметь явный, обоснованный дедлайн.</li>
+<li><strong>Кооперативная природа Go:</strong> Помните, что <code>context.Context</code> не прерывает горутины принудительно. Регулярно опрашивайте <code>&lt;-ctx.Done()</code> в циклических и ресурсоемких операциях.</li>
+<li><strong>Глубокая интеграция с Netpoll:</strong> Сетевые дедлайны сокетов в Go работают с максимальной эффективностью благодаря неблокирующему вводу-выводу ядра Linux (<code>epoll</code>) и парковке горутин без расхода процессорных тактов.</li>
+<li><strong>Сквозная отмена:</strong> Пробрасывайте <code>ctx</code> через все слои микросервиса — от входного веб-хендлера до SQL-запросов и RPC-клиентов.</li>
 </ol>
-<p>Но что, если один медленный или проблемный эндпоинт (например, генерация тяжелых отчетов) начинает утилизировать все свободные горутины, не оставляя ресурсов для легких и быстрых эндпоинтов (например, проверки healthcheck)? Таймауты здесь помогут, но не спасут от исчерпания пула. Для изоляции ресурсов применяется другой паттерн, который мы разберем в следующей статье: <a href="4-bulkhead.html" class="wikilink">4. Bulkhead</a>.</p>
+<p>Однако даже при идеально настроенных таймаутах один внезапный всплеск тяжелых аналитических запросов способен монополизировать все доступные горутины сервиса, парализуя жизненно важные быстрые эндпоинты (такие как Health Checks). Для надежной изоляции ресурсов между независимыми сценариями применяется архитектурный паттерн, который мы разберем в следующей статье: <a href="4-bulkhead.html" class="wikilink">4. Bulkhead</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2421,7 +2496,7 @@ func HeavyTaskSafe(ctx context.Context) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vremya-kak-kriticheskiy-resurs-pochemu-beskonechnoe-ozhidanie-ubivaet">Время как критический ресурс: Почему бесконечное ожидание убивает</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-context-withtimeout">Под капотом: context.WithTimeout</a></li><li class="toc-item toc-h2"><a href="#network-timeouts-i-netpoll-vzglyad-so-storony-os">Network Timeouts и Netpoll: Взгляд со стороны ОС</a></li><li class="toc-item toc-h2"><a href="#lovushki-standartnoy-biblioteki-gotchas">Ловушки стандартной библиотеки (Gotchas)</a></li><li class="toc-item toc-h3"><a href="#1-defoltnyy-http-client-put-k-katastrofe">1. Дефолтный http.Client — путь к катастрофе</a></li><li class="toc-item toc-h3"><a href="#2-otmena-konteksta-ne-ubivaet-gorutinu-apparatno">2. Отмена контекста не &quot;убивает&quot; горутину аппаратно</a></li><li class="toc-item toc-h2"><a href="#server-side-timeouts-zashchita-ot-medlennykh-klientov">Server-Side Timeouts: Защита от медленных клиентов</a></li><li class="toc-item toc-h3"><a href="#bd-i-sql-taymauty">БД и SQL Таймауты</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#vremya-kak-kriticheskiy-resurs-pochemu-beskonechnoe-ozhidanie-ubivaet">Время как критический ресурс: Почему бесконечное ожидание убивает</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-context-withtimeout">Под капотом: context.WithTimeout</a></li><li class="toc-item toc-h2"><a href="#network-timeouts-i-netpoll-vzglyad-so-storony-os">Network Timeouts и Netpoll: Взгляд со стороны ОС</a></li><li class="toc-item toc-h2"><a href="#lovushki-standartnoy-biblioteki-gotchas">Ловушки стандартной библиотеки (Gotchas)</a></li><li class="toc-item toc-h3"><a href="#1-defoltnyy-http-client-put-k-katastrofe">1. Дефолтный http.Client — путь к катастрофе</a></li><li class="toc-item toc-h3"><a href="#2-otmena-konteksta-ne-ubivaet-gorutinu-apparatno">2. Отмена контекста не &quot;убивает&quot; горутину аппаратно</a></li><li class="toc-item toc-h2"><a href="#server-side-timeouts-zashchita-ot-medlennykh-klientov">Server-Side Timeouts: Защита от медленных клиентов</a></li><li class="toc-item toc-h2"><a href="#bd-i-sql-taymauty">БД и SQL Таймауты</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
