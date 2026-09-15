@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Network policies</h1>
           </header>
@@ -2177,27 +2177,57 @@
           <div class="article-markdown">
             <h2 id="faervol-dlya-mikroservisov-izolyatsiya-na-urovne-paketov">Фаервол для микросервисов: Изоляция на уровне пакетов</h2>
 
-<p>В прошлой статье <a href="3-mtls.html" class="wikilink">3. mTLS</a> мы перешли к парадигме Zero Trust. Мы заставили наши сервисы предъявлять криптографические паспорта при каждом соединении. Кажется, мы в полной безопасности: даже если злоумышленник проникнет в кластер, он не сможет прочитать трафик или выдать себя за другой сервис без приватного ключа.</p>
-<p>Но криптография отвечает только на вопрос <em>«Кто ты?»</em>. Она работает на прикладном уровне (L7) или на верхнем транспортном (TLS). Что если зараженный контейнер попытается просканировать порты базы данных? Или попытается отправить гигабайты мусорного трафика в соседний под, вызывая отказ в обслуживании (DDoS)? </p>
-<p>Доводить дело до TLS-рукопожатия (которое, как мы помним, очень дорогое для CPU) в таких случаях — непозволительная роскошь. Вражеский трафик нужно уничтожать еще на подлете, на уровне сетевых пакетов (L3/L4). </p>
-<p>В Kubernetes за это отвечает <strong>Network Policies (Сетевые политики)</strong>. В этой статье мы разберем, как они работают под капотом, почему из-за них зависают Go-клиенты и как правильно сегментировать сеть.</p>
+<p>В прошлой статье <a href="3-mtls.html" class="wikilink">3. mTLS</a> мы перешли к парадигме Zero Trust: научили наши сервисы предъявлять криптографические паспорта при каждом рукопожатии. Казалось бы, периметр надёжен: даже если злоумышленник прослушивает коммутаторы дата-центра, он не сможет прочитать зашифрованный трафик или сымитировать легитимный сервис без приватного ключа.</p>
+<p>Но криптография отвечает исключительно на вопрос <em>«Кто ты?»</em>. Она работает на прикладном уровне (L7) или на верхнем транспортном слое (TLS). Что произойдет, если скомпрометированный контейнер в демилитаризованной зоне решит просканировать внутренние порты базы данных? Или начнет заливать соседа терабайтами мусорных пакетов, вызывая классический отказ в обслуживании (DDoS)?</p>
+<p>Доводить дело до TLS-рукопожатия (которое, как мы убедились, сжигает драгоценные миллисекунды и такты CPU на вычисления асимметричных шифров) в таких ситуациях — непозволительная расточительность. Вражеский или аномальный трафик должен уничтожаться мгновенно, ещё «на подлёте», на уровне сырых сетевых пакетов (L3/L4).</p>
+<p>В оркестраторах вроде Kubernetes первой линией обороны служат <strong>Network Policies (Сетевые политики)</strong>. В этой лекции мы разберём, как они устроены на уровне ядра Linux, почему небрежно настроенный фаервол способен парализовать планировщик Go-рантайма, и как выстроить глубокоэшелонированную изоляцию микросервисов.</p>
 <hr />
 <h2 id="illyuziya-ploskoy-seti">Иллюзия плоской сети</h2>
 
-<p>По умолчанию в Kubernetes работает правило плоской сети (Flat Network): <strong>Любой под может установить соединение с любым другим подом в кластере</strong>, даже если они находятся в разных namespace-ах.</p>
-<p>Представьте, что у вас есть namespace <code>frontend</code> и namespace <code>finance-db</code>. По умолчанию взломанный pod фронтенда может напрямую открыть TCP-сокет к базе данных с платежами. Если в БД есть уязвимость, или пароль утек в переменные окружения, кластер скомпрометирован.</p>
-<p>Сетевые политики — это манифесты, которые говорят Kubernetes: «Разреши этому поду общаться только с вот этими подами на таких-то портах, а весь остальной трафик — уничтожь».</p>
+<p>Исторически Kubernetes строился вокруг концепции радикального упрощения сетевой топологии — так называемой <strong>плоской сети (Flat Network)</strong>:</p>
+<blockquote>
+<p><strong>Базовый постулат плоской сети:</strong><br />
+Каждый под получает уникальный IP-адрес внутри кластера. <strong>Любой под может свободно установить соединение с любым другим подом</strong>, даже если они находятся на разных физических серверах или в совершенно разных пространствах имён (<code>namespace</code>).</p>
+</blockquote>
+<p>В лаборатории или стартапе на пять микросервисов это выглядит настоящим инженерным чудом: никакой ручной настройки маршрутизаторов, никакого NAT между подами, единое адресное пространство. Но в продакшене корпоративного уровня плоская сеть превращается в пороховую бочку.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Flat[&quot;Плоская сеть (Flat Network по умолчанию)&quot;]
+direction TB
+F1[&quot;frontend pod&quot;] --&gt;|&quot;Прямой доступ к порту 5432!| DB1[&quot;finance-db pod&quot;]
+F1 --&gt;|&quot;Свободный TCP SYN| AUTH1[&quot;auth-service&quot;]
+end
+
+subgraph Segmented[&quot;Сегментированная сеть (Network Policies)&quot;]
+direction TB
+F2[&quot;frontend pod&quot;] -.-&gt;|&quot;BLOCKED (DROP)| DB2[&quot;finance-db pod&quot;]
+F2 --&gt;|&quot;Разрешено (HTTP 8080)| GW[&quot;api-gateway&quot;]
+GW --&gt;|&quot;Разрешено| AUTH2[&quot;auth-service&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Представьте, что у вас есть общедоступный namespace <code>frontend</code> и изолированный namespace <code>finance-db</code>. По умолчанию взломанный pod фронтенда (например, через RCE в уязвимой сторонней JS/Go-библиотеке) может напрямую открыть обычный TCP-сокет к реплике базы данных с платёжными транзакциями. Если в СУБД найдена уязвимость нулевого дня или пароль случайно утек в логи, весь кластер оказывается мгновенно скомпрометирован.</p>
+<p>В кораблестроении трюм судна всегда разделяют на водонепроницаемые отсеки: пробоина в одном отсеке не должна топить весь корабль. <strong>Сетевые политики (Network Policies)</strong> — это переборки в кластере. Это декларативные спецификации, предписывающие инфраструктуре: <em>«Разреши этому поду общаться только с вот этим списком подов на строго определённых портах, а весь остальной трафик — уничтожь на корню»</em>.</p>
 <hr />
 <h2 id="mechanical-sympathy-cni-iptables-i-ebpf">Mechanical Sympathy: CNI, iptables и eBPF</h2>
 
-<p>Сами по себе манифесты <code>NetworkPolicy</code> в Kubernetes ничего не делают. Kubernetes API просто сохраняет их в <code>etcd</code>. Всю грязную работу выполняет <strong>CNI (Container Network Interface)</strong> — сетевой плагин кластера (например, Calico, Cilium, Flannel).</p>
-<p>Как именно CNI физически блокирует пакет?</p>
-<h3 id="klassicheskiy-podkhod-iptables">Классический подход (iptables)</h3>
-<p>В плагинах вроде Calico агент, работающий на каждой ноде кластера, транслирует NetworkPolicy в тысячи правил <code>iptables</code> (или <code>IPVS</code>) ядра Linux.<br />
-Каждый пакет, выходящий из вашего Go-приложения или входящий в него, проходит через длинные цепочки проверок (<code>PREROUTING</code>, <code>FORWARD</code>, <code>POSTROUTING</code>). Если правил много (тысячи подов), маршрутизация пакета начинает потреблять заметное процессорное время, увеличивая Latency.</p>
-<h3 id="sovremennyy-podkhod-ebpf">Современный подход (eBPF)</h3>
-<p>Современные CNI, такие как Cilium, используют <strong>eBPF (Extended Berkeley Packet Filter)</strong>. Вместо того чтобы гонять пакеты по цепочкам <code>iptables</code>, Cilium компилирует C-подобный код проверки политик прямо в ядро Linux и прикрепляет его непосредственно к виртуальному сетевому интерфейсу пода (<code>veth</code>). <br />
-Это происходит на уровне драйвера (XDP - eXpress Data Path), еще до того, как пакет попадет в сетевой стек ОС. Если пакет запрещен, он уничтожается за наносекунды с нулевым оверхедом.</p>
+<p>Сами по себе манифесты <code>NetworkPolicy</code> в Kubernetes — это лишь абстрактные документы в формате YAML. Компонент Kubernetes API просто валидирует их синтаксис и сохраняет запись в распределённое хранилище <code>etcd</code>. Контроллер Kubernetes не накладывает правила фильтрации на сетевую карту. </p>
+<p>Всю физическую работу по перехвату и фильтрации трафика выполняет <strong>CNI (Container Network Interface)</strong> — сетевой плагин кластера (например, Calico, Cilium, Weave Net или Flannel). </p>
+<p>Как именно CNI физически отсекает запрещённый трафик на уровне операционной системы?</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2212,46 +2242,110 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-GoApp[&quot;Go-приложение&lt;br&gt;syscall write&quot;] --&gt; Veth[&quot;Виртуальный интерфейс&lt;br&gt;veth0&quot;]
+App[&quot;Go-приложение&lt;br&gt;(syscall write / sendto)&quot;] --&gt; Veth[&quot;Виртуальный сетевой интерфейс&lt;br&gt;veth0 (cgroup namespace)&quot;]
 
-Veth --&gt; Hook[&quot;eBPF XDP Hook&lt;br&gt;Проверка Network Policy&quot;]
+subgraph Filter[&quot;Фильтрация на уровне ядра Linux&quot;]
+Veth --&gt; Engine{&quot;Архитектура CNI&quot;}
+Engine --&gt;|&quot;Классический CNI (Calico / iptables)&quot;| IPT[&quot;iptables / IPVS chains&lt;br&gt;PREROUTING / FORWARD / POSTROUTING&lt;br&gt;Линейный перебор O(N)&quot;]
+Engine --&gt;|&quot;Современный CNI (Cilium / eBPF)&quot;| BPF[&quot;eBPF TC / XDP Hook&lt;br&gt;Хэш-таблицы BPF maps&lt;br&gt;Константная выборка O(1)&quot;]
+end
 
-Hook --&gt;|Запрещено| Drop[&quot;Пакет уничтожен&lt;br&gt;DROP&quot;]
-Hook --&gt;|Разрешено| Stack[&quot;Сетевой стек Linux&lt;br&gt;eth0&quot;]
+IPT --&gt;|DROP| Blackhole1[&quot;Черная дыра (Silent DROP)&quot;]
+IPT --&gt;|ACCEPT| Eth0[&quot;Физический адаптер eth0&quot;]
 
-Stack --&gt; Network[&quot;Физическая сеть&quot;]
+BPF --&gt;|DROP| Blackhole2[&quot;Мгновенный сброс (XDP_DROP)&quot;]
+BPF --&gt;|PASS| Eth0
   </pre>
 </div>
 
 
+<h3 id="1-klassicheskiy-podkhod-tsepochki-iptables-i-ipvs">1. Классический подход: цепочки iptables и IPVS</h3>
+<p>В классических CNI (таких как Calico в режиме iptables) локальный демон-агент, запущенный на каждом узле кластера, непрерывно транслирует объекты <code>NetworkPolicy</code> в тысячи низкоуровневых правил утилиты <code>iptables</code> ядра Linux.</p>
+<p>Каждый сетевой пакет, покидающий виртуальный интерфейс пода (<code>veth</code>) или поступающий в него, вынужден последовательно преодолевать длинные цепочки проверок ядра:<br />
+- <code>PREROUTING</code>: трансляция адресов и первичный учет;<br />
+- <code>FORWARD</code>: маршрутизация пакетов между виртуальными интерфейсами подов;<br />
+- <code>POSTROUTING</code>: финальная обработка перед отправкой в физический адаптер.</p>
+<p>При масштабировании кластера до тысяч подов и сервисов количество правил в цепочках <code>iptables</code> исчисляется десятками тысяч. Поскольку стандартный движок <code>iptables</code> выполняет линейный перебор правил ($O(N)$), задержка (Latency) обработки каждого TCP-пакета начинает ощутимо деградировать, а процессор узла сжигает драгоценные такты на холостую работу в ядре. Применение технологии <code>IPVS</code> частично спасает ситуацию за счёт хэш-таблиц IP-адресов, но глобальная архитектурная сложность остаётся высокой.</p>
+<h3 id="2-sovremennyy-podkhod-ebpf-cilium">2. Современный подход: eBPF (Cilium)</h3>
+<p>Современные сетевые плагины нового поколения, такие как Cilium, полностью отказываются от неповоротливого стека <code>iptables</code>. Они опираются на <strong>eBPF (Extended Berkeley Packet Filter)</strong>.</p>
+<p>Вместо обхода статических цепочек правил Cilium компилирует компактные программы на языке C прямо в байт-код ядра Linux. Эти микропрограммы монтируются в самые ранние точки сетевого тракта:<br />
+- <strong>TC (Traffic Control):</strong> перехват пакетов на уровне виртуального интерфейса <code>veth</code>;<br />
+- <strong>XDP (eXpress Data Path):</strong> обработка на уровне кольцевых буферов драйвера сетевой карты (NIC Ring Buffer), ещё до того, как ядро выделит структуру <code>sk_buff</code>!</p>
+<p>Политики безопасности хранятся в эффективных хэш-таблицах (eBPF Maps). Проверка прав доступа выполняется со скоростью $O(1)$ за доли наносекунд. Если пакет запрещён, eBPF-программа возвращает инструкцию <code>XDP_DROP</code> — пакет стирается из памяти сетевого адаптера без малейшей нагрузки на сетевой стек ядра.</p>
 <hr />
 <h2 id="vzglyad-iz-go-drop-protiv-reject">Взгляд из Go: DROP против REJECT</h2>
 
-<p>Это самый важный раздел для бэкенд-разработчика. Разница между тем, КАК фаервол блокирует пакет, радикально влияет на поведение рантайма Go.</p>
-<p>Фаервол (и Network Policies в K8s) всегда использует правило <strong>DROP (Отбросить)</strong>, а не REJECT (Отклонить). </p>
-<ul>
-<li><strong>REJECT:</strong> Если фаервол использует REJECT, он отправляет обратно пакет <code>RST</code> (Reset) или <code>ICMP Port Unreachable</code>. Ваш Go-код (<code>http.Get</code> или <code>net.Dial</code>) мгновенно получит ошибку <code>connection refused</code> и пойдет дальше по логике (например, в деградацию).</li>
-<li><strong>DROP (Поведение K8s):</strong> Пакет просто бесследно исчезает. Сервер ничего не отвечает.</li>
-</ul>
+<p>Для Go-разработчика понимание механики блокировки сетевого пакета критически важно. От того, <em>как именно</em> фаервол обрывает нежелательную коммуникацию, зависит жизнеспособность рантайма Go под нагрузкой.</p>
+<p>В сетевых экранах существует два принципиально разных способа обработки запрещённого пакета:</p>
+<ol>
+<li><strong>REJECT (Явный отказ):</strong><br />
+   Фаервол перехватывает запрещённый пакет и тут же отправляет отправителю служебный ответ. Для протокола TCP это пакет с флагом <code>RST</code> (Reset), а для UDP — контрольное сообщение <code>ICMP Port Unreachable</code>.</li>
+<li><strong>DROP (Скрытое отбрасывание):</strong><br />
+   Фаервол бесследно стирает пакет. В обратную сторону не летит абсолютно ничего — пакет проваливается в «чёрную дыру».</li>
+</ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Анатомия зависания горутины при DROP</span>
   </div>
   <div class="callout-body">
-    <p>Что происходит внутри Go при DROP?<br />
-Ваша горутина вызывает <code>net.DialContext</code>. В ядро ОС улетает пакет <code>TCP SYN</code>. Ответа нет.<br />
-Ядро Linux (и Go-рантайм, заблокированный в <code>epoll</code>) начинает ждать. Linux делает экспоненциальные ретраи отправки <code>SYN</code> (1s, 2s, 4s, 8s...). <br />
-По умолчанию (параметр <code>tcp_syn_retries</code> = 6) <strong>ОС сдастся только через 130 секунд!</strong> &gt; <br />
-Все эти 2 минуты ваша горутина будет висеть в памяти. Если на этот роут идет трафик, вы за минуты исчерпаете пул горутин и словите OOM. </p>
+    <p>Kubernetes Network Policies <strong>всегда работают в режиме DROP</strong>, а не REJECT.  </p>
+<p>Что происходит внутри Go-приложения, если сетевая политика блокирует запрос?<br />
+1. Ваша горутина вызывает <code>net.Dial</code> или <code>net.DialContext</code> (например, неявно внутри <code>http.Get</code> или <code>sql.Open</code>).<br />
+2. Сетевой стек Linux формирует стартовый пакет <code>TCP SYN</code> и выбрасывает его в виртуальный кабель <code>veth</code>.<br />
+3. CNI молча уничтожает пакет. Ответа нет.<br />
+4. Go-рантайм регистрирует файловый дескриптор сокета в системном мультиплексоре <code>epoll</code> и переводит горутину в спящее состояние (<code>_Gwaiting</code>), отдавая поток ОС <code>M</code> другим задачам.<br />
+5. Сетевой стек ядра Linux добросовестно ожидает ответа <code>SYN-ACK</code>. Не дождавшись, ядро повторяет попытку отправки <code>SYN</code> с экспоненциальной задержкой (1s, 2s, 4s, 8s, 16s, 32s...).<br />
+6. Системный параметр ядра Linux <code>tcp_syn_retries</code> по умолчанию равен <strong>6</strong>. Это означает, что операционная система признает неудачу и вернёт ошибку <code>connection refused</code> только через <strong>127–130 секунд!</strong></p>
+<p>Если ваш Go-сервис обрабатывает входящие запросы и на каждый запрос пытается постучаться в закрытый фаерволом сервис без контекста с таймаутом, за 2 минуты в памяти зависнут десятки тысяч горутин. Каждая горутина удерживает свои стековые фреймы и ассоциированные структуры <code>epoll</code>, что неминуемо ведёт к исчерпанию дескрипторов и аварийному падению по OOM (Out of Memory).</p>
   </div>
 </div>
 
-<p><strong>Именно поэтому отсутствие таймаутов смертельно в K8s.</strong> Если вы забыли настроить контекст (как мы обсуждали в <a href="../05-nadezhnost/3-timeout.html" class="wikilink">3. Timeout</a>), ошибка настройки Network Policy у девопсов полностью убьет ваш микросервис.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Go as Go Runtime (netpoll)
+participant Kernel as Linux TCP Stack
+participant CNI as NetworkPolicy (CNI)
+
+Go-&gt;&gt;Kernel: net.DialContext (TCP SYN)
+Kernel-&gt;&gt;CNI: Пакет SYN на veth0
+Note over CNI: NetworkPolicy: DROP!&lt;br&gt;(пакет уничтожен без ответа)
+
+Note over Kernel: Ожидание SYN-ACK... (1 сек)
+Kernel-&gt;&gt;CNI: Ретрай 1: TCP SYN
+Note over Kernel: Ожидание... (2 сек)
+Kernel-&gt;&gt;CNI: Ретрай 2: TCP SYN
+Note over Kernel: tcp_syn_retries=6...&lt;br&gt;Итоговое зависание ~130 секунд!
+
+alt Если контекст с таймаутом настроен
+Go--&gt;&gt;Kernel: context.WithTimeout сработал (например, 2s) -&gt; close(fd)
+Go-&gt;&gt;Go: Горутина освобождена!
+else Забыли таймаут
+Note over Go: Горутина висит в epoll 130 секунд,&lt;br&gt;память течет, пул горутин исчерпан
+end
+  </pre>
+</div>
+
+
+<p>Именно поэтому мы столь настойчиво изучали управление задержками в статье <a href="../05-nadezhnost/3-timeout.html" class="wikilink">3. Timeout</a>. В микросервисной среде Kubernetes вызов функции <code>context.WithTimeout</code> — это не просто признак аккуратности, а единственный механизм выживания при любых инцидентах в сетевой топологии.</p>
 <hr />
 <h2 id="pattern-default-deny-zapretit-vsyo">Паттерн: Default Deny (Запретить всё)</h2>
 
-<p>Лучшая практика (Best Practice) при внедрении сетевых политик — это подход <strong>Default Deny</strong>. Мы закрываем весь трафик в namespace, а затем точечно пробиваем «дырки» для легитимных связей.</p>
+<p>Канонический принцип информационной безопасности гласит: <strong>«Всё, что явно не разрешено — запрещено»</strong>. </p>
+<p>Если в кластере создаётся новый namespace без сетевых политик, он распахивает двери для любых соединений. Корректная стратегия настройки изоляции всегда начинается с развёртывания правила <strong>Default Deny</strong>:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2261,22 +2355,21 @@ Stack --&gt; Network[&quot;Физическая сеть&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml"># Пример политики Default Deny для namespace
-apiVersion: networking.k8s.io/v1
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: default-deny-all
   namespace: my-services
 spec:
-  podSelector: {} # Пустой селектор означает &quot;выбрать ВСЕ поды&quot;
+  podSelector: {} # Пустой селектор означает &quot;выбрать ВСЕ поды в namespace&quot;
   policyTypes:
   - Ingress # Блокируем весь входящий трафик
   - Egress  # Блокируем весь исходящий трафик
 </code></pre>
 </div>
 
-<p>После применения этого манифеста <strong>все ваши Go-сервисы в этом namespace перестанут работать</strong>. Они не смогут общаться ни друг с другом, ни с БД.</p>
-<p>Далее мы разрешаем конкретному сервису (например, <code>auth-service</code>) принимать трафик только от <code>api-gateway</code>:</p>
+<p>Как только системный администратор применяет этот манифест, <strong>все Go-сервисы в пространстве имён <code>my-services</code> мгновенно теряют способность к любой сетевой коммуникации</strong>. Они не могут связаться с базой данных, не могут ответить на входящий HTTP-запрос и не могут опросить соседей.</p>
+<p>Теперь мы начинаем точечно прорезать строго контролируемые «окна». Допустим, у нас есть сервис авторизации <code>auth-service</code>, который должен принимать входящий трафик исключительно от шлюза <code>api-gateway</code> на порт 8080:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2290,6 +2383,7 @@ spec:
 kind: NetworkPolicy
 metadata:
   name: allow-gateway-to-auth
+  namespace: my-services
 spec:
   podSelector:
     matchLabels:
@@ -2300,29 +2394,35 @@ spec:
   - from:
     - podSelector:
         matchLabels:
-          app: api-gateway # Разрешаем входящие только от api-gateway
+          app: api-gateway # Разрешаем входящие пакеты ТОЛЬКО от api-gateway
     ports:
     - protocol: TCP
       port: 8080
 </code></pre>
 </div>
 
+<p>Теперь никакой другой под (включая скомпрометированный контейнер из <code>frontend</code>) физически не сможет отправить ни одного TCP-сегмента на порт сервиса <code>auth-service</code>.</p>
 <hr />
 <h2 id="skrytaya-ugroza-dns-resolution">Скрытая угроза: DNS Resolution</h2>
 
-<p>Когда вы применяете Default Deny <code>Egress</code> (запрет исходящего трафика), вы обрубаете связи не только с базами данных. Вы обрубаете связь с <strong>CoreDNS</strong> — внутренним DNS-сервером Kubernetes.</p>
+<p>Внедрение политики Default Deny для исходящего трафика (<code>Egress</code>) таит в себе классическую инженерную ловушку, на которую регулярно наступают даже опытные разработчики.</p>
+<p>Запрещая исходящий трафик, вы блокируете не только запросы к сторонним API и базам данных. Вы отрезаете под от сердца внутренней инфраструктуры кластера — сервиса <strong>CoreDNS</strong> (или <code>kube-dns</code>), расположенного в служебном пространстве имён <code>kube-system</code>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Вы применили Network Policy, разрешающую доступ к <code>database-pod</code>. Но ваш Go-клиент при вызове <code>sql.Open</code> получает ошибку: <code>dial tcp: lookup database-svc on 10.96.0.10:53: no such host</code> или таймаут. В чем проблема?<br />
-<strong>Ответ:</strong> Go-приложению нужно разрезолвить имя <code>database-svc</code> в IP-адрес. Пакет <code>net</code> делает UDP-запрос на порт 53 к <code>kube-dns</code>. Так как Default Deny блокирует весь Egress-трафик, DNS-запрос отбрасывается. </p>
+    <p><strong>Вопрос:</strong> Вы применили Network Policy, разрешающую сервису исходящий доступ к поду базы данных <code>database-pod</code>. Но в логах вашего Go-микросервиса при вызове <code>sql.Open</code> или <code>net.Dial</code> сыплются ошибки:<br />
+<code>dial tcp: lookup database-svc on 10.96.0.10:53: no such host</code><br />
+либо вызовы аварийно завершаются по таймауту. База данных доступна и исправна. В чём кроется первопричина сбоя?  </p>
+<p><strong>Ответ:</strong> Go-приложение не обращается к базе данных по сырому IP-адресу — оно использует доменное имя Kubernetes-сервиса (<code>database-svc</code>). Для этого стандартный пакет <code>net</code> отправляет UDP-дейтаграмму на 53 порт кластерного DNS-резолвера (<code>kube-dns</code> с адресом <code>10.96.0.10</code>).<br />
+Поскольку политика Default Deny <code>Egress</code> заблокировала абсолютно весь исходящий трафик из пода, DNS-запрос отбрасывается на уровне интерфейса <code>veth</code>. Go-резолвер не получает ответа и рапортует об ошибке <code>no such host</code>.  </p>
+<p><strong>Решение:</strong> Вместе с правилом Default Deny всегда создаётся глобальная разрешающая политика для CoreDNS.</p>
   </div>
 </div>
 
-<p>Чтобы Go-приложение вообще могло находить другие сервисы, вы <strong>обязаны</strong> создать политику, разрешающую исходящий трафик по протоколу UDP на порт 53 в namespace <code>kube-system</code>.</p>
+<p>Чтобы сетевой стек Go мог превращать DNS-имена микросервисов в сетевые координаты, мы <strong>обязаны</strong> явно разрешить исходящие UDP-пакеты на 53 порт системного пространства имён <code>kube-system</code>:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2336,8 +2436,9 @@ spec:
 kind: NetworkPolicy
 metadata:
   name: allow-dns-egress
+  namespace: my-services
 spec:
-  podSelector: {} # Для всех подов
+  podSelector: {} # Применяется ко всем подам namespace
   policyTypes:
   - Egress
   egress:
@@ -2354,21 +2455,55 @@ spec:
 <hr />
 <h2 id="network-policies-vs-service-mesh-istio">Network Policies vs Service Mesh (Istio)</h2>
 
-<p>Мы изучили Service Mesh в статьях <a href="1-service-mesh.html" class="wikilink">1. Service mesh</a> и <a href="2-envoy-i-sidecar.html" class="wikilink">2. Envoy и sidecar</a>. В Istio есть свой механизм управления доступом — <code>AuthorizationPolicy</code>. Зачем нам Kubernetes Network Policies?</p>
-<p>Это классический принцип <strong>Defense in Depth (Глубокоэшелонированная защита)</strong>.</p>
-<ul>
-<li><strong>Istio AuthorizationPolicy (L7):</strong> Работает на прикладном уровне. Он может сказать: "Разрешить <code>api-gateway</code> делать HTTP GET на путь <code>/api/v1/users</code>, но запретить HTTP POST". Это очень гибко. Но если в самом коде прокси Envoy (написанном на C++) найдут критическую уязвимость (RCE или Buffer Overflow), злоумышленник получит контроль над контейнером Envoy и сможет отправлять любые пакеты в сеть.</li>
-<li><strong>Kubernetes NetworkPolicy (L3/L4):</strong> Работает на уровне IP-адресов и портов в ядре Linux. Он ничего не знает про HTTP-пути. Но если Envoy скомпрометирован, NetworkPolicy, контролируемый ядром ОС и CNI (через eBPF), просто не выпустит TCP-пакеты хакера за пределы пода к ресурсам, к которым у этого пода не должно быть доступа.</li>
-</ul>
+<p>В предыдущих лекциях <a href="1-service-mesh.html" class="wikilink">1. Service mesh</a> и <a href="2-envoy-i-sidecar.html" class="wikilink">2. Envoy и sidecar</a> мы подробно разбирали проксирование трафика через Service Mesh, где безопасность контролируется правилами <code>AuthorizationPolicy</code>. Возникает резонный вопрос: если у нас уже развёрнут Istio, зачем тратить усилия на поддержку Kubernetes Network Policies?</p>
+<p>Ответ заключается в фундаментальном принципе <strong>Defense in Depth (Глубокоэшелонированная защита)</strong>. Разные уровни сетевой модели OSI защищают от принципиально разных классов угроз:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Характеристика</th>
+<th>Istio AuthorizationPolicy (L7)</th>
+<th>Kubernetes NetworkPolicy (L3/L4)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Уровень абстракции</strong></td>
+<td>Прикладной уровень (HTTP, gRPC, URL, Headers)</td>
+<td>Сетевой и транспортный уровни (IP, TCP, UDP, Ports)</td>
+</tr>
+<tr>
+<td><strong>Точка исполнения</strong></td>
+<td>User-space прокси (Envoy Sidecar)</td>
+<td>Kernel-space (ядро Linux: eBPF / iptables)</td>
+</tr>
+<tr>
+<td><strong>Гранулярность</strong></td>
+<td>Тонкая (HTTP-метод, путь <code>/api/v1/users</code>, токены JWT)</td>
+<td>Грубая (IP-подсеть, селектор подов, номер порта)</td>
+</tr>
+<tr>
+<td><strong>Устойчивость к RCE</strong></td>
+<td>Уязвимость в коде Envoy компрометирует правила L7</td>
+<td>Изоляция ядра ОС не зависит от состояния пользовательских процессов</td>
+</tr>
+</tbody>
+</table></div>
+<p>Рассмотрим практический сценарий:<br />
+1. Вы настроили в Istio правило: <em>«Разрешить сервису <code>api-gateway</code> выполнять HTTP GET по маршруту <code>/api/v1/users</code>, но запретить HTTP POST»</em>. Это элегантное L7-регулирование.<br />
+2. В кодовой базе Envoy (написанной на C++) обнаруживается уязвимость переполнения буфера или Remote Code Execution (RCE).<br />
+3. Злоумышленник захватывает процесс Envoy внутри пода и получает сырой Linux-сокет. Он может попытаться открыть прямое соединение с финансовой базой данных <code>finance-db</code> в обход всей прикладной логики.<br />
+4. На этом этапе в игру вступает <strong>Kubernetes NetworkPolicy</strong>: на уровне ядра Linux eBPF-фильтр видит исходящий TCP-пакет на закрытый порт базы данных и молниеносно уничтожает его, блокируя горизонтальное распространение атаки (lateral movement).</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Изоляция:</strong> Network Policies делят плоскую сеть кластера на изолированные отсеки, предотвращая распространение атаки (lateral movement).</li>
-<li><strong>Уровень пакетов:</strong> CNI (Cilium/Calico) блокирует трафик в ядре (iptables/eBPF) с помощью отбрасывания пакетов (DROP).</li>
-<li><strong>Опасность DROP для Go:</strong> Отброшенные пакеты не возвращают ошибку. Они вызывают зависание горутин на фазе установки TCP-соединения (<code>SYN</code>), делая жесткие таймауты (<code>context.WithTimeout</code>) абсолютно необходимыми.</li>
-<li><strong>Не забудьте про DNS:</strong> Политики по умолчанию блокируют всё, включая критически важные запросы к CoreDNS.</li>
+<li><strong>Разрушение иллюзии:</strong> Плоская сеть кластера по умолчанию удобна для экспериментов, но фатальна в продакшене. Сетевые политики превращают монолитную сеть в систему изолированных отсеков.</li>
+<li><strong>Аппаратное сочувствие к ядру:</strong> CNI-плагины транслируют правила либо в неповоротливые линейные цепочки <code>iptables</code>, либо в высокоскоростные eBPF-хуки (<code>XDP</code>), проверяющие пакеты за константное время $O(1)$.</li>
+<li><strong>DROP молчит и убивает:</strong> Сетевые экраны Kubernetes используют отбрасывание пакетов (<code>DROP</code>), а не явный отказ (<code>REJECT</code>). Неотвеченный <code>TCP SYN</code> удерживает горутину в пуле <code>epoll</code> до 130 секунд по вине <code>tcp_syn_retries</code>. Жёсткие таймауты (<code>context.WithTimeout</code>) — обязательное условие стабильности Go-кода.</li>
+<li><strong>Не забывайте про DNS:</strong> Политика Default Deny отрезает под от CoreDNS (<code>kube-system</code>, UDP порт 53). Без явного разрешения DNS-резолвер Go вернёт ошибку разрешения имён.</li>
+<li><strong>Эшелонированная оборона:</strong> Network Policies (L3/L4) и Service Mesh (L7) дополняют друг друга, защищая кластер как от прикладных атак, так и от прямого захвата сетевых сокетов.</li>
 </ol>
-<p>Мы настроили железный фаервол внутри кластера. Сеть защищена от несанкционированных проникновений и подмены лиц. Но что делать, если легитимный трафик ведет себя непредсказуемо? Если кто-то начинает скачивать гигантские файлы, забивая весь канал, или один клиент отправляет миллион валидных запросов в секунду? Нам нужно научиться управлять формой и объемом трафика. Об этом — в следующей статье: <a href="5-traffic-shaping.html" class="wikilink">5. Traffic shaping</a>.</p>
+<p>Мы возвели непреодолимую стену сетевых политик. Несанкционированный трафик уничтожается ядром Linux. Но что делать, если легитимные пользователи начинают скачивать тяжёлые файлы и вызывают затор в пропускной способности канала? Как обуздать burst-всплески сетевого трафика? Об этом — в следующей лекции: <a href="5-traffic-shaping.html" class="wikilink">5. Traffic shaping</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2396,7 +2531,7 @@ spec:
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#faervol-dlya-mikroservisov-izolyatsiya-na-urovne-paketov">Фаервол для микросервисов: Изоляция на уровне пакетов</a></li><li class="toc-item toc-h2"><a href="#illyuziya-ploskoy-seti">Иллюзия плоской сети</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-cni-iptables-i-ebpf">Mechanical Sympathy: CNI, iptables и eBPF</a></li><li class="toc-item toc-h3"><a href="#klassicheskiy-podkhod-iptables">Классический подход (iptables)</a></li><li class="toc-item toc-h3"><a href="#sovremennyy-podkhod-ebpf">Современный подход (eBPF)</a></li><li class="toc-item toc-h2"><a href="#vzglyad-iz-go-drop-protiv-reject">Взгляд из Go: DROP против REJECT</a></li><li class="toc-item toc-h2"><a href="#pattern-default-deny-zapretit-vsyo">Паттерн: Default Deny (Запретить всё)</a></li><li class="toc-item toc-h2"><a href="#skrytaya-ugroza-dns-resolution">Скрытая угроза: DNS Resolution</a></li><li class="toc-item toc-h2"><a href="#network-policies-vs-service-mesh-istio">Network Policies vs Service Mesh (Istio)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#faervol-dlya-mikroservisov-izolyatsiya-na-urovne-paketov">Фаервол для микросервисов: Изоляция на уровне пакетов</a></li><li class="toc-item toc-h2"><a href="#illyuziya-ploskoy-seti">Иллюзия плоской сети</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-cni-iptables-i-ebpf">Mechanical Sympathy: CNI, iptables и eBPF</a></li><li class="toc-item toc-h3"><a href="#1-klassicheskiy-podkhod-tsepochki-iptables-i-ipvs">1. Классический подход: цепочки iptables и IPVS</a></li><li class="toc-item toc-h3"><a href="#2-sovremennyy-podkhod-ebpf-cilium">2. Современный подход: eBPF (Cilium)</a></li><li class="toc-item toc-h2"><a href="#vzglyad-iz-go-drop-protiv-reject">Взгляд из Go: DROP против REJECT</a></li><li class="toc-item toc-h2"><a href="#pattern-default-deny-zapretit-vsyo">Паттерн: Default Deny (Запретить всё)</a></li><li class="toc-item toc-h2"><a href="#skrytaya-ugroza-dns-resolution">Скрытая угроза: DNS Resolution</a></li><li class="toc-item toc-h2"><a href="#network-policies-vs-service-mesh-istio">Network Policies vs Service Mesh (Istio)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

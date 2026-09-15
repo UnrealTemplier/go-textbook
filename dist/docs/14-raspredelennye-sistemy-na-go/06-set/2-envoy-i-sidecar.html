@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Envoy и sidecar</h1>
           </header>
@@ -2177,48 +2177,53 @@
           <div class="article-markdown">
             <h2 id="envoy-titanovyy-proksi-v-kolyaske">Envoy: Титановый прокси в коляске</h2>
 
-<p>В прошлой статье <a href="1-service-mesh.html" class="wikilink">1. Service mesh</a> мы разобрали, зачем архитекторы выносят логику сетевого взаимодействия (ретраи, таймауты, балансировку) из кода сервиса на уровень инфраструктуры. Мы говорили о "плоскости данных" (Data Plane) как об абстрактных "умных прокси".</p>
-<p>В 90% современных инсталляций Kubernetes этот "умный прокси" — это <strong>Envoy</strong>. </p>
-<p>Envoy — это высокопроизводительный распределенный прокси-сервер L3/L4 и L7, изначально разработанный в Lyft, а теперь являющийся бриллиантом Cloud Native Computing Foundation (CNCF). Именно он работает под капотом Istio, AWS App Mesh, Consul Connect и множества других Service Mesh реализаций.</p>
-<p>Для Go-разработчика, претендующего на Senior-уровни, Envoy — это не просто "черный ящик", который настраивают девопсы. Это ключевой компонент, напрямую влияющий на задержки (latency) и потребление ресурсов вашего микросервиса.</p>
-<p>В этой статье мы заглянем под капот Envoy, разберем его потоковую модель, процесс перехвата трафика и поймем, почему его не написали на Go.</p>
+<p>В предыдущей статье <a href="1-service-mesh.html" class="wikilink">1. Service mesh</a> мы подробно разобрали концептуальные предпосылки сервисных сеток: зачем архитекторы выносят логику повторов, таймаутов, распределенной трассировки и балансировки из бизнес-кода на уровень инфраструктурных прокси.</p>
+<p>В подавляющем большинстве современных инсталляций Kubernetes (будь то Istio, AWS App Mesh, HashiCorp Consul Connect или Kuma) роль этой рабочей лошадки Data Plane выполняет один конкретный инструмент — <strong>Envoy Proxy</strong>.</p>
+<p>Envoy — это высокопроизводительный распределенный L3/L4 и L7 прокси-сервер, изначально спроектированный инженерами компании Lyft, а ныне являющийся флагманским выпускным проектом фонда Cloud Native Computing Foundation (CNCF). Для опытного Go-разработчика Envoy — это не просто загадочный черный ящик, который «девопсы настраивают через Helm-чарты», а непосредственный сосед по поду, разделяющий с рантаймом Go ядро операционной системы, сетевой стек и процессорные ресурсы.</p>
+<p>В этой статье мы заглянем под титановый капот Envoy, исследуем его потоковую модель без блокировок, детально разберем механизм перехвата пакетов и ответим на главный мировоззренческий вопрос: почему сам прокси написан на C++, а не на Go?</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Pod[&quot;Kubernetes Pod (Network Namespace: localhost)&quot;]
+direction TB
+App[&quot;Go Application&lt;br/&gt;(user-service)&quot;] &lt;--&gt;|&quot;syscall.Read/Write&lt;br/&gt;(Чистый HTTP)&quot;| Envoy[&quot;Envoy Sidecar&lt;br/&gt;(Worker Threads: epoll)&quot;]
+end
+
+Envoy &lt;==&gt;|&quot;mTLS / HTTP/2&lt;br/&gt;(eth0)&quot;| Cluster[&quot;Сеть Kubernetes Кластера&quot;]
+ControlPlane[&quot;Istiod (Control Plane)&quot;] -.-&gt;|&quot;gRPC xDS API (Стримы)&quot;| Envoy
+  </pre>
+</div>
+
+
 <hr />
 <h2 id="mechanical-sympathy-pochemu-c-a-ne-go">Mechanical Sympathy: Почему C++, а не Go?</h2>
 
-<p>Это один из самых философских вопросов. Go — идеальный язык для бэкенда и облачной инфраструктуры (Docker, Kubernetes, Prometheus, Terraform написаны на Go). Тот же Traefik или ранний Linkerd написаны на Go и Scala/Rust. Так почему царем горы стал Envoy, написанный на современном C++14?</p>
-<p><strong>Ответ: Непредсказуемость Garbage Collector (GC) и борьба за хвостовые задержки (Tail Latency).</strong></p>
-<p>В Go сборщик мусора работает параллельно (Concurrent Mark and Sweep). Несмотря на то, что паузы STW (Stop The World) в современном Go сведены к долям миллисекунд, работа GC потребляет процессорное время (иногда до 25% CPU при жестком профиле аллокаций). </p>
-<p>Прокси-сервер, через который проходят миллионы запросов в секунду (RPS), постоянно выделяет и освобождает буферы под сетевые пакеты. <br />
-* В Go это привело бы к огромному давлению на GC, что вызвало бы спайки (всплески) задержек на перцентилях p99 и p99.9.<br />
-* В C++ память управляется вручную (через RAII и умные указатели). Envoy использует пулы арен (Arena Memory Allocation), переиспользуя участки памяти для сетевых буферов. Это гарантирует абсолютно предсказуемую и ровную задержку, независимо от нагрузки.</p>
+<p>Это один из самых увлекательных вопросов современной системной архитектуры. Язык Go по праву считается официальным языком облачной инфраструктуры: само ядро Docker, оркестратор Kubernetes, система мониторинга Prometheus, шлюзы Traefik и Terraform написаны на Go. Почему же абсолютным королем Data Plane стал Envoy, написанный на современном диалекте C++14?</p>
+<p><strong>Фундаментальный ответ: Борьба за предсказуемость хвостовых задержек (Tail Latency) и отсутствие сборщика мусора (Garbage Collector).</strong></p>
+<p>В рантайме Go сборщик мусора работает конкурентно (Concurrent Mark and Sweep). Несмотря на то, что паузы полной остановки мира (Stop-The-World) в современных версиях Go исчисляются микросекундами, фоновое сканирование кучи неизбежно расходует такты CPU (до 25% ресурсов ядер при интенсивных аллокациях), а при нехватке памяти рантайм принудительно активирует механизм <em>Mark Assist</em>.</p>
+<p>Сетевой L7-прокси, перемалывающий сотни тысяч запросов в секунду (RPS) на узел:<br />
+* Непрерывно выделяет, нарезает и освобождает миллионы буферов под заголовки HTTP, фреймы HTTP/2 и фрагменты полезной нагрузки.<br />
+* В Go такой профиль нагрузки породил бы колоссальное давление на кучу и привел к неизбежным всплескам хвостовых задержек (Spikes) на критических перцентилях <strong>p99</strong> и <strong>p99.9</strong> (когда один запрос из тысячи зависает на 50–100 мс из-за чистки мусора).<br />
+* В C++ управление памятью является строго детерминированным. Envoy применяет кастомные арены памяти (Arena Allocators) и циклические кольцевые буферы, переиспользуя непрерывные области памяти без возврата операционной системе. Это обеспечивает плоский, абсолютно ровный график задержек с разбросом менее 1 мс даже при предельных пиковых нагрузках.</p>
 <hr />
 <h2 id="potokovaya-model-envoy-threading-model">Потоковая модель Envoy (Threading Model)</h2>
 
-<p>Чтобы прокси не стал бутылочным горлышком, он должен работать с железом максимально эффективно. Envoy использует архитектуру <strong>Event-Driven Non-Blocking I/O</strong> (похожую на Nginx, но со своими особенностями).</p>
-<p>В Envoy есть два типа потоков ОС:<br />
-1. <strong>Main Thread (Главный поток):</strong> Занимается инициализацией, конфигурацией (xDS API), сбором метрик и управлением процессами. Он НИКОГДА не касается пользовательского трафика.<br />
-2. <strong>Worker Threads (Рабочие потоки):</strong> Занимаются непосредственно обработкой сетевого трафика. По умолчанию Envoy запускает ровно столько воркеров, сколько у вас ядер процессора.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Каждый Worker Thread крутит свой собственный цикл событий (на базе <code>epoll</code> в Linux). <br />
-<strong>Самое важное правило Envoy:</strong> Каждое сетевое соединение (connection) жестко привязывается к ОДНОМУ воркеру на всё время своей жизни. </p>
-<p>Это означает, что при обработке конкретного HTTP-запроса внутри Envoy <strong>вообще нет мьютексов (Locks)</strong>. Воркеру не нужно синхронизировать доступ к буферам памяти с другими потоками. Это устраняет Lock Contention и проблему инвалидации кэш-линий процессора, позволяя прокси молотить трафик со скоростью света.</p>
-  </div>
-</div>
-
-<hr />
-<h2 id="kak-sidecar-perekhvatyvaet-trafik-vashego-go-prilozheniya">Как Sidecar перехватывает трафик вашего Go-приложения?</h2>
-
-<p>Вы написали простейший HTTP-клиент на Go: <code>http.Get("http://user-service/api/users")</code>. Ваш код ничего не знает про Envoy. Как запрос попадает в прокси?</p>
-<p>В Kubernetes это реализуется через механизм <strong>Mutating Admission Webhook</strong> и контейнер инициализации (<code>InitContainer</code>).</p>
+<p>Чтобы проксировать миллионы пакетов и не превратиться в узкое горлышко, Envoy выжимает максимум из архитектуры многоядерных процессоров. В его основе лежит событийно-ориентированная неблокирующая модель <strong>Event-Driven Non-Blocking I/O</strong>.</p>
+<p>Внутри процесса Envoy функционируют два типа системных потоков операционной системы:</p>
 <ol>
-<li><strong>Инъекция:</strong> Когда вы деплоите свой под, Kubernetes API видит это и "на лету" добавляет в манифест вашего пода еще два контейнера: <code>istio-init</code> и <code>istio-proxy</code> (сам Envoy).</li>
-<li><strong>Настройка iptables:</strong> Контейнер <code>istio-init</code> запускается самым первым с привилегиями <code>NET_ADMIN</code>. Он выполняет bash-скрипт, который переписывает правила маршрутизации ядра Linux (<code>iptables</code>) <strong>только внутри сетевого пространства этого пода</strong>.</li>
-<li><strong>Перехват:</strong> Правило <code>iptables</code> гласит: "Любой исходящий TCP-пакет, кроме тех, что сгенерировал пользователь envoy, должен быть перенаправлен (REDIRECT) на локальный порт 15001".</li>
+<li><strong>Main Thread (Главный управляющий поток):</strong> Отвечает за начальный старт, чтение первичных конфигураций, координацию жизненного цикла, прием gRPC-стримов динамической конфигурации (xDS API) и экспорт метрик. Главный поток <strong>никогда не касается сокетов пользовательского трафика</strong>.</li>
+<li><strong>Worker Threads (Рабочие потоки):</strong> Занимаются исключительно пересылкой и обработкой сетевых пакетов. По умолчанию Envoy запускает ровно столько потоков-воркеров, сколько физических ядер CPU выделено контейнеру.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2234,21 +2239,76 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-GoApp[&quot;Go-приложение&lt;br&gt;HTTP Client&quot;]--&gt;|&quot;syscall write&lt;br&gt;Порт 80&quot;|Kernel[&quot;Ядро Linux&lt;br&gt;Сетевой стек&quot;]
-Kernel--&gt;|&quot;iptables REDIRECT&quot;|EnvoyPort[&quot;Локальный порт 15001&quot;]
-EnvoyPort--&gt;Envoy[&quot;Envoy Sidecar&lt;br&gt;Worker Thread&quot;]
-Envoy--&gt;|&quot;Шифрование, ретраи&quot;|Net[&quot;Внешняя сеть&lt;br&gt;eth0&quot;]
+subgraph EnvoyInternals[&quot;Внутренняя потоковая модель Envoy&quot;]
+Main[&quot;Main Thread&lt;br/&gt;(Прием xDS API, метрики, сигналы)&quot;]
+W1[&quot;Worker Thread 1 (Core 0)&lt;br/&gt;epoll loop&quot;]
+W2[&quot;Worker Thread 2 (Core 1)&lt;br/&gt;epoll loop&quot;]
+W3[&quot;Worker Thread 3 (Core 2)&lt;br/&gt;epoll loop&quot;]
+
+Main -.-&gt;|&quot;xDS Updates (Lock-free)&quot;| W1 &amp; W2 &amp; W3
+end
+
+Conn1[&quot;TCP Conn A&quot;] --&gt;|&quot;Привязка на весь цикл жизни&quot;| W1
+Conn2[&quot;TCP Conn B&quot;] --&gt;|&quot;Привязка на весь цикл жизни&quot;| W2
+Conn3[&quot;TCP Conn C&quot;] --&gt;|&quot;Привязка на весь цикл жизни&quot;| W3
   </pre>
 </div>
 
 
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом</span>
+  </div>
+  <div class="callout-body">
+    <p>Каждый рабочий поток крутит свой собственный независимый цикл обработки событий на базе системного вызова ядра Linux <code>epoll</code>.</p>
+<p><strong>Железное правило Envoy:</strong> Каждое входящее клиентское TCP-соединение в момент рукопожатия жестко закрепляется за <strong>одним конкретным воркером</strong> на все время своей жизни.</p>
+<p>Это означает, что при вычитывании байтов, парсинге HTTP-заголовков, маршрутизации и TLS-шифровании внутри Envoy <strong>вообще не используются мьютексы (Locks)!</strong> Воркеру не нужно синхронизировать доступ к структурам сессии с соседними потоками. Это полностью исключает Lock Contention и проблему инвалидации процессорных кэш-линий (Cache Line Bouncing) протокола когерентности MESI.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="kak-sidecar-perekhvatyvaet-trafik-vashego-go-prilozheniya">Как Sidecar перехватывает трафик вашего Go-приложения?</h2>
+
+<p>Вы написали лаконичный HTTP-клиент на Go: <code>http.Get("http://user-service/api/users")</code>. Ваш код вообще ничего не знает об Envoy. Каким образом исходящий TCP-пакет волшебным образом оказывается в лапах прокси?</p>
+<p>В кластере Kubernetes эта магия разворачивается в три этапа при участии механизма <strong>Mutating Admission Webhook</strong> и служебных контейнеров:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+GoApp[&quot;Go-приложение (user-service)&quot;] --&gt;|&quot;1. syscall.Write в сокет :80&quot;| Kernel[&quot;Ядро Linux (Network Namespace)&quot;]
+Kernel --&gt;|&quot;2. netfilter (PREROUTING/OUTPUT)&quot;| Rules[&quot;iptables правила (istio-init)&quot;]
+Rules --&gt;|&quot;3. REDIRECT&quot;| EnvoyPort[&quot;Локальный сокет :15001&quot;]
+EnvoyPort --&gt; Envoy[&quot;Envoy Worker (epoll)&quot;]
+Envoy --&gt;|&quot;4. Маршрутизация, mTLS&quot;| PhysicalNet[&quot;eth0 -&gt; Внешняя сеть&quot;]
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>Инъекция манифеста:</strong> Когда контроллер разворачивает под, мутирующий вебхук платформы на лету дописывает в спецификацию пода два контейнера: инициализирующий <code>istio-init</code> и долгоживущий <code>istio-proxy</code> (бинарник Envoy).</li>
+<li><strong>Низкоуровневая настройка iptables:</strong> Контейнер <code>istio-init</code> запускается первым в статусе <code>InitContainer</code>. Он наделен специальной Linux-привилегией <code>NET_ADMIN</code>. Контейнер исполняет набор низкоуровневых команд, которые переписывают таблицы маршрутизации ядра Linux (<code>iptables</code>) <strong>исключительно внутри изолированного сетевого пространства имен (Network Namespace) данного конкретного пода</strong>.</li>
+<li><strong>Захват трафика:</strong> Правила <code>iptables</code> предписывают: любой исходящий TCP-трафик (кроме пакетов, сгенерированных самим служебным пользователем envoy UID 1337) перенаправлять через действие <code>REDIRECT</code> на локальный порт <code>15001</code>.</li>
+<li><strong>Проксирование:</strong> Сетевой стек ядра заворачивает пакет на порт <code>15001</code>, где его мгновенно вычитывает воркер Envoy.</li>
+</ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Ваш Go-сервис (условно 20 МБ RAM) теперь делит ресурсы с Envoy (условно 50-150 МБ RAM). Более того, прохождение через <code>iptables</code> и возврат в User Space для обработки в Envoy добавляет накладные расходы на переключение контекста. Это "налог", который вы платите за функционал Service Mesh. В высоконагруженных системах с микро-задержками этот налог пытаются убрать с помощью технологий eBPF (минуя iptables), о которых мы упоминали ранее.</p>
+    <p>Ваш компактный микросервис на Go (потребляющий условные 25 МБ оперативной памяти) теперь делит лимиты пода с C++ процессом Envoy, который может аллоцировать от 60 до 150 МБ под кэши маршрутов и TLS-сессий. </p>
+<p>Более того, заворачивание каждого сетевого пакета через <code>iptables</code> и двойное прохождение сквозь границу ядра с переключением контекста в User Space добавляет накладные расходы по CPU. В сверхнагруженных кластерах этот налог минимизируют с помощью технологии eBPF, заменяющей <code>iptables</code> прямым пробросом сокетов в ядре.</p>
   </div>
 </div>
 
@@ -2261,20 +2321,13 @@ Envoy--&gt;|&quot;Шифрование, ретраи&quot;|Net[&quot;Внешн�
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему Nginx нельзя использовать как Sidecar в Service Mesh, а Envoy — можно?<br />
-<strong>Ответ:</strong> Главное отличие — архитектура конфигурации. Nginx использует статические файлы. При обновлении списка серверов вам нужно обновить конфиг и послать сигнал <code>reload</code>. Это создает новый процесс воркеров и медленно "сливает" (drain) старые. В облаке поды появляются и умирают ежесекундно. Постоянный <code>reload</code> убил бы производительность.<br />
-Envoy был изначально спроектирован для <strong>динамической конфигурации по gRPC потокам</strong> без перезагрузки процессов. </p>
+    <p><strong>Вопрос:</strong> Почему Nginx исторически не прижился в качестве Sidecar-прокси для динамических микросервисов, уступив пальму первенства Envoy?<br />
+<strong>Ответ:</strong> Ключевое различие кроется в парадигме управления конфигурацией. Nginx традиционно опирается на статические текстовые файлы. Чтобы обновить список живых бэкендов, необходимо перезаписать файл на диске и отправить системный сигнал <code>reload</code> процессу. Это приводит к спавну новых воркеров и медленному дожиданию завершения старых (Drain). В облаке Kubernetes, где поды рождаются и умирают ежесекундно, непрерывный <code>reload</code> быстро парализовал бы производительность узла.</p>
+<p>Envoy изначально проектировался для <strong>динамического обновления состояния на лету по потоковым gRPC API</strong> без единого рестарта или сброса сетевых соединений.</p>
   </div>
 </div>
 
-<p>Набор этих gRPC API называется <strong>xDS (Discovery Service)</strong>. Control Plane (например, Istiod) стримит изменения прямо в память Envoy.</p>
-<p>Разберем конвейер обработки запроса внутри Envoy через призму xDS-сущностей:</p>
-<ol>
-<li><strong>LDS (Listener Discovery Service):</strong> Прокси слушает порты. Листенер на порту 15001 принимает перехваченный трафик.</li>
-<li><strong>RDS (Route Discovery Service):</strong> Прокси читает HTTP-заголовки. "Ага, мы идем на Host: user-service, путь /api/users". Роутер решает, в какой кластер направить запрос.</li>
-<li><strong>CDS (Cluster Discovery Service):</strong> Кластер — это логическая группа сервисов. Envoy знает, что кластер <code>user-service</code> требует таймаута в 2 секунды и Circuit Breaker-а.</li>
-<li><strong>EDS (Endpoint Discovery Service):</strong> Envoy смотрит список конкретных IP-адресов подов, где живет <code>user-service</code>, применяет алгоритм балансировки (например, Least Request) и отправляет байты на выбранный IP.</li>
-</ol>
+<p>Семейство этих динамических управляющих протоколов носит общее название <strong>xDS API (Any Discovery Service)</strong>:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2289,35 +2342,45 @@ Envoy был изначально спроектирован для <strong>ди
   </div>
   <pre class="mermaid">
 flowchart LR
-LDS[&quot;Listener&lt;br&gt;Прием TCP&quot;]--&gt;|&quot;HTTP/2 парсер&quot;|RDS[&quot;Route&lt;br&gt;Маршрут&quot;]
-RDS--&gt;|&quot;Выбор сервиса&quot;|CDS[&quot;Cluster&lt;br&gt;Логика и лимиты&quot;]
-CDS--&gt;|&quot;Балансировка&quot;|EDS[&quot;Endpoint&lt;br&gt;Конкретный IP&quot;]
+LDS[&quot;LDS&lt;br/&gt;(Listener Discovery)&lt;br/&gt;Слушающий порт :15001&quot;] --&gt; RDS[&quot;RDS&lt;br/&gt;(Route Discovery)&lt;br/&gt;Сопоставление хостов и путей&quot;]
+RDS --&gt; CDS[&quot;CDS&lt;br/&gt;(Cluster Discovery)&lt;br/&gt;Группа сервиса и лимиты&quot;]
+CDS --&gt; EDS[&quot;EDS&lt;br/&gt;(Endpoint Discovery)&lt;br/&gt;Конкретные IP подов&quot;]
   </pre>
 </div>
 
 
+<p>Конвейер обработки входящего пакета внутри Envoy поэтапно проходит сквозь эту иерархию:<br />
+1. <strong>LDS (Listener Discovery Service):</strong> Листенер слушает входящий сокет <code>15001</code> и принимает TCP-соединение.<br />
+2. <strong>RDS (Route Discovery Service):</strong> L7-фильтр парсит заголовки HTTP/gRPC. Видя заголовок <code>Host: user-service</code>, роутер сопоставляет его с нужным виртуальным маршрутом.<br />
+3. <strong>CDS (Cluster Discovery Service):</strong> Кластер определяет целевой бэкенд, его таймауты, параметры Circuit Breaker и протокол (HTTP/2 или gRPC).<br />
+4. <strong>EDS (Endpoint Discovery Service):</strong> Envoy выбирает конкретный физический IP-адрес пода из актуального пула эндпоинтов и направляет туда байты.</p>
 <hr />
 <h2 id="arkhitekturnye-lovushki-dlya-go-razrabotchika">Архитектурные ловушки для Go-разработчика</h2>
 
 <h3 id="1-dvoynye-taymauty-i-retrai">1. Двойные таймауты и ретраи</h3>
-<p>Распространенная ошибка — дублирование логики. Если вы настроили <a href="../05-nadezhnost/2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a> в вашем Go-клиенте на 3 попытки, и девопсы настроили ретраи в Istio (Envoy) на 3 попытки, то при сбое сети ваш сервис сгенерирует $3 \times 3 = 9$ запросов, устроив DDoS зависимой системе.<br />
-<strong>Правило:</strong> Если в кластере есть Service Mesh, вырезайте всю логику ретраев и Circuit Breakers из Go-кода. Оставьте только жесткие высокоуровневые таймауты через <code>context.Context</code> (как защиту последнего рубежа).</p>
+<p>Распространенный антипаттерн — дублирование логики отказоустойчивости. <br />
+Если разработчик настроил в HTTP-клиенте Go политику <a href="../05-nadezhnost/2-retry-i-backoff.html" class="wikilink">2. Retry и backoff</a> на 3 попытки с экспоненциальным шагом, а DevOps-инженеры включили в Istio VirtualService еще 3 попытки, то при кратковременном сетевом сбое один исходящий вызов превратится в $3 \times 3 = 9$ сетевых ударов по зависимому сервису!</p>
+<p><strong>Правило:</strong> При работе под крылом Service Mesh удаляйте сложную логику ретраев и Circuit Breakers из прикладного Go-кода. Оставляйте только жесткий общий дедлайн через <code>context.Context</code> (как последний рубеж обороны приложения).</p>
 <h3 id="2-poterya-istinnogo-ip-klienta">2. Потеря истинного IP клиента</h3>
-<p>Когда запрос проходит через несколько Envoy (Ingress Gateway -&gt; Sidecar A -&gt; Sidecar B), на уровне TCP соединение всегда идет от локального Envoy. Истинный IP клиента теряется.<br />
-<strong>Решение:</strong> Ваш Go-бэкенд должен читать IP не из <code>r.RemoteAddr</code>, а из заголовка <code>X-Forwarded-For</code> (или <code>X-Real-IP</code>). Envoy заботливо поддерживает эту цепочку заголовков, если настроен правильно.</p>
+<p>Когда внешний клиент обращается к системе, сетевой путь выглядит так:<br />
+<code>Клиент -&gt; Ingress Gateway -&gt; Envoy Sidecar A -&gt; Go App A -&gt; Envoy Sidecar B -&gt; Go App B</code>.</p>
+<p>На уровне транспортного TCP-сокета входящее соединение в Go App всегда открывается с локального адреса <code>127.0.0.1</code> (или IP Sidecar-контейнера). Чтение поля <code>r.RemoteAddr</code> в Go вернет <code>127.0.0.1</code>!</p>
+<p><strong>Решение:</strong> Для аудита безопасности и геолокации извлекайте реальный IP клиента исключительно из HTTP-заголовков <code>X-Forwarded-For</code> или <code>X-Real-IP</code>, которые Envoy формирует и передает по цепочке.</p>
 <h3 id="3-graceful-shutdown-i-race-conditions">3. Graceful Shutdown и Race Conditions</h3>
-<p>Когда Kubernetes убивает под, он одновременно посылает <code>SIGTERM</code> вашему Go-приложению и Sidecar-контейнеру Envoy. <br />
-Если Envoy закроется на долю секунды раньше, чем ваше Go-приложение успеет завершить текущие запросы и дописать данные в базу (сделав исходящий HTTP-вызов), вы получите ошибку "Connection refused", так как прокси уже мертв, а <code>iptables</code> всё еще заворачивают трафик на него.<br />
-<strong>Решение:</strong> В Kubernetes нужно настраивать задержку (preStop hook) на убиение Envoy, чтобы он гарантированно жил, пока ваше Go-приложение не завершит работу (обычно через паттерны координации или задержку завершения sidecar-контейнера).</p>
+<p>Когда Kubernetes принимает решение о выводе пода из эксплуатации (например, при Rolling Update), системный сигнал <code>SIGTERM</code> отправляется <strong>одновременно</strong> во все контейнеры пода — и в ваше Go-приложение, и в контейнер Envoy.</p>
+<p>Если Envoy завершит свой процесс на 100 миллисекунд раньше, чем Go-приложение успеет завершить текущие запросы и зафиксировать транзакцию в базе данных (выполнив исходящий RPC-вызов), ваше приложение мгновенно получит ошибку <code>Connection Refused</code>! Ведь правила <code>iptables</code> всё еще активны, а слушающий порт <code>15001</code> уже мертв.</p>
+<p><strong>Решение:</strong> В манифестах Kubernetes настраивают хук задержки остановки (<code>preStop</code> hook) для контейнера Envoy (<code>sleep 5</code>), гарантируя, что Sidecar продолжит обслуживать исходящий трафик до тех пор, пока Go-сервер не закроет все соединения.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Envoy — это Data Plane:</strong> Высокопроизводительный С++ прокси, работающий по событийной модели без блокировок.</li>
-<li><strong>Sidecar-инъекция:</strong> Перехватывает трафик через прозрачную модификацию <code>iptables</code> в ядре Linux, делая Go-код полностью независимым от топологии сети.</li>
-<li><strong>xDS API:</strong> Основа динамичности Service Mesh, позволяющая обновлять маршруты, лимиты и сертификаты на лету без перезагрузки процессов.</li>
-<li><strong>Контроль пересечений:</strong> Не дублируйте паттерны надежности. Если работает Service Mesh, ваш Go-код должен стать "глупым".</li>
+<li><strong>Envoy как эталон Data Plane:</strong> Событийный прокси на C++, исключающий накладные расходы на сборку мусора и обеспечивающий стабильные хвостовые задержки (Tail Latency).</li>
+<li><strong>Lock-Free потоковая модель:</strong> Закрепление сокета за одним Worker Thread с собственным циклом <code>epoll</code> гарантирует отсутствие межпоточных блокировок памяти.</li>
+<li><strong>Прозрачность перехвата:</strong> Контейнер <code>istio-init</code> перенаправляет трафик через <code>iptables</code> без необходимости менять код Go-клиентов.</li>
+<li><strong>Динамика xDS API:</strong> Конфигурация маршрутов, эндпоинтов и сертификатов стримится по gRPC в память без перезагрузки процессов.</li>
+<li><strong>Инженерная гигиена:</strong> Не дублируйте логику ретраев в Go-коде, извлекайте реальные IP из <code>X-Forwarded-For</code> и настраивайте хуки координации при остановке контейнеров.</li>
 </ol>
-<p>Мы выяснили, как Envoy направляет и контролирует потоки данных. Но одна из главных "продающих" фич Service Mesh — это прозрачная криптография и безопасность внутри кластера. Как сделать так, чтобы никто в дата-центре не мог прослушать ваш трафик или притвориться вашим сервисом? В следующей статье мы разберем технологию, за которую отвечает Envoy: <a href="3-mtls.html" class="wikilink">3. mTLS</a>.</p>
+<p>Одной из самых востребованных и критичных функций связки Envoy и Service Mesh является автоматическая криптографическая защита межсервисных каналов без вмешательства в прикладной код. Как устроена аутентификация микросервисов по стандарту SPIFFE и шифрование трафика в облаке, мы разберем в следующей статье: <a href="3-mtls.html" class="wikilink">3. mTLS</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

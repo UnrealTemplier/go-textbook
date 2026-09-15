@@ -2168,8 +2168,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Rate limiting</h1>
           </header>
@@ -2177,31 +2177,14 @@
           <div class="article-markdown">
             <h2 id="feyskontrol-dlya-vashego-api-zashchita-ot-abyuza-i-ddos">Фейсконтроль для вашего API: Защита от абьюза и DDoS</h2>
 
-<p>В предыдущей статье мы обсуждали <a href="5-traffic-shaping.html" class="wikilink">5. Traffic shaping</a>, где учились "причесывать" наш исходящий трафик, чтобы быть вежливыми клиентами и не ломать чужие системы. Теперь мы меняем перспективу: мы — сервер, выставленный в жестокий интернет, и нам нужно защищать себя.</p>
-<p>Даже если у нас настроен <a href="../05-nadezhnost/5-load-shedding.html" class="wikilink">5. Load shedding</a> (защита сервера от глобальной перегрузки), это не решает проблему несправедливости. Один агрессивный клиент (или скрипт парсера) может занять все 100% пропускной способности нашего <code>Load Shedder</code>, из-за чего честные пользователи получат <code>503 Service Unavailable</code>. </p>
-<p>Паттерн <strong>Rate Limiting (Ограничение скорости)</strong> — это механизм квотирования ресурсов. Он определяет, <em>кто</em> делает запрос, проверяет его лимит и, если лимит исчерпан, возвращает <code>429 Too Many Requests</code>. </p>
-<p>В этой статье мы разберем математику классических алгоритмов лимитирования, напишем middleware на Go с учетом утечек памяти и поймем, почему Redis — лучший друг Rate Limiter'а в распределенных системах.</p>
+<p>В предыдущей статье <a href="5-traffic-shaping.html" class="wikilink">5. Traffic shaping</a> мы примерили на себя роль вежливого клиента: учились «причёсывать» исходящие вызовы, чтобы не создавать помех чужим серверам и беречь буферы сетевых коммутаторов. Теперь мы разворачиваемся на 180 градусов: мы — сервер, выставленный открытым лицом в агрессивный публичный интернет, и наша прямая обязанность — защитить внутренние ресурсы от захлёбывания.</p>
+<p>Ранее мы познакомились с механизмом <a href="../05-nadezhnost/5-load-shedding.html" class="wikilink">5. Load shedding</a>. Он выступает в роли аварийного рубильника при глобальной перегрузке ноды. Но у механизма <code>Load Shedder</code> есть фундаментальный изъян: он слеп к источнику трафика. Если один недобросовестный клиент (или сломавшийся сторонний парсер) начнёт бомбардировать шлюз миллионами запросов, <code>Load Shedder</code> начнёт без разбора сбрасывать запросы всех подряд, и добропорядочные пользователи увидят холодный ответ <code>503 Service Unavailable</code>.</p>
+<p>Паттерн <strong>Rate Limiting (Ограничение скорости / Квотирование)</strong> восстанавливает справедливость. Он выясняет, <em>кто именно</em> стучится в дверь, сопоставляет интенсивность его запросов с выделенной квотой, и при превышении лимита хладнокровно возвращает код ответа <code>429 Too Many Requests</code>.</p>
+<p>В этой лекции мы препарируем математику классических алгоритмов лимитирования, спроектируем потокобезопасное middleware на Go с защитой от утечек памяти и разберём, почему Redis и язык Lua стали стандартом де-факто для распределённого квотирования.</p>
 <hr />
 <h2 id="algoritmy-rate-limiting">Алгоритмы Rate Limiting</h2>
 
-<p>Чтобы писать эффективный код, нужно понимать, как работают фундаментальные алгоритмы квотирования. На system design собеседованиях от вас ждут не просто названий, а понимания краевых эффектов (edge cases) каждого из них.</p>
-<h3 id="1-fixed-window-counter-schetchik-fiksirovannogo-okna">1. Fixed Window Counter (Счетчик фиксированного окна)</h3>
-<p>Самый простой алгоритм. Мы делим время на фиксированные окна (например, с 12:00 до 12:01). Заводим счетчик для каждого клиента. Если счетчик превышает лимит (100 запросов), отклоняем трафик до начала следующей минуты.</p>
-<ul>
-<li><strong>Плюс:</strong> Элементарно реализуется в памяти или Redis (<code>INCR</code> + <code>EXPIRE</code>).</li>
-<li><strong>Минус (Thundering Herd):</strong> Проблема всплеска на границе окон. Клиент может отправить 100 запросов в 12:00:59 и еще 100 в 12:01:00. Итого сервер получит 200 запросов за 2 секунды, хотя лимит был "100 в минуту".</li>
-</ul>
-<h3 id="2-sliding-window-log-zhurnal-skolzyashchego-okna">2. Sliding Window Log (Журнал скользящего окна)</h3>
-<p>Вместо счетчика мы сохраняем точный <em>timestamp</em> каждого запроса клиента (например, в Sorted Set в Redis). При новом запросе мы удаляем все timestamp'ы старше одной минуты и считаем оставшиеся.</p>
-<ul>
-<li><strong>Плюс:</strong> Абсолютно точное ограничение, никаких всплесков на границах.</li>
-<li><strong>Минус:</strong> Огромное потребление памяти. Если лимит миллион запросов — вам придется хранить миллион timestamp'ов для каждого пользователя. Это дорого.</li>
-</ul>
-<h3 id="3-sliding-window-counter-schetchik-skolzyashchego-okna">3. Sliding Window Counter (Счетчик скользящего окна)</h3>
-<p>Гибридный подход, являющийся индустриальным стандартом (используется в Cloudflare). Мы храним счетчики для текущей и предыдущей минуты, и вычисляем вес пропорционально прошедшему времени в текущей минуте.<br />
-<em>Формула:</em> <code>Запросы = (Счетчик предыдущей минуты * % оставшегося времени) + Счетчик текущей минуты</code>.</p>
-<h3 id="4-token-bucket-markernaya-korzina">4. Token Bucket (Маркерная корзина)</h3>
-<p>Тот самый алгоритм, который мы использовали в пакете <code>x/time/rate</code> для формирования трафика, но теперь применяем для фильтрации входящих (используя метод <code>Allow()</code>, а не <code>Wait()</code>). Токены генерируются с постоянной скоростью, позволяя кратковременные всплески (burst), но строго ограничивая среднюю скорость.</p>
+<p>Проектирование надёжного лимитера начинается с выбора математической модели. На архитектурных собеседованиях недостаточно просто назвать алгоритм — важно ясно понимать его краевые эффекты (Edge Cases) и цену по памяти.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2216,12 +2199,57 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Req[&quot;Входящий HTTP-запрос&quot;] --&gt; ID{&quot;Идентификация&lt;br&gt;IP, Token, API Key&quot;}
+subgraph Models[&quot;Фундаментальные алгоритмы Rate Limiting&quot;]
+direction TB
+FW[&quot;Fixed Window Counter&lt;br&gt;Простые счетчики по интервалам&lt;br&gt;(Опасность Thundering Herd)&quot;]
+SWL[&quot;Sliding Window Log&lt;br&gt;Точный лог таймстампов в памяти&lt;br&gt;(Высокий расход RAM)&quot;]
+SWC[&quot;Sliding Window Counter&lt;br&gt;Взвешенная интерполяция двух окон&lt;br&gt;(Индустриальный стандарт Cloudflare)&quot;]
+TB[&quot;Token Bucket&lt;br&gt;Корзина токенов с допуском Burst&lt;br&gt;(x/time/rate Allow)&quot;]
+end
+  </pre>
+</div>
+
+
+<h3 id="1-fixed-window-counter-schyotchik-fiksirovannogo-okna">1. Fixed Window Counter (Счётчик фиксированного окна)</h3>
+<p>Самый примитивный подход: ось времени разбивается на равные дискретные интервалы (например, ровно с 12:00 до 12:01). Для каждого уникального идентификатора клиента в памяти или хранилище поддерживается целочисленный счётчик. При поступлении запроса счётчик инкрементируется. Если он превысил квоту (например, 100 запросов), входящие вызовы блокируются вплоть до наступления следующей календарной минуты.</p>
+<ul>
+<li><strong>Преимущества:</strong> Предельная простота реализации. В Redis сводится к паре команд <code>INCR</code> и <code>EXPIRE</code>.</li>
+<li><strong>Недостатки (Проблема Thundering Herd на стыке окон):</strong> Всплеск нагрузки на границе интервалов. Если хитрый клиент отправит 100 запросов в 12:00:59, а следующие 100 запросов — в 12:01:01, ваш сервер за две секунды получит двойной удар в 200 запросов, хотя формально лимит «100 запросов в минуту» формально не был нарушен ни в одном из окон.</li>
+</ul>
+<h3 id="2-sliding-window-log-zhurnal-skolzyashchego-okna">2. Sliding Window Log (Журнал скользящего окна)</h3>
+<p>Чтобы избавиться от проблемы стыка окон, мы отказываемся от единого счётчика и начинаем протоколировать точный <em>timestamp</em> (метку времени) каждого поступившего запроса (например, с помощью структуры Sorted Set в Redis). При поступлении очередного запроса система удаляет все метки старше расчётного окна (например, старше 60 секунд) и проверяет размер оставшегося множества.</p>
+<ul>
+<li><strong>Преимущества:</strong> Абсолютная математическая точность. Никаких артефактов на границах окон.</li>
+<li><strong>Недостатки:</strong> Колоссальный аппетит к оперативной памяти. Если лимит клиента составляет 10 000 RPS, вам придётся непрерывно аллоцировать и хранить тысячи 64-битных чисел для каждого активного пользователя.</li>
+</ul>
+<h3 id="3-sliding-window-counter-schyotchik-skolzyashchego-okna">3. Sliding Window Counter (Счётчик скользящего окна)</h3>
+<p>Элегантный компромисс, снискавший статус промышленного стандарта (в частности, лежит в основе алгоритмов Cloudflare). Вместо хранения лога запросов мы храним всего два целочисленных счётчика: для <em>текущего</em> и <em>предыдущего</em> фиксированного окна.</p>
+<p>При проверке запроса интенсивность трафика интерполируется по времени:<br />
+$$\text{Оценка запросов} = (\text{Счётчик предыдущего окна} \times \% \text{оставшегося времени}) + \text{Счётчик текущего окна}$$</p>
+<p>Алгоритм требует мизерного объёма памяти (всего два числа на пользователя), полностью сглаживает скачки на стыках окон и даёт погрешность не более 0.05% на реальном трафике.</p>
+<h3 id="4-token-bucket-markernaya-korzina">4. Token Bucket (Маркерная корзина)</h3>
+<p>Алгоритм, с которым мы работали в пакете <code>x/time/rate</code>. Корзина непрерывно пополняется токенами с заданной скоростью до предела ёмкости. Приходящий запрос списывает токен. Если токенов нет — запрос отсекается.</p>
+<p>Для фильтрации входящего трафика мы используем неблокирующий метод <code>Allow()</code> (вместо усыпляющего <code>Wait()</code>). Если <code>Allow()</code> вернул <code>false</code> — сервер мгновенно рапортует об отказе.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Req[&quot;Входящий HTTP-запрос&quot;] --&gt; ID{&quot;Идентификация&lt;br&gt;(IP, JWT, API Key)&quot;}
 ID --&gt; Fetch[&quot;Получение состояния&lt;br&gt;Token Bucket из памяти&quot;]
 Fetch --&gt; Check{&quot;Токенов &gt; 0?&quot;}
 
-Check --&gt;|Да| Allow[&quot;Уменьшение токенов на 1&lt;br&gt;Пропуск к хендлеру&quot;]
-Check --&gt;|Нет| Deny[&quot;Fast Fail&lt;br&gt;429 Too Many Requests&quot;]
+Check --&gt;|Да| Allow[&quot;Уменьшение токенов на 1&lt;br&gt;(Allow() == true)&lt;br&gt;Пропуск к бизнес-логике&quot;]
+Check --&gt;|Нет| Deny[&quot;Fast Fail&lt;br&gt;(Allow() == false)&lt;br&gt;HTTP 429 Too Many Requests&quot;]
   </pre>
 </div>
 
@@ -2229,17 +2257,35 @@ Check --&gt;|Нет| Deny[&quot;Fast Fail&lt;br&gt;429 Too Many Requests&quot;]
 <hr />
 <h2 id="realizatsiya-in-memory-lokalnyy-rate-limiter">Реализация In-Memory (Локальный Rate Limiter)</h2>
 
-<p>Частая задача на собеседовании — написать middleware для защиты API по IP-адресу с использованием стандартных библиотек Go.</p>
+<p>Классическая практическая задача на проектирование Go-сервисов — создание HTTP-middleware для защиты эндпоинтов по IP-адресу без привлечения внешних баз данных.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Смертоносная утечка памяти (Memory Leak)</span>
   </div>
   <div class="callout-body">
-    <p>Джуниоры часто пишут структуру с <code>sync.Map</code>, где ключом является IP-адрес, а значением — <code>rate.Limiter</code>. <strong>Это классическая утечка памяти (Memory Leak).</strong> &gt; Если ваш сервис торчит наружу, его будут сканировать миллионы ботов с разных IP-адресов. Ваша мапа раздуется до гигабайтов и убьет сервис по OOM. Правильная реализация ОБЯЗАНА иметь фоновый процесс очистки старых записей.</p>
+    <p>Неопытные разработчики часто создают структуру на базе <code>sync.Map</code> или обычной мапы под мьютексом:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">var ipLimiters sync.Map // map[string]*rate.Limiter
+</code></pre>
+</div>
+
+<p>Где ключом выступает строка IP-адреса, а значением — локальный экземпляр <code>rate.Limiter</code>.  </p>
+<p><strong>Это гарантированная бомба замедленного действия.</strong><br />
+В реальном интернете ваш публичный шлюз ежесуточно сканируют миллионы уникальных ботнетов, краулеров и заражённых хостов. Каждый новый IP-адрес добавит запись в <code>sync.Map</code>. Но поскольку записи никогда не удаляются, размер хэш-таблицы будет неуклонно разрастаться до гигабайтов, пока операционная система Linux не пристрелит ваш Go-процесс через OOM Killer.  </p>
+<p>Любая рабочая реализация <strong>обязана иметь механизм фоновой очистки (Eviction / GC)</strong> неактивных ключей.</p>
   </div>
 </div>
 
+<p>Ниже приведена образцовая реализация локального in-memory лимитера с контролем устаревания записей:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2252,7 +2298,6 @@ Check --&gt;|Нет| Deny[&quot;Fast Fail&lt;br&gt;429 Too Many Requests&quot;]
   <pre class="language-go"><code class="language-go">package ratelimit
 
 import (
-    &quot;log&quot;
     &quot;net/http&quot;
     &quot;sync&quot;
     &quot;time&quot;
@@ -2325,28 +2370,66 @@ func (m *IPMiddleware) cleanupStaleClients() {
 </code></pre>
 </div>
 
+<hr />
 <h3 id="mechanical-sympathy-problema-globalnogo-myuteksa">Mechanical Sympathy: Проблема глобального мьютекса</h3>
-<p>В коде выше есть <code>sync.RWMutex</code>, который блокируется на <strong>каждый</strong> входящий HTTP-запрос. На 10 000 RPS этот мьютекс превратится в горячую точку (Lock Contention). Горутины будут парковаться, планировщик сойдет с ума, а кэш-линии процессора будут постоянно инвалидироваться.</p>
-<p><strong>Как оптимизировать?</strong><br />
-Вместо одной большой мапы использовать паттерн <strong>Shard Map</strong> (как в <code>concurrent-map</code>). Разбить хэш-таблицу на 256 шардов (корзин), каждая со своим мьютексом. Хэш от IP-адреса будет определять корзину. Это снизит конкуренцию (contention) в 256 раз!</p>
+
+<p>Взгляните на наш middleware глазами аппаратуры многоядерного процессора. В коде используется единая блокировка <code>sync.RWMutex</code> (а точнее, <code>m.mu.Lock()</code>), которая захватывается в эксклюзивном режиме на <strong>каждый входящий HTTP-запрос</strong> для обновления метки <code>lastSeen</code>.</p>
+<p>Если через сервис проходит скромный трафик в 100 RPS, накладные расходы незаметны. Но когда нагрузка достигает 10 000–50 000 RPS на 32-ядерном сервере, этот единственный мьютекс превращается в чудовищное узкое место — точку жесточайшей <strong>конкуренции за блокировку (Lock Contention)</strong>:<br />
+1. Десятки ядер процессора одновременно пытаются выполнить атомарную инструкцию <code>LOCK CMPXCHG</code> над одной строкой кэша L3 (Cache Line 64 байта).<br />
+2. Происходит бесконечный шторм инвалидации кэшей межъядерной шины (Cache Bouncing).<br />
+3. Планировщик Go вынужден вытеснять горутины в очередь ожидания семафора рантайма (<code>semacquire</code>), сжигая драгоценные миллисекунды в системных паузах.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Single[&quot;Глобальный Mutex (Высокая конкуренция)&quot;]
+Reqs1[&quot;10 000 RPS&quot;] --&gt; Mutex[&quot;Единый sync.RWMutex&lt;br&gt;(Lock Contention, Cache Bouncing)&quot;]
+Mutex --&gt; Map1[&quot;Единая map[string]*client&quot;]
+end
+
+subgraph Sharded[&quot;Шардированная структура (Sharded Map)&quot;]
+Reqs2[&quot;10 000 RPS&quot;] --&gt; Hash[&quot;Хэш от IP (FNV-1a / Murmur3)&quot;]
+Hash --&gt; B0[&quot;Корзина 0 (Mutex 0)&quot;]
+Hash --&gt; B1[&quot;Корзина 1 (Mutex 1)&quot;]
+Hash --&gt; B255[&quot;Корзина 255 (Mutex 255)&quot;]
+end
+  </pre>
+</div>
+
+
+<p><strong>Как устранить бутылочное горлышко?</strong><br />
+Вместо единой гигантской мапы используется паттерн <strong>Sharded Map</strong> (принцип, популяризированный пакетами <code>concurrent-map</code> и внутренним дизайном <code>sync.Map</code>). Мы создаём массив из 256 независимых корзин (шардов). Каждая корзина защищена своим персональным мьютексом. Быстрый хэш от IP-адреса направляет запрос в соответствующий шард:<br />
+$$\text{Шард} = \text{hash}(IP) \pmod{256}$$<br />
+Это распределяет нагрузку на межъядерную шину и снижает уровень конкуренции за блокировку ровно в 256 раз!</p>
 <hr />
 <h2 id="raspredelennyy-rate-limiter-redis">Распределенный Rate Limiter (Redis)</h2>
 
-<p>Локальный Rate Limiter в памяти отлично подходит для защиты от DDoS. Но для бизнес-лимитов (например, "Тариф Базовый: 100 запросов API в час") он не годится. У вас 10 подов в Kubernetes — клиент будет попадать на разные инстансы и сможет обойти лимит в 10 раз.</p>
-<p>Нам нужно единое хранилище состояния. Идеальный кандидат — Redis.</p>
-<p>Для реализации Sliding Window в Redis используют <strong>Lua-скрипты</strong>. </p>
+<p>Локальный лимитер в оперативной памяти превосходно справляется с защитой от грубых атак типа DoS/DDoS. Однако он принципиально непригоден для управления бизнес-квотами (например, «Пользователь тарифного плана Free имеет право на 1000 запросов к API в час»).</p>
+<p>В продакшене ваше Go-приложение масштабировано на 10 независимых подов в Kubernetes за балансировщиком нагрузки. Если пользователь будет отправлять запросы в цикле, они будут равномерно распределяться между подами. В результате клиент сможет безнаказанно совершить $10 \times 1000 = 10\,000$ обращений в час!</p>
+<p>Для поддержания глобальной согласованности необходимо централизованное хранилище состояния с минимальной задержкой. Общепризнанным стандартом индустрии здесь выступает <strong>Redis</strong>.</p>
+<p>Но наивная реализация в связке с Redis опасна. Если Go-сервер сначала делает <code>GET key</code>, затем инкрементирует число в коде и делает <code>SET key</code>, в условиях высокой конкуренции возникает классическое состояние гонки (Race Condition). Чтобы гарантировать строгость подсчёта, проверки оформляют в виде атомарных <strong>Lua-скриптов</strong>:</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Почему Lua в Redis гарантирует атомарность?</span>
   </div>
   <div class="callout-body">
-    <p>Почему именно Lua?<br />
-Redis выполняет Lua-скрипты атомарно. Пока выполняется скрипт, никакие другие команды от других клиентов не обрабатываются. Это гарантирует отсутствие состояния гонки (Race Condition), когда 10 подов Go одновременно пытаются прочитать лимит, увеличить его и записать обратно.</p>
+    <p>Архитектура движка Redis по умолчанию однопоточна (Single-Threaded Execution Loop). Когда Redis приступает к выполнению переданного Lua-скрипта, он гарантирует, что ни одна другая сетевая команда от других клиентов не вклинится в обработку вплоть до полного завершения скрипта.<br />
+Это даёт нам транзакционную изоляцию уровня Serializable без необходимости явных блокировок.</p>
   </div>
 </div>
 
-<p>Пример логики Lua-скрипта для Fixed Window (для простоты):</p>
+<p>Канонический Lua-скрипт для алгоритма фиксированного окна с автоматической установкой времени жизни (TTL):</p>
 
 <div class="code-block" data-lang="lua">
   <div class="code-header">
@@ -2361,50 +2444,106 @@ local limit = tonumber(ARGV[1])
 local current = redis.call(&quot;GET&quot;, key)
 
 if current and tonumber(current) &gt;= limit then
-    return 0 -- Лимит превышен (HTTP 429)
+    return 0 -- Лимит исчерпан: возвращаем отказ (HTTP 429)
 end
 
 redis.call(&quot;INCR&quot;, key)
 if not current then
-    -- Если ключ только что создан, ставим TTL 60 секунд
+    -- Если счетчик создан впервые, устанавливаем TTL 60 секунд
     redis.call(&quot;EXPIRE&quot;, key, 60)
 end
-return 1 -- Запрос разрешен (HTTP 200)
+return 1 -- Запрос одобрен (HTTP 200)
 </code></pre>
 </div>
 
-<p>В Go вы используете пакет <code>go-redis</code>, компилируете этот скрипт при старте и вызываете его через <code>EvalSha</code>, передавая <code>KEYS</code> (IP или Token) и <code>ARGV</code> (Лимит).</p>
+<p>На стороне Go для взаимодействия с Redis используется библиотека <code>go-redis</code>. Для максимальной производительности скрипт загружается в память Redis единожды при старте приложения, после чего вызывается через команду <code>EvalSha</code>, передающую лишь SHA-1 хэш скрипта, массив ключей <code>KEYS</code> (IP-адрес или идентификатор клиента) и аргументы <code>ARGV</code> (максимально допустимый лимит):</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Вызов предкомпилированного Lua-скрипта через EvalSha в go-redis
+res, err := redisClient.EvalSha(ctx, scriptSHA, []string{clientKey}, limit).Int()
+</code></pre>
+</div>
+
 <hr />
 <h2 id="arkhitekturnye-lovushki-gotchas">Архитектурные ловушки (Gotchas)</h2>
 
 <h3 id="1-podmena-x-forwarded-for-ip-spoofing">1. Подмена X-Forwarded-For (IP Spoofing)</h3>
-<p>В коде выше мы использовали <code>r.RemoteAddr</code>. Если ваш сервис стоит за балансировщиком (AWS ALB, Nginx, Envoy), <code>RemoteAddr</code> всегда будет показывать IP-адрес балансировщика! <br />
-Вам нужно читать HTTP-заголовок <code>X-Forwarded-For</code> или <code>X-Real-IP</code>. <br />
-<strong>Ловушка:</strong> Заголовки можно подделать. Если злоумышленник отправит запрос <code>X-Forwarded-For: 1.2.3.4</code>, а ваш Nginx просто допишет туда свой IP, вы заблокируете не того человека.<br />
-<strong>Решение:</strong> Настраивайте ваш Edge-прокси так, чтобы он ПЕРЕЗАПИСЫВАЛ (или строго валидировал) <code>X-Forwarded-For</code>, отбрасывая фальшивые значения от недоверенных клиентов.</p>
-<h3 id="2-tsena-raspredelennogo-limitirovaniya">2. Цена распределенного лимитирования</h3>
-<p>Делать сетевой запрос к Redis на <em>каждый</em> входящий HTTP-запрос — значит добавить от 1 до 5 мс Latency к ответу. Если Redis "моргнет", ваш Rate Limiter может положить весь кластер. <br />
-<strong>Решение:</strong> Разделяйте уровни. Защиту от DDoS по IP делайте локально в памяти на уровне API Gateway или через Service Mesh (например, Global Rate Limit Service в Envoy — см. <a href="2-envoy-i-sidecar.html" class="wikilink">2. Envoy и sidecar</a>). А в Redis проверяйте только сложные бизнес-лимиты по JWT-токенам.</p>
+<p>В нашем примере локального лимитера мы обратились к полю <code>r.RemoteAddr</code>. Однако в реальной инфраструктуре контейнеры Go всегда изолированы за сетевыми балансировщиками (AWS ALB, Cloudflare, Ingress-контроллеры Nginx или Envoy). Значение <code>r.RemoteAddr</code> будет неизменно содержать внутренний IP-адрес самого балансировщика! Если вы начнёте блокировать по этому адресу, то при первом же нарушении положите весь входящий трафик кластера.</p>
+<p>Инженеры вынуждены извлекать реальный IP клиента из HTTP-заголовков <code>X-Forwarded-For</code> или <code>X-Real-IP</code>.</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Фальсификация заголовков клиентом</span>
+  </div>
+  <div class="callout-body">
+    <p>Любой злоумышленник может отправить произвольный сырой HTTP-заголовок, например:<br />
+<code>X-Forwarded-For: 1.2.3.4</code><br />
+Если ваш пограничный прокси настроен некорректно и просто дописывает новые IP-адреса через запятую, злоумышленник сможет искусственно заблокировать любого честного пользователя или корпоративную подсеть.  </p>
+<p><strong>Решение:</strong> Edge-прокси обязан быть доверенным (Trusted Proxy). Он должен либо полностью <strong>перезаписывать</strong> заголовок <code>X-Forwarded-For</code> фактическим IP-адресом входящего TCP-соединения, либо брать строго крайний справа адрес из цепочки доверенных прокси.</p>
+  </div>
+</div>
+
+<h3 id="2-tsena-raspredelennogo-limitirovaniya-i-strategiya-fail-open">2. Цена распределенного лимитирования и стратегия Fail Open</h3>
+<p>Каждый сетевой раундтрип к Redis добавляет от 1 до 3 миллисекунд к задержке ответа. Если Redis испытывает перегрузку или его сетевой сегмент моргнул, распределённый лимитер способен утянуть на дно всю цепочку микросервисов.</p>
+<p>Как реагировать Go-приложению на сбой центрального хранилища?</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Start[&quot;Запрос к Redis EvalSha&quot;] --&gt; State{&quot;Доступен ли Redis?&quot;}
+State --&gt;|OK| Check{&quot;Лимит превышен?&quot;}
+Check --&gt;|Нет| Allow[&quot;HTTP 200 OK&quot;]
+Check --&gt;|Да| Deny[&quot;HTTP 429 Too Many Requests&quot;]
+
+State --&gt;|TIMEOUT / ERROR| Strategy{&quot;Выбор стратегии&quot;}
+Strategy --&gt;|Fail Closed| Kill[&quot;HTTP 500 Error&lt;br&gt;(Падение бизнеса)&quot;]
+Strategy --&gt;|Fail Open (Рекомендовано)| Pass[&quot;Логирование инцидента&lt;br&gt;Пропуск запроса (HTTP 200)&quot;]
+  </pre>
+</div>
+
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что делать, если Redis, хранящий счетчики Rate Limits, упал? Должен ли ваш Go-сервис возвращать ошибку 500?<br />
-<strong>Ответ:</strong> Зависит от приоритетов бизнеса. Но стандартный подход — <strong>Fail Open (Отказ с открытием)</strong>. Ограничение скорости — это некритичный бизнес-процесс (в отличие от авторизации). Если Redis недоступен, мы должны пропустить трафик, залогировав ошибку. Лучше обслужить клиента сверх лимита, чем полностью остановить продажи из-за падения инфраструктурного компонента.</p>
+    <p><strong>Вопрос:</strong> База данных Redis, хранящая счётчики Rate Limits, временно перестала отвечать по таймауту. Должен ли наш Go-сервис возвращать клиентам ошибку <code>500 Internal Server Error</code>?  </p>
+<p><strong>Ответ:</strong> За исключением критических систем безопасности, общепринятым стандартом в распределённых архитектурах является принцип <strong>Fail Open (Отказ с открытием шлюза)</strong>.<br />
+Ограничение частоты запросов — это вспомогательный защитный механизм, а не ключевая бизнес-логика. Если счётчик недоступен, мы обязаны залогировать ошибку в Sentry/Prometheus, но <strong>пропустить запрос клиента к обработчику</strong>.<br />
+Бизнес-ущерб от того, что клиент сделает на 10 запросов больше бесплатной нормы, несоизмеримо меньше катастрофы, при которой миллионы легитимных пользователей потеряют доступ к платформе из-за сбоя кэша.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog-razdela-set">Итог раздела "Сеть"</h2>
 
 <ol>
-<li><strong>Многоуровневость:</strong> Мы защищаем сервер слоями. Сначала Rate Limiting (от недобросовестных клиентов), затем Load Shedding (от глобальной перегрузки).</li>
-<li><strong>Аллокации и локи:</strong> Локальный Rate Limiter в Go — частая причина утечек памяти и Lock Contention. Используйте фоновую очистку и шардированные мапы.</li>
-<li><strong>Распределенность:</strong> Для точных бизнес-лимитов используйте Redis + Lua (для гарантии атомарности). </li>
-<li><strong>Безопасность:</strong> Никогда не доверяйте заголовкам клиента напрямую, только через настроенный Edge-прокси.</li>
+<li><strong>Эшелонированное квотирование:</strong> Мы защищаем бэкенд многослойно: сначала быстрый L4/L7 Rate Limiting отсекает недобросовестных потребителей, а при экстремальном системном стрессе аварийный Load Shedding спасает процесс от падения.</li>
+<li><strong>Опасность наивных структур:</strong> Локальный лимитер в Go обязан иметь цикл сборки устаревших ключей (TTL), иначе сервис неминуемо погибнет от утечки памяти при атаке ботов.</li>
+<li><strong>Механическое сочувствие к памяти:</strong> На высоких нагрузках глобальный <code>sync.RWMutex</code> парализует производительность из-за Lock Contention. Шардирование таблицы клиентов на 256 корзин кратно увеличивает пропускную способность.</li>
+<li><strong>Атомарность распределённых лимитов:</strong> Для согласованного контроля квот между множеством реплик в Kubernetes используется связка Redis + Lua-скрипты, вызываемые через <code>EvalSha</code>.</li>
+<li><strong>Отказоустойчивость:</strong> При деградации распределённого хранилища лимитов используйте стратегию Fail Open: стабильность клиентского сервиса всегда в приоритете.</li>
 </ol>
-<p>Мы закончили огромный раздел, посвященный сети, надежности, проксированию и защите распределенных систем. Наш код стал пуленепробиваемым. Но как нам упаковать этот код, чтобы он одинаково надежно работал и на ноутбуке разработчика, и на тысячах серверов в дата-центре? Мы переходим к фундаментальным основам инфраструктуры и развертывания. Следующий раздел и его первая статья: <a href="../07-kubernetes-i-deploy/1-konteynerizatsiya-i-docker.html" class="wikilink">1. Контейнеризация и Docker</a>.</p>
+<p>Мы завершили фундаментальный и насыщенный раздел, охватывающий сетевой стек, сервис-меши, mTLS, сетевые политики, шейпинг и квотирование трафика в распределённых системах. Теперь наш Go-код надёжен, защищён и готов к любым штормам. Но как упаковать этот сложный ансамбль сервисов так, чтобы он развёртывался предсказуемо и одинаково безупречно на ноутбуке инженера и на кластерах из тысяч физических серверов? </p>
+<p>Мы открываем новую большую главу, посвящённую контейнеризации и оркестрации. Вперёд, к следующему разделу: <a href="../07-kubernetes-i-deploy/1-konteynerizatsiya-i-docker.html" class="wikilink">1. Контейнеризация и Docker</a>!</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2432,7 +2571,7 @@ return 1 -- Запрос разрешен (HTTP 200)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#feyskontrol-dlya-vashego-api-zashchita-ot-abyuza-i-ddos">Фейсконтроль для вашего API: Защита от абьюза и DDoS</a></li><li class="toc-item toc-h2"><a href="#algoritmy-rate-limiting">Алгоритмы Rate Limiting</a></li><li class="toc-item toc-h3"><a href="#1-fixed-window-counter-schetchik-fiksirovannogo-okna">1. Fixed Window Counter (Счетчик фиксированного окна)</a></li><li class="toc-item toc-h3"><a href="#2-sliding-window-log-zhurnal-skolzyashchego-okna">2. Sliding Window Log (Журнал скользящего окна)</a></li><li class="toc-item toc-h3"><a href="#3-sliding-window-counter-schetchik-skolzyashchego-okna">3. Sliding Window Counter (Счетчик скользящего окна)</a></li><li class="toc-item toc-h3"><a href="#4-token-bucket-markernaya-korzina">4. Token Bucket (Маркерная корзина)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-in-memory-lokalnyy-rate-limiter">Реализация In-Memory (Локальный Rate Limiter)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-problema-globalnogo-myuteksa">Mechanical Sympathy: Проблема глобального мьютекса</a></li><li class="toc-item toc-h2"><a href="#raspredelennyy-rate-limiter-redis">Распределенный Rate Limiter (Redis)</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-lovushki-gotchas">Архитектурные ловушки (Gotchas)</a></li><li class="toc-item toc-h3"><a href="#1-podmena-x-forwarded-for-ip-spoofing">1. Подмена X-Forwarded-For (IP Spoofing)</a></li><li class="toc-item toc-h3"><a href="#2-tsena-raspredelennogo-limitirovaniya">2. Цена распределенного лимитирования</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-set">Итог раздела &quot;Сеть&quot;</a></li>
+    <li class="toc-item toc-h2"><a href="#feyskontrol-dlya-vashego-api-zashchita-ot-abyuza-i-ddos">Фейсконтроль для вашего API: Защита от абьюза и DDoS</a></li><li class="toc-item toc-h2"><a href="#algoritmy-rate-limiting">Алгоритмы Rate Limiting</a></li><li class="toc-item toc-h3"><a href="#1-fixed-window-counter-schyotchik-fiksirovannogo-okna">1. Fixed Window Counter (Счётчик фиксированного окна)</a></li><li class="toc-item toc-h3"><a href="#2-sliding-window-log-zhurnal-skolzyashchego-okna">2. Sliding Window Log (Журнал скользящего окна)</a></li><li class="toc-item toc-h3"><a href="#3-sliding-window-counter-schyotchik-skolzyashchego-okna">3. Sliding Window Counter (Счётчик скользящего окна)</a></li><li class="toc-item toc-h3"><a href="#4-token-bucket-markernaya-korzina">4. Token Bucket (Маркерная корзина)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-in-memory-lokalnyy-rate-limiter">Реализация In-Memory (Локальный Rate Limiter)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-problema-globalnogo-myuteksa">Mechanical Sympathy: Проблема глобального мьютекса</a></li><li class="toc-item toc-h2"><a href="#raspredelennyy-rate-limiter-redis">Распределенный Rate Limiter (Redis)</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-lovushki-gotchas">Архитектурные ловушки (Gotchas)</a></li><li class="toc-item toc-h3"><a href="#1-podmena-x-forwarded-for-ip-spoofing">1. Подмена X-Forwarded-For (IP Spoofing)</a></li><li class="toc-item toc-h3"><a href="#2-tsena-raspredelennogo-limitirovaniya-i-strategiya-fail-open">2. Цена распределенного лимитирования и стратегия Fail Open</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-set">Итог раздела &quot;Сеть&quot;</a></li>
   </ul>
 </aside>
 
