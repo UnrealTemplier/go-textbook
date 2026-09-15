@@ -2168,77 +2168,240 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~7 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Service discovery</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В старые добрые времена (эпоха bare-metal серверов) жизнь бэкенд-разработчика была предсказуемой: у тебя был сервер базы данных с IP <code>192.168.1.10</code> и сервер приложения. Ты просто прописывал эти адреса в <code>.yaml</code> конфиг, и всё работало годами.</p>
-<p>В мире микросервисов и облаков (Kubernetes, AWS, HashiCorp Nomad) статичные IP — это миф. Поды в K8s постоянно переезжают с узла на узел, перезапускаются после падений или масштабируются с 2 до 200 экземпляров за секунды. Каждый раз они получают <strong>новый динамический IP</strong>.</p>
-<p><strong>Service Discovery (Обнаружение сервисов)</strong> — это механизм, который позволяет микросервисам находить друг друга в этой динамической среде без ручной правки конфигов.</p>
+            <p>В старые добрые времена физических bare-metal серверов жизнь бэкенд-разработчика отличалась спартанским спокойствием: в серверной стойке стоял физический сервер СУБД с неизменным IP-адресом <code>192.168.1.10</code>, а рядом — два сервера приложений. Разработчик единожды прописывал эти адреса в текстовый <code>.yaml</code> конфиг, и система работала годами без малейших изменений топологии.</p>
+<p>Но в эпоху контейнеризации и динамических облачных платформ (Kubernetes, HashiCorp Nomad, AWS ECS) концепция постоянных IP-адресов окончательно ушла в прошлое. Контейнеры и поды мигрируют между физическими нодами, гибнут при нехватке памяти (OOMKilled), автоматически масштабируются горизонтально (HPA) от 3 до 300 реплик во время пиковых распродаж. Каждый вновь рожденный экземпляр получает совершенно новый эфемерный IP-адрес. Прописывать такие адреса вручную в файлы конфигураций физически невозможно.</p>
+<p><strong>Service Discovery (Обнаружение сервисов)</strong> — это фундаментальный архитектурный паттерн и инфраструктурный механизм, позволяющий микросервисам динамически находить сетевые координаты друг друга в постоянно меняющемся облачном окружении без перезапуска и ручной правки конфигураций.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph RegistryCluster[&quot;Высокодоступный реестр (Service Registry: etcd / Consul)&quot;]
+Registry[(&quot;Реестр адресов&lt;br/&gt;Payment -&gt; [10.0.1.5:8080, 10.0.2.8:8080]&quot;)]
+end
+
+subgraph ProviderInstance[&quot;Экземпляр сервиса Payment&quot;]
+P1[&quot;Payment Pod (10.0.1.5:8080)&quot;]
+end
+
+subgraph ConsumerInstance[&quot;Клиентский сервис Order&quot;]
+O1[&quot;Order Pod&quot;]
+end
+
+P1 --&gt;|&quot;1. Регистрация при старте (Register)&quot;| Registry
+P1 -.-&gt;|&quot;2. Периодический пульс (Heartbeat)&quot;| Registry
+O1 --&gt;|&quot;3. Запрос актуальных адресов (Lookup)&quot;| Registry
+Registry --&gt;|&quot;4. Список активных эндпоинтов&quot;| O1
+O1 ==&gt;|&quot;5. Прямой RPC-запрос&quot;| P1
+  </pre>
+</div>
+
+
 <hr />
-<h3 id="1-kak-eto-rabotaet-reestr-servisov">1. Как это работает: Реестр сервисов</h3>
+<h2 id="1-kak-eto-rabotaet-reestr-servisov">1. Как это работает: Реестр сервисов</h2>
 
-<p>В центре любой системы Discovery стоит <strong>Service Registry</strong> (Реестр сервисов) — высокодоступная база данных (обычно на базе консенсуса Raft, как <code>etcd</code> или <code>Consul</code>), которая хранит актуальную карту сети.</p>
-<p>Процесс состоит из трех фаз:<br />
-1.  <strong>Registration (Регистрация):</strong> Когда сервис <code>Payment</code> запускается, он сообщает реестру: «Я — Payment-сервис, мой адрес 10.0.45.12, порт 8080».<br />
-2.  <strong>Health Check (Проверка здоровья):</strong> Реестр периодически опрашивает сервис: «Ты жив?». Если сервис не отвечает (или упал по OOM), реестр вычеркивает его из списка.<br />
-3.  <strong>Lookup (Поиск):</strong> Когда сервису <code>Order</code> нужно вызвать <code>Payment</code>, он спрашивает реестр: «Дай мне список живых адресов Payment».</p>
+<p>В эпицентре любой распределенной системы обнаружения находится <strong>Service Registry</strong> (Реестр сервисов). Это распределенная, отказоустойчивая база данных (обычно работающая на базе алгоритма консенсуса Raft, такая как <code>etcd</code> или <code>Consul</code>), выполняющая роль актуальной телефонной книги кластера.</p>
+<p>Жизненный цикл взаимодействия состоит из трех ключевых этапов:</p>
+<ol>
+<li><strong>Регистрация (Registration):</strong> В момент инициализации процесс сервиса <code>Payment</code> обращается к реестру и сообщает: «Я экземпляр сервиса <code>Payment</code>, мой сетевой адрес <code>10.0.1.5</code>, порт <code>8080</code>». Запись снабжается временным сертификатом аренды (Lease / TTL).</li>
+<li><strong>Проверка жизнеспособности (Health Check / Heartbeat):</strong> Сервис обязан каждые несколько секунд подтверждать свой статус («пульс» или TTL keep-alive). Если процесс завис в dead-lock или аварийно завершился, аренда истекает, и реестр автоматически вычеркивает мертвый узел из маршрутной карты.</li>
+<li><strong>Обнаружение (Lookup):</strong> Когда сервису <code>Order</code> требуется провести транзакцию через <code>Payment</code>, он запрашивает у реестра перечень всех активных реплик и получает актуальный срез IP-адресов для балансировки.</li>
+</ol>
 <hr />
-<h3 id="2-klientskoe-vs-servernoe-obnaruzhenie">2. Клиентское vs Серверное обнаружение</h3>
+<h2 id="2-klientskoe-vs-servernoe-obnaruzhenie">2. Клиентское vs Серверное обнаружение</h2>
 
-<h4 id="client-side-discovery">Client-Side Discovery</h4>
-<p>Клиент (твой Go-код) сам идет в реестр, получает список IP и <strong>сам выбирает</strong>, на какой из них отправить запрос (используя алгоритмы балансировки вроде Round Robin).<br />
-* <strong>Инструменты:</strong> Netflix Eureka, HashiCorp Consul.<br />
-* <strong>Плюсы:</strong> Нет лишнего сетевого прыжка (hop).<br />
-* <strong>Минусы:</strong> В каждый сервис нужно тащить библиотеку для работы с реестром.</p>
-<h4 id="server-side-discovery">Server-Side Discovery</h4>
-<p>Клиент отправляет запрос на <strong>Load Balancer</strong> (например, Nginx или AWS ELB). Балансировщик сам спрашивает реестр и перенаправляет запрос на нужный узел.<br />
-* <strong>Инструменты:</strong> Kubernetes Services, AWS ALB, Nginx Plus.<br />
-* <strong>Плюсы:</strong> Клиент вообще не знает о существовании Discovery. Код остается чистым.<br />
-* <strong>Минусы:</strong> Лишний узел в сети, который может стать узким местом.</p>
+<p>В зависимости от того, на чьи плечи ложится обязанность обращения в реестр и выбора конкретного узла, архитектура разделяется на два диаметральных подхода:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph ClientSide[&quot;Client-Side Discovery (Клиентская балансировка)&quot;]
+C1[&quot;Go Client&quot;] --&gt;|&quot;1. Lookup&quot;| Reg1[(&quot;Service Registry&quot;)]
+Reg1 --&gt;|&quot;2. IP List&quot;| C1
+C1 --&gt;|&quot;3. Прямой запрос (Round-Robin)&quot;| PodA[&quot;Pod 1&quot;]
+C1 -.-&gt; PodB[&quot;Pod 2&quot;]
+end
+
+subgraph ServerSide[&quot;Server-Side Discovery (Серверная балансировка)&quot;]
+C2[&quot;Go Client&quot;] --&gt;|&quot;1. Запрос на виртуальный адрес&quot;| LB[&quot;Load Balancer / Kube-Proxy&quot;]
+LB &lt;--&gt;|&quot;Синхронизация&quot;| Reg2[(&quot;Service Registry&quot;)]
+LB --&gt;|&quot;2. Проксирование&quot;| PodC[&quot;Pod 1&quot;]
+LB -.-&gt; PodD[&quot;Pod 2&quot;]
+end
+  </pre>
+</div>
+
+
+<h3 id="client-side-discovery">Client-Side Discovery</h3>
+<p>В модели обнаружения на стороне клиента само вызывающее приложение (ваш Go-код или встроенная клиентская библиотека) берет на себя всю координацию:<br />
+- Клиент обращается в реестр (Consul / Eureka), забирает полный список инстансов целевого сервиса и кэширует его в оперативной памяти.<br />
+- При каждом сетевом вызове клиентский балансировщик выбирает конкретный IP (по алгоритмам Round Robin, Power of Two Choices или Least Connections) и шлет пакет напрямую на целевой сокет.<br />
+- <strong>Инструменты:</strong> Netflix Ribbon/Eureka, HashiCorp Consul SDK, нативные gRPC-резолверы (<code>resolver.Builder</code> в Go).<br />
+- <strong>Плюсы:</strong> Отсутствие промежуточных сетевых узлов (hops), минимальная задержка (микросекунды), тонкий контроль балансировки прямо из Go-кода.<br />
+- <strong>Минусы:</strong> Логика обнаружения внедряется в каждый микросервис, раздувая клиентский стек и усложняя поддержку при наличии зоопарка языков (Go, Python, Java).</p>
+<h3 id="server-side-discovery">Server-Side Discovery</h3>
+<p>Клиент ничего не знает о динамической топологии сети. Он отправляет запрос на стабильный виртуальный хостнейм или промежуточный балансировщик (Load Balancer).<br />
+- Балансировщик непрерывно синхронизирует таблицу маршрутизации с реестром и берет на себя диспетчеризацию входящего трафика.<br />
+- <strong>Инструменты:</strong> Kubernetes Services (Kube-proxy), AWS ALB, Envoy Proxy, Nginx.<br />
+- <strong>Плюсы:</strong> Абсолютная прозрачность для кода микросервиса. Клиент использует стандартные библиотеки <code>net/http</code> без внешних зависимостей.<br />
+- <strong>Минусы:</strong> Дополнительный промежуточный сетевой прыжок, увеличивающий сетевую задержку и требующий масштабирования самого балансировщика.</p>
 <hr />
-<h3 id="3-service-discovery-v-kubernetes">3. Service Discovery в Kubernetes</h3>
+<h2 id="3-service-discovery-v-kubernetes">3. Service Discovery в Kubernetes</h2>
 
-<p>Если ты работаешь в K8s, ты используешь Service Discovery каждую секунду, даже не замечая этого. Здесь он реализован через <strong>CoreDNS</strong> и <strong>Services</strong>.</p>
-<p>Когда ты создаешь объект <code>Service</code> с именем <code>auth-srv</code>, Kubernetes выделяет ему стабильный виртуальный IP (ClusterIP) и создает запись в DNS. Твой Go-код просто делает запрос на <code>http://auth-srv:8080</code>.<br />
-* <strong>Kube-proxy:</strong> Следит за тем, чтобы трафик, пришедший на виртуальный IP, попал на реальный IP одного из живых подов.</p>
+<p>Если ваш микросервисный стек развернут в оркестраторе Kubernetes, вы непрерывно используете Service Discovery, даже не задумываясь об этом. Механизм прозрачно реализован через тандем <strong>CoreDNS</strong> и абстракцию <strong>Service</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Client[&quot;Go App&quot;] --&gt;|&quot;DNS Resolve: auth-srv&quot;| DNS[&quot;CoreDNS&quot;]
+DNS --&gt;|&quot;Virtual IP: 10.96.0.10&quot;| Client
+Client --&gt;|&quot;TCP Syn: 10.96.0.10:8080&quot;| KP[&quot;Linux Kernel&lt;br/&gt;(kube-proxy iptables / IPVS / eBPF)&quot;]
+KP --&gt;|&quot;DNAT на реальный Pod&quot;| RealPod[&quot;auth-srv Pod&lt;br/&gt;(10.244.2.15:8080)&quot;]
+  </pre>
+</div>
+
+
+<p>Когда манифест определяет абстрактный ресурс <code>Service</code> с именем <code>auth-srv</code>, Kubernetes выполняет следующее:<br />
+1. Выделяет стабильный виртуальный IP-адрес из диапазона сервисов (ClusterIP), который никогда не меняется на протяжении жизни манифеста.<br />
+2. Внутренний DNS-сервер CoreDNS связывает имя <code>auth-srv</code> с выделенным ClusterIP.<br />
+3. Ваш Go-сервис просто выполняет вызов по адресу <code>http://auth-srv:8080</code>.<br />
+4. Демон <strong>kube-proxy</strong>, используя возможности ядра Linux (цепочки <code>iptables</code>, хеш-таблицы <code>IPVS</code> или eBPF-программы в современных CNI вроде Cilium), перехватывает пакеты, направленные на виртуальный ClusterIP, и на лету подменяет адрес назначения (<code>DNAT</code>) на реальный эфемерный IP одного из живых подов.</p>
 <hr />
-<h3 id="4-mechanical-sympathy-registratsiya-i-graceful-shutdown-v-go">4. Mechanical Sympathy: Регистрация и Graceful Shutdown в Go</h3>
+<h2 id="4-mechanical-sympathy-registratsiya-i-graceful-shutdown-v-go">4. Mechanical Sympathy: Регистрация и Graceful Shutdown в Go</h2>
 
-<p>При написании сервиса на Go важно не просто «зарегистрироваться», но и правильно «разрегистрироваться» (Deregister). Если твой сервис упал (panic) или деплоится новая версия, он не должен висеть в реестре как живой, заставляя других клиентов получать ошибки <code>Connection Refused</code>.</p>
-<p>Идиоматичный подход в Go — ловить системные сигналы (<code>SIGTERM</code>, <code>SIGINT</code>) и явно сообщать реестру об уходе со сцены.</p>
-<p>```go<br />
-func main() {<br />
-    // 1. Регистрация в Consul/etcd<br />
-    registry.Register("order-service", "10.0.1.5", 8080)</p>
-<pre><code>stop := make(chan os.Signal, 1)
-signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+<p>В распределенной системе недостаточно просто корректно зарегистрироваться в реестре при старте. Куда важнее — <strong>вовремя и дисциплинированно разрегистрироваться (Deregister)</strong> при завершении работы.</p>
+<p>Если под в Kubernetes получает команду на завершение (например, при деплое новой версии), а процесс Go мгновенно схлопывается, в реестре еще некоторое время (до истечения таймаута Health Check) остается запись о мертвом инстансе. Клиенты, продолжая слать туда запросы, будут сталкиваться с пачками системных ошибок <code>Connection Refused</code>.</p>
+<p>Идиоматичный паттерн в продакшене Go — перехват системных сигналов операционной системы (<code>SIGTERM</code>, <code>SIGINT</code>) и реализация строгого двухфазного Graceful Shutdown:</p>
 
-// Блокируемся до получения сигнала
-&lt;-stop
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
 
-// 2. Graceful Shutdown
-log.Println("Stopping service...")
+import (
+    &quot;context&quot;
+    &quot;log&quot;
+    &quot;net/http&quot;
+    &quot;os&quot;
+    &quot;os/signal&quot;
+    &quot;syscall&quot;
+    &quot;time&quot;
+)
 
-// Удаляем себя из списка ДО остановки сервера
-registry.Deregister("order-service")
+func main() {
+    server := &amp;http.Server{Addr: &quot;:8080&quot;}
 
-// Даем серверу время дообработать текущие запросы
-server.Shutdown(context.Background())
+    // 1. Регистрация в реестре (Consul / etcd)
+    // registry.Register(&quot;order-service&quot;, &quot;10.0.1.5&quot;, 8080)
+
+    // Канал для перехвата сигналов ОС
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+
+    go func() {
+        if err := server.ListenAndServe(); err != nil &amp;&amp; err != http.ErrServerClosed {
+            log.Fatalf(&quot;Listen error: %v&quot;, err)
+        }
+    }()
+
+    // Блокируем горутину до получения сигнала остановки
+    &lt;-stop
+    log.Println(&quot;Получен сигнал завершения. Начинаем Graceful Shutdown...&quot;)
+
+    // 2. ФАЗА 1: Немедленная разрегистрация в Service Discovery
+    // Сообщаем реестру, чтобы клиенты прекратили слать нам новые запросы
+    // registry.Deregister(&quot;order-service&quot;)
+
+    // Небольшая пауза для распространения обновления по сети и сброса кэшей
+    time.Sleep(2 * time.Second)
+
+    // 3. ФАЗА 2: Остановка HTTP-сервера с контекстом дедлайна
+    // Даем 10 секунд на корректное завершение уже выполняющихся запросов
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    if err := server.Shutdown(ctx); err != nil {
+        log.Printf(&quot;Принудительное завершение сервера: %v&quot;, err)
+    }
+
+    log.Println(&quot;Сервер успешно остановлен без потери клиентских соединений.&quot;)
+}
 </code></pre>
-<p>}<br />
-````</p>
+</div>
+
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Ротация и DNS Caching в Go</span>
+  </div>
+  <div class="callout-body">
+    <p>По умолчанию резолвер в стандартном пакете Go <code>net</code> кэширует DNS-ответы операционной системы. Если ваше приложение обращается к соседнему сервису через имя хоста, убедитесь, что вы не удерживаете постоянный TCP-коннект к одному-единственному поду вечно, игнорируя появление новых реплик. Настройка <code>MaxIdleConnsPerHost</code> и периодический <code>IdleConnTimeout</code> в <code>http.Transport</code> заставляют Go корректно балансировать трафик по всему динамическому пулу инстансов.</p>
+  </div>
+</div>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> В чем разница между Client-Side и Server-Side Discovery и что выбрать для микросервисов на Go?<br />
+<strong>Ответ:</strong> При Server-Side Discovery (Kubernetes Service) архитектура проще: код на Go чист от инфраструктурных библиотек, а маршрутизацию берет на себя платформа. <br />
+Однако при переходе на высокопроизводительный gRPC и стриминг через HTTP/2 стандартный L4-балансировщик Kube-proxy оказывается бессилен: он открывает одно TCP-соединение на один под и шлет туда весь трафик. Для полноценной балансировки gRPC-стримов в Go применяют либо <strong>Client-Side Discovery</strong> (через gRPC headless service resolver), либо <strong>Service Mesh</strong> (Envoy sidecar proxy), распределяющий вызовы на L7-уровне.</p>
+  </div>
+</div>
+
 <hr />
-<h3 id="5-itog">5. Итог</h3>
+<h2 id="5-itog">5. Итог</h2>
 
 <ol>
-<li><strong>Service Discovery</strong> — это «телефонная книга» для микросервисов в динамических средах.</li>
-<li><strong>Kubernetes</strong> делает это прозрачно через DNS, но для сложных сценариев (например, multi-cluster) часто используют <strong>Consul</strong> или <strong>Istio</strong>.</li>
-<li>В Go-приложении всегда реализуй <strong>Graceful Shutdown</strong>, чтобы реестр не забивался «зомби-адресами» упавших инстансов.</li>
+<li><strong>Service Discovery</strong> — это динамическая «телефонная книга» и навигатор распределенной системы, обеспечивающий бесшовную маршрутизацию в условиях постоянного масштабирования и сбоев.</li>
+<li><strong>Kubernetes</strong> предоставляет Server-Side Discovery из коробки через связку CoreDNS, ClusterIP и Kube-proxy, снимая рутину маршрутизации с прикладного разработчика.</li>
+<li>При построении высоконагруженных gRPC-кластеров на Go приоритет смещается в сторону клиентской балансировки или L7 Service Mesh для честного распределения HTTP/2-потоков.</li>
+<li><strong>Graceful Shutdown</strong> в связке с явной разрегистрацией в реестре при сигналах <code>SIGTERM</code> / <code>SIGINT</code> — железное правило предотвращения ошибок <code>Connection Refused</code> во время плановых релизов.</li>
 </ol>
+<p>Но даже когда сервисы умеют моментально находить друг друга по сети, им необходимо знать, с какими параметрами, флагами и лимитами работать. Как доставлять актуальные настройки в сотни работающих подов без перезапуска приложений? Об этом мы поговорим в следующей статье: <a href="9-configuration-management.html" class="wikilink">9. Configuration management</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2266,7 +2429,7 @@ server.Shutdown(context.Background())
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h3"><a href="#1-kak-eto-rabotaet-reestr-servisov">1. Как это работает: Реестр сервисов</a></li><li class="toc-item toc-h3"><a href="#2-klientskoe-vs-servernoe-obnaruzhenie">2. Клиентское vs Серверное обнаружение</a></li><li class="toc-item toc-h4"><a href="#client-side-discovery">Client-Side Discovery</a></li><li class="toc-item toc-h4"><a href="#server-side-discovery">Server-Side Discovery</a></li><li class="toc-item toc-h3"><a href="#3-service-discovery-v-kubernetes">3. Service Discovery в Kubernetes</a></li><li class="toc-item toc-h3"><a href="#4-mechanical-sympathy-registratsiya-i-graceful-shutdown-v-go">4. Mechanical Sympathy: Регистрация и Graceful Shutdown в Go</a></li><li class="toc-item toc-h3"><a href="#5-itog">5. Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-kak-eto-rabotaet-reestr-servisov">1. Как это работает: Реестр сервисов</a></li><li class="toc-item toc-h2"><a href="#2-klientskoe-vs-servernoe-obnaruzhenie">2. Клиентское vs Серверное обнаружение</a></li><li class="toc-item toc-h3"><a href="#client-side-discovery">Client-Side Discovery</a></li><li class="toc-item toc-h3"><a href="#server-side-discovery">Server-Side Discovery</a></li><li class="toc-item toc-h2"><a href="#3-service-discovery-v-kubernetes">3. Service Discovery в Kubernetes</a></li><li class="toc-item toc-h2"><a href="#4-mechanical-sympathy-registratsiya-i-graceful-shutdown-v-go">4. Mechanical Sympathy: Регистрация и Graceful Shutdown в Go</a></li><li class="toc-item toc-h2"><a href="#5-itog">5. Итог</a></li>
   </ul>
 </aside>
 
