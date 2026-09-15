@@ -2168,31 +2168,63 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Inbox pattern</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье (<a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>) мы решили фундаментальную проблему на стороне отправителя: как гарантированно сохранить данные в базу и отправить событие в брокер, не став жертвой частичного сбоя (Dual Write). Outbox дает нам железобетонную гарантию <strong>At-least-once доставки</strong> от Продюсера до брокера.</p>
-<p>Но как мы помним из статьи <a href="../01-fundament-asinkhronnosti/4-modeli-dostavki-at-most-once-at-least-once-exactly-on.html" class="wikilink">4. Модели доставки. At most once, at least once, exactly once</a>, семантика At-least-once означает, что наш Консьюмер неизбежно столкнется с дубликатами. Сеть может оборваться на этапе отправки <code>Ack</code>, брокер может пережить failover, или сам Консьюмер может упасть по OOM сразу после записи в БД, но до подтверждения сообщения.</p>
-<p>Чтобы не списать деньги с клиента дважды, мы обязаны сделать Консьюмер идемпотентным (<a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>). И если Outbox — это меч для надежной отправки, то <strong>Inbox Pattern (Входящие сообщения)</strong> — это наш щит для надежного приема. </p>
-<p>Вместе эти два паттерна формируют "Святой Грааль" распределенных систем: <strong>Effectively-once processing (Эффективная обработка ровно один раз)</strong> на уровне приложения.</p>
+            <h1>7. Transactional Inbox: надежная дедупликация и Effectively-Once семантика</h1>
+<blockquote>
+<p><em>"Idempotence is the ultimate defense in distributed systems. If doing something twice produces the same result as doing it once, network retries cease to be dangerous."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> В <a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a> мы создали несокрушимый механизм гарантированной отправки событий на стороне продюсера (At-least-once). Однако сетевые сбои, повторные ретраи брокера и падения подов консьюмера неизбежно приводят к дубликатам сообщений. В этой лекции мы изучим зеркальный защитный щит — <strong>Transactional Inbox (Входящий ящик)</strong>, подробно разберем механику дедупликации на уровне транзакций базы данных и добьемся семантики <strong>Effectively-once processing</strong>. В следующей лекции мы перейдем к оркестрации распределенных шагов: <a href="8-saga-cherez-brokery.html" class="wikilink">8. Saga через брокеры</a>.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="problema-dublikatov-v-asinkhronnom-mire">Проблема дубликатов в асинхронном мире</h2>
+
+<p>В распределенных системах действуют суровые законы физики: невозможно построить абсолютно надежную сеть. </p>
+<p>Паттерн <a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a> гарантирует, что продюсер отправит событие в брокер как минимум один раз (<strong>At-least-once delivery</strong>). Но что происходит на принимающей стороне?</p>
+<p>Рассмотрим типичные сбои на консьюмере:<br />
+1. Консьюмер вычитал сообщение из Kafka или RabbitMQ, списал деньги со счета клиента в базе данных, но в момент отправки сетевого подтверждения (<code>Ack</code>) оборвался кабель или упал свитч. Брокер посчитает консьюмера мертвым и переотправит то же самое сообщение другой реплике;<br />
+2. Go-процесс консьюмера завершился по OOM Killer сразу после коммита в СУБД, не успев отправить <code>Ack</code>;<br />
+3. Процесс ребалансировки партиций в Kafka (Rebalance) привел к повторной выдаче еще не закоммиченных смещений.</p>
+<p>Если наш обработчик наивен, он выполнит бизнес-логику повторно и спишет деньги дважды. Для пользователя и бизнеса это катастрофа.</p>
+<p>Чтобы избежать этого, обработчик обязан быть <strong>идемпотентным</strong> (см. <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>). И если Outbox — это меч для надежной отправки, то <strong>Inbox Pattern (Входящие сообщения)</strong> — это наш надежный щит на стороне приема. Вместе они формируют стандарт надежности: <strong>Effectively-once processing (Обработка ровно один раз на прикладном уровне)</strong>.</p>
+<hr />
 <h2 id="anatomiya-patterna-inbox">Анатомия паттерна Inbox</h2>
 
-<p>Суть паттерна Inbox симметрична паттерну Outbox: мы используем локальные ACID-транзакции реляционной БД (PostgreSQL/MySQL), чтобы атомарно объединить проверку на дубликат и выполнение бизнес-логики.</p>
-<p>Вместо того чтобы размазывать логику дедупликации по бизнес-таблицам (добавляя колонки <code>last_processed_msg_id</code> к каждому агрегату), мы выделяем специальную инфраструктурную таблицу — <code>inbox</code> (входящие ящики).</p>
-<p><strong>Алгоритм работы консьюмера:</strong><br />
-1. Получаем сообщение из брокера (RabbitMQ/Kafka).<br />
-2. Открываем транзакцию в БД (<code>BEGIN</code>).<br />
-3. Пытаемся записать ID сообщения в таблицу <code>inbox</code>.<br />
-4. <strong>Ветвление:</strong><br />
-   * Если база возвращает ошибку уникальности (Unique Constraint Violation) — это дубликат! Сообщение уже было обработано. Мы прерываем выполнение, делаем <code>ROLLBACK</code> транзакции (или просто ничего не делаем, если использовали <code>ON CONFLICT DO NOTHING</code>), и самое важное — <strong>возвращаем <code>Ack</code> брокеру</strong>, чтобы он отстал от нас.<br />
-   * Если запись прошла успешно, мы находимся внутри защищенной транзакции.<br />
-5. Выполняем бизнес-логику (например, <code>UPDATE balances</code>).<br />
-6. Фиксируем транзакцию (<code>COMMIT</code>).<br />
-7. Отправляем <code>Ack</code> брокеру.</p>
+<p>Суть паттерна Inbox абсолютно симметрична паттерну Outbox: мы используем строгие свойства локальных ACID-транзакций реляционной базы данных (PostgreSQL/MySQL), чтобы <strong>атомарно объединить дедупликацию и выполнение бизнес-логики</strong>.</p>
+<pre><code>    Бытовая аналогия паттерна Inbox:
+    В канцелярию компании поступает входящее письмо. Секретарь ставит на конверт 
+    штамп регистрации: «Входящий №123 от 15.09.2026». 
+    Если через час курьер по ошибке привозит дубликат той же накладной, секретарь 
+    смотрит в журнал, видит, что №123 уже зарегистрирован и передан в бухгалтерию, 
+    расписывается курьеру в доставке (Ack), а дубликат отправляет в корзину.
+</code></pre>
+<p>Вместо того чтобы размазывать проверки на дубликаты по всем бизнес-таблицам (добавляя колонки <code>last_processed_msg_id</code> к каждому агрегату), мы создаем единую инфраструктурную таблицу — <code>inbox</code> (журнал входящих сообщений).</p>
+<h3 id="poshagovyy-algoritm-raboty-konsyumera">Пошаговый алгоритм работы консьюмера:</h3>
+<ol>
+<li>Получаем сообщение с уникальным <code>message_id</code> из брокера;</li>
+<li>Открываем транзакцию в базе данных (<code>BEGIN</code>);</li>
+<li>Пытаемся вставить <code>message_id</code> в таблицу <code>inbox</code>;</li>
+<li><strong>Анализ конфликта:</strong><br />
+   - Если база данных сообщает о нарушении уникальности (Primary Key / Unique Constraint Violation) — это дубликат! Сообщение уже было обработано ранее. Мы прерываем транзакцию (<code>ROLLBACK</code> или используем <code>ON CONFLICT DO NOTHING</code>) и немедленно <strong>отправляем <code>Ack</code> брокеру</strong>, чтобы он удалил дубликат из очереди;<br />
+   - Если запись добавлена успешно — мы первыми захватили право на обработку сообщения в рамках открытой транзакции;</li>
+<li>Выполняем бизнес-логику (например, <code>UPDATE balances SET amount = amount - 100</code>);</li>
+<li>Фиксируем транзакцию (<code>COMMIT</code>);</li>
+<li>Отправляем подтверждение (<code>Ack</code>) брокеру сообщений.</li>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2207,34 +2239,50 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Брокер сообщений&quot;] --&gt;|&quot;Доставка сообщения ID: 123&quot;| B[&quot;Go-консьюмер&quot;]
-B --&gt; C{&quot;Начало транзакции&lt;br&gt;BEGIN&quot;}
-C --&gt; D[&quot;INSERT INTO inbox ID: 123&quot;]
-D --&gt;|&quot;Конфликт PK&lt;br&gt;Дубликат&quot;| E[&quot;Игнорируем бизнес-логику&quot;]
-E --&gt; F[&quot;Отправка Ack брокеру&quot;]
-D --&gt;|&quot;Успех&lt;br&gt;Новое сообщение&quot;| G[&quot;Выполнение бизнес-логики&lt;br&gt;UPDATE balances&quot;]
-G --&gt; H[&quot;Фиксация транзакции&lt;br&gt;COMMIT&quot;]
+A[&quot;Брокер сообщений&lt;br&gt;(Kafka / RabbitMQ / NATS)&quot;] --&gt;|&quot;1. Доставка сообщения (ID: 123)&quot;| B[&quot;Go Consumer Worker&quot;]
+B --&gt; C{&quot;2. BEGIN Transaction&quot;}
+C --&gt; D[&quot;3. INSERT INTO inbox (message_id: 123)&quot;]
+
+D --&gt;|&quot;Конфликт PK (Дубликат!)&quot;| E[&quot;4a. Пропуск бизнес-логики&quot;]
+E --&gt; F[&quot;7. Отправка Ack в брокер&lt;br&gt;(Снятие с очереди)&quot;]
+
+D --&gt;|&quot;Успешная вставка (Новое событие)&quot;| G[&quot;4b. Выполнение бизнес-логики&lt;br&gt;(UPDATE balances)&quot;]
+G --&gt; H[&quot;5. COMMIT Transaction&quot;]
 H --&gt; F
+
+style A fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style B fill:#131d33,stroke:#6366f1,stroke-width:2px
+style D fill:#1e293b,stroke:#f59e0b,stroke-width:2px
+style G fill:#1e293b,stroke:#10b981,stroke-width:2px
+style F fill:#064e3b,stroke:#10b981,stroke-width:2px
   </pre>
 </div>
 
 
+<hr />
+<h2 id="mechanical-sympathy-isklyuchenie-sostoyaniya-gonki-na-urovne-yadra-subd">Mechanical Sympathy: Исключение состояния гонки на уровне ядра СУБД</h2>
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Mechanical Sympathy и состояния гонки</span>
+    <span class="callout-title">Под капотом: Row-level locks, B-Tree и параллельные воркеры</span>
   </div>
   <div class="callout-body">
-    <p>Что произойдет, если брокер сойдет с ума и отправит два абсолютно одинаковых сообщения двум разным Go-воркерам <em>одновременно</em>? <br />
-На уровне рантайма Go обе горутины параллельно дойдут до шага <code>INSERT INTO inbox</code>. <br />
-Ядро PostgreSQL при обработке <code>INSERT</code> обращается к B-Tree индексу первичного ключа. Первая транзакция, успевшая захватить блокировку строки (Row-level lock) или страницы индекса, запишет значение <code>123</code>. <br />
-Вторая транзакция попытается записать то же значение и <strong>будет заблокирована</strong> на уровне ядра ОС/СУБД, ожидая завершения первой транзакции. Как только первая сделает <code>COMMIT</code>, вторая мгновенно "проснется", получит ошибку <code>duplicate key value violates unique constraint</code> и безопасно завершит работу. Состояние гонки (Race Condition) математически исключено архитектурой СУБД.</p>
+    <p>Что произойдет, если брокер из-за сетевого дребезга доставит два идентичных сообщения двум параллельным воркерам на Go в одну и ту же миллисекунду?  </p>
+<p>На уровне рантайма Go обе горутины параллельно отправят в СУБД команду <code>INSERT INTO inbox</code>.<br />
+Ядро PostgreSQL при обработке вставки обращается к B-Tree индексу первичного ключа <code>message_id</code>:<br />
+1. Первая транзакция захватывает эксклюзивную блокировку строки (<strong>Row-level lock</strong>) и вставляет кортеж;<br />
+2. Вторая транзакция пытается вставить то же значение первичного ключа и <strong>блокируется ядром СУБД</strong>, ожидая разрешения первой транзакции;<br />
+3. Когда первая транзакция делает <code>COMMIT</code>, вторая мгновенно разблокируется и генерирует ошибку:<br />
+<code>duplicate key value violates unique constraint</code>.  </p>
+<p>Состояние гонки (<strong>Race Condition</strong>) математически исключено на уровне механизмов изоляции транзакций СУБД!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="idiomatichnyy-go-realizatsiya-inbox">Идиоматичный Go: Реализация Inbox</h2>
 
-<p>Для реализации нам потребуется таблица:</p>
+<p>Для реализации создается компактная таблица в реляционной базе данных:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2252,7 +2300,7 @@ H --&gt; F
 </code></pre>
 </div>
 
-<p>Код на Go должен строго соблюдать границы транзакции и правильно обрабатывать конфликты. Мы будем использовать конструкцию <code>ON CONFLICT DO NOTHING</code>, которая позволяет избежать "грязных" ошибок транзакции и элегантно обработать дубликат.</p>
+<p>В коде на Go мы используем идиоматичную конструкцию <code>ON CONFLICT (message_id) DO NOTHING</code> с клаузой <code>RETURNING message_id</code>. Это избавляет от необходимости обрабатывать системные ошибки базы данных и позволяет обнаружить дубликат за один сетевой round-trip к СУБД:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2270,7 +2318,7 @@ import (
     &quot;fmt&quot;
 )
 
-// Message - абстрактное входящее сообщение
+// Message представляет абстрактное входящее сообщение брокера
 type Message struct {
     ID      string
     Topic   string
@@ -2281,17 +2329,20 @@ type OrderProcessor struct {
     db *sql.DB
 }
 
-// ProcessMessage вызывается воркер-пулом на каждое сообщение
+func NewOrderProcessor(db *sql.DB) *OrderProcessor {
+    return &amp;OrderProcessor{db: db}
+}
+
+// ProcessMessage вызывается воркером консьюмера на каждое полученное сообщение
 func (p *OrderProcessor) ProcessMessage(ctx context.Context, msg Message) error {
     tx, err := p.db.BeginTx(ctx, nil)
     if err != nil {
         return fmt.Errorf(&quot;begin tx: %w&quot;, err)
     }
-    // Гарантируем откат в случае паники или ошибки
-    defer tx.Rollback() 
+    defer tx.Rollback() // Гарантированный откат при панике или ошибке
 
-    // 1. Атомарная проверка Inbox (Дедупликация)
-    // RETURNING message_id вернет значение только если произошел реальный INSERT
+    // 1. Атомарная проверка Inbox на дубликат:
+    // RETURNING message_id вернет непустое значение ТОЛЬКО если произошла реальная вставка.
     var insertedID string
     err = tx.QueryRowContext(ctx, `
         INSERT INTO inbox (message_id, topic) 
@@ -2302,22 +2353,22 @@ func (p *OrderProcessor) ProcessMessage(ctx context.Context, msg Message) error 
 
     if err != nil {
         if err == sql.ErrNoRows {
-            // Это дубликат! Строка не была вставлена.
-            // Возвращаем nil, чтобы консьюмер сделал msg.Ack() и удалил его из брокера
+            // Это дубликат! Строка уже была вставлена предыдущей успешной транзакцией.
+            // Возвращаем nil: воркер спокойно отправит Ack брокеру и удалит дубль из очереди.
             return nil 
         }
-        return fmt.Errorf(&quot;inbox check failed: %w&quot;, err)
+        return fmt.Errorf(&quot;ошибка проверки inbox: %w&quot;, err)
     }
 
-    // 2. Выполнение бизнес-логики (безопасно, мы знаем, что мы первые)
+    // 2. Выполнение бизнес-логики: мы гарантированно первые и единственные обработчики!
     err = p.applyBusinessLogic(ctx, tx, msg.Payload)
     if err != nil {
-        // Ошибка бизнес-логики (например, нет денег на счету)
-        // Возвращаем ошибку. Консьюмер сделает Nack/DLQ.
-        return fmt.Errorf(&quot;business logic failed: %w&quot;, err)
+        // Ошибка бизнес-инвариантов: возвращаем ошибку.
+        // Транзакция откатится (включая запись в inbox), консьюмер сделает Nack/DLQ.
+        return fmt.Errorf(&quot;ошибка бизнес-логики: %w&quot;, err)
     }
 
-    // 3. Коммит транзакции
+    // 3. Атомарная фиксация транзакции: бизнес-данные и inbox коммитятся вместе
     if err := tx.Commit(); err != nil {
         return fmt.Errorf(&quot;commit tx: %w&quot;, err)
     }
@@ -2326,9 +2377,10 @@ func (p *OrderProcessor) ProcessMessage(ctx context.Context, msg Message) error 
 }
 
 func (p *OrderProcessor) applyBusinessLogic(ctx context.Context, tx *sql.Tx, payload []byte) error {
-    // Здесь выполняются UPDATE/INSERT бизнес-сущностей, 
-    // строго используя переданный *sql.Tx
-    return nil
+    // Бизнес-логика модификации счетов, заказов или остатков.
+    // КРИТИЧЕСКИ ВАЖНО: запросы обязаны выполняться СТРОГО через переданный *sql.Tx!
+    _, err := tx.ExecContext(ctx, &quot;UPDATE balances SET amount = amount - 100 WHERE account_id = $1&quot;, 42)
+    return err
 }
 </code></pre>
 </div>
@@ -2336,39 +2388,66 @@ func (p *OrderProcessor) applyBusinessLogic(ctx context.Context, tx *sql.Tx, pay
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Чужой `Tx`</span>
+    <span class="callout-title">Ловушка / Gotcha: Чужой коннект к базе (`db` вместо `tx`)</span>
   </div>
   <div class="callout-body">
-    <p>Классическая ошибка Middle-разработчиков: передать внутрь <code>applyBusinessLogic</code> не саму транзакцию <code>tx</code>, а пул соединений <code>p.db</code> (или случайно использовать его внутри). В этом случае <code>INSERT</code> в <code>inbox</code> и бизнес-апдейты произойдут в <strong>разных</strong> транзакциях. Если бизнес-апдейт упадет, <code>inbox</code> может остаться закоммиченным (или наоборот), навсегда "отравив" это сообщение (оно будет считаться обработанным, хотя бизнес-логика не выполнилась). В Go всегда явно пробрасывайте <code>*sql.Tx</code> по стеку вызовов!</p>
+    <p>Самая опасная ошибка начинающих разработчиков: передать внутрь <code>applyBusinessLogic</code> не объект текущей транзакции <code>tx</code>, а глобальный пул <code>p.db</code> (или случайно обратиться к нему).<br />
+В этом случае вставка в <code>inbox</code> и обновление баланса произойдут в <strong>двух разных независимых транзакциях</strong>!<br />
+Если бизнес-логика упадет, запись в таблице <code>inbox</code> останется закоммиченной. Сообщение навсегда окажется помеченным как «обработанное», хотя деньги так и не были переведены. В Go всегда явно пробрасывайте <code>*sql.Tx</code> по стеку вызовов!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="arkhitekturnye-nyuansy-inbox">Архитектурные нюансы Inbox</h2>
 
 <h3 id="1-perepolnenie-tablitsy-inbox-table-bloat">1. Переполнение таблицы Inbox (Table Bloat)</h3>
-<p>Таблица <code>inbox</code> растет на каждую успешно обработанную транзакцию. В HighLoad системах она будет пухнуть на миллионы записей в день. Поскольку нам нужны эти данные только для защиты от дубликатов на коротком интервале времени (пока брокер не получит <code>Ack</code>), хранить их вечно не нужно.</p>
-<p>Решения:<br />
-* <strong>Background Cleanup:</strong> Фоновый процесс (CronJob) на Go, который делает <code>DELETE FROM inbox WHERE processed_at &lt; NOW() - INTERVAL '7 days'</code>. <br />
-* <strong>Time-To-Live (TTL) в БД:</strong> Некоторые БД поддерживают TTL из коробки. В PostgreSQL это обычно решается через Table Partitioning (партиции по дням) и жесткий <code>DROP TABLE</code> старых партиций.</p>
+
+<p>Таблица <code>inbox</code> пополняется на каждое успешно обработанное входящее событие. В высоконагруженных системах она может прирастать на десятки миллионов записей в сутки. Хранить эти записи вечно нет необходимости: дубликаты обычно прилетают в течение минут или часов после сбоя.</p>
+<p>Решения для очистки:<br />
+- <strong>Background Cleanup (Фоновый сборщик мусора):</strong> Регулярный фоновый процесс (CronJob) на Go, удаляющий записи старше 7 дней:<br />
+<code>sql
+  DELETE FROM inbox WHERE processed_at &lt; NOW() - INTERVAL '7 days';</code><br />
+- <strong>Партиционирование по датам (Table Partitioning):</strong> Создание дневных партиций <code>inbox_YYYY_MM_DD</code> и удаление устаревших секций через мгновенный <code>DROP TABLE</code> без нагрузки на планировщик вакуума (Vacuum).</p>
+<hr />
 <h3 id="2-masshtabirovanie-vynos-inbox-v-redis">2. Масштабирование: Вынос Inbox в Redis</h3>
-<p>Если нагрузка на чтение/запись настолько высока, что PostgreSQL становится узким местом, разработчики часто пытаются вынести Inbox в Redis (используя команду <code>SETNX</code>).</p>
-<p><strong>Почему это опасно?</strong><br />
-Как только вы выносите Inbox из той же БД, где лежат ваши бизнес-данные (PostgreSQL), вы теряете ACID транзакцию. <br />
-1. Сделали <code>SETNX</code> в Redis (успех).<br />
-2. Делаем <code>UPDATE</code> в Postgres $\rightarrow$ Ошибка сети.<br />
-3. Сообщение возвращается в очередь брокера.<br />
-4. При повторной попытке Redis скажет "Дубликат!", и сообщение будет отброшено. Деньги не спишутся, статус заказа "зависнет".</p>
-<p>Выносить Inbox в Redis можно <strong>только</strong> для тех сервисов, которые не имеют локальной транзакционной базы (например, сервис отправки Email или генерации метрик). Для финтеха, e-commerce и работы со стейтом — Inbox должен жить строго в той же СУБД, что и бизнес-таблицы.</p>
+
+<p>Когда пропускная способность базы данных становится узким местом, инженеры часто пытаются вынести дедупликацию в Redis с помощью быстрой атомарной команды <code>SETNX</code> (Set if Not Exists).</p>
+<p><strong>Почему это опасно для транзакционных бизнес-процессов?</strong></p>
+<p>Как только проверка дубликатов выносится из базы данных, где лежат ваши бизнес-данные (PostgreSQL), вы <strong>мгновенно теряете ACID-гарантию</strong> и снова попадаете в ловушку Dual Write:<br />
+1. Выполнили <code>SETNX</code> в Redis (успех, ключ сохранен);<br />
+2. Выполняем <code>UPDATE balances</code> в PostgreSQL $\to$ база вернула ошибку или упала сеть;<br />
+3. Сообщение возвращается в брокер для повторной попытки (requeue);<br />
+4. При следующей попытке Redis проверит ключ и заявит: <em>«Это дубликат!»</em>, отбросив сообщение. Деньги никогда не спишутся, а заказ зависнет навсегда!</p>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Важно</span>
+  </div>
+  <div class="callout-body">
+    <p>Выносить Inbox в Redis допустимо <strong>исключительно</strong> для сервисов без транзакционного состояния (например, сервис отправки Email или сбора метрик). В финансовом и биллинговом коде таблица <code>inbox</code> обязана жить <strong>строго в одной СУБД с бизнес-таблицами</strong>!</p>
+  </div>
+</div>
+
+<hr />
 <h3 id="3-middleware-podkhod-v-go">3. Middleware подход в Go</h3>
-<p>В крупных проектах логика Inbox выносится на уровень инфраструктурного кода. Вы можете написать декоратор (Middleware) для ваших консьюмеров, который принимает интерфейс обработчика, сам открывает транзакцию, проверяет Inbox, вызывает обработчик, передавая ему <code>*sql.Tx</code>, и сам делает коммит. Это избавляет разработчиков продуктовых команд от написания инфраструктурного бойлерплейта в каждом хендлере.</p>
+
+<p>В зрелых микросервисных проектах логика Inbox выносится в обобщенные компоненты промежуточного слоя (<strong>Middleware</strong>). Декоратор консьюмера автоматически:<br />
+1. Открывает транзакцию <code>*sql.Tx</code>;<br />
+2. Проверяет и резервирует <code>message_id</code> в таблице <code>inbox</code>;<br />
+3. Вызывает чистый доменный обработчик бизнес-логики;<br />
+4. Коммитит транзакцию и подтверждает <code>Ack</code> брокеру.</p>
+<p>Это освобождает продуктовых инженеров от написания инфраструктурного бойлерплейта в каждом микросервисе.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Inbox Pattern</strong> — это механизм дедупликации сообщений на стороне потребителя с использованием локальной транзакции базы данных.</li>
-<li>Связка <strong>Outbox (на стороне отправки) + Inbox (на стороне приема)</strong> гарантирует, что бизнес-событие будет доставлено и обработано <strong>Effectively-once</strong>, несмотря на любые сбои сети, брокера или подов Kubernetes.</li>
-<li>В Go реализация требует строгого контроля за объектом <code>*sql.Tx</code> и правильной обработки ошибок (особенно маскировки ошибки уникальности, чтобы позволить консьюмеру сделать <code>Ack</code>).</li>
+<li><strong>Inbox Pattern</strong> — фундаментальный механизм дедупликации сообщений на стороне консьюмера с опорой на локальные ACID-транзакции СУБД.</li>
+<li>Архитектурная связка <strong>Outbox (на отправке) + Inbox (на приеме)</strong> обеспечивает надежность класса <strong>Effectively-once</strong> поверх ненадежной сети и брокеров с гарантией At-least-once.</li>
+<li>В коде на Go правильная реализация требует использования <code>ON CONFLICT DO NOTHING</code>, строгого проброса <code>*sql.Tx</code> и корректного подтверждения <code>Ack</code> при обнаружении дубликата.</li>
+<li>Вынос дедупликации во внешние in-memory кэши (Redis) нарушает атомарность и допустим только для некритичных stateless-сервисов.</li>
 </ol>
-<p>Теперь, когда наши сервисы могут надежно общаться друг с другом без потери данных и дубликатов, мы готовы решать главную проблему распределенных микросервисов: как реализовать длинную транзакцию (например, оплатить $\rightarrow$ зарезервировать склад $\rightarrow$ отправить товар), которая затрагивает несколько независимых баз данных? На помощь приходит паттерн распределенных транзакций, который мы детально разберем в следующей статье: <a href="8-saga-cherez-brokery.html" class="wikilink">8. Saga через брокеры</a>.</p>
+<p>Теперь наши сервисы защищены от потери данных при отправке и от дубликатов при приеме. Но что делать, если бизнес-процесс требует согласованного выполнения цепочки действий в трех разных сервисах (Оплата $\to$ Склад $\to$ Доставка), у каждого из которых своя собственная база данных? </p>
+<p>В следующей лекции мы перейдем к паттерну распределенных транзакций: <a href="8-saga-cherez-brokery.html" class="wikilink">8. Saga через брокеры</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2396,7 +2475,7 @@ func (p *OrderProcessor) applyBusinessLogic(ctx context.Context, tx *sql.Tx, pay
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-patterna-inbox">Анатомия паттерна Inbox</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-realizatsiya-inbox">Идиоматичный Go: Реализация Inbox</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-nyuansy-inbox">Архитектурные нюансы Inbox</a></li><li class="toc-item toc-h3"><a href="#1-perepolnenie-tablitsy-inbox-table-bloat">1. Переполнение таблицы Inbox (Table Bloat)</a></li><li class="toc-item toc-h3"><a href="#2-masshtabirovanie-vynos-inbox-v-redis">2. Масштабирование: Вынос Inbox в Redis</a></li><li class="toc-item toc-h3"><a href="#3-middleware-podkhod-v-go">3. Middleware подход в Go</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#problema-dublikatov-v-asinkhronnom-mire">Проблема дубликатов в асинхронном мире</a></li><li class="toc-item toc-h2"><a href="#anatomiya-patterna-inbox">Анатомия паттерна Inbox</a></li><li class="toc-item toc-h3"><a href="#poshagovyy-algoritm-raboty-konsyumera">Пошаговый алгоритм работы консьюмера:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-isklyuchenie-sostoyaniya-gonki-na-urovne-yadra-subd">Mechanical Sympathy: Исключение состояния гонки на уровне ядра СУБД</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-realizatsiya-inbox">Идиоматичный Go: Реализация Inbox</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-nyuansy-inbox">Архитектурные нюансы Inbox</a></li><li class="toc-item toc-h3"><a href="#1-perepolnenie-tablitsy-inbox-table-bloat">1. Переполнение таблицы Inbox (Table Bloat)</a></li><li class="toc-item toc-h3"><a href="#2-masshtabirovanie-vynos-inbox-v-redis">2. Масштабирование: Вынос Inbox в Redis</a></li><li class="toc-item toc-h3"><a href="#3-middleware-podkhod-v-go">3. Middleware подход в Go</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

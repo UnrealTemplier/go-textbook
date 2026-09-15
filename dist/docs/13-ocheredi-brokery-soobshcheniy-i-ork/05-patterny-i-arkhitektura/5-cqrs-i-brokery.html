@@ -2168,34 +2168,61 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. CQRS и брокеры</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статье <a href="4-event-sourcing-i-brokery.html" class="wikilink">4. Event sourcing и брокеры</a> мы столкнулись с фундаментальным парадоксом архитектуры: база данных, идеально оптимизированная для сверхбыстрой записи (Append-only лог), абсолютно не пригодна для сложных выборок, агрегаций и поиска. </p>
-<p>Если вы попытаетесь сделать полнотекстовый поиск по истории событий в Kafka, вы положите кластер. Если вы попробуете сделать JOIN пяти таблиц в нормализованной реляционной БД на каждый чих пользователя, вы упретесь в лимиты CPU и дискового I/O базы данных.</p>
-<p>Для построения высоконагруженных систем, где соотношение чтений к записям часто составляет 100:1 (пользователи чаще смотрят каталог, чем покупают), индустрия выработала паттерн <strong>CQRS (Command Query Responsibility Segregation — Разделение ответственности команд и запросов)</strong>. В этой статье мы разберем, как брокеры сообщений выступают кровеносной системой этого паттерна.</p>
+            <h1>5. CQRS и брокеры сообщений: разделение команд, запросов и проекций</h1>
+<blockquote>
+<p><em>"The essence of clean design is separation of concerns. Do not ask a component to serve two masters with conflicting physical requirements."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> В <a href="4-event-sourcing-i-brokery.html" class="wikilink">4. Event sourcing и брокеры</a> мы столкнулись с архитектурным парадоксом: хранилище, идеально оптимизированное для последовательной записи (Append-only лог событий), категорически не пригодно для произвольных фильтраций, выборок и поисковых агрегаций. В этой лекции мы изучим паттерн <strong>CQRS (Command Query Responsibility Segregation — Разделение ответственности команд и запросов)</strong>, где брокер сообщений выступает в роли асинхронного моста между миром записи и миром чтения. Это знание подготовит нас к анализу паттерна <a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="problema-crud-konflikt-apparatnykh-profiley">Проблема CRUD: конфликт аппаратных профилей</h2>
+
+<p>В традиционных архитектурах (CRUD) одна и та же реляционная база данных и одни и те же сущности (Data Model Objects) используются одновременно и для записи, и для чтения. </p>
+<p>В небольших проектах это работает великолепно. Но при переходе в HighLoad (где соотношение запросов чтения к записи часто составляет 100:1 или 1000:1) единая база данных неизбежно сталкивается с <strong>физическим конфликтом аппаратных профилей</strong>:</p>
+<pre><code>    Аппаратный конфликт внутри одной СУБД:
+
+    [Транзакция Записи] ──&gt; B-Tree Page Splits ──&gt; Random I/O на 10 индексах ──&gt; WAL fsync()
+                                      ▲
+                                      │ Вытеснение страниц из Buffer Pool!
+                                      ▼
+    [Запрос на Чтение]  ──&gt; Сканирование памяти ──&gt; Cache Miss ──&gt; Задержки p99 растут!
+</code></pre>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Mechanical Sympathy и конфликт дискового I/O</span>
+  </div>
+  <div class="callout-body">
+    <p>Почему традиционные CRUD-базы данных деградируют под смешанной нагрузкой?<br />
+- <strong>Профиль записи (Write):</strong> Требует обновления первичных и всех вторичных индексов (B-Tree). Это порождает разбиение страниц памяти (Page Splits), инвалидацию страничного кэша ядра ОС (<code>OS Page Cache</code>), фрагментацию и синхронный сброс журнала упреждающей записи на диск через системный вызов <code>fsync</code>.<br />
+- <strong>Профиль чтения (Read):</strong> Требует, чтобы горячие строки и индексы непрерывно находились в оперативной памяти (Buffer Pool) и процессорных кэшах L1/L2/L3.  </p>
+<p>Когда транзакция пишет в таблицу с 10 индексами, она заставляет дисковый контроллер совершать дорогой случайный ввод-вывод (Random I/O), вытесняя из оперативной памяти полезные страницы данных для чтения.</p>
+<p><strong>CQRS изолирует эти нагрузки на аппаратном уровне:</strong><br />
+- Сервер записи (Write DB) оснащается сверхбыстрыми накопителями NVMe SSD и настраивается на максимальную пропускную способность коммитов (индексов минимум);<br />
+- Сервер чтения (Read DB) комплектуется терабайтами оперативной памяти (RAM) для кэширования плоских витрин без дискового ожидания (например, Redis, Elasticsearch или ClickHouse).</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="anatomiya-cqrs">Анатомия CQRS</h2>
 
-<p>Традиционная архитектура (CRUD) использует одну и ту же модель данных (DMO — Data Model Object) и одну и ту же базу данных как для записи, так и для чтения. </p>
-<p><strong>CQRS ломает этот стереотип.</strong> Паттерн утверждает: модель, которая проверяет бизнес-правила и меняет состояние (Команда), и модель, которая отдает данные пользователю (Запрос), должны быть <strong>физически и логически разделены</strong>.</p>
-<ol>
-<li><strong>Command Side (Сторона Записи):</strong> * Получает команды (например, <code>CreateOrder</code>).<br />
-   * Содержит сложную бизнес-логику и инварианты.<br />
-   * Оптимизирована для высокой пропускной способности записи (High Write Throughput). Почти не имеет индексов.<br />
-   * База данных: PostgreSQL (нормализованная), EventStoreDB или Apache Kafka.</li>
-<li><strong>Query Side (Сторона Чтения):</strong><br />
-   * Получает запросы (например, <code>GetOrderHistory</code>).<br />
-   * Не содержит никакой бизнес-логики.<br />
-   * Оптимизирована для сверхнизкой задержки чтения (Low Read Latency). Данные максимально денормализованы ("плоские" таблицы), индексы построены под конкретные экраны UI.<br />
-   * База данных: Elasticsearch, Redis, MongoDB, ClickHouse или отдельные View в PostgreSQL.</li>
-</ol>
-<h2 id="rol-brokera-most-mezhdu-mirami">Роль брокера: Мост между мирами</h2>
-
-<p>Как данные попадают из базы для записи в базу для чтения? Через асинхронную проекцию (Projection). И здесь брокер сообщений (Kafka, RabbitMQ, NATS) становится критическим узлом.</p>
+<p>Паттерн <strong>CQRS</strong> утверждает: модель, которая проверяет доменные инварианты и фиксирует изменения (Команда), и модель, которая отдает структурированные данные пользователю (Запрос), должны быть <strong>логически и физически разделены</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2210,41 +2237,64 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph Command Context - Запись
-A[&quot;Command API &lt;br&gt; Go Service&quot;] --&gt;|&quot;Валидация&quot;| B[/&quot;Write DB &lt;br&gt; Event Store&quot;/]
+subgraph ClientLayer [&quot;Пользовательский интерфейс / Клиенты&quot;]
+UI[&quot;Web / Mobile UI&quot;]
 end
 
-B -.-&gt;|&quot;CDC / Outbox Pattern&quot;| C{&quot;Брокер &lt;br&gt; Kafka / RabbitMQ&quot;}
-
-subgraph Query Context - Чтение
-C --&gt;|&quot;Асинхронный Consumer&quot;| D[&quot;Projector &lt;br&gt; Go Worker&quot;]
-D --&gt;|&quot;Upsert&quot;| E[/&quot;Read DB &lt;br&gt; Elastic / Redis&quot;/]
-F[&quot;Query API &lt;br&gt; Go Service&quot;] --&gt;|&quot;Fast Read &lt;br&gt; Без JOIN-ов&quot;| E
+subgraph CommandSide [&quot;Command Side (Сторона Записи)&quot;]
+UI --&gt;|&quot;1. POST /orders (Команда)&quot;| C_API[&quot;Command API (Go)&quot;]
+C_API --&gt;|&quot;2. Проверка бизнес-правил&quot;| AGG[&quot;Доменный Агрегат&quot;]
+AGG --&gt;|&quot;3. Запись&quot;| W_DB[/&quot;Write DB / Event Store&lt;br&gt;(PostgreSQL / Kafka)&quot;/]
 end
+
+W_DB -.-&gt;|&quot;4. Асинхронный стриминг событий&lt;br&gt;(CDC / Outbox / JetStream)&quot;| Broker{&quot;Брокер сообщений&lt;br&gt;(Kafka / RabbitMQ / NATS)&quot;}
+
+subgraph QuerySide [&quot;Query Side (Сторона Чтения)&quot;]
+Broker --&gt;|&quot;5. Подписка на события&quot;| PROJ[&quot;Projector Worker (Go)&quot;]
+PROJ --&gt;|&quot;6. Обновление плоских проекций&quot;| R_DB[/&quot;Read DB&lt;br&gt;(Elasticsearch / Redis / Postgres View)&quot;/]
+UI --&gt;|&quot;7. GET /orders/history (Запрос)&quot;| Q_API[&quot;Query API (Go)&quot;]
+Q_API --&gt;|&quot;8. Быстрый SELECT без JOIN&quot;| R_DB
+end
+
+style Broker fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style W_DB fill:#1e293b,stroke:#f59e0b,stroke-width:2px
+style R_DB fill:#1e293b,stroke:#10b981,stroke-width:2px
+style C_API fill:#131d33,stroke:#f59e0b,stroke-width:2px
+style Q_API fill:#131d33,stroke:#10b981,stroke-width:2px
   </pre>
 </div>
 
 
-<p>Процесс "Проектор" (Projector) — это ваш Go-консьюмер, который подписывается на события изменения состояния из брокера, трансформирует их (собирает нужный JSON) и записывает в базу для чтения.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Mechanical Sympathy и Дисковый I/O</span>
-  </div>
-  <div class="callout-body">
-    <p>Почему CRUD-базы начинают "тормозить" под нагрузкой? Это конфликт аппаратных профилей.<br />
-* <strong>Запись:</strong> Требует обновления B-Tree индексов. Это вызывает разбиение страниц памяти (Page Splits), инвалидацию кэша ОС (Page Cache) и синхронный сброс WAL (Write-Ahead Log) на диск через <code>fsync</code>.<br />
-* <strong>Чтение:</strong> Хочет, чтобы данные непрерывно лежали в оперативной памяти (Buffer Pool) и кэше L1/L2 процессора. </p>
-<p>Когда вы пишете в таблицу с 10 индексами, вы заставляете диск совершать дорогостоящий Random I/O, вытесняя из кэша полезные данные для чтения. <br />
-<strong>CQRS изолирует эти нагрузки на уровне железа.</strong> Write-сервер может иметь быстрые NVMe SSD без избытка RAM (индексов почти нет). Read-сервер может иметь терабайты оперативной памяти для кэширования агрегаций и работать вообще без дорогих дисков (если это Redis).</p>
-  </div>
-</div>
+<h3 id="1-command-side-storona-zapisi">1. Command Side (Сторона Записи)</h3>
+<ul>
+<li><strong>Назначение:</strong> Принимает императивные команды изменения мира: <code>CreateOrder</code>, <code>CancelSubscription</code>, <code>TransferMoney</code>;</li>
+<li><strong>Логика:</strong> Содержит всю валидацию, бизнес-инварианты и проверку прав доступа;</li>
+<li><strong>Оптимизация:</strong> Направлена на высокую пропускную способность записи (<strong>High Write Throughput</strong>). Никаких тяжелых JOIN-ов, минимум вторичных индексов;</li>
+<li><strong>СУБД:</strong> Нормализованный PostgreSQL, специализированный Event Store или Apache Kafka.</li>
+</ul>
+<h3 id="2-query-side-storona-chteniya">2. Query Side (Сторона Чтения)</h3>
+<ul>
+<li><strong>Назначение:</strong> Обслуживает запросы на получение данных: <code>GetOrderHistory</code>, <code>SearchCatalog</code>, <code>GetDashboardMetrics</code>;</li>
+<li><strong>Логика:</strong> Лишена бизнес-правил; чистая проекция и отдача данных;</li>
+<li><strong>Оптимизация:</strong> Направлена на минимальную задержку отдачи (<strong>Low Read Latency</strong>). Таблицы предельно денормализованы (все данные заказа, включая адрес и имя клиента, склеены в одну строку или JSON-документ);</li>
+<li><strong>СУБД:</strong> Elasticsearch (полнотекстовый поиск), Redis (кэш профиля), ClickHouse (аналитика) или плоские материализованные представления в PostgreSQL.</li>
+</ul>
+<hr />
+<h2 id="rol-brokera-most-mezhdu-mirami">Роль брокера: Мост между мирами</h2>
 
+<p>Как данные из транзакционной базы записи попадают в денормализованные витрины для чтения?<br />
+Через механизм <strong>асинхронной проекции (Projections)</strong>. Брокер сообщений (Kafka, RabbitMQ, NATS) становится транспортной артерией всей системы:</p>
+<ol>
+<li>Сервис записи фиксирует изменение и публикует доменное событие в брокер;</li>
+<li>Специальный фоновый процесс — <strong>Проектор (Projector)</strong> — подписан на эти события;</li>
+<li>Получив событие, Проектор преобразует его структуру в формат, удобный для экрана пользователя, и выполняет <code>Upsert</code> в Read DB.</li>
+</ol>
+<hr />
 <h2 id="idiomatichnyy-go-proektor-i-idempotentnost">Идиоматичный Go: Проектор и Идемпотентность</h2>
 
-<p>Проектор (Projector) — это классический консьюмер. И, как мы выяснили в <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>, он будет получать дубликаты событий. </p>
-<p>Если событие — это <code>OrderTotalUpdated { NewTotal: 500, Version: 4 }</code>, как правильно обновить Read-модель в PostgreSQL (или MongoDB), чтобы дубликаты или нарушение порядка сообщений (Ordering) не сломали наши данные?</p>
-<p>Используем паттерн <strong>Optimistic Concurrency Control (Оптимистичные блокировки)</strong> на стороне Read DB. Для этого мы <strong>обязаны</strong> передавать версию агрегата в событии.</p>
+<p>Проектор на Go — это консьюмер брокера сообщений. Из-за природы распределенных систем он неизбежно будет сталкиваться с повторной доставкой сообщений (at-least-once) и возможным нарушением хронологического порядка.</p>
+<p>Если брокер доставит событие <code>OrderTotalUpdated</code> с новым чеком, как обновить витрину <code>read_orders_view</code>, чтобы дубликат или запоздавшее старое событие не перезаписали актуальные данные?</p>
+<p>Применяется механизм <strong>оптимистичной блокировки по версии (Optimistic Concurrency Control)</strong> непосредственно в SQL-запросе проектора:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2260,11 +2310,30 @@ import (
     &quot;context&quot;
     &quot;database/sql&quot;
     &quot;fmt&quot;
+    &quot;log/slog&quot;
 )
 
-// Обработчик события из брокера
+// OrderUpdatedEvent представляет контракт события изменения заказа
+type OrderUpdatedEvent struct {
+    OrderID string `json:&quot;order_id&quot;`
+    Status  string `json:&quot;status&quot;`
+    Total   int64  `json:&quot;total&quot;`
+    Version int64  `json:&quot;version&quot;` // Монотонно возрастающая версия агрегата!
+}
+
+// OrderProjector отвечает за асинхронное обновление витрины чтения
+type OrderProjector struct {
+    db     *sql.DB
+    logger *slog.Logger
+}
+
+func NewOrderProjector(db *sql.DB, logger *slog.Logger) *OrderProjector {
+    return &amp;OrderProjector{db: db, logger: logger}
+}
+
+// HandleOrderUpdated атомарно обновляет материализованное представление
 func (p *OrderProjector) HandleOrderUpdated(ctx context.Context, event OrderUpdatedEvent) error {
-    // В CQRS Read-модель часто предельно плоская, чтобы избежать JOIN
+    // Денормализованная таблица read_orders_view содержит готовые для фронтенда данные
     query := `
         INSERT INTO read_orders_view (order_id, status, total, version)
         VALUES ($1, $2, $3, $4)
@@ -2274,71 +2343,91 @@ func (p *OrderProjector) HandleOrderUpdated(ctx context.Context, event OrderUpda
             total = EXCLUDED.total,
             version = EXCLUDED.version
         -- КРИТИЧЕСКИ ВАЖНО: Защита от дубликатов и нарушения порядка!
-        -- Мы обновляем строку ТОЛЬКО если пришедшее событие новее текущего.
+        -- Строка обновляется ТОЛЬКО если версия входящего события строго больше текущей
         WHERE read_orders_view.version &lt; EXCLUDED.version
     `
 
     res, err := p.db.ExecContext(ctx, query, event.OrderID, event.Status, event.Total, event.Version)
     if err != nil {
-        return fmt.Errorf(&quot;upsert read model: %w&quot;, err)
+        return fmt.Errorf(&quot;ошибка upsert в read model: %w&quot;, err)
     }
 
-    rowsAffected, _ := res.RowsAffected()
+    rowsAffected, err := res.RowsAffected()
+    if err != nil {
+        return fmt.Errorf(&quot;ошибка проверки rows affected: %w&quot;, err)
+    }
+
     if rowsAffected == 0 {
-        // Событие проигнорировано. 
-        // Это либо дубликат (версии равны), либо старое сообщение (нарушен порядок в брокере).
-        p.logger.Debug(&quot;Event ignored due to older or duplicate version&quot;, &quot;order_id&quot;, event.OrderID)
+        // Событие проигнорировано базой данных.
+        // Это либо дубликат (версии равны), либо старое сообщение (нарушен порядок в сети).
+        p.logger.DebugContext(ctx, &quot;Событие проигнорировано: версия устарела или уже применена&quot;,
+            &quot;order_id&quot;, event.OrderID,
+            &quot;incoming_version&quot;, event.Version,
+        )
     }
 
-    return nil // Возвращаем nil, чтобы консьюмер сделал Ack брокеру
+    return nil // Возвращаем nil для отправки подтверждения (Ack) брокеру
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="glavnaya-bol-cqrs-eventual-consistency">Главная боль CQRS: Eventual Consistency</h2>
 
-<p>Когда вы разделяете базу на две через асинхронный брокер, вы получаете <strong>Согласованность в конечном счете (Eventual Consistency)</strong>. </p>
-<p>Задержка (Lag) между тем, как данные попали в Write DB, и тем, как Проектор обновил Read DB, может составлять от 50 миллисекунд до нескольких минут (при высоких нагрузках).</p>
+<p>Когда поток записи отделен от потока чтения асинхронным брокером, система неизбежно переходит в режим <strong>согласованности в конечном счете (Eventual Consistency)</strong>.</p>
+<p>Задержка репликации (Replication Lag) между коммитом в Write DB и обновлением строки в Read DB обычно составляет от 10 до 100 миллисекунд, но при всплеске нагрузки может вырастать до секунд.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Проблема Read Your Own Writes</span>
+    <span class="callout-title">Ловушка / Gotcha: Проблема Read Your Own Writes (Чтение собственных изменений)</span>
   </div>
   <div class="callout-body">
-    <p>Пользователь добавляет товар в корзину (Command API $\rightarrow$ Write DB $\rightarrow$ HTTP 200 OK).<br />
-UI мгновенно делает редирект на страницу корзины (Query API $\rightarrow$ Read DB).<br />
-Но проектор еще не успел обработать событие в Kafka! Пользователь видит <strong>пустую корзину</strong> и в панике нажимает кнопку "Добавить" еще пять раз.</p>
+    <p>Пользователь нажимает кнопку «Добавить товар в корзину»:<br />
+1. Браузер отправляет команду: <code>POST /cart/items</code> $\to$ Command API $\to$ Write DB $\to$ <code>HTTP 200 OK</code>;<br />
+2. Фронтенд немедленно делает редирект на экран корзины: <code>GET /cart</code> $\to$ Query API $\to$ Read DB;<br />
+3. Но Проектор еще не успел вычитать событие из Kafka и обновить Read DB!</p>
+<p>Пользователь видит <strong>абсолютно пустую корзину</strong>, впадает в недоумение и нажимает кнопку покупки еще 5 раз. Бизнес получает жалобы и дубликаты заказов.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="kak-reshat-etu-problemu-voprosy-s-sobesedovaniy-senior">Как решать эту проблему (Вопросы с собеседований Senior+)</h3>
 
-<p>На интервью вас обязательно спросят, как сгладить UX в CQRS. Вот классические инженерные решения:</p>
+<p>На интервью системного дизайна вас обязательно спросят: <em>«Как обойти лаг репликации в CQRS, чтобы пользователь не видел устаревших данных?»</em> </p>
+<p>Существует три канонических инженерных решения:</p>
 <ol>
-<li><strong>Optimistic UI (Оптимистичный интерфейс):</strong> Клиентское приложение (JS/Mobile) само локально добавляет товар в кэш и отрисовывает его, не дожидаясь ответа от Query API. Если спустя время бэкенд возвращает ошибку, UI "откатывает" визуальное состояние.</li>
-<li><strong>Polling с версионированием:</strong> Command API возвращает <code>Version</code> или <code>Revision ID</code> измененной сущности (например, <code>Revision: 5</code>). Query API принимает эту версию как параметр: <code>GET /cart?min_revision=5</code>. Если Read DB имеет только 4-ю версию, Query API заблокирует запрос (через <code>time.Sleep</code> и retry-loop под капотом, или Long Polling) до тех пор, пока Проектор не догонит нужную версию.</li>
-<li><strong>WebSockets / Server-Sent Events:</strong> Command API просто принимает задачу (<code>HTTP 202 Accepted</code>). Пользователь видит лоадер. Когда Проектор успешно обновляет Read DB, он отправляет событие через WebSocket в браузер: "Корзина обновлена, перерисовывай".</li>
+<li><strong>Optimistic UI (Оптимистичный интерфейс):</strong><br />
+   Фронтенд-приложение (Single Page Application / Mobile App) не ждет повторного запроса <code>GET</code>. Оно само локально обновляет внутреннее состояние и сразу рисует товар в корзине. Если бэкенд через пару секунд вернет ошибку фоновой обработки, UI покажет всплывающее уведомление и откатит отрисовку.</li>
+<li><strong>Polling с версионированием (<code>min_revision</code>):</strong><br />
+   Command API в ответе на команду возвращает <code>Version</code> или <code>Revision ID</code> измененной сущности (например, <code>Revision: 5</code>).<br />
+   При запросе чтения фронтенд передает эту метку в параметрах: <code>GET /cart?min_revision=5</code>. Query API проверяет версию в Read DB: если в витрине пока доступна только 4-я версия, Query API <strong>не отдает устаревший ответ сразу</strong>, а приостанавливает выполнение (через <code>time.Sleep</code> и retry-loop под капотом, либо через Long Polling) до тех пор, пока Проектор не догонит нужную версию.</li>
+<li><strong>WebSockets / Server-Sent Events (SSE):</strong><br />
+   Command API возвращает клиенту статус <code>HTTP 202 Accepted</code> («Принято в обработку»). Пользователь видит аккуратный спиннер. Как только Проектор обновил Read DB, он отправляет push-уведомление через WebSocket прямо в браузер: <em>«Корзина обновлена»</em>, после чего интерфейс запрашивает актуальный слепок.</li>
 </ol>
+<hr />
 <h2 id="supersila-cqrs-perestroyka-modeley-rebuilding">Суперсила CQRS: Перестройка моделей (Rebuilding)</h2>
 
-<p>Главная архитектурная прелесть связки CQRS + Event Store (через Kafka) — это возможность путешествовать во времени и исправлять исторические ошибки.</p>
-<p>Представьте, что бизнес требует новую фичу: <em>"Сделайте дашборд, который показывает средний чек пользователей в разрезе городов за последние 5 лет"</em>.</p>
-<p>В CRUD-системе, если вы исторически не сохраняли "город" в момент покупки, вы не сможете это сделать. В CQRS с Event Sourcing вы делаете следующее:<br />
-1. Создаете новую БД для чтения (например, таблицу в ClickHouse).<br />
-2. Пишете новый Go-консьюмер (Новый Проектор).<br />
-3. Натравливаете его на топик Kafka с параметром <code>auto.offset.reset = earliest</code> (читать с самого первого сообщения).<br />
-4. За несколько часов Проектор "переварит" 5-летнюю историю компании на скорости миллионов событий в секунду и наполнит ClickHouse идеальными, готовыми агрегациями.<br />
-5. Вы просто переключаете Query API на новую БД. Zero downtime.</p>
+<p>Главная архитектурная магия тандема <strong>CQRS + Event Sourcing (на базе Kafka)</strong> — это возможность безболезненно менять бизнес-требования задним числом.</p>
+<p>Представьте, что руководство компании требует:<br />
+<em>«Нам срочно нужен новый дашборд: распределение выручки по городам и категориям товаров за последние 5 лет»</em>.</p>
+<p>В классической CRUD-системе, если вы исторически не нормализовали город доставки в отдельную индексированную колонку, построить такой дашборд на миллиардах строк без блокировки продакшен-базы невозможно.</p>
+<p>В архитектуре CQRS вы действуете по прозрачному алгоритму:<br />
+1. Создаете новую, идеально подходящую базу данных (например, ClickHouse);<br />
+2. Пишете новый легковесный сервис-проектор на Go;<br />
+3. Подключаете его к топику Kafka с параметром <code>auto.offset.reset = earliest</code>;<br />
+4. За несколько часов Проектор на полной скорости процессора перечитывает всю 5-летнюю историю компании из лога Kafka и формирует безупречную аналитическую витрину;<br />
+5. Вы бесшовно переключаете дашборд на ClickHouse. <strong>Zero Downtime, ноль изменений в продакшен-базе записи!</strong></p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>CQRS</strong> физически разделяет потоки на Запись (команды, валидация) и Чтение (быстрая отдача данных без JOIN-ов).</li>
-<li><strong>Брокер сообщений</strong> — это транспорт, который доставляет события об изменениях из Write-модели в Read-модель.</li>
-<li>Оптимизация на уровне <strong>аппаратных профилей</strong> позволяет использовать NVMe диски для быстрых записей (Append-only) и огромные пулы RAM для чтений (Redis/Elastic).</li>
-<li>Главный компромисс — <strong>Eventual Consistency</strong>. Бэкенд-инженер обязан проектировать API и взаимодействовать с Frontend-разработчиками для обхода задержек репликации.</li>
+<li><strong>CQRS</strong> физически разносит потоки Записи (команды, сложная валидация) и Чтения (быстрые выборки без тяжелых JOIN-ов).</li>
+<li><strong>Брокер сообщений</strong> служит надежным асинхронным конвейером передачи фактов изменений из Write-модели в Read-модель.</li>
+<li><strong>Изоляция аппаратных профилей:</strong> вы настраиваете NVMe SSD под последовательный append-only лог записи и гигантские пулы оперативной памяти под кэши чтения.</li>
+<li><strong>Компромисс:</strong> появление <strong>Eventual Consistency</strong> требует проектирования идемпотентных проекторов с контролем версий строк и специальных UI-паттернов (Optimistic UI, <code>min_revision</code>).</li>
 </ol>
-<p>Мы описали идеальную картину: Command API пишет в базу и шлет событие в брокер, а Проектор это читает. Но мы намеренно опустили "слона в комнате". Как именно Command API может надежно, не теряя данных и не ломая транзакции, записать бизнес-сущность в Postgres и одновременно отправить уведомление в Kafka? Это технически невозможно сделать атомарно. </p>
-<p>Для решения этой фундаментальной проблемы двойной записи существует архитектурный спасательный круг, который мы детально разберем в следующей статье: <a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>.</p>
+<p>Мы описали стройную картину: Command API записывает агрегат и шлет событие в брокер. Но как гарантировать, что транзакция в базе данных и отправка сообщения в брокер произойдут <strong>абсолютно надежно</strong>, без потери событий при сетевых сбоях и падениях серверов?</p>
+<p>В следующей лекции мы детально разберем фундаментальный архитектурный паттерн, решающий проблему двойной записи: <a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2366,7 +2455,7 @@ UI мгновенно делает редирект на страницу кор
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-cqrs">Анатомия CQRS</a></li><li class="toc-item toc-h2"><a href="#rol-brokera-most-mezhdu-mirami">Роль брокера: Мост между мирами</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-proektor-i-idempotentnost">Идиоматичный Go: Проектор и Идемпотентность</a></li><li class="toc-item toc-h2"><a href="#glavnaya-bol-cqrs-eventual-consistency">Главная боль CQRS: Eventual Consistency</a></li><li class="toc-item toc-h3"><a href="#kak-reshat-etu-problemu-voprosy-s-sobesedovaniy-senior">Как решать эту проблему (Вопросы с собеседований Senior+)</a></li><li class="toc-item toc-h2"><a href="#supersila-cqrs-perestroyka-modeley-rebuilding">Суперсила CQRS: Перестройка моделей (Rebuilding)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#problema-crud-konflikt-apparatnykh-profiley">Проблема CRUD: конфликт аппаратных профилей</a></li><li class="toc-item toc-h2"><a href="#anatomiya-cqrs">Анатомия CQRS</a></li><li class="toc-item toc-h3"><a href="#1-command-side-storona-zapisi">1. Command Side (Сторона Записи)</a></li><li class="toc-item toc-h3"><a href="#2-query-side-storona-chteniya">2. Query Side (Сторона Чтения)</a></li><li class="toc-item toc-h2"><a href="#rol-brokera-most-mezhdu-mirami">Роль брокера: Мост между мирами</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-proektor-i-idempotentnost">Идиоматичный Go: Проектор и Идемпотентность</a></li><li class="toc-item toc-h2"><a href="#glavnaya-bol-cqrs-eventual-consistency">Главная боль CQRS: Eventual Consistency</a></li><li class="toc-item toc-h3"><a href="#kak-reshat-etu-problemu-voprosy-s-sobesedovaniy-senior">Как решать эту проблему (Вопросы с собеседований Senior+)</a></li><li class="toc-item toc-h2"><a href="#supersila-cqrs-perestroyka-modeley-rebuilding">Суперсила CQRS: Перестройка моделей (Rebuilding)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

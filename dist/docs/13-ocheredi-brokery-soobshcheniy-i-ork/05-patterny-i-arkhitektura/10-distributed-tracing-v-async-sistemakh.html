@@ -2168,24 +2168,67 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">10. Distributed tracing в async системах</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Распределенные системы, построенные на базе событийно-ориентированной архитектуры (EDA), приносят потрясающую масштабируемость. Но когда дело доходит до отладки, они превращаются в сущий кошмар. </p>
-<p>Представьте: пользователь нажимает кнопку "Оформить заказ". Запрос попадает в <code>API Gateway</code>, который публикует событие в Kafka. Его вычитывают <code>Сервис Склада</code> и <code>Сервис Оплаты</code>. <code>Сервис Оплаты</code> шлет запрос в эквайринг, получает ответ и публикует новое событие, которое читает <code>Сервис Нотификаций</code>. <br />
-Вдруг пользователь жалуется: <em>"Мой заказ завис, письмо не пришло"</em>. </p>
-<p>В монолите вы бы просто открыли логи по <code>order_id</code> и прочитали весь стек вызовов (Stack Trace) сверху вниз. В асинхронных микросервисах логи размазаны по пяти разным серверам. Попытка связать их обычным <code>grep</code> по логам обречена на провал, потому что один и тот же <code>order_id</code> может обрабатываться конкурентно десятками воркеров, а сеть может задерживать события на минуты.</p>
-<p>Чтобы вернуть контроль над хаосом, индустрия стандартизировала подход <strong>Distributed Tracing (Распределенная трассировка)</strong>. В этой статье мы разберем, как трассировка работает под капотом, как она интегрируется в рантайм Go и как правильно пробрасывать контекст через брокеры сообщений.</p>
+            <h1>10. Распределенная трассировка (Distributed Tracing) в асинхронных системах</h1>
+<blockquote>
+<p><em>"Debugging is twice as hard as writing the code in the first place. Therefore, if you write the code as cleverly as possible, you are, by definition, not smart enough to debug it."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> В предыдущих статьях мы построили сложный асинхронный ландшафт: события передаются через <a href="1-pub-sub.html" class="wikilink">1. Pub Sub</a> и <a href="2-work-queue.html" class="wikilink">2. Work Queue</a>, данные дедуплицируются через <a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a> и <a href="7-inbox-pattern.html" class="wikilink">7. Inbox pattern</a>, а саги координируют сервисы в <a href="8-saga-cherez-brokery.html" class="wikilink">8. Saga через брокеры</a> и <a href="9-message-choreography-vs-orchestration.html" class="wikilink">9. Message choreography vs orchestration</a>. Однако когда сообщения начинают асинхронно перепрыгивать через брокеры, отладка превращается в детективное расследование. В этой заключительной лекции подраздела мы разберем <strong>Distributed Tracing (Распределенную трассировку)</strong> в экосистеме OpenTelemetry (OTEL) и рантайме Go, прежде чем перейти к следующему подразделу — <span class="wikilink-unresolved" title="Заметка в разработке">06. Оркестрация процессов/1. Что такое workflow orchestration</span>.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="problema-chernogo-yashchika-v-asinkhronnom-mire">Проблема «черного ящика» в асинхронном мире</h2>
+
+<p>Распределенные системы, построенные на базе событийно-ориентированной архитектуры (EDA), приносят потрясающую масштабируемость и устойчивость к пиковым нагрузкам. Но когда дело доходит до отладки и мониторинга в продакшене, они способны превратить жизнь инженера в кошмар.</p>
+<p>Представьте классический путь заказа:<br />
+1. Пользователь нажимает кнопку «Оформить заказ»;<br />
+2. Запрос принимает <code>API Gateway</code>, который после сохранения в БД публикует событие в Apache Kafka;<br />
+3. Событие параллельно вычитывают <code>Сервис Склада</code> и <code>Сервис Оплаты</code>;<br />
+4. <code>Сервис Оплаты</code> отправляет HTTP-запрос во внешний банковский эквайринг, получает ответ и публикует новое событие в RabbitMQ;<br />
+5. Событие подхватывает <code>Сервис Нотификаций</code>, чтобы отправить чек клиенту.</p>
+<p>Вдруг в саппорт поступает жалоба: <em>«Деньги с карты списались, а чек и подтверждение заказа не пришли»</em>.</p>
+<p>В классическом монолите вы бы открыли лог по <code>order_id</code> и прочитали непрерывный стек вызовов (Stack Trace) сверху вниз. В асинхронных микросервисах логи размазаны по десяткам независимых подов и серверов. </p>
+<p>Попытка связать их обычным <code>grep</code> по логам обречена на провал:<br />
+- Один и тот же <code>order_id</code> может обрабатываться конкурентно десятками воркеров;<br />
+- Сеть, очереди и ретраи могут задерживать доставку событий на минуты и часы;<br />
+- Сервис нотификаций мог упасть, вычитать сообщение, но не записать <code>order_id</code> в строку лога из-за ошибки парсинга.</p>
+<p>Чтобы вернуть контроль над хаосом, индустрия стандартизировала подход <strong>Distributed Tracing (Распределенная трассировка)</strong>.</p>
+<pre><code>    Бытовая аналогия: Международная почтовая накладная (Waybill):
+    Когда посылка отправляется через весь мир, ей присваивается глобальный трек-номер 
+    (TraceID). В каждом транзитном узле (аэропорт, таможня, сортировочный центр) 
+    сканер фиксирует время и локальный этап (SpanID), ссылаясь на предыдущий сканер 
+    (ParentSpanID). В любой момент отправитель видит сквозной маршрут 
+    в едином интерфейсе.
+</code></pre>
+<hr />
 <h2 id="anatomiya-raspredelennoy-trassirovki">Анатомия Распределенной Трассировки</h2>
 
-<p>Трассировка базируется на двух фундаментальных понятиях:<br />
-1. <strong>Trace (Трейс):</strong> Полный граф выполнения бизнес-процесса от начала до конца. Идентифицируется уникальным <code>TraceID</code> (обычно 16 байт / 32 hex-символа).<br />
-2. <strong>Span (Спан):</strong> Единица работы внутри трейса (например, один HTTP-запрос, один SQL-запрос или обработка одного сообщения из Kafka). Каждый спан имеет свой <code>SpanID</code> (8 байт), время начала, длительность и <code>ParentSpanID</code> (ссылку на родительский спан, кто его вызвал).</p>
-<p>Собранные вместе, спаны формируют ориентированный ациклический граф (DAG), который визуализируется в виде каскада (Waterfall) в системах вроде Jaeger, Zipkin или Grafana Tempo.</p>
+<p>Распределенная трассировка базируется на двух фундаментальных понятиях:</p>
+<ol>
+<li><strong>Trace (Трейс):</strong> Полный ориентированный ациклический граф (DAG) выполнения сквозного бизнес-процесса от клика пользователя в браузере до финального коммита в БД. Идентифицируется глобально уникальным <code>TraceID</code> (16 байт / 32 шестнадцатеричных символа);</li>
+<li><strong>Span (Спан):</strong> Единица работы внутри трейса (например, один входящий HTTP-запрос, выполнение SQL-запроса, публикация пакета в Kafka или обработка сообщения воркером). </li>
+</ol>
+<p>Каждый спан содержит:<br />
+- Собственный <code>SpanID</code> (8 байт / 16 hex-символов);<br />
+- Имя операции (например, <code>kafka.produce</code>, <code>SELECT FROM orders</code>);<br />
+- Временную метку старта и продолжительность;<br />
+- <code>ParentSpanID</code> — ссылку на идентификатор родительского спана, вызвавшего текущую операцию;<br />
+- Набор метаданных: теги (<code>Attributes</code>), логи внутри спана (<code>Events</code>) и статус ошибки.</p>
+<p>Собранные воедино спаны визуализируются в виде наглядного каскадного графика (Waterfall) в системах наблюдаемости — Jaeger, Grafana Tempo или Zipkin:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2200,49 +2243,80 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;API Заказов&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: A&quot;] --&gt;|&quot;Publish&quot;| B{&quot;Kafka&quot;}
-A --&gt;|&quot;Insert&quot;| DB1[/&quot;PostgreSQL&quot;/]
+A[&quot;API Заказов&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: A&quot;] --&gt;|&quot;1. Publish&quot;| B{&quot;Брокер сообщений&lt;br&gt;Kafka&quot;}
+A --&gt;|&quot;2. Insert&quot;| DB1[/&quot;PostgreSQL&quot;/]
 
-B --&gt;|&quot;Consume&quot;| C[&quot;Сервис Оплаты&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: B&lt;br&gt;Parent: A&quot;]
-B --&gt;|&quot;Consume&quot;| D[&quot;Сервис Склада&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: C&lt;br&gt;Parent: A&quot;]
+B --&gt;|&quot;3. Consume&quot;| C[&quot;Сервис Оплаты&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: B&lt;br&gt;Parent: A&quot;]
+B --&gt;|&quot;4. Consume&quot;| D[&quot;Сервис Склада&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: C&lt;br&gt;Parent: A&quot;]
 
-C --&gt;|&quot;HTTP POST&quot;| E[&quot;Внешний Эквайринг&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: D&lt;br&gt;Parent: B&quot;]
+C --&gt;|&quot;5. HTTP POST&quot;| E[&quot;Внешний Эквайринг&lt;br&gt;TraceID: 123&lt;br&gt;SpanID: D&lt;br&gt;Parent: B&quot;]
+
+style B fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style A fill:#1e293b,stroke:#6366f1,stroke-width:2px
+style C fill:#131d33,stroke:#10b981,stroke-width:2px
+style D fill:#131d33,stroke:#10b981,stroke-width:2px
+style E fill:#1e1b4b,stroke:#f59e0b,stroke-width:2px
   </pre>
 </div>
 
 
+<hr />
 <h2 id="context-propagation-magiya-probrosa">Context Propagation: Магия проброса</h2>
 
-<p>Чтобы Сервис Оплаты узнал, что он является частью трейса <code>123</code>, <code>API Заказов</code> должно как-то передать ему этот идентификатор. Этот процесс называется <strong>Пробросом контекста (Context Propagation)</strong>.</p>
-<p>В 2019 году W3C утвердил стандарт <strong>Trace Context</strong>, который положил конец зоопарку проприетарных заголовков. Стандарт обязывает передавать метаданные через строго определенный HTTP-заголовок (или мета-заголовок в брокере):<br />
-<code>traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01</code></p>
-<p>Формат <code>traceparent</code>: <code>[version]-[trace-id]-[parent-span-id]-[trace-flags]</code>.</p>
+<p>Чтобы <code>Сервис Оплаты</code> узнал, что полученное из брокера сообщение является звеном цепочки с <code>TraceID: 123</code>, <code>API Заказов</code> обязан передать контекст через границы процессов. Этот механизм называется <strong>пробросом контекста (Context Propagation)</strong>.</p>
+<p>В 2019 году консорциум W3C утвердил официальный стандарт <strong>Trace Context</strong>, положивший конец эпохе несовместимых проприетарных заголовков (<code>X-B3-TraceId</code>, <code>uber-trace-id</code>).</p>
+<p>Стандарт обязывает передавать метаданные через заголовок:</p>
+
+<div class="code-block" data-lang="http">
+  <div class="code-header">
+    <span class="code-lang-tag">HTTP</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-http"><code class="language-http">traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+</code></pre>
+</div>
+
+<p>Структура заголовка <code>traceparent</code>:<br />
+- <code>00</code> — версия спецификации W3C;<br />
+- <code>0af7651916cd43dd8448eb211c80319c</code> — 16-байтный <code>TraceID</code>;<br />
+- <code>b7ad6b7169203331</code> — 8-байтный <code>ParentSpanID</code> (идентификатор вызывающего спана);<br />
+- <code>01</code> — битовые флаги (<code>TraceFlags</code>), где <code>01</code> означает, что спан включен в выборку трассировки (<code>Sampled</code>).</p>
+<hr />
 <h3 id="sravnenie-s-drugimi-yazykami">Сравнение с другими языками</h3>
-<p>В Java, C# или Python контекст запроса часто привязан к потоку выполнения операционной системы (ThreadLocal-переменные). Это удобно для разработчика (не нужно передавать контекст руками), но ломается при асинхронном программировании, когда поток переиспользуется пулом.<br />
-В Go нет ThreadLocal. Рантайм Go агрессивно перекидывает горутины (<code>g</code>) между потоками (<code>m</code>). Поэтому в Go контекст пробрасывается <strong>явно</strong> через интерфейс <code>context.Context</code>. Это идеальный паттерн для трассировки.</p>
+
+<p>В экосистемах Java (JVM), C# (.NET) или Python контекст запроса традиционно привязывается к текущему системному потоку ОС через потоко-локальные переменные (<strong>ThreadLocal</strong>). Это позволяет прозрачно считывать контекст в любом месте программы без явной передачи аргументов.</p>
+<p><strong>В Go концепция ThreadLocal отсутствует намеренно.</strong><br />
+Рантайм Go непрерывно переключает и мигрирует миллионы легковесных горутин (<code>g</code>) между небольшим пулом системных потоков ОС (<code>m</code>). Использование потоко-локальной памяти в Go привело бы к фатальному загрязнению контекста между не связанными горутинами.</p>
+<p>Поэтому в Go контекст всегда передается <strong>явно первым аргументом функции</strong> через интерфейс <code>context.Context</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: context.Context в Go</span>
   </div>
   <div class="callout-body">
-    <p>Структура <code>context</code> — это иммутабельное дерево. Когда вы вызываете библиотеку OpenTelemetry (OTEL) для старта спана <code>tracer.Start(ctx, "name")</code>, OTEL создает новый объект Span, кладет его в новый <code>valueCtx</code> (обертка над переданным <code>ctx</code>) и возвращает этот новый контекст. Все вложенные функции, принимающие этот <code>ctx</code>, смогут извлечь текущий <code>Span</code> и узнать его <code>TraceID</code>. </p>
+    <p>Структура <code>context.Context</code> в Go — это иммутабельное дерево связных узлов.<br />
+Когда библиотека OpenTelemetry (OTEL) стартует новый спан через вызов <code>tracer.Start(ctx, "name")</code>, OTEL создает объект <code>Span</code>, оборачивает его во внутреннюю структуру <code>valueCtx</code> и возвращает новый дочерний контекст.<br />
+Все функции и методы вниз по стеку вызовов, принимающие этот <code>ctx</code>, могут извлечь текущий <code>Span</code> и получить доступ к метаданным трассировки без глобальных мьютексов и блокировок.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="kak-probrosit-traceid-cherez-broker">Как пробросить TraceID через Брокер?</h3>
 
-<p>Брокеры сообщений не используют HTTP. Но современные брокеры поддерживают концепцию <strong>Headers (Заголовков) / Properties</strong>, которая позволяет прикреплять метаданные к сообщению без изменения самого бизнес-пейлоада (JSON/Protobuf).</p>
-<ul>
-<li><strong>RabbitMQ:</strong> Поддерживает структуру <code>Headers</code> (map) внутри <code>amqp.Publishing</code>.</li>
-<li><strong>Kafka:</strong> Начиная с версии 0.11, протокол Kafka поддерживает <code>Record Headers</code> на уровне формата сообщений на диске (Zero-copy этому не мешает).</li>
-</ul>
+<p>Брокеры сообщений оперируют не HTTP-запросами, а бинарными пакетами. Однако все современные брокеры предоставляют поддержку метаданных на уровне протокола:<br />
+- <strong>RabbitMQ:</strong> Поддерживает структуру метаданных <code>Headers</code> (ассоциативный массив ключ-значение) внутри структуры <code>amqp.Publishing</code>;<br />
+- <strong>Apache Kafka:</strong> Начиная с версии Kafka 0.11 (KIP-82), формат сообщений включает встроенные <strong>Record Headers</strong>, сохраняемые на диске без нарушения Zero-copy передачи данных;<br />
+- <strong>NATS:</strong> Поддерживает заголовки сообщений стандарта NATS Headers (<code>msg.Header</code>), синтаксически идентичные HTTP-заголовкам.</p>
+<hr />
 <h2 id="idiomatichnyy-go-integratsiya-opentelemetry">Идиоматичный Go: Интеграция OpenTelemetry</h2>
 
-<p>Рассмотрим, как правильно инструментировать Продюсер и Консьюмер в Kafka с использованием стандарта OpenTelemetry (OTEL).</p>
+<p>Рассмотрим практическую реализацию сквозной трассировки в Apache Kafka на Go с использованием официального SDK OpenTelemetry (<code>go.opentelemetry.io/otel</code>).</p>
 <h3 id="1-storona-prodyusera-inject">1. Сторона Продюсера (Inject)</h3>
 
-<p>Наша задача: взять <code>context.Context</code>, в котором уже есть текущий Span (например, созданный HTTP-мидлварью), и <strong>внедрить (Inject)</strong> его в заголовки Kafka перед отправкой.</p>
+<p>Задача продюсера: извлечь текущий контекст трассировки из <code>context.Context</code> и <strong>внедрить (Inject)</strong> его в заголовки отправляемого сообщения <code>sarama.ProducerMessage</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2257,38 +2331,41 @@ C --&gt;|&quot;HTTP POST&quot;| E[&quot;Внешний Эквайринг&lt;br&
 import (
     &quot;context&quot;
 
-    &quot;[github.com/IBM/sarama](https://github.com/IBM/sarama)&quot;
+    &quot;github.com/IBM/sarama&quot;
     &quot;go.opentelemetry.io/otel&quot;
     &quot;go.opentelemetry.io/otel/propagation&quot;
     &quot;go.opentelemetry.io/otel/trace&quot;
 )
 
-// MapCarrier - адаптер для заголовков Kafka, чтобы OTEL мог в них писать
+// kafkaCarrier реализует интерфейс propagation.TextMapCarrier для заголовков Sarama Kafka
 type kafkaCarrier struct {
     msg *sarama.ProducerMessage
 }
 
-func (c kafkaCarrier) Get(key string) string { return &quot;&quot; } // При Inject чтение не нужно
+func (c kafkaCarrier) Get(key string) string { return &quot;&quot; } // При Inject чтение не используется
+
 func (c kafkaCarrier) Set(key string, value string) {
     c.msg.Headers = append(c.msg.Headers, sarama.RecordHeader{
         Key:   []byte(key),
         Value: []byte(value),
     })
 }
+
 func (c kafkaCarrier) Keys() []string { return nil }
 
+// PublishWithTrace оборачивает публикацию сообщения в спан и внедряет W3C Traceparent
 func PublishWithTrace(ctx context.Context, producer sarama.SyncProducer, msg *sarama.ProducerMessage) error {
-    tracer := otel.Tracer(&quot;my-kafka-producer&quot;)
+    tracer := otel.Tracer(&quot;order-service-producer&quot;)
 
     // 1. Создаем Span отправки сообщения (Kind: Producer)
     ctx, span := tracer.Start(ctx, &quot;kafka.produce&quot;, trace.WithSpanKind(trace.SpanKindProducer))
     defer span.End()
 
-    // 2. Внедряем TraceID из context в заголовки Kafka
+    // 2. Внедряем TraceID и SpanID из Go context в бинарные заголовки Kafka
     propagator := otel.GetTextMapPropagator()
     propagator.Inject(ctx, kafkaCarrier{msg: msg})
 
-    // 3. Физическая отправка (в реальности здесь еще перехват ошибок для span.RecordError)
+    // 3. Отправляем сообщение брокеру
     _, _, err := producer.SendMessage(msg)
     if err != nil {
         span.RecordError(err)
@@ -2298,9 +2375,10 @@ func PublishWithTrace(ctx context.Context, producer sarama.SyncProducer, msg *sa
 </code></pre>
 </div>
 
+<hr />
 <h3 id="2-storona-konsyumera-extract">2. Сторона Консьюмера (Extract)</h3>
 
-<p>Наша задача: прочитать байты заголовков из Kafka, <strong>извлечь (Extract)</strong> из них <code>TraceID</code> и создать новый Span, который станет логическим продолжением распределенного графа.</p>
+<p>Задача консьюмера: прочитать заголовки из <code>sarama.ConsumerMessage</code>, <strong>извлечь (Extract)</strong> идентификаторы трейса и создать новый дочерний Span с типом <code>SpanKindConsumer</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2315,13 +2393,13 @@ func PublishWithTrace(ctx context.Context, producer sarama.SyncProducer, msg *sa
 import (
     &quot;context&quot;
 
-    &quot;[github.com/IBM/sarama](https://github.com/IBM/sarama)&quot;
+    &quot;github.com/IBM/sarama&quot;
     &quot;go.opentelemetry.io/otel&quot;
     &quot;go.opentelemetry.io/otel/propagation&quot;
     &quot;go.opentelemetry.io/otel/trace&quot;
 )
 
-// Адаптер для чтения
+// kafkaExtractCarrier реализует адаптер чтения заголовков Kafka для OpenTelemetry
 type kafkaExtractCarrier struct {
     headers []*sarama.RecordHeader
 }
@@ -2334,7 +2412,9 @@ func (c kafkaExtractCarrier) Get(key string) string {
     }
     return &quot;&quot;
 }
+
 func (c kafkaExtractCarrier) Set(key string, value string) {}
+
 func (c kafkaExtractCarrier) Keys() []string {
     keys := make([]string, len(c.headers))
     for i, h := range c.headers {
@@ -2343,17 +2423,18 @@ func (c kafkaExtractCarrier) Keys() []string {
     return keys
 }
 
+// ConsumeWithTrace восстанавливает контекст трейса и оборачивает бизнес-логику в Consumer Span
 func ConsumeWithTrace(ctx context.Context, msg *sarama.ConsumerMessage, businessLogic func(context.Context) error) error {
-    // 1. Извлекаем TraceContext из заголовков Kafka
+    // 1. Извлекаем W3C TraceContext из заголовков входящего сообщения Kafka
     propagator := otel.GetTextMapPropagator()
     extractedCtx := propagator.Extract(ctx, kafkaExtractCarrier{headers: msg.Headers})
 
-    // 2. Стартуем Span Консьюмера, используя извлеченный контекст
-    tracer := otel.Tracer(&quot;my-kafka-consumer&quot;)
+    // 2. Запускаем дочерний Span консьюмера, связывая его с родительским спаном продюсера
+    tracer := otel.Tracer(&quot;order-service-consumer&quot;)
     logicCtx, span := tracer.Start(extractedCtx, &quot;kafka.consume&quot;, trace.WithSpanKind(trace.SpanKindConsumer))
     defer span.End()
 
-    // 3. Передаем новый контекст в бизнес-логику!
+    // 3. Передаем обогащенный контекст в бизнес-обработчик!
     err := businessLogic(logicCtx)
     if err != nil {
         span.RecordError(err)
@@ -2366,10 +2447,10 @@ func ConsumeWithTrace(ctx context.Context, msg *sarama.ConsumerMessage, business
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Потеря контекста внутри горутин</span>
+    <span class="callout-title">Ловушка / Gotcha: Потеря контекста при порождении фоновых горутин</span>
   </div>
   <div class="callout-body">
-    <p>Самая частая ошибка разработчиков в Go при работе с асинхронными воркерами:</p>
+    <p>Самая распространенная ошибка разработчиков на Go:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2380,27 +2461,61 @@ func ConsumeWithTrace(ctx context.Context, msg *sarama.ConsumerMessage, business
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func handle(ctx context.Context, msg Message) {
-    // АНТИПАТТЕРН: Вы создаете новую горутину и передаете туда context.Background(),
-    // или вообще не передаете ctx! Связь трейса обрывается навсегда.
+    // АНТИПАТТЕРН: передача context.Background() обрывает дерево трейса!
     go doHeavyWork(context.Background()) 
 }
 </code></pre>
 </div>
 
-<p>Вы <strong>обязаны</strong> пробрасывать <code>ctx</code> во все внутренние вызовы, БД-запросы и новые горутины (с учетом таймаутов, возможно, используя <code>context.WithoutCancel(ctx)</code>, если горутина должна пережить родительский HTTP-запрос, но сохранить TraceID).</p>
+<p>Вы <strong>обязаны</strong> пробрасывать исходный <code>ctx</code> во все дочерние вызовы.<br />
+Если фоновая операция должна продолжить выполнение даже в случае отмены клиентского HTTP-запроса, используйте стандартный метод Go 1.21+ <code>context.WithoutCancel(ctx)</code>: он сохраняет все значения трассировки (<code>TraceID</code>, спаны), но отвязывает дедлайн отмены!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="vysshiy-pilotazh-batch-processing-i-span-links">Высший пилотаж: Batch Processing и Span Links</h2>
 
-<p>В статье <a href="../07-praktika/5-batch-processing-soobshcheniy.html" class="wikilink">5. Batch processing сообщений</a> мы обсуждали, что чтение по одному сообщению убивает пропускную способность. Консьюмер должен читать батчами (например, по 500 сообщений) и делать один <code>INSERT</code> в БД.</p>
-<p>Но как быть с трассировкой? <br />
-500 сообщений пришли из <strong>500 разных трейсов</strong> (разные HTTP-запросы пользователей). Вы не можете создать один Span, у которого 500 <code>ParentSpanID</code>. Стандарт W3C допускает только одного родителя.</p>
-<p>Для этой задачи в OpenTelemetry существует концепция <strong>Links (Ссылки)</strong>.</p>
+<p>В высоконагруженных системах обработка сообщений по одному неэффективна: консьюмер вычитывает сообщения пачками (например, по 500 штук) и вставляет их в СУБД единым батчем (Batch Ingestion).</p>
+<p>Но как оформить трассировку батча?<br />
+Каждое из 500 сообщений пришло из <strong>500 независимых пользовательских трейсов</strong>!<br />
+Спецификация W3C запрещает указывать у одного спана несколько родителей (<code>ParentSpanID</code> строго один).</p>
+<p>Для решения этой дилеммы OpenTelemetry предоставляет механизм <strong>Span Links (Ссылки спанов)</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+T1[&quot;Trace 1: Клиент Alice&quot;] --&gt; S1[&quot;Producer Span 1&quot;]
+T2[&quot;Trace 2: Клиент Bob&quot;] --&gt; S2[&quot;Producer Span 2&quot;]
+T3[&quot;Trace 3: Клиент Charlie&quot;] --&gt; S3[&quot;Producer Span 3&quot;]
+
+S1 -.-&gt;|&quot;Span Link&quot;| BatchSpan[&quot;Batch Consumer Span (batch_insert)&lt;br&gt;(Корневой спан пакетной обработки)&quot;]
+S2 -.-&gt;|&quot;Span Link&quot;| BatchSpan
+S3 -.-&gt;|&quot;Span Link&quot;| BatchSpan
+
+BatchSpan --&gt; DB[/&quot;INSERT INTO orders VALUES (...), (...)&quot;/]
+
+style BatchSpan fill:#1e293b,stroke:#f59e0b,stroke-width:2px
+style S1 fill:#131d33,stroke:#38bdf8,stroke-width:2px
+style S2 fill:#131d33,stroke:#38bdf8,stroke-width:2px
+style S3 fill:#131d33,stroke:#38bdf8,stroke-width:2px
+  </pre>
+</div>
+
+
 <ol>
-<li>Консьюмер читает батч из 500 сообщений.</li>
-<li>Консьюмер создает абсолютно <strong>новый</strong>, независимый корневой Span для процесса обработки батча.</li>
-<li>Консьюмер извлекает <code>TraceContext</code> из каждого сообщения и добавляет их в свой новый Span в виде <code>Links</code>.</li>
+<li>Консьюмер вычитывает пакет из 500 сообщений;</li>
+<li>Создается абсолютно <strong>новый независимый корневой Span</strong> для пакетной вставки: <code>batch_insert</code>;</li>
+<li>Контекст каждого входящего сообщения извлекается и добавляется в новый спан через атрибут <code>trace.WithLinks</code>:</li>
 </ol>
 
 <div class="code-block" data-lang="go">
@@ -2411,49 +2526,60 @@ func ConsumeWithTrace(ctx context.Context, msg *sarama.ConsumerMessage, business
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Пример (Псевдокод для концепции)
-var links []trace.Link
-for _, msg := range batch {
-    ctx := extractContext(msg)
-    links = append(links, trace.Link{SpanContext: trace.SpanContextFromContext(ctx)})
+  <pre class="language-go"><code class="language-go">func processBatchWithLinks(tracer trace.Tracer, batch []*sarama.ConsumerMessage) {
+    var links []trace.Link
+    for _, msg := range batch {
+        // Извлекаем контекст из заголовков каждого сообщения
+        ctx := extractContext(msg)
+        spanCtx := trace.SpanContextFromContext(ctx)
+        if spanCtx.IsValid() {
+            links = append(links, trace.Link{SpanContext: spanCtx})
+        }
+    }
+
+    // Создаем корневой спан пакетной операции, связанный ссылками с 500 трейсами
+    batchCtx, span := tracer.Start(context.Background(), &quot;batch_insert&quot;, trace.WithLinks(links...))
+    defer span.End()
+
+    // Выполняем пакетный INSERT в базу данных...
+    _ = executeBulkInsert(batchCtx, batch)
 }
-
-// Создаем Span, связывающий множество трейсов
-batchCtx, span := tracer.Start(context.Background(), &quot;batch_insert&quot;, trace.WithLinks(links...))
-defer span.End()
-
-// ... выполняем батч-запрос
 </code></pre>
 </div>
 
-<p>В Jaeger этот спан будет отображаться как отдельный процесс, но из любого родительского трейса пользователя можно будет провалиться по ссылке в этот батч-спан и посмотреть, сколько времени заняла физическая запись в базу.</p>
+<p>В интерфейсе Jaeger или Tempo этот батч отобразится как самостоятельный процесс, но из любого родительского трейса клиента можно будет перейти по ссылке (Link) и увидеть, в какой именно батч попало сообщение и сколько миллисекунд заняла запись на диск.</p>
+<hr />
 <h2 id="tsena-nablyudaemosti-mechanical-sympathy">Цена наблюдаемости (Mechanical Sympathy)</h2>
 
-<p>Трассировка не бесплатна. Каждая генерация UUID (TraceID), каждая аллокация структуры Span, каждая фиксация времени (syscall <code>clock_gettime</code>) отнимает процессорные такты. Плюс, собранные спаны нужно отправлять по сети в Jaeger/Tempo.</p>
+<p>Распределенная трассировка требует аппаратных ресурсов:<br />
+- Каждое создание спана вызывает системный вызов получения времени ядра ОС (<code>clock_gettime</code>, оптимизированный через vDSO, но не бесплатный при 100 000 вызовов в секунду);<br />
+- Создание структур спанов порождает аллокации в куче;<br />
+- Сериализация и отправка телеметрии по gRPC/Protobuf в коллектор нагружает сетевой стек.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Стратегии сэмплирования (Sampling)</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Если у нас 100 000 RPS, полное включение OpenTelemetry убьет CPU серверов и забьет сеть мониторинга. Как этого избежать?<br />
-<strong>Ответ:</strong> Использовать <strong>Сэмплирование (Sampling)</strong>.<br />
-Существует два вида:<br />
-1. <strong>Head-Based Sampling:</strong> Продюсер (на входе) бросает монетку и решает, например, трейсить только 1% запросов. Этот флаг (<code>sampled=1</code>) пробрасывается до конца, и все последующие сервисы тоже трейсят этот запрос. Это экономит ресурсы, но мы можем пропустить редкие ошибки.<br />
-2. <strong>Tail-Based Sampling:</strong> Все сервисы генерируют спаны и отправляют их в локальный OTEL Collector (в оперативной памяти). Коллектор ждет завершения трейса и принимает решение: если трейс прошел успешно и быстро — удаляем его из памяти (дропаем). Если трейс содержит ошибки (HTTP 500) или аномальные задержки — отправляем в Jaeger. Это дает идеальную видимость ошибок без перегрузки хранилища.</p>
+    <p><strong>Вопрос:</strong> «При нагрузке в 200 000 RPS сохранение 100% трейсов убьет процессорные кэши серверов и заполнит петабайты дисков Tempo за сутки. Как защитить инфраструктуру мониторинга?»<br />
+<strong>Ответ:</strong> Использовать стратегии <strong>сэмплирования (Sampling)</strong>:<br />
+1. <strong>Head-Based Sampling (Сэмплирование на входе):</strong> Шлюз API «бросает монетку» и принимает решение: например, трассировать только 1% входящих запросов. Флаг <code>sampled=1</code> передается по всей цепочке через <code>traceparent</code>, и downstream-сервисы собирают спаны только для выбранного процента. Это экономит ресурсы, но может упустить редкие аномальные ошибки в оставшихся 99% запросов;<br />
+2. <strong>Tail-Based Sampling (Сэмплирование на выходе):</strong> Все микросервисы генерируют спаны и отправляют их в локальный агент <strong>OpenTelemetry Collector</strong>, удерживающий трейсы в кольцевом буфере оперативной памяти. Коллектор дожидается завершения всего графа трейса и применяет умный фильтр: если трейс отработал быстро (до 100 мс) со статусом <code>HTTP 200 OK</code>, он сбрасывается из памяти без сохранения на диск. Если же в трейсе зафиксирована ошибка (<code>HTTP 500</code>, паника) или задержка превысила p99-порог (например, &gt; 2 секунд), коллектор сохраняет трейс на диск на 100%. Это идеальный баланс видимости аномалий и экономии хранилища.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog-razdela-patterny-i-arkhitektura">Итог раздела "Паттерны и архитектура"</h2>
 
-<p>Мы завершили огромный архитектурный блок. Мы прошли путь от простых очередей к сложным паттернам:<br />
-1. Научились развязывать системы через <strong>Pub/Sub</strong> и масштабировать воркеры через <strong>Work Queue</strong>.<br />
-2. Погрузились в мир <strong>Event Driven Architecture</strong>, поняли концепции <strong>Event Sourcing</strong> и <strong>CQRS</strong>.<br />
-3. Решили фундаментальную проблему двойной записи (Dual Write) связкой паттернов <strong>Outbox</strong> и <strong>Inbox</strong>.<br />
-4. Построили распределенные транзакции на базе <strong>Саги (Saga)</strong> и сравнили Хореографию с Оркестрацией.<br />
-5. И, наконец, научились отлаживать всю эту асинхронную магию с помощью <strong>OpenTelemetry</strong>.</p>
-<p>Но как мы выяснили в статье про Оркестрацию, писать свой надежный Оркестратор бизнес-процессов на Go с конечными автоматами, таймерами, поллингом базы и ретраями — это колоссальный труд, не имеющий прямого отношения к вашему бизнесу. </p>
-<p>Для решения проблем сложных распределенных Саг (сотни шагов, ожидание днями, компенсации) индустрия создала отдельный класс систем — движки Оркестрации. В следующем разделе мы начнем изучать концепцию и флагмана этого направления. Переходим к: <a href="../06-orkestratsiya-protsessov/1-chto-takoe-workflow-orchestration.html" class="wikilink">1. Что такое workflow orchestration</a>.</p>
+<p>Мы завершили фундаментальный архитектурный блок проектирования современных асинхронных систем:<br />
+1. <strong>Pub/Sub</strong> (<a href="1-pub-sub.html" class="wikilink">1. Pub Sub</a>) и <strong>Work Queue</strong> (<a href="2-work-queue.html" class="wikilink">2. Work Queue</a>) заложили базовые сетевые топологии взаимодействия;<br />
+2. <strong>Event Driven Architecture</strong> (<a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a>) объяснила реактивную модель и аппаратное поведение рантайма Go;<br />
+3. <strong>Event Sourcing</strong> (<a href="4-event-sourcing-i-brokery.html" class="wikilink">4. Event sourcing и брокеры</a>) и <strong>CQRS</strong> (<a href="5-cqrs-i-brokery.html" class="wikilink">5. CQRS и брокеры</a>) изолировали конфликты профилей чтения и записи;<br />
+4. <strong>Transactional Outbox</strong> (<a href="6-outbox-pattern.html" class="wikilink">6. Outbox pattern</a>) и <strong>Transactional Inbox</strong> (<a href="7-inbox-pattern.html" class="wikilink">7. Inbox pattern</a>) обеспечили математическую надежность класса <strong>Effectively-Once</strong>;<br />
+5. <strong>Saga</strong> (<a href="8-saga-cherez-brokery.html" class="wikilink">8. Saga через брокеры</a> и <a href="9-message-choreography-vs-orchestration.html" class="wikilink">9. Message choreography vs orchestration</a>) решила проблему распределенных транзакций;<br />
+6. <strong>Distributed Tracing</strong> восстановила прозрачность и управляемость в асинхронном графе сервисов.</p>
+<p>Однако, как мы увидели в анализе оркестрации, написание собственного распределенного движка бизнес-процессов на Go (с конечными автоматами, таблицами таймеров, персистентным состоянием и ретраями) — это повторное изобретение колеса, отнимающее месяцы инженерного труда.</p>
+<p>В следующем модуле мы перейдем к специализированным промышленным платформам распределенного исполнения процессов. Встречайте: <span class="wikilink-unresolved" title="Заметка в разработке">06. Оркестрация процессов/1. Что такое workflow orchestration</span>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2481,7 +2607,7 @@ defer span.End()
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-raspredelennoy-trassirovki">Анатомия Распределенной Трассировки</a></li><li class="toc-item toc-h2"><a href="#context-propagation-magiya-probrosa">Context Propagation: Магия проброса</a></li><li class="toc-item toc-h3"><a href="#sravnenie-s-drugimi-yazykami">Сравнение с другими языками</a></li><li class="toc-item toc-h3"><a href="#kak-probrosit-traceid-cherez-broker">Как пробросить TraceID через Брокер?</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-integratsiya-opentelemetry">Идиоматичный Go: Интеграция OpenTelemetry</a></li><li class="toc-item toc-h3"><a href="#1-storona-prodyusera-inject">1. Сторона Продюсера (Inject)</a></li><li class="toc-item toc-h3"><a href="#2-storona-konsyumera-extract">2. Сторона Консьюмера (Extract)</a></li><li class="toc-item toc-h2"><a href="#vysshiy-pilotazh-batch-processing-i-span-links">Высший пилотаж: Batch Processing и Span Links</a></li><li class="toc-item toc-h2"><a href="#tsena-nablyudaemosti-mechanical-sympathy">Цена наблюдаемости (Mechanical Sympathy)</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-patterny-i-arkhitektura">Итог раздела &quot;Паттерны и архитектура&quot;</a></li>
+    <li class="toc-item toc-h2"><a href="#problema-chernogo-yashchika-v-asinkhronnom-mire">Проблема «черного ящика» в асинхронном мире</a></li><li class="toc-item toc-h2"><a href="#anatomiya-raspredelennoy-trassirovki">Анатомия Распределенной Трассировки</a></li><li class="toc-item toc-h2"><a href="#context-propagation-magiya-probrosa">Context Propagation: Магия проброса</a></li><li class="toc-item toc-h3"><a href="#sravnenie-s-drugimi-yazykami">Сравнение с другими языками</a></li><li class="toc-item toc-h3"><a href="#kak-probrosit-traceid-cherez-broker">Как пробросить TraceID через Брокер?</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-integratsiya-opentelemetry">Идиоматичный Go: Интеграция OpenTelemetry</a></li><li class="toc-item toc-h3"><a href="#1-storona-prodyusera-inject">1. Сторона Продюсера (Inject)</a></li><li class="toc-item toc-h3"><a href="#2-storona-konsyumera-extract">2. Сторона Консьюмера (Extract)</a></li><li class="toc-item toc-h2"><a href="#vysshiy-pilotazh-batch-processing-i-span-links">Высший пилотаж: Batch Processing и Span Links</a></li><li class="toc-item toc-h2"><a href="#tsena-nablyudaemosti-mechanical-sympathy">Цена наблюдаемости (Mechanical Sympathy)</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-patterny-i-arkhitektura">Итог раздела &quot;Паттерны и архитектура&quot;</a></li>
   </ul>
 </aside>
 

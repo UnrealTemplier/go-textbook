@@ -2168,20 +2168,42 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Work Queue</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье (<a href="1-pub-sub.html" class="wikilink">1. Pub Sub</a>) мы рассматривали сценарии, когда одно событие должно быть доставлено всем заинтересованным сервисам для параллельной реакции. Но что делать, если ваша задача — не уведомить систему, а выполнить тяжелую работу, которую <strong>нельзя</strong> дублировать?</p>
-<p>Например: вам нужно сгенерировать PDF-отчет на 500 страниц, сжать видеофайлы, загруженные пользователем, или отправить SMS с одноразовым кодом (OTP). Если вы отправите эту задачу через Pub/Sub, все 10 ваших реплик Сервиса Нотификаций получат событие, и пользователь получит 10 одинаковых SMS. Это финансовые потери и крах UX.</p>
-<p>Здесь на сцену выходит паттерн <strong>Work Queue (Очередь задач)</strong>, также известный как <strong>Task Queue</strong> или паттерн <strong>Competing Consumers (Конкурирующие потребители)</strong>.</p>
+            <h1>2. Work Queue: балансировка нагрузки и паттерн конкурирующих потребителей</h1>
+<blockquote>
+<p><em>"Do not try to make the program do too much at once. Break it into small, independent tasks, and let specialized workers execute them without stepping on each other's toes."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> В <a href="1-pub-sub.html" class="wikilink">1. Pub Sub</a> мы разобрали широковещательную рассылку событий всем заинтересованным подписчикам (Fan-out). Однако в реальных системах огромная часть работы состоит не в оповещении, а в распределении тяжелых задач между параллельными исполнителями. В этой статье мы изучим паттерн <strong>Work Queue (Очередь задач)</strong>, также известный как <strong>Competing Consumers (Конкурирующие потребители)</strong>. Мы разберем механику честного распределения (Fair Dispatch), свяжем размер пула горутин с QoS брокера и подготовимся к концепции событийно-ориентированных архитектур в <a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a>.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="zachem-nuzhna-ochered-zadach">Зачем нужна очередь задач?</h2>
+
+<p>Представьте типичные сценарии бэкенда:<br />
+- Пользователь нажал кнопку «Сформировать выписку за 5 лет» (генерация PDF-документа на 500 страниц);<br />
+- Маркетплейс получил архив с 10 000 фотографий товаров для сжатия и нарезки миниатюр;<br />
+- Биллинг рассылает SMS с одноразовым кодом авторизации (OTP).</p>
+<p>Если опубликовать эти задачи через обычный <a href="1-pub-sub.html" class="wikilink">1. Pub Sub</a>, то все запущенные реплики вашего сервиса параллельно получат копию задачи. В результате пользователь получит 10 одинаковых SMS-сообщений (что приведет к убыткам и ярости клиента), а 10 серверов будут одновременно генерировать один и тот же PDF-файл, сжигая процессорные циклы.</p>
+<p>Для задач, которые <strong>должны быть выполнены строго один раз</strong> с равномерным распределением нагрузки по вычислительным узлам, используется паттерн <strong>Work Queue (Очередь задач / Task Queue)</strong>.</p>
+<hr />
 <h2 id="anatomiya-patterna-work-queue">Анатомия паттерна Work Queue</h2>
 
-<p>Суть паттерна предельно проста: у вас есть одна логическая очередь задач и множество воркеров (потребителей), которые "соревнуются" за задачи из этой очереди. </p>
-<p>Главный контракт паттерна: <strong>каждое сообщение из очереди должно быть успешно обработано строго одним воркером</strong>.</p>
+<p>Суть паттерна заключается в наличии <strong>одной логической очереди</strong> и пула параллельных обработчиков (воркеров), которые <strong>конкурируют</strong> за получение следующей доступной задачи.</p>
+<p>Фундаментальный контракт паттерна: <strong>каждое сообщение из очереди должно быть получено и успешно обработано строго одним воркером из пула</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2196,71 +2218,186 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-P1[&quot;API Gateway 1&quot;] --&gt;|&quot;Task A&quot;| Q{&quot;Work Queue&quot;}
-P2[&quot;API Gateway 2&quot;] --&gt;|&quot;Task B, C&quot;| Q
+P1[&quot;API Gateway 1&lt;br&gt;(Издатель задач)&quot;] --&gt;|&quot;Task A&quot;| Q{&quot;Work Queue&lt;br&gt;(Очередь брокера)&quot;}
+P2[&quot;API Gateway 2&lt;br&gt;(Издатель задач)&quot;] --&gt;|&quot;Task B, Task C&quot;| Q
 
-Q --&gt;|&quot;Task A&quot;| W1[&quot;Worker 1 &lt;br&gt; Idle&quot;]
-Q --&gt;|&quot;Task B&quot;| W2[&quot;Worker 2 &lt;br&gt; Busy&quot;]
-Q --&gt;|&quot;Task C&quot;| W3[&quot;Worker 3 &lt;br&gt; Idle&quot;]
+Q --&gt;|&quot;Task A (Раздача ровно одному)&quot;| W1[&quot;Worker 1&lt;br&gt;(Статус: Свободен / Idle)&quot;]
+Q --&gt;|&quot;Task B (Раздача ровно одному)&quot;| W2[&quot;Worker 2&lt;br&gt;(Статус: Занят / Busy)&quot;]
+Q --&gt;|&quot;Task C (Раздача ровно одному)&quot;| W3[&quot;Worker 3&lt;br&gt;(Статус: Свободен / Idle)&quot;]
+
+W1 --&gt;|&quot;Ack (Задача A завершена)&quot;| Q
+W2 --&gt;|&quot;Ack (Задача B завершена)&quot;| Q
+W3 --&gt;|&quot;Ack (Задача C завершена)&quot;| Q
+
+style Q fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style W1 fill:#131d33,stroke:#10b981,stroke-width:2px
+style W2 fill:#131d33,stroke:#f59e0b,stroke-width:2px
+style W3 fill:#131d33,stroke:#10b981,stroke-width:2px
   </pre>
 </div>
 
 
-<p>Горизонтальное масштабирование здесь достигается тривиально: если очередь начинает расти (Producer-ы генерируют задачи быстрее, чем Consumer-ы их разгребают), вы просто поднимаете в Kubernetes еще 5 подов с вашим Go-приложением. Брокер автоматически распределит новые задачи между новыми воркерами.</p>
+<h3 id="preimushchestva-arkhitektury">Преимущества архитектуры:</h3>
+<ol>
+<li><strong>Эластичное горизонтальное масштабирование:</strong> Если нагрузка растет и очередь задач начинает накапливаться (In-flight messages увеличиваются), Kubernetes Horizontal Pod Autoscaler (HPA) поднимает еще 10 подов воркеров. Брокер мгновенно начинает распределять задачи на новые экземпляры без изменения топологии сети.</li>
+<li><strong>Изоляция сбоев (Fault Isolation):</strong> Если воркер аварийно завершится (panic, OOM Killer ядра Linux) посреди обработки задачи, брокер заметит обрыв TCP-сессии и автоматически перенаправит неподтвержденную задачу другому живому воркеру.</li>
+<li><strong>Сглаживание пиковых нагрузок (Traffic Leveling):</strong> Клиенты могут отправить 100 000 задач за 5 секунд, но воркеры будут забирать их со стабильной скоростью, не рискуя исчерпать ресурсы серверов и СУБД.</li>
+</ol>
+<hr />
 <h2 id="mechanical-sympathy-lokalnye-vs-raspredelennye-ocheredi">Mechanical Sympathy: Локальные vs Распределенные очереди</h2>
 
-<p>Если вы пишете на Go, ваша первая мысль: <em>«Зачем мне RabbitMQ? Я могу сделать очередь задач на обычном буферизованном канале <code>chan Task</code> и пуле горутин!»</em></p>
-<p>Действительно, локальный Worker Pool на каналах работает в памяти текущего процесса.<br />
-* <strong>Локальная очередь (Go <code>chan</code>):</strong> Сверхбыстрая (десятки наносекунд). Передача данных — это просто копирование указателя под мьютексом внутри рантайма Go. Структуры <code>sudog</code> перекидывают горутины (<code>g</code>) между потоками ОС (<code>m</code>) через локальные очереди планировщика (<code>p</code>).<br />
-* <strong>Распределенная очередь (RabbitMQ):</strong> Дорогая. Сообщение должно быть сериализовано (JSON/Protobuf), отправлено через системный вызов <code>write</code> в сетевой стек ядра, пройти по TCP до брокера, быть сохраненным на диске (<code>fsync</code>), и только потом отправлено консьюмеру через <code>read</code>. Это миллисекунды (в $10^5$ раз медленнее!).</p>
-<p><strong>Но почему мы платим эту цену?</strong><br />
-1. <strong>Volatile Memory:</strong> Если ваш Go-процесс с локальным каналом падает (OOM Killer, аппаратный сбой), все невыполненные задачи в <code>chan</code> исчезают навсегда. Распределенный брокер хранит задачи на диске независимо от воркеров.<br />
-2. <strong>Справедливая балансировка:</strong> Один процесс ограничен ядрами одного физического сервера. Распределенная очередь позволяет балансировать CPU-bound задачи (например, кодирование видео) на сотни серверов.</p>
+<p>Каждый инженер на Go рано или поздно задается вопросом:<br />
+<em>«Зачем разворачивать кластер RabbitMQ или NATS, настраивать TLS и мониторинг, если я могу написать <code>tasks := make(chan Task, 1000)</code> и запустить 8 горутин прямо в памяти процесса?»</em></p>
+<p>Давайте сравним физику работы этих двух подходов:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th style="text-align: left;">Параметр</th>
+<th style="text-align: left;">Локальная очередь (Go <code>chan</code>)</th>
+<th style="text-align: left;">Распределенная очередь (RabbitMQ / NATS)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Среда выполнения</strong></td>
+<td style="text-align: left;">Оперативная память (RAM) одного процесса</td>
+<td style="text-align: left;">Отдельный кластер серверов по сети</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Задержка передачи</strong></td>
+<td style="text-align: left;">~20–50 наносекунд</td>
+<td style="text-align: left;">~1–5 миллисекунд ($10^5$ раз медленнее!)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Накладные расходы</strong></td>
+<td style="text-align: left;">Копирование указателя, лок мьютекса в рантайме Go</td>
+<td style="text-align: left;">Сериализация в JSON/Protobuf, syscall <code>write</code>, TCP-стек, <code>fsync</code></td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Отказоустойчивость</strong></td>
+<td style="text-align: left;"><strong>Нулевая</strong>: при падении процесса задачи в <code>chan</code> уничтожаются</td>
+<td style="text-align: left;"><strong>Высокая</strong>: задачи персистентно сохраняются в логе на диске</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Границы масштабирования</strong></td>
+<td style="text-align: left;">Ограничено ядрами и RAM одного сервера</td>
+<td style="text-align: left;">Сотни физических узлов в Kubernetes</td>
+</tr>
+</tbody>
+</table></div>
+<pre><code>    Анатомия передачи в Go (наносекунды):
+    Горутина 1 ──&gt; [chan Task] ──(копирование указателя)──&gt; Горутина 2
+                   Структура sudog и переключение g/p в рантайме Go.
+
+    Анатомия передачи через брокер (миллисекунды):
+    Сервис A ──&gt; JSON Encode ──&gt; Syscall write() ──&gt; TCP/IP Socket
+             ──&gt; Сетевой коммутатор ──&gt; Broker RAM/Disk fsync()
+             ──&gt; Syscall read() ──&gt; JSON Decode ──&gt; Сервис B
+</code></pre>
+<ul>
+<li><strong>Локальная очередь (Go <code>chan</code>):</strong> Сверхбыстрая. Передача данных — это просто копирование указателя под мьютексом внутри рантайма Go. Структуры <code>sudog</code> перекидывают горутины (<code>g</code>) между потоками ОС (<code>m</code>) через локальные очереди планировщика (<code>p</code>). Но если контейнер перезагрузится, задачи исчезнут без следа.</li>
+<li><strong>Распределенная очередь:</strong> Платит накладными расходами сети и дискового ввода-вывода ради главного свойства — <strong>сохранности данных (Durability)</strong> и возможности распределять CPU-bound задачи (например, кодирование видео) на сотни серверов в облаке.</li>
+</ul>
+<hr />
 <h2 id="spravedlivoe-raspredelenie-fair-dispatch">Справедливое распределение (Fair Dispatch)</h2>
 
-<p>Представьте ситуацию: у нас есть тяжелые задачи (отчеты по 10 секунд) и легкие (по 100 мс). Если мы используем RabbitMQ и подключаем к нему два воркера, RabbitMQ по умолчанию использует алгоритм <strong>Round-robin</strong> — он раздает задачи строго по очереди: 1-му, 2-му, 1-му, 2-му.</p>
+<p>Представьте систему, в которой задачи имеют разную вычислительную сложность:<br />
+- <strong>Легкие задачи:</strong> отправка email (выполняются за 100 мс);<br />
+- <strong>Тяжелые задачи:</strong> расчет аналитического отчета (требуют 10 секунд на 100% CPU).</p>
+<p>Если мы запустим два воркера и подключим их к брокеру, брокер по умолчанию будет использовать циклический алгоритм <strong>Round-robin</strong> — он выдает сообщения строго по очереди: первому, второму, первому, второму.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+participant B as Брокер (Round-robin)
+participant W1 as Worker 1 (Легкие задачи)
+participant W2 as Worker 2 (Тяжелые задачи)
+
+Note over B: В очереди 4 задачи: [Тяжелая, Легкая, Тяжелая, Легкая]
+B-&gt;&gt;W1: Задача 1 (Тяжелая, 10с)
+B-&gt;&gt;W2: Задача 2 (Легкая, 0.1с)
+Note over W2: Завершил за 100мс, простаивает!
+B-&gt;&gt;W1: Задача 3 (Тяжелая, 10с)
+B-&gt;&gt;W2: Задача 4 (Легкая, 0.1с)
+Note over W1: Перегружен! 2 задачи в очереди выполнения
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Проблема Head-of-Line Blocking на консьюмере</span>
   </div>
   <div class="callout-body">
     <p>Что произойдет, если все четные задачи окажутся тяжелыми, а нечетные — легкими?<br />
-RabbitMQ "вслепую" отправит 50 тяжелых задач Воркеру 2 и 50 легких Воркеру 1. Воркер 1 выполнит свои 50 задач за 5 секунд и будет простаивать. А Воркер 2 будет "потеть" над своими задачами 500 секунд, держа их в оперативной памяти (Unacknowledged). <br />
-Это приводит к перекосу ресурсов и Head-of-Line Blocking на уровне конкретного потребителя.</p>
+Брокер «вслепую» отдаст 50 тяжелых задач Воркеру 1 и 50 легких задач Воркеру 2. Воркер 2 закончит свою работу за 5 секунд и будет бессмысленно простаивать. В это время Воркер 1 будет непрерывно молотить процессор на протяжении 500 секунд, удерживая все 50 сообщений в оперативной памяти как неподтвержденные (<strong>Unacknowledged</strong>).<br />
+Это приводит к неравномерной утилизации ресурсов и классической блокировке начала очереди (<strong>Head-of-Line Blocking</strong>).</p>
   </div>
 </div>
 
+<hr />
 <h3 id="reshenie-prefetch-count-qos">Решение: Prefetch Count (QoS)</h3>
 
-<p>Чтобы сделать распределение "справедливым", мы обязаны использовать механизм <code>QoS</code> (Quality of Service), который мы будем подробно изучать в <a href="../02-rabbitmq/5-prefetch-i-qos.html" class="wikilink">5. Prefetch и QoS</a>. </p>
-<p>В коде консьюмера мы устанавливаем <code>Prefetch Count = 1</code> (или равным размеру пула локальных горутин). Это говорит брокеру: <em>«Не давай мне новую задачу, пока я не пришлю тебе <code>Ack</code> (подтверждение) за предыдущую»</em>. <br />
-В этом случае задачи хранятся в брокере, и как только любой из воркеров освобождается, он забирает следующую задачу. Балансировка становится идеальной.</p>
+<p>Чтобы гарантировать подлинно справедливое распределение (<strong>Fair Dispatch</strong>), используется механизм управления качеством обслуживания (<strong>QoS — Quality of Service</strong>), подробнее рассматриваемый в <a href="../02-rabbitmq/5-prefetch-i-qos.html" class="wikilink">5. Prefetch и QoS</a>.</p>
+<p>В конфигурации соединения консьюмера задается параметр <strong>Prefetch Count</strong> (например, <code>Prefetch Count = 1</code> или равный размеру пула параллельных горутин воркера). Это правило на уровне сетевого протокола указывает брокеру:<br />
+<em>«Не отправляй мне новую порцию данных, пока число неподтвержденных мной задач (<code>Unacknowledged</code>) не уменьшится!»</em></p>
+<p>В результате задачи остаются в центральной очереди брокера. Как только любой из воркеров завершает обработку и отправляет подтверждение (<code>Ack</code>), он тут же забирает следующую задачу. Балансировка становится математически идеальной.</p>
+<hr />
 <h2 id="realizatsiya-patternov-work-queue-v-raznykh-brokerakh">Реализация паттернов Work Queue в разных брокерах</h2>
 
-<p>В мире Message Brokers нет единого стандарта. RabbitMQ и Kafka реализуют Work Queue абсолютно разными механизмами, и незнание этих отличий — классическая причина провала архитектуры.</p>
-<h3 id="rabbitmq-nativnaya-ochered">RabbitMQ (Нативная очередь)</h3>
-<p>RabbitMQ создан для паттерна Work Queue. Вы создаете одну логическую очередь (Queue), и подключаете к ней N консьюмеров. RabbitMQ сам управляет блокировками и раздачей сообщений (через Push-модель). Если воркер отвалился (TCP-соединение разорвано), RabbitMQ мгновенно забирает у него все <code>Unacknowledged</code> сообщения и передает их живым воркерам.</p>
-<h3 id="apache-kafka-consumer-groups">Apache Kafka (Consumer Groups)</h3>
-<p>Kafka — это лог, а не очередь. Там нельзя просто "взять задачу и удалить ее". <br />
-В Kafka паттерн Work Queue реализуется через <strong>Consumer Groups</strong> (подробнее в <a href="../03-kafka/4-consumer-groups.html" class="wikilink">4. Consumer groups</a>). <br />
-Все воркеры объединяются в одну группу (с одинаковым <code>group.id</code>). Kafka распределяет партиции (Partitions) топика между воркерами в группе.</p>
+<p>В мире Message Brokers не существует универсального API. RabbitMQ, Kafka и NATS решают задачу конкурирующих потребителей с использованием фундаментально различных архитектурных подходов.</p>
+<h3 id="1-rabbitmq-nativnye-ocheredi-soobshcheniy">1. RabbitMQ: Нативные очереди сообщений</h3>
+
+<p>RabbitMQ был буквально спроектирован вокруг паттерна Work Queue:<br />
+- Создается одна именованная очередь (<code>Queue</code>);<br />
+- К ней подключаются $N$ независимых консьюмеров через AMQP;<br />
+- Брокер сам управляет атомарным снятием задач из начала очереди и доставкой воркерам по push-модели;<br />
+- Если соединение с воркером падает, брокер мгновенно возвращает все неподтвержденные сообщения (<code>Unacknowledged</code>) в голову очереди для выдачи другим воркерам.</p>
+<h3 id="2-apache-kafka-consumer-groups-i-ogranichenie-partitsiy">2. Apache Kafka: Consumer Groups и ограничение партиций</h3>
+
+<p>Kafka — это упорядоченный append-only лог, из которого нельзя просто так «вырезать» или «удалить» выполненную запись. В Kafka паттерн Work Queue строится поверх механизма групп потребителей (<strong>Consumer Groups</strong> с общим идентификатором <code>group.id</code>, см. <a href="../03-kafka/4-consumer-groups.html" class="wikilink">4. Consumer groups</a>).</p>
+<p>Брокер распределяет <strong>партиции (Partitions)</strong> топика между участниками группы:</p>
+<pre><code>    Топик: 4 Партиции [ P0, P1, P2, P3 ]
+
+    Сценарий А (4 воркера):   W1-&gt;P0, W2-&gt;P1, W3-&gt;P2, W4-&gt;P3  (100% утилизация)
+    Сценарий Б (6 воркеров):  W1-&gt;P0, W2-&gt;P1, W3-&gt;P2, W4-&gt;P3, W5-&gt;IDLE, W6-&gt;IDLE!
+</code></pre>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы используем Kafka. У нас 10 партиций в топике. Мы видим, что задачи копятся (Lag растет), и решаем поднять количество воркеров в Kubernetes (HPA) с 10 до 20. Ускорит ли это обработку?<br />
-<strong>Ответ:</strong> НЕТ! В Kafka один воркер (в рамках группы) может читать несколько партиций, но <strong>одну партицию не могут читать два воркера из одной группы одновременно</strong>. Если у вас 10 партиций и 20 воркеров, 10 воркеров будут простаивать (Idle), не получая ни одного сообщения. Чтобы масштабировать Work Queue в Kafka, вам нужно увеличивать количество партиций!</p>
+    <p><strong>Вопрос:</strong> «Мы используем Apache Kafka в качестве очереди задач. В топике настроено 10 партиций. Мы замечаем, что очередь задач растет (Consumer Lag увеличивается), и Kubernetes HPA автоматически масштабирует количество подов воркеров с 10 до 20. Поможет ли это ускорить разгребание очереди?»<br />
+<strong>Ответ:</strong> <strong>Категорически нет!</strong><br />
+В модели конкурирующих потребителей Kafka действует фундаментальное правило: <strong>одну партицию топика не могут одновременно читать два воркера из одной Consumer Group</strong>.<br />
+Если у вас 10 партиций и 20 воркеров, ровно 10 воркеров получат по одной партиции, а оставшиеся 10 воркеров перейдут в состояние <strong>Idle (простой)</strong> и не получат ни единого байта данных.<br />
+Чтобы масштабировать Work Queue в Kafka, необходимо <strong>увеличивать количество партиций</strong> топика!</p>
   </div>
 </div>
 
+<h3 id="3-nats-queue-groups-i-jetstream-workqueue">3. NATS: Queue Groups и JetStream WorkQueue</h3>
+
+<p>В экосистеме NATS Work Queue реализуется через:<br />
+- <strong>Core NATS Queue Groups:</strong> вызов <code>nc.QueueSubscribe("tasks", "worker_pool", handler)</code>. Сервер NATS балансирует сообщения между подписчиками группы по алгоритму Round-Robin;<br />
+- <strong>JetStream WorkQueue Policy:</strong> поток с политикой <code>Retention: nats.WorkQueuePolicy</code>, где сообщение гарантированно удаляется из персистентного лога сразу после первого успешного <code>msg.Ack()</code>.</p>
+<hr />
 <h2 id="idiomatichnyy-go-soedinyaem-lokalnyy-i-raspredelennyy-puly">Идиоматичный Go: Соединяем локальный и распределенный пулы</h2>
 
-<p>Senior-паттерн при работе с очередями в Go — это комбинация распределенной Work Queue (брокер) и локального Worker Pool (горутины). </p>
-<p>Нельзя запускать <code>go handle(msg)</code> на каждое входящее сообщение, иначе вы уроните базу данных количеством открытых коннектов (см. проблему Thundering Herd).</p>
-<p><strong>Правило: Prefetch Count должен быть строго равен размеру вашего локального Worker Pool!</strong></p>
+<p>Senior-паттерн при проектировании воркеров на Go заключается в правильной координации распределенной очереди брокера и локального пула горутин.</p>
+<p>Запускать <code>go handle(msg)</code> на каждое входящее из сети сообщение категорически запрещено: при резком наплыве 50 000 сообщений вы породите 50 000 горутин, исчерпаете лимиты подключений к базе данных и уроните приложение по OOM (классический эффект Thundering Herd).</p>
+<p><strong>Фундаментальное правило: Значение Prefetch Count брокера должно быть строго согласовано с размером локального пула горутин (<code>poolSize</code>)!</strong></p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2276,21 +2413,28 @@ import (
     &quot;context&quot;
     &quot;log&quot;
 
-    amqp &quot;[github.com/rabbitmq/amqp091-go](https://github.com/rabbitmq/amqp091-go)&quot;
+    amqp &quot;github.com/rabbitmq/amqp091-go&quot;
 )
 
-// WorkQueueConsumer управляет чтением из RabbitMQ и локальным пулом
+// WorkQueueConsumer управляет распределенным чтением и локальным пулом горутин
 type WorkQueueConsumer struct {
     poolSize int
 }
 
+// NewWorkQueueConsumer создает новый экземпляр консьюмера
+func NewWorkQueueConsumer(poolSize int) *WorkQueueConsumer {
+    return &amp;WorkQueueConsumer{poolSize: poolSize}
+}
+
+// Start запускает чтение задач и фиксированный пул воркеров
 func (c *WorkQueueConsumer) Start(ctx context.Context, ch *amqp.Channel, queueName string) error {
     // 1. Критически важно: Синхронизируем QoS с размером пула горутин!
-    // Если poolSize=10, мы не возьмем из сети 11-ю задачу, пока не закончим одну из 10.
+    // Если poolSize = 10, брокер выдаст ровно 10 задач и остановится, 
+    // пока хотя бы одна горутина не пришлет Ack/Nack.
     err := ch.Qos(
-        c.poolSize, // prefetch count
-        0,          // prefetch size
-        false,      // global
+        c.poolSize, // prefetch count: максимальное число не подтвержденных сообщений
+        0,          // prefetch size: без ограничения по объему в байтах
+        false,      // global: false означает ограничение на текущий канал/консьюмер
     )
     if err != nil {
         return err
@@ -2298,8 +2442,8 @@ func (c *WorkQueueConsumer) Start(ctx context.Context, ch *amqp.Channel, queueNa
 
     msgs, err := ch.Consume(
         queueName,
-        &quot;&quot;,    // consumer name
-        false, // auto-ack (ОБЯЗАТЕЛЬНО FALSE для Work Queue!)
+        &quot;&quot;,    // consumer tag (генерируется брокером)
+        false, // auto-ack: ОБЯЗАТЕЛЬНО FALSE для надежных Work Queues!
         false, // exclusive
         false, // no-local
         false, // no-wait
@@ -2309,64 +2453,72 @@ func (c *WorkQueueConsumer) Start(ctx context.Context, ch *amqp.Channel, queueNa
         return err
     }
 
-    // 2. Создаем локальный канал для балансировки между горутинами
-    // Буфер не нужен, так как QoS уже ограничивает нас
+    // 2. Локальный канал для передачи задач пулу горутин.
+    // Небуферизованный канал идеален: префетч уже ограничен сетевым QoS
     tasks := make(chan amqp.Delivery)
 
-    // 3. Запускаем фиксированный Worker Pool
+    // 3. Запускаем фиксированный пул горутин
     for i := 0; i &lt; c.poolSize; i++ {
         go c.workerLoop(ctx, tasks, i)
     }
 
-    // 4. Диспетчер: читает из сети и отдает локальным воркерам
+    // 4. Диспетчер: считывает сообщения из сетевого канала AMQP и передает в пул
     for {
         select {
         case &lt;-ctx.Done():
-            log.Println(&quot;Shutting down dispatcher...&quot;)
+            log.Println(&quot;Остановка диспетчера очередей...&quot;)
             return nil
         case msg, ok := &lt;-msgs:
             if !ok {
-                return nil // Канал закрыт
+                return nil // Сетевой канал закрыт
             }
-            // Блокируется, если все вокеры заняты. 
-            // Из-за QoS=poolSize блокировки здесь почти не будет, 
-            // но это защищает нас от утечек.
+            // Блокируется, только если все горутины в пуле заняты
             tasks &lt;- msg 
         }
     }
 }
 
+// workerLoop представляет цикл работы отдельного воркера в пуле
 func (c *WorkQueueConsumer) workerLoop(ctx context.Context, tasks &lt;-chan amqp.Delivery, id int) {
     for {
         select {
         case &lt;-ctx.Done():
             return
         case msg := &lt;-tasks:
-            // Имитация тяжелой работы
+            // Обработка тяжелой вычислительной или I/O задачи
             err := processHeavyTask(ctx, msg.Body)
 
             if err != nil {
-                log.Printf(&quot;Worker %d failed: %v&quot;, id, err)
-                // Возвращаем задачу в очередь для другого воркера
-                msg.Nack(false, true)
+                log.Printf(&quot;[Worker %d] Ошибка обработки задачи: %v&quot;, id, err)
+                // Возвращаем задачу обратно в очередь для повторной попытки (requeue = true)
+                _ = msg.Nack(false, true)
             } else {
-                // Успех. Только теперь диспетчер сможет вычитать новую задачу
-                msg.Ack(false)
+                // Успех: отправляем подтверждение в брокер
+                _ = msg.Ack(false)
             }
         }
     }
 }
+
+// processHeavyTask имитирует выполнение бизнес-логики
+func processHeavyTask(ctx context.Context, payload []byte) error {
+    // Бизнес-логика генерации отчета или транскодирования видео...
+    return nil
+}
 </code></pre>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Work Queue</strong> используется для масштабирования тяжелых вычислительных или I/O задач, где сообщение должно быть обработано ровно один раз.</li>
-<li>Для честного распределения (Fair Dispatch) и защиты памяти Go-процесса необходимо жестко связывать <strong>Prefetch Count</strong> брокера и размер пула горутин.</li>
-<li>Разные брокеры требуют разного подхода к масштабированию: в RabbitMQ мы просто добавляем консьюмеры к очереди, в Kafka — мы обязаны следить за балансом <code>Количество Воркеров &lt;= Количество Партиций</code>.</li>
+<li><strong>Work Queue (Очередь задач)</strong> гарантирует, что каждое сообщение обрабатывается ровно одним исполнителем из пула конкурирующих потребителей.</li>
+<li><strong>Fair Dispatch</strong> достигается ограничением параметра <code>Prefetch Count</code> (QoS), защищая систему от перекоса нагрузки и блокировок Head-of-Line.</li>
+<li>В <strong>RabbitMQ</strong> масштабирование осуществляется простым добавлением воркеров к очереди; в <strong>Apache Kafka</strong> число параллельных воркеров жестко ограничено числом партиций топика.</li>
+<li>В коде на Go правильная архитектура требует синхронизации лимита <code>ch.Qos</code> брокера с фиксированным пулом горутин воркера.</li>
 </ol>
-<p>Work Queue и Pub/Sub — это низкоуровневые строительные блоки асинхронного мира. Но когда мы начинаем строить на их базе сложные бизнес-процессы микросервисов, мы переходим на уровень архитектурных парадигм. В следующей статье мы поднимемся на уровень выше и рассмотрим глобальную концепцию: <a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a>.</p>
+<p>Мы разобрали два ключевых базовых паттерна: <a href="1-pub-sub.html" class="wikilink">1. Pub Sub</a> для оповещения всех и <a href="2-work-queue.html" class="wikilink">2. Work Queue</a> для распределения задач одному. Но как собрать эти примитивы в глобальную архитектуру предприятия? </p>
+<p>В следующей лекции мы переходим к анализу парадигмы: <a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2394,7 +2546,7 @@ func (c *WorkQueueConsumer) workerLoop(ctx context.Context, tasks &lt;-chan amqp
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-patterna-work-queue">Анатомия паттерна Work Queue</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-lokalnye-vs-raspredelennye-ocheredi">Mechanical Sympathy: Локальные vs Распределенные очереди</a></li><li class="toc-item toc-h2"><a href="#spravedlivoe-raspredelenie-fair-dispatch">Справедливое распределение (Fair Dispatch)</a></li><li class="toc-item toc-h3"><a href="#reshenie-prefetch-count-qos">Решение: Prefetch Count (QoS)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-patternov-work-queue-v-raznykh-brokerakh">Реализация паттернов Work Queue в разных брокерах</a></li><li class="toc-item toc-h3"><a href="#rabbitmq-nativnaya-ochered">RabbitMQ (Нативная очередь)</a></li><li class="toc-item toc-h3"><a href="#apache-kafka-consumer-groups">Apache Kafka (Consumer Groups)</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-soedinyaem-lokalnyy-i-raspredelennyy-puly">Идиоматичный Go: Соединяем локальный и распределенный пулы</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#zachem-nuzhna-ochered-zadach">Зачем нужна очередь задач?</a></li><li class="toc-item toc-h2"><a href="#anatomiya-patterna-work-queue">Анатомия паттерна Work Queue</a></li><li class="toc-item toc-h3"><a href="#preimushchestva-arkhitektury">Преимущества архитектуры:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-lokalnye-vs-raspredelennye-ocheredi">Mechanical Sympathy: Локальные vs Распределенные очереди</a></li><li class="toc-item toc-h2"><a href="#spravedlivoe-raspredelenie-fair-dispatch">Справедливое распределение (Fair Dispatch)</a></li><li class="toc-item toc-h3"><a href="#reshenie-prefetch-count-qos">Решение: Prefetch Count (QoS)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-patternov-work-queue-v-raznykh-brokerakh">Реализация паттернов Work Queue в разных брокерах</a></li><li class="toc-item toc-h3"><a href="#1-rabbitmq-nativnye-ocheredi-soobshcheniy">1. RabbitMQ: Нативные очереди сообщений</a></li><li class="toc-item toc-h3"><a href="#2-apache-kafka-consumer-groups-i-ogranichenie-partitsiy">2. Apache Kafka: Consumer Groups и ограничение партиций</a></li><li class="toc-item toc-h3"><a href="#3-nats-queue-groups-i-jetstream-workqueue">3. NATS: Queue Groups и JetStream WorkQueue</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-soedinyaem-lokalnyy-i-raspredelennyy-puly">Идиоматичный Go: Соединяем локальный и распределенный пулы</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

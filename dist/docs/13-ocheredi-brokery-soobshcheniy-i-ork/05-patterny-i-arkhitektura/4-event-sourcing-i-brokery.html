@@ -2168,20 +2168,33 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Event sourcing и брокеры</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье мы погрузились в хаос и красоту <a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a>. Мы выяснили, что главной головной болью асинхронного мира является проблема <strong>Dual Write (Двойной записи)</strong>: как атомарно сохранить новое состояние сущности в локальную базу данных (например, PostgreSQL) и отправить уведомление об этом в брокер сообщений (Kafka/RabbitMQ)? </p>
-<p>Что если я скажу вам, что эта проблема существует только потому, что мы мыслим категориями «текущего состояния»? </p>
-<p>Что если мы <strong>вообще перестанем хранить текущее состояние</strong> в базе данных, а вместо этого будем хранить только историю того, как мы к этому состоянию пришли? Эта радикальная смена парадигмы называется <strong>Event Sourcing (Порождение событий)</strong>, и брокеры сообщений играют в ней роль первой скрипки.</p>
+            <h1>4. Event Sourcing и брокеры сообщений: архитектура неизменяемых логов</h1>
+<blockquote>
+<p><em>"Accountants don't use erasers; otherwise, they would go to jail. In good engineering, as in good accounting, the history of how you arrived at a number is far more valuable than the number itself."</em><br />
+— Грег Янг</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> В <a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a> мы вскрыли фундаментальную проблему распределенных систем — <strong>Dual Write (Двойную запись)</strong>: невозможность атомарного обновления локальной СУБД и отправки события в брокер. В этой статье мы познакомимся с радикальным решением, которое переворачивает архитектуру с ног на голову: <strong>Event Sourcing (Порождение событий)</strong>. Мы разберем, как Kafka и NATS JetStream превращаются в полноценные базы данных, как устроена регидратация сущностей в Go, и почему этот паттерн неразрывно связан со следующей лекцией — <a href="5-cqrs-i-brokery.html" class="wikilink">5. CQRS и брокеры</a>.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="illyuziya-tekushchego-sostoyaniya-crud-vs-event-sourcing">Иллюзия текущего состояния (CRUD vs Event Sourcing)</h2>
 
-<p>Классический бэкенд построен на парадигме CRUD (Create, Read, Update, Delete). База данных хранит слепок реальности на данный момент.</p>
-<p>Представьте банковский счет. В CRUD-модели при переводе денег вы делаете:</p>
+<p>Классическая веб-разработка последних трех десятилетий заложница парадигмы CRUD (Create, Read, Update, Delete). Мы привыкли считать, что база данных обязана хранить мгновенный «слепок» текущей реальности.</p>
+<p>Представьте банковский счет. В традиционной реляционной CRUD-модели при переводе денег разработчик выполняет деструктивную операцию:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2195,36 +2208,52 @@
 </code></pre>
 </div>
 
-<p>Старое значение баланса безвозвратно уничтожено (затерто). Если через год клиент спросит: "А почему у меня такой баланс?", вы не сможете ответить, опираясь только на таблицу <code>accounts</code>. Вам придется строить сбоку костыли в виде таблиц аудита (<code>audit_logs</code>), которые часто расходятся с реальностью.</p>
-<p><strong>Event Sourcing</strong> работает иначе. Вдохновленный бухгалтерскими книгами (Ledgers), он запрещает операции <code>UPDATE</code> и <code>DELETE</code>. Существует только <code>INSERT</code>. </p>
-<p>Состояние системы — это производная (функция свертки) от всех событий, произошедших с момента создания.</p>
+<p>В этот момент физические байты на диске перезаписываются (или помечаются мертвыми в MVCC). Старое значение баланса <strong>безвозвратно уничтожено</strong>. Если через полгода регулятор или клиент задаст вопрос: <em>«Почему 15 марта на счете было 4 200 рублей, а не 5 000?»</em>, ответить по одной лишь таблице <code>accounts</code> невозможно. Приходится нагромождать костыли в виде таблиц аудита (<code>audit_logs</code>), триггеров и версионирования строк, которые со временем неизбежно рассинхронизируются с реальным состоянием.</p>
+<p><strong>Event Sourcing</strong> заимствует мудрость многовековой практики бухгалтерского учета (Double-Entry Bookkeeping). Бухгалтеры никогда не используют ластик: если совершена ошибка или произошел перевод, в гроссбух <strong>дописывается новая корректирующая проводка</strong>. </p>
+<p>В Event Sourcing операции <code>UPDATE</code> и <code>DELETE</code> <strong>запрещены на физическом уровне</strong>. Допустима строго одна операция — <code>INSERT</code> (Append).</p>
+<pre><code>    CRUD Модель (Деструктивное состояние):
+    [Таблица accounts: ID=42, Balance=400] &lt;-- Прошлые значения стерты навсегда!
+
+    Event Sourcing Модель (Иммутабельный лог):
+    [t0: AccountCreated (0)] ──&gt; [t1: MoneyDeposited (+500)] ──&gt; [t2: MoneyWithdrawn (-100)]
+                                                                           │
+                                           Текущее состояние: SUM() = 400 ◄┘
+</code></pre>
+<p>Текущее состояние агрегата — это математическая функция свертки (Fold / Reduce) от всех событий, произошедших с момента его создания:</p>
+<p>$$\text{CurrentState} = \sum_{i=0}^{N} \text{Apply}(\text{Event}_i)$$</p>
 <p><strong>Поток событий (Event Stream) для счета №42:</strong><br />
 1. <code>AccountCreated { InitBalance: 0 }</code><br />
 2. <code>MoneyDeposited { Amount: 500 }</code><br />
 3. <code>MoneyWithdrawn { Amount: 100 }</code></p>
-<p>Текущий баланс (400) <strong>не хранится нигде</strong>. Он вычисляется (Rehydration / Rebuilding) в оперативной памяти Go-сервиса путем последовательного применения этих трех событий.</p>
+<p>Текущий баланс (400) <strong>не хранится как статическое поле</strong>. Он вычисляется в оперативной памяти процесса в ходе быстрой процедуры восстановления — <strong>регидратации (Rehydration)</strong>.</p>
+<hr />
 <h2 id="broker-kak-baza-dannykh-idealnyy-match">Брокер как База Данных (Идеальный Match)</h2>
 
-<p>Для реализации Event Sourcing нам нужен <strong>Event Store (Хранилище событий)</strong>. Это хранилище должно обладать тремя свойствами:<br />
-1. Строгий порядок событий (Ordering).<br />
-2. Иммутабельность (Append-only лог).<br />
-3. Возможность подписки на новые события (Pub/Sub).</p>
-<p>Именно поэтому <strong>Apache Kafka</strong> является идеальным техническим фундаментом для Event Sourcing (гораздо лучшим, чем реляционные СУБД). </p>
-<p>Вспомним <a href="../03-kafka/1-kafka-arkhitektura-i-model-log-based-sistemy.html" class="wikilink">1. Kafka. Архитектура и модель log based системы</a>. Kafka — это и есть распределенный Append-only лог. Если мы установим в топике Kafka <code>retention.bytes = -1</code> и <code>retention.ms = -1</code> (хранить вечно), топик превращается в полноценную базу данных. Партиция Kafka выступает гарантом строгого порядка событий для конкретного агрегата (если использовать ID агрегата как Partition Key).</p>
+<p>Для работы Event Sourcing необходим специализированный компонент — <strong>Event Store (Хранилище событий)</strong>. </p>
+<p>К Event Store предъявляются три жестких требования:<br />
+1. <strong>Строгий порядок событий (Strict Ordering):</strong> транзакции должны воспроизводиться строго в хронологическом порядке;<br />
+2. <strong>Иммутабельность:</strong> история никогда не модифицируется и не сжимается задним числом (Append-only Log);<br />
+3. <strong>Реактивная подписка:</strong> возможность стриминга новых событий подписчикам в реальном времени (Pub/Sub).</p>
+<p>Именно поэтому распределенный лог <strong>Apache Kafka</strong> (а также <strong>NATS JetStream</strong>) выступает идеальным техническим фундаментом для Event Sourcing — куда более естественным, чем классические реляционные СУБД!</p>
+<p>Вспомним устройство распределенного журнала из <span class="wikilink-unresolved" title="Заметка в разработке">1. Apache Kafka. Архитектура и концепции</span>: Kafka спроектирована как последовательный Append-only лог сегментов на диске. Если задать параметры топика:<br />
+- <code>retention.bytes = -1</code> (бесконечный объем);<br />
+- <code>retention.ms = -1</code> (вечное хранение),<br />
+то топик Kafka де-факто превращается в высоконадежную, персистентную СУБД. При этом использование ID агрегата (например, <code>account_id</code>) в качестве ключа партиционирования (<strong>Partition Key</strong>) гарантирует, что все события конкретного банковского счета попадут в одну и ту же партицию, обеспечивая абсолютный порядок чтения и записи.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: RabbitMQ не подходит</span>
+    <span class="callout-title">Ловушка / Gotcha: RabbitMQ не подходит для Event Sourcing</span>
   </div>
   <div class="callout-body">
-    <p>RabbitMQ — это транзитный брокер (Smart Broker). Его философия: "доставил — удалил". Если вы попытаетесь построить Event Sourcing на RabbitMQ, вам придется дублировать события в отдельную БД (например, EventStoreDB или PostgreSQL), что моментально возвращает вас к проблеме Dual Write!</p>
+    <p>RabbitMQ — это брокер очередей, работающий по принципу <em>«доставил и сразу удалил из памяти»</em>. В RabbitMQ нет концепции неизменяемого персистентного журнала с произвольным смещением (Offset).<br />
+Если попытаться построить Event Sourcing на RabbitMQ, вам придется сохранять события в стороннюю БД (PostgreSQL или EventStoreDB), а брокер использовать только для рассылки уведомлений. Это мгновенно возвращает вас к кошмару проблемы <strong>Dual Write</strong>!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="anatomiya-agregata-v-go">Анатомия Агрегата в Go</h2>
 
-<p>Давайте посмотрим, как концепция Event Sourcing элегантно ложится на идиоматичный Go-код.</p>
-<p>Мы создаем Доменную сущность (Aggregate Root). У нее есть внутреннее состояние, но оно никогда не мутируется напрямую извне. Изменение состояния происходит только через функцию <code>Apply()</code>, которая принимает доменное событие.</p>
+<p>Посмотрим, как фундаментальный паттерн Event Sourcing реализуется в чистом и идиоматичном коде на Go:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2241,29 +2270,37 @@ import (
     &quot;fmt&quot;
 )
 
-// Aggregate: Банковский счет
+// Account — Доменный Агрегат (Aggregate Root)
+// Состояние не мутируется напрямую публичными методами!
 type Account struct {
     ID      string
     Balance int64
-    Version int // Важно для оптимистичных блокировок
+    Version int // Критично для проверки оптимистичных блокировок
 }
 
-// Базовый интерфейс события
+// Event — базовый интерфейс любого доменного события
 type Event interface {
     EventType() string
 }
 
-// Конкретные события
-type AccountCreated struct { AccountID string }
+// Конкретные неизменяемые события:
+type AccountCreated struct {
+    AccountID string
+}
 func (e AccountCreated) EventType() string { return &quot;AccountCreated&quot; }
 
-type MoneyDeposited struct { Amount int64 }
+type MoneyDeposited struct {
+    Amount int64
+}
 func (e MoneyDeposited) EventType() string { return &quot;MoneyDeposited&quot; }
 
-type MoneyWithdrawn struct { Amount int64 }
+type MoneyWithdrawn struct {
+    Amount int64
+}
 func (e MoneyWithdrawn) EventType() string { return &quot;MoneyWithdrawn&quot; }
 
-// Apply: Единственный способ изменить состояние агрегата
+// Apply — чистая функция-мутатор: единственный способ изменить поля структуры.
+// Внутри Apply запрещена любая логика ввода-вывода (I/O) и валидации!
 func (a *Account) Apply(event Event) {
     switch e := event.(type) {
     case AccountCreated:
@@ -2277,22 +2314,27 @@ func (a *Account) Apply(event Event) {
     a.Version++
 }
 
-// LoadFromHistory: Восстановление состояния из лога (Rehydration)
+// NewAccountFromHistory восстанавливает состояние агрегата из цепочки событий (Rehydration)
 func NewAccountFromHistory(events []Event) *Account {
     account := &amp;Account{}
     for _, e := range events {
-        account.Apply(e) // O-n сложность
+        account.Apply(e) // O(N) проход в оперативной памяти
     }
     return account
 }
 
-// Бизнес-логика (Commands)
-// Она проверяет инварианты и ГЕНЕРИРУЕТ новые события, если всё ок.
+// Withdraw реализует команду бизнес-логики.
+// Метод проверяет инварианты и ГЕНЕРИРУЕТ новое событие, но НЕ меняет состояние сам!
 func (a *Account) Withdraw(amount int64) (Event, error) {
-    if a.Balance &lt; amount {
-        return nil, errors.New(&quot;insufficient funds&quot;)
+    if amount &lt;= 0 {
+        return nil, errors.New(&quot;сумма списания должна быть строго положительной&quot;)
     }
-    // Мы не меняем a.Balance здесь! Мы только создаем факт.
+    if a.Balance &lt; amount {
+        return nil, fmt.Errorf(&quot;insufficient funds: доступно %d, запрошено %d&quot;, a.Balance, amount)
+    }
+
+    // Мы НЕ пишем a.Balance -= amount! 
+    // Мы только фиксируем факт успешного формирования события:
     return MoneyWithdrawn{Amount: amount}, nil
 }
 </code></pre>
@@ -2301,32 +2343,80 @@ func (a *Account) Withdraw(amount int64) (Event, error) {
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Mechanical Sympathy и Escape Analysis</span>
+    <span class="callout-title">Под капотом: Mechanical Sympathy, Escape Analysis и интерфейс itab</span>
   </div>
   <div class="callout-body">
-    <p>Восстановление агрегата (<code>NewAccountFromHistory</code>) требует прохода по массиву событий. С точки зрения железа, если массив <code>events</code> лежит в непрерывном блоке памяти, CPU загрузит его в кэш-линию L1 и выполнит регидратацию миллионов событий за микросекунды (Cache Locality). <br />
-Однако, в Go передача интерфейсов (<code>[]Event</code>) часто приводит к аллокациям в куче (Escape Analysis фейлится, так как рантайму нужна таблица виртуальных методов itab). При очень длинных историях событий это создаст давление на GC. На критических путях HighLoad систем часто используют кодогенерацию или <code>union</code>-подобные структуры на базе слайсов байт вместо массивов интерфейсов.</p>
+    <p>Восстановление состояния агрегата (<code>NewAccountFromHistory</code>) требует итерации по срезу событий.<br />
+Если события упакованы в последовательный непрерывный буфер памяти, процессор с легкостью подгрузит их в кэш первого уровня (L1 Data Cache) благодаря линейной локальности ссылок (Cache Locality).<br />
+Однако обратите внимание на тип среза: <code>[]Event</code>. В Go присваивание конкретной структуры интерфейсному типу <code>Event</code> приводит к созданию структуры <code>runtime.iface</code> с указателем на таблицу методов <code>itab</code>. Если компилятор не сможет доказать, что переменная не утекает из функции (Escape Analysis fails), память под каждое событие будет аллоцирована в куче (Heap), создавая колоссальную работу для Сборщика Мусора (GC).<br />
+В критических HighLoad-системах на Go вместо срезов интерфейсов <code>[]Event</code> используют кодогенерацию, <code>union</code>-подобные плоские структуры или бинарные протоколы (Protobuf/FlatBuffers), упакованные в монолитный слайс байт <code>[]byte</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="reshenie-problemy-dual-write">Решение проблемы Dual Write</h2>
 
-<p>Event Sourcing решает проблему двойной записи самым радикальным образом: <strong>запись остается только одна</strong>.</p>
-<p>Поток выполнения:<br />
-1. API получает команду (HTTP POST).<br />
-2. Go-сервис вычитывает всю историю событий агрегата из брокера (Kafka) в оперативную память.<br />
-3. Сервис восстанавливает состояние (Rehydration).<br />
-4. Сервис выполняет бизнес-проверки.<br />
-5. Сервис <strong>записывает новое событие в Kafka</strong>.<br />
-6. Возвращает пользователю HTTP 200 OK.</p>
-<p>Всё. Нет никакой локальной базы данных, которую нужно обновлять синхронно. Брокер сообщений <em>и есть</em> база данных.</p>
+<p>Главный триумф Event Sourcing заключается в том, что проблема <strong>Dual Write</strong> (двойной записи) не просто решается — <strong>она перестает существовать в принципе</strong>!</p>
+<p>Поскольку мы больше не ведем отдельную таблицу текущего состояния, в архитектуре <strong>остается ровно одна операция записи</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant C as Клиент (HTTP)
+participant S as Go Service
+participant K as Kafka / JetStream (Event Store)
+
+C-&gt;&gt;S: POST /accounts/42/withdraw {&quot;amount&quot;: 100}
+S-&gt;&gt;K: Чтение истории событий (account_id = 42)
+Note over S: Регидратация: NewAccountFromHistory()&lt;br&gt;Баланс = 500, Версия = 2
+Note over S: Проверка: Balance &gt;= 100 (OK)
+Note over S: Генерация MoneyWithdrawn{100}
+S-&gt;&gt;K: Append: MoneyWithdrawn (ОДНА АТОМАРНАЯ ЗАПИСЬ!)
+Note over K: Запись в журнал, смещение Offset=3
+S-&gt;&gt;C: HTTP 200 OK {&quot;status&quot;: &quot;success&quot;, &quot;new_version&quot;: 3}
+  </pre>
+</div>
+
+
+<p>Нет никакой локальной реляционной базы данных, которую требовалось бы координировать с брокером через двухфазный коммит. Брокер сообщений <strong>и есть ваша база данных</strong>. Запись всегда атомарна, последовательна и иммутабельна.</p>
+<hr />
 <h2 id="temnaya-storona-kak-chitat-dannye-vvedenie-v-cqrs">Темная сторона: Как читать данные? (Введение в CQRS)</h2>
 
-<p>У Event Sourcing есть один фатальный недостаток. </p>
-<p>Представьте, что бизнес просит: <em>"Выведи мне список всех счетов, где баланс больше 1000 долларов"</em>.<br />
-В PostgreSQL вы бы написали <code>SELECT * FROM accounts WHERE balance &gt; 1000</code>.</p>
-<p>В Event Sourcing у вас нет столбца <code>balance</code>. У вас есть только терабайтный лог транзакций в Kafka. Чтобы выполнить этот запрос, вам придется вычитать <strong>весь лог с самого начала времен</strong>, восстановить в памяти <strong>каждый</strong> счет, проверить его баланс и отфильтровать. Это $O(N)$ по времени и объему памяти, где $N$ — все события в системе. Это убьет ваш сервис.</p>
-<p>Для решения этой проблемы Event Sourcing всегда (в 100% случаев) применяется вместе с паттерном <strong>CQRS (Command Query Responsibility Segregation)</strong>.</p>
+<p>У Event Sourcing есть обратная сторона медали, которая может стать фатальной, если не подготовить архитектуру чтения заранее.</p>
+<p>Представьте, что отдел комплаенса просит предоставить отчет:<br />
+<em>«Выведи список всех счетов, где текущий баланс превышает 1 000 долларов»</em>.</p>
+<p>В обычной реляционной базе данных вы бы выполнили мгновенный запрос:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">SELECT * FROM accounts WHERE balance &gt; 1000;
+</code></pre>
+</div>
+
+<p><strong>В чистом Event Sourcing выполнить такой запрос невозможно!</strong><br />
+У вас нет таблицы с колонкой <code>balance</code>. У вас есть только терабайтный журнал миллионов транзакций в Kafka. Чтобы найти подходящие счета, вам пришлось бы:<br />
+1. Вычитать миллиарды событий из Kafka с самого первого дня существования банка;<br />
+2. Сгруппировать события по миллионам пользователей;<br />
+3. Регидрировать каждый агрегат в оперативной памяти и проверить баланс.</p>
+<p>Сложность операции — $O(N)$ по объему всего лога событий в мире. Это вызовет гарантированный отказ сервиса по памяти и CPU.</p>
+<p>По этой причине <strong>Event Sourcing практически никогда не используется в одиночку</strong>. В 100% реальных продакшен-систем он работает в неразрывной связке с паттерном <strong>CQRS (Command Query Responsibility Segregation)</strong>:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2341,50 +2431,94 @@ func (a *Account) Withdraw(amount int64) (Event, error) {
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph Command Side - Запись
-A[&quot;Command API&quot;] --&gt;|&quot;Business Logic&quot;| B[&quot;Append Event&quot;]
-B --&gt; C{&quot;Kafka - Event Store&quot;}
+subgraph CommandSide [&quot;Command Side (Запись: Event Store)&quot;]
+direction TB
+CMD[&quot;Command API&quot;] --&gt;|&quot;1. Валидация команды&quot;| AGG[&quot;Aggregate: Account&quot;]
+AGG --&gt;|&quot;2. Append Event&quot;| ES{&quot;Kafka Event Store&quot;}
 end
 
-subgraph Query Side - Чтение
-C --&gt;|&quot;Асинхронный Consumer&quot;| D[&quot;Read Model Updater&quot;]
-D --&gt;|&quot;INSERT / UPDATE&quot;| E[/&quot;PostgreSQL View &lt;br&gt; Таблица текущих балансов&quot;/]
-E --&gt;|&quot;SELECT WHERE balance &gt; 1000&quot;| F[&quot;Query API&quot;]
+subgraph QuerySide [&quot;Query Side (Чтение: Проекции / Materialized Views)&quot;]
+direction TB
+ES --&gt;|&quot;3. Асинхронный стриминг событий&quot;| PROJ[&quot;Projection Worker (Go)&quot;]
+PROJ --&gt;|&quot;4. Обновление денормализованной витрины&quot;| RDB[/&quot;PostgreSQL View / ElasticSearch&lt;br&gt;(Таблица текущих балансов)&quot;/]
+RDB --&gt;|&quot;5. Быстрый SELECT WHERE balance &gt; 1000&quot;| QRY[&quot;Query API&quot;]
 end
+
+style ES fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style RDB fill:#1e293b,stroke:#10b981,stroke-width:2px
+style CMD fill:#131d33,stroke:#f59e0b,stroke-width:2px
+style QRY fill:#131d33,stroke:#a855f7,stroke-width:2px
   </pre>
 </div>
 
 
-<p>Мы разделяем систему на "Писателя" (работает через события и Kafka) и "Читателя". <br />
-Асинхронный фоновый воркер на Go (Consumer) читает события из Kafka и строит <strong>Материализованное представление (Read Model / Projection)</strong> в обычной реляционной БД (или ElasticSearch, или Redis). Эта БД спроектирована исключительно для сверхбыстрого чтения и фильтрации.</p>
+<p>Система разделяется на два независимых крыла:<br />
+- <strong>Command Side (Запись):</strong> принимает команды, валидирует бизнес-правила и дописывает новые события в неизменяемый Event Store (Kafka);<br />
+- <strong>Query Side (Чтение):</strong> фоновые консьюмеры слушают новые события из Kafka и обновляют классические оптимизированные базы данных (PostgreSQL, ClickHouse, Redis, Elasticsearch), создавая готовые для чтения витрины (<strong>Materialized Views / Projections</strong>).</p>
+<hr />
+<h2 id="optimizatsiya-snapshotting-snapshoty">Оптимизация: Snapshotting (Снапшоты)</h2>
+
+<p>Если банковский счет активно используется на протяжении 5 лет, для него могут накопиться десятки тысяч транзакций. Вычитывать и прогонять через <code>Apply()</code> 50 000 событий при каждой попытке списать 100 рублей — непозволительная трата времени и процессорных тактов.</p>
+<p>Для решения проблемы применяется техника <strong>Snapshotting (Снимки состояния)</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+E1[&quot;События 1..1000&quot;] --&gt; S1[(&quot;Snapshot v1000&lt;br&gt;Balance=5000&quot;)]
+S1 -.-&gt;|&quot;Базовое состояние&quot;| R[&quot;Регидратация&quot;]
+E2[&quot;Событие 1001&quot;] --&gt; R
+E3[&quot;Событие 1002&quot;] --&gt; R
+R --&gt; Final[&quot;Актуальный Агрегат&lt;br&gt;Balance=4900 (v1002)&quot;]
+
+style S1 fill:#1e293b,stroke:#f59e0b,stroke-width:2px
+style Final fill:#0f172a,stroke:#10b981,stroke-width:2px
+  </pre>
+</div>
+
+
+<ol>
+<li>Фоновый процесс или сам обработчик раз в $N$ событий (например, каждые 1 000 событий) сериализует текущее восстановленное состояние агрегата и сохраняет его в быстрое хранилище (Redis, S3 или отдельный компактный топик Kafka).</li>
+<li>При поступлении новой команды сервис загружает последний снапшот (версия 1 000, баланс 5 000).</li>
+<li>Из Event Store запрашиваются только те события, чья версия строго больше 1 000.</li>
+<li>Сервис «докручивает» всего 2–3 свежих события поверх снапшота. Время отклика возвращается к константному $O(1)$!</li>
+</ol>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: GDPR и право на забвение в иммутабельных логах</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В Евросоюзе действует закон GDPR (Право на забвение). Если пользователь требует удалить все свои данные, как вы это сделаете в Event Sourcing, где главное правило — "Append-only, ничего удалять нельзя"?<br />
-<strong>Ответ:</strong> Это классический архитектурный парадокс. Решается паттерном <strong>Crypto-Shredding (Криптографическое уничтожение)</strong>. Продюсер шифрует PII (Personal Identifiable Information) пользователя симметричным ключом перед отправкой события в лог. Ключ сохраняется в отдельной строгой Key-Value БД (Vault). Когда пользователь запрашивает удаление, вы просто удаляете <em>ключ</em> из Vault. События в иммутабельном логе остаются, но расшифровать их больше невозможно — они превращаются в криптографический мусор. Закон GDPR считает это легитимным удалением.</p>
+    <p><strong>Вопрос:</strong> «В европейском законодательстве действует регламент GDPR (Право на забвение — Right to be Forgotten). Если пользователь требует полностью удалить свои персональные данные, как это сделать в системе с Event Sourcing, где фундаментальное правило архитектуры гласит: "Append-only, данные никогда не удаляются и не изменяются"?»<br />
+<strong>Ответ:</strong> Это классический вопрос на проверку зрелости архитектора. Удалять или редактировать события в середине append-only лога Kafka нельзя — это сломает хеширование, смещения (Offsets) и вызовет каскадную порчу репликации.<br />
+Решение заключается в архитектурном паттерне <strong>Crypto-Shredding (Криптографическое уничтожение)</strong>:<br />
+1. Персональные данные пользователя (PII: ФИО, паспорт, телефон, email) шифруются уникальным для каждого пользователя симметричным ключом (AES-256-GCM) перед формированием события.<br />
+2. Ключи шифрования хранятся в защищенном внешнем хранилище (HashiCorp Vault или СУБД с поддержкой <code>DELETE</code>). В событие пишется только зашифрованный шифротекст и идентификатор ключа <code>key_id</code>.<br />
+3. Когда пользователь запрашивает удаление по GDPR, вы <strong>удаляете только его ключ шифрования</strong> из Vault.<br />
+4. События в неизменяемом логе Kafka остаются физически целыми, но полезная нагрузка превращается в нерасшифровываемый криптографический белый шум. Юридически и технически данные считаются уничтоженными навсегда!</p>
   </div>
 </div>
 
-<h2 id="optimizatsiya-snapshotting-snapshoty">Оптимизация: Snapshotting (Снапшоты)</h2>
-
-<p>Если счет живет 10 лет, у него могут накопиться сотни тысяч транзакций. Читать их все из Kafka при каждой операции записи (<code>Withdraw</code>) становится слишком дорого по CPU и сети.</p>
-<p>Для оптимизации используется механизм <strong>Snapshots (Снимков состояния)</strong>. Раз в N событий (например, каждые 1000 событий) система сериализует текущее восстановленное состояние агрегата и сохраняет его в отдельный топик Kafka (или в Redis/S3) с указанием версии.</p>
-<p>При следующем запросе сервис:<br />
-1. Загружает последний Snapshot (Баланс 5000 на версии 1000).<br />
-2. Запрашивает из Event Store только те события, которые произошли <em>после</em> версии 1000.<br />
-3. Докручивает (Apply) эти несколько новых событий поверх снапшота.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Event Sourcing</strong> отказывается от хранения текущего состояния в пользу хранения иммутабельной истории фактов (Append-only лог).</li>
-<li><strong>Брокеры (Kafka)</strong> выступают в роли идеальной базы данных (Event Store) благодаря последовательному I/O, OS Page Cache и гарантиям упорядочивания в партициях.</li>
-<li><strong>Dual Write полностью исчезает</strong>, так как единственной транзакционной операцией становится добавление (Append) нового факта в брокер.</li>
-<li><strong>Сложность:</strong> Паттерн требует сложного версионирования контрактов (Schema Evolution) и порождает Eventual Consistency, так как чтение данных осуществляется через асинхронные Read-модели.</li>
+<li><strong>Event Sourcing</strong> заменяет деструктивное хранение текущего состояния на непрерывный иммутабельный журнал доменных событий.</li>
+<li><strong>Apache Kafka и NATS JetStream</strong> служат естественными хранилищами событий (Event Store) благодаря модели Append-only лога с гарантией порядка внутри партиции.</li>
+<li><strong>Проблема Dual Write исчезает</strong>, поскольку единственным источником правды становится брокер.</li>
+<li><strong>Архитектурный компромисс:</strong> Event Sourcing делает запись тривиальной, но усложняет чтение. Для выборок и аналитики необходимы асинхронные проекции.</li>
 </ol>
-<p>Мы вплотную подошли к необходимости разделить операции изменения состояния и запросов данных. Невозможно построить эффективный Event Sourcing без правильной архитектуры чтения. В следующей статье мы детально разберем вторую половину этого дуэта: <a href="5-cqrs-i-brokery.html" class="wikilink">5. CQRS и брокеры</a>.</p>
+<p>В следующей лекции мы досконально исследуем вторую половину этого тандема: как правильно проектировать асинхронные проекции и витрины данных в рамках паттерна <a href="5-cqrs-i-brokery.html" class="wikilink">5. CQRS и брокеры</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

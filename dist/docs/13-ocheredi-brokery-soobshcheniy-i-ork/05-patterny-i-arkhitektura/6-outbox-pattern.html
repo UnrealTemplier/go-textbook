@@ -2168,17 +2168,35 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Outbox pattern</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="proklyatie-dvoynoy-zapisi-dual-write">Проклятие двойной записи (Dual Write)</h2>
+            <h1>6. Transactional Outbox: надежная доставка сообщений без Dual Write</h1>
+<blockquote>
+<p><em>"Whenever you try to update two separate state machines at the same time without a single authority, you will eventually discover that physics and the network will conspire against you."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> В <a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a> и <a href="5-cqrs-i-brokery.html" class="wikilink">5. CQRS и брокеры</a> мы зафиксировали проблему <strong>Dual Write</strong>: невозможность в рамках одной распределенной транзакции обновить данные в реляционной СУБД и отправить сообщение в брокер (Kafka/RabbitMQ/NATS). В этой лекции мы детально разберем паттерн <strong>Transactional Outbox (Исходящий ящик)</strong> — индустриальный золотой стандарт гарантированной публикации событий. В следующей лекции — <a href="7-inbox-pattern.html" class="wikilink">7. Inbox pattern</a> — мы изучим его зеркальное отражение на стороне консьюмера.</p>
+  </div>
+</div>
 
-<p>В статьях <a href="3-event-driven-architecture.html" class="wikilink">3. Event Driven Architecture</a> и <a href="5-cqrs-i-brokery.html" class="wikilink">5. CQRS и брокеры</a> мы выяснили, что асинхронный мир требует от нас рассылать уведомления (события) обо всем, что происходит в системе. Классический сценарий: пользователь создает заказ, мы должны сохранить его в базу данных (PostgreSQL) и отправить событие <code>OrderCreatedEvent</code> в брокер сообщений (Kafka или RabbitMQ), чтобы Сервис Склада начал сборку.</p>
-<p>Звучит тривиально. Как это пишет джуниор на Go?</p>
+<hr />
+<h2 id="proklyatie-dvoynoy-zapisi-dual-write">Проклятие двойной записи (Dual Write)</h2>
+
+<p>Классический сценарий микросервиса электронной коммерции: пользователь нажимает кнопку «Оформить заказ». Нам требуется выполнить две элементарные операции:<br />
+1. Сохранить сущность заказа в реляционную базу данных (PostgreSQL);<br />
+2. Опубликовать событие <code>OrderCreatedEvent</code> в брокер сообщений (Kafka или RabbitMQ), чтобы Сервис Склада начал комплектацию товара.</p>
+<p>Как выглядит наивная попытка реализовать это на Go?</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2188,21 +2206,22 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (s *Service) CreateOrder(ctx context.Context, req OrderRequest) error {
-    // 1. Начинаем транзакцию в БД
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Наивная попытка связать СУБД и брокер
+func (s *Service) CreateOrder(ctx context.Context, req OrderRequest) error {
+    // 1. Начинаем ACID-транзакцию в БД
     tx, _ := s.db.BeginTx(ctx, nil)
 
-    // 2. Сохраняем бизнес-сущность
+    // 2. Сохраняем бизнес-сущность заказа в таблицу
     _ = saveOrderToDB(tx, req)
 
-    // 3. Отправляем событие в брокер
+    // 3. Отправляем событие в брокер сообщений
     err := s.kafka.Publish(&quot;orders&quot;, req.ToEvent())
     if err != nil {
         tx.Rollback() // Откатываем БД, если брокер недоступен
         return err
     }
 
-    // 4. Коммитим БД
+    // 4. Коммитим транзакцию в БД
     return tx.Commit() 
 }
 </code></pre>
@@ -2211,26 +2230,32 @@
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Бомба замедленного действия под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Этот код — бомба замедленного действия. Он падает жертвой проблемы <strong>Dual Write</strong>.<br />
-Что произойдет, если <code>s.kafka.Publish</code> отработал успешно (брокер принял сообщение), но на этапе <code>tx.Commit()</code> база данных вернула ошибку (например, моргнула сеть, или сработал <code>UNIQUE</code> constraint)?</p>
-<p>База данных откатится. Заказа в системе не существует. Но событие <code>OrderCreatedEvent</code> <strong>уже улетело в Kafka</strong>. Сервис Склада радостно соберет посылку для заказа, которого нет в базе! Ваша система пришла в абсолютно неконсистентное состояние.</p>
+    <p>Этот код — архитектурная мина. Он обречен на возникновение рассинхронизации данных (<strong>Dual Write</strong>):<br />
+Что произойдет, если брокер Kafka успешно принял сообщение (<code>s.kafka.Publish</code> завершился успехом), но на этапе <code>tx.Commit()</code> база данных вернула ошибку (например, кратковременный сетевой сбой, обрыв соединения, конфликт блокировок или сработал <code>UNIQUE</code> constraint)?  </p>
+<p>Транзакция в базе данных откатывается. Заказа в системе физически не существует. Но событие <code>OrderCreatedEvent</code> <strong>уже улетело в брокер</strong>! Сервис Склада радостно соберет и отправит посылку для несуществующего заказа, а деньги у клиента не спишутся. Система приходит в несогласованное состояние, которое невозможно исправить автоматически.</p>
   </div>
 </div>
 
-<p>Вы не можете объединить PostgreSQL и Kafka в одну ACID-транзакцию без использования громоздкого протокола 2PC (Two-Phase Commit), который убьет производительность всей системы.</p>
-<p>Решение этой фундаментальной проблемы — паттерн <strong>Transactional Outbox (Исходящие сообщения)</strong>.</p>
+<p>Пытаться объединить PostgreSQL и Kafka в двухфазный коммит (<strong>2PC / XA Transactions</strong>) в современных облачных средах бессмысленно: 2PC превращает систему в хрупкую конструкцию, где сбой любого узла блокирует ресурсы базы, а пропускная способность падает до единиц запросов в секунду.</p>
+<p>Инженерное решение этой задачи — паттерн <strong>Transactional Outbox (Исходящие сообщения)</strong>.</p>
+<hr />
 <h2 id="anatomiya-patterna-outbox">Анатомия паттерна Outbox</h2>
 
-<p>Суть паттерна гениально проста: мы используем ACID-свойства нашей реляционной базы данных (PostgreSQL/MySQL), чтобы гарантировать атомарность.</p>
-<p>Вместо того чтобы писать напрямую в брокер, мы создаем в базе данных дополнительную таблицу — <code>outbox</code> (исходящие ящики).</p>
-<p>В рамках <strong>одной транзакции</strong> базы данных мы делаем два действия:<br />
-1. Записываем изменения бизнес-сущности (таблица <code>orders</code>).<br />
-2. Записываем само событие (JSON payload) в таблицу <code>outbox</code>.</p>
-<p>Если транзакция коммитится успешно — у нас есть и заказ, и событие в базе. Если откатывается — нет ни того, ни другого. Атомарность достигнута! </p>
-<p>После этого в игру вступает отдельный асинхронный процесс — <strong>Relay (Релей / Диспетчер)</strong>, который читает таблицу <code>outbox</code> и перекладывает события в брокер.</p>
+<p>Философия паттерна гениально проста: мы используем локальные ACID-свойства нашей проверенной реляционной базы данных (PostgreSQL/MySQL), чтобы гарантировать 100% атомарность.</p>
+<p>Вместо того чтобы совершать ненадежный сетевой вызов к брокеру посреди транзакции, мы создаем в той же базе данных служебную таблицу — <code>outbox</code> (ящик исходящей почты).</p>
+<pre><code>    Реальная бытовая аналогия:
+    Руководитель подписывает контракт и сразу кладет его в лоток «Исходящие» 
+    на своем столе. Если выключится свет, и контракт, и конверт останутся 
+    на столе в сохранности. Позже курьер (Relay) заберет конверт и отнесет на почту.
+</code></pre>
+<p>В рамках <strong>одной локальной транзакции</strong> выполняются строго два действия:<br />
+1. Записываются изменения бизнес-сущности (таблица <code>orders</code>);<br />
+2. Записывается тело события (JSON payload) в таблицу <code>outbox</code>.</p>
+<p>Если транзакция коммитится успешно — в базе данных <strong>одновременно</strong> появляются и заказ, и готовое к отправке событие. Если транзакция откатывается — исчезают оба. Атомарность гарантирована ядром СУБД!</p>
+<p>После этого в игру вступает отдельный асинхронный процесс — <strong>Relay (Релей / Диспетчер)</strong>, который считывает строки из таблицы <code>outbox</code> и гарантированно перекладывает их в брокер сообщений.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2245,22 +2270,27 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph App [&quot;Go Backend - API&quot;]
-A[&quot;Бизнес-логика&quot;] --&gt;|&quot;1 - Begin TX&lt;br&gt;2 - INSERT orders&lt;br&gt;3 - INSERT outbox&lt;br&gt;4 - Commit TX&quot;| B[/&quot;PostgreSQL&quot;/]
+subgraph App [&quot;Go Backend (API Сервис)&quot;]
+A[&quot;Бизнес-логика&quot;] --&gt;|&quot;1. Begin TX&lt;br&gt;2. INSERT INTO orders&lt;br&gt;3. INSERT INTO outbox&lt;br&gt;4. Commit TX&quot;| B[/&quot;PostgreSQL (ACID)&quot;/]
 end
 
-subgraph Relay [&quot;Outbox Relay&quot;]
-C[&quot;Message Dispatcher&quot;] --&gt;|&quot;5 - Читает новые строки&quot;| B
-C --&gt;|&quot;6 - Publish&quot;| D{&quot;Message Broker&lt;br&gt;Kafka / RabbitMQ&quot;}
-C --&gt;|&quot;7 - Удаляет/помечает&lt;br&gt;строку как отправленную&quot;| B
+subgraph Relay [&quot;Outbox Relay (Диспетчер)&quot;]
+C[&quot;Message Dispatcher&lt;br&gt;(Polling или Debezium CDC)&quot;] --&gt;|&quot;5. Читает новые строки outbox&quot;| B
+C --&gt;|&quot;6. Publish в топик&quot;| D{&quot;Брокер сообщений&lt;br&gt;(Kafka / RabbitMQ / NATS)&quot;}
+C --&gt;|&quot;7. Удаляет или помечает&lt;br&gt;строки как отправленные&quot;| B
 end
+
+style B fill:#1e293b,stroke:#10b981,stroke-width:2px
+style D fill:#0f172a,stroke:#38bdf8,stroke-width:2px
+style C fill:#131d33,stroke:#f59e0b,stroke-width:2px
   </pre>
 </div>
 
 
+<hr />
 <h2 id="idiomatichnyy-go-realizatsiya-zapisi-command-side">Идиоматичный Go: Реализация записи (Command Side)</h2>
 
-<p>Реализация на стороне API максимально прозрачна. Мы просто пишем в две таблицы в одной транзакции.</p>
+<p>На стороне API-сервиса код становится предельно надежным и избавляется от любых внешних сетевых зависимостей в момент обработки клиентского запроса:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2280,7 +2310,7 @@ import (
     &quot;time&quot;
 )
 
-// OutboxMessage - структура для нашей исходящей таблицы
+// OutboxMessage представляет контракт структуры в исходящей таблице
 type OutboxMessage struct {
     ID        string
     Topic     string
@@ -2288,24 +2318,40 @@ type OutboxMessage struct {
     CreatedAt time.Time
 }
 
+type Order struct {
+    ID    string
+    Total int64
+}
+
+type OrderService struct {
+    db *sql.DB
+}
+
 func (s *OrderService) CreateOrder(ctx context.Context, order Order) error {
     tx, err := s.db.BeginTx(ctx, nil)
     if err != nil {
-        return err
+        return fmt.Errorf(&quot;begin tx: %w&quot;, err)
     }
     defer tx.Rollback()
 
-    // 1. Сохраняем заказ
+    // 1. Сохраняем заказ в бизнес-таблицу orders
     _, err = tx.ExecContext(ctx, &quot;INSERT INTO orders (id, total) VALUES ($1, $2)&quot;, order.ID, order.Total)
     if err != nil {
         return fmt.Errorf(&quot;insert order: %w&quot;, err)
     }
 
-    // 2. Формируем событие
-    event := map[string]any{&quot;event&quot;: &quot;OrderCreated&quot;, &quot;order_id&quot;: order.ID}
-    payload, _ := json.Marshal(event)
+    // 2. Формируем событие доменной модели
+    event := map[string]any{
+        &quot;event&quot;:    &quot;OrderCreated&quot;,
+        &quot;order_id&quot;: order.ID,
+        &quot;total&quot;:    order.Total,
+    }
+    payload, err := json.Marshal(event)
+    if err != nil {
+        return fmt.Errorf(&quot;marshal outbox payload: %w&quot;, err)
+    }
 
-    // 3. Сохраняем событие в Outbox
+    // 3. Сохраняем событие в таблицу outbox в ТОЙ ЖЕ САМОЙ транзакции
     _, err = tx.ExecContext(ctx, `
         INSERT INTO outbox (id, topic, payload, created_at) 
         VALUES (gen_random_uuid(), 'orders_topic', $1, NOW())
@@ -2314,29 +2360,37 @@ func (s *OrderService) CreateOrder(ctx context.Context, order Order) error {
         return fmt.Errorf(&quot;insert outbox: %w&quot;, err)
     }
 
-    // Атомарный коммит! Если успешно - событие гарантированно отправится.
-    return tx.Commit()
+    // Атомарный коммит! Если успешно — событие 100% будет доставлено
+    if err := tx.Commit(); err != nil {
+        return fmt.Errorf(&quot;commit tx: %w&quot;, err)
+    }
+
+    return nil
 }
 </code></pre>
 </div>
 
-<h2 id="mekhanizmy-relay-dostavka-iz-bazy-v-broker">Механизмы Relay (Доставка из базы в брокер)</h2>
+<hr />
+<h2 id="mekhanizmy-relay-dostavka-iz-bazy-v-broker">Механизмы Relay: Доставка из базы в брокер</h2>
 
-<p>Записать в <code>outbox</code> — это половина дела. Как теперь эффективно и надежно вытащить данные оттуда и положить в брокер? Есть два основных подхода.</p>
-<h3 id="podkhod-1-polling-publisher-opros-bd">Подход 1: Polling Publisher (Опрос БД)</h3>
+<p>Записать строку в <code>outbox</code> — половина дела. Как надежно и с минимальной задержкой извлечь эти данные и доставить их в брокер сообщений? В индустрии существует два основных подхода.</p>
+<h3 id="podkhod-1-polling-publisher-opros-bazy-dannykh">Подход 1: Polling Publisher (Опрос базы данных)</h3>
 
-<p>Мы запускаем отдельную горутину (или CronJob), которая раз в N миллисекунд делает <code>SELECT</code> из таблицы <code>outbox</code>.</p>
+<p>Периодический фоновый воркер на Go раз в $N$ миллисекунд опрашивает таблицу <code>outbox</code> обычным SQL-запросом.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Блокировки в Polling</span>
+    <span class="callout-title">Ловушка / Gotcha: Блокировки и гонки при конкурентном Polling</span>
   </div>
   <div class="callout-body">
-    <p>Если вы запустите несколько экземпляров Relay (для отказоустойчивости) и они одновременно сделают <code>SELECT * FROM outbox WHERE status = 'pending'</code>, они прочитают одни и те же строки и отправят в Kafka лютые дубликаты.</p>
+    <p>Если запустить несколько реплик сервиса Relay для отказоустойчивости, наивный запрос:<br />
+<code>SELECT * FROM outbox WHERE status = 'pending'</code><br />
+приведет к тому, что все воркеры прочитают одни и те же строки и отправят в Kafka пачки дубликатов!<br />
+Попытка заблокировать таблицу через обычный <code>FOR UPDATE</code> заблокирует параллельные воркеры, превратив конкурентную обработку в узкое горлышко.</p>
   </div>
 </div>
 
-<p>Чтобы безопасно читать таблицу в несколько потоков, необходимо использовать механизм PostgreSQL <strong><code>FOR UPDATE SKIP LOCKED</code></strong>. Он блокирует прочитанные строки для других транзакций, а если строка уже заблокирована кем-то другим — просто пропускает её.</p>
+<p>Чтобы организовать параллельное чтение без взаимных блокировок, в PostgreSQL используется специализированная конструкция <strong><code>FOR UPDATE SKIP LOCKED</code></strong>:</p>
 
 <div class="code-block" data-lang="sql">
   <div class="code-header">
@@ -2346,7 +2400,7 @@ func (s *OrderService) CreateOrder(ctx context.Context, order Order) error {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-sql"><code class="language-sql">-- Идеальный SQL-запрос для Polling Relay в PostgreSQL
+  <pre class="language-sql"><code class="language-sql">-- Эталонный запрос конкурентного Polling Relay в PostgreSQL:
 BEGIN;
 
 WITH cte AS (
@@ -2354,68 +2408,80 @@ WITH cte AS (
     WHERE status = 'pending'
     ORDER BY created_at ASC
     LIMIT 100
-    FOR UPDATE SKIP LOCKED -- Магия конкурентного доступа!
+    FOR UPDATE SKIP LOCKED -- Пропускает строки, уже занятые другим воркером!
 )
 UPDATE outbox SET status = 'processing'
 WHERE id IN (SELECT id FROM cte)
 RETURNING id, topic, payload;
 
--- Отправляем в Kafka (в коде Go)
-
--- Если Kafka ответила успехом:
+-- 1. Полученные строки отправляются в брокер Kafka/RabbitMQ в коде Go
+-- 2. При подтверждении успешной отправки от брокера:
 DELETE FROM outbox WHERE id IN (...);
+
 COMMIT;
 </code></pre>
 </div>
 
-<p><em>Минусы Polling:</em> Высокая нагрузка на базу данных из-за постоянных <code>SELECT</code> (даже когда сообщений нет). Задержка (Latency) между коммитом заказа и отправкой события равна интервалу поллинга.</p>
+<p><em>Минусы Polling:</em> Постоянная нагрузка на CPU базы данных (даже когда новых событий нет) и неизбежный лаг доставки, равный интервалу таймера опроса.</p>
+<hr />
 <h3 id="podkhod-2-transaction-log-tailing-cdc-industrialnyy-standart">Подход 2: Transaction Log Tailing (CDC) — Индустриальный стандарт</h3>
 
-<p>Для HighLoad систем поллинг неприменим. Вместо этого используют <strong>Change Data Capture (CDC)</strong>.</p>
+<p>В высоконагруженных системах (HighLoad) периодический опрос базы данных неприменим из-за накладных расходов. Вместо этого применяется технология <strong>Change Data Capture (CDC — Захват изменений данных)</strong>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: Mechanical Sympathy и PostgreSQL WAL</span>
+    <span class="callout-title">Под капотом: Mechanical Sympathy, PostgreSQL WAL и Debezium</span>
   </div>
   <div class="callout-body">
-    <p>Как работает CDC на уровне ядра СУБД? Любая современная БД пишет все изменения сначала в Write-Ahead Log (WAL) на диске. Это сверхбыстрый append-only журнал.<br />
-Инструменты CDC (например, <strong>Debezium</strong>, написанный на базе Kafka Connect) подключаются к PostgreSQL по протоколу логической репликации. Debezium притворяется еще одной репликой PostgreSQL! <br />
-Ядро Postgres само (асинхронно, не блокируя основную транзакцию!) отправляет (Push) поток изменений WAL в Debezium. Debezium парсит этот лог, видит <code>INSERT</code> в таблицу <code>outbox</code> и мгновенно перекладывает JSON-событие в Kafka.</p>
+    <p>Как работает CDC на физическом уровне?<br />
+Любая современная реляционная база данных (PostgreSQL, MySQL) сначала последовательно сбрасывает все транзакции в журнал упреждающей записи — <strong>Write-Ahead Log (WAL)</strong>. Это append-only журнал на диске, работающий на скорости контроллера без блокировок таблиц.<br />
+Инструменты CDC (например, <strong>Debezium</strong>, работающий на базе Kafka Connect) подключаются к PostgreSQL по стандартному протоколу логической репликации (<code>pgoutput</code>). Для базы данных Debezium выглядит как обычная реплика!<br />
+Ядро СУБД само асинхронно проталкивает (Push) бинарный поток изменений WAL в Debezium. Debezium фильтрует транзакции, выделяет вставки в таблицу <code>outbox</code> и мгновенно публикует JSON-события в топик Kafka.</p>
   </div>
 </div>
 
-<p><em>Плюсы CDC:</em><br />
-1. Нулевая нагрузка на CPU и диски базы данных от <code>SELECT</code>-ов.<br />
-2. Мгновенная доставка (Latency измеряется миллисекундами).<br />
-3. Полностью внешний процесс — вашему Go-коду вообще не нужно знать про отправку событий. Вы просто пишете в таблицу <code>outbox</code> и забываете.</p>
+<p><em>Преимущества CDC:</em><br />
+1. <strong>Нулевая нагрузка на диски и индексы СУБД</strong> от повторяющихся <code>SELECT</code>-ов;<br />
+2. <strong>Минимальная задержка:</strong> событие попадает в брокер за считанные миллисекунды после коммита транзакции;<br />
+3. <strong>Чистый код сервиса:</strong> Go-приложению больше не нужно содержать воркеры отправки — сервис только пишет в таблицу <code>outbox</code>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Гарантии доставки CDC</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Если мы используем Debezium (CDC) для паттерна Outbox, гарантирует ли это нам Exactly-once доставку событий в Kafka?<br />
-<strong>Ответ:</strong> Нет! Debezium (и любой CDC) гарантирует семантику <strong>At-least-once</strong>. Если Debezium успешно запишет батч в Kafka, но упадет до того, как закоммитит свой LSN (Log Sequence Number) обратно в PostgreSQL, после рестарта он прочитает тот же кусок WAL снова и отправит дубликаты. Ваш микросервис-консьюмер <strong>обязан</strong> быть идемпотентным (см. <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>).</p>
+    <p><strong>Вопрос:</strong> «Если мы используем Debezium (CDC) для паттерна Outbox, гарантирует ли это нам семантику Exactly-once доставки событий в Kafka?»<br />
+<strong>Ответ:</strong> <strong>Категорически нет!</strong><br />
+Debezium (как и любой другой механизм репликации WAL) обеспечивает строго семантику <strong>At-least-once</strong>. Если Debezium успешно отправит пачку событий в брокер, но упадет до того, как зафиксирует текущую позицию лога (<strong>LSN — Log Sequence Number</strong>) обратно в слот репликации PostgreSQL, после рестарта он перечитает тот же сегмент WAL и отправит дубликаты!<br />
+Любой сервис-консьюмер в архитектуре с Outbox <strong>обязан быть идемпотентным</strong>.</p>
   </div>
 </div>
 
-<h2 id="ochistka-outbox-tablitsy">Очистка Outbox-таблицы</h2>
+<hr />
+<h2 id="ochistka-outbox-tablitsy-housekeeping">Очистка Outbox-таблицы (Housekeeping)</h2>
 
-<p>Таблица <code>outbox</code> имеет тенденцию расти бесконечно, превращаясь в "мусорку" уже отправленных событий. Если её не чистить, <code>INSERT</code> начнет деградировать из-за роста индексов и распухания таблицы (Table Bloat в Postgres).</p>
-<p>Как с этим бороться:<br />
-1. <strong>Жесткое удаление (Hard Delete):</strong> Polling Relay делает <code>DELETE FROM outbox WHERE id = X</code> сразу после успешного <code>Publish</code>.<br />
-2. <strong>Фоновый сборщик мусора (Background Cron):</strong> CDC (Debezium) не удаляет строки. Поэтому нужен отдельный фоновый Go-воркер, который раз в час выполняет <code>DELETE FROM outbox WHERE created_at &lt; NOW() - INTERVAL '1 day'</code>.<br />
-3. <strong>Партицирование:</strong> В сверхнагруженных базах используют Table Partitioning по дням и просто делают <code>DROP TABLE outbox_2024_05_01</code> — это освобождает диск мгновенно (Zero I/O operation), в отличие от <code>DELETE</code>, который порождает новые записи в WAL.</p>
+<p>Таблица <code>outbox</code> имеет неприятное свойство непрерывно расти. Если ее не очищать, размер таблицы и ее индексов быстро превысит сотни гигабайт, замедляя основные бизнес-транзакции <code>INSERT INTO orders</code> и вызывая разрастание мертвых строк (<strong>Table Bloat</strong> в PostgreSQL).</p>
+<p>Стратегии очистки:<br />
+1. <strong>Жесткое удаление (Hard Delete):</strong> При использовании Polling Relay успешно отправленные строки удаляются сразу в транзакции отправки: <code>DELETE FROM outbox WHERE id = X</code>.<br />
+2. <strong>Фоновый сборщик мусора (Background Cron):</strong> Поскольку Debezium CDC только читает WAL и не трогает строки на диске, запускается регулярный фоновый воркер, выполняющий удаление устаревших данных пачками:<br />
+<code>sql
+   DELETE FROM outbox WHERE created_at &lt; NOW() - INTERVAL '1 day';</code><br />
+3. <strong>Партиционирование (Partitioning):</strong> В сверхнагруженных базах таблицу <code>outbox</code> секционируют по дням (например, <code>outbox_2024_05_01</code>). По прошествии суток администратор выполняет:<br />
+<code>sql
+   DROP TABLE outbox_2024_05_01;</code><br />
+   Удаление файла партиции на уровне файловой системы происходит за доли миллисекунды (<strong>Zero I/O operation</strong>) и не порождает мертвых строк MVCC и мусора в WAL.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Dual Write</strong> (запись в БД и брокер) без 2PC — антипаттерн, ведущий к потери консистентности.</li>
-<li><strong>Outbox Pattern</strong> решает проблему, используя локальную ACID транзакцию реляционной БД для сохранения сущности и события вместе.</li>
-<li>Доставка в брокер выполняется отдельным процессом (Relay).</li>
-<li>Простые решения используют <strong>Polling</strong> (обязательно с <code>FOR UPDATE SKIP LOCKED</code>).</li>
-<li>HighLoad архитектуры используют <strong>CDC (Debezium)</strong> для чтения из WAL базы данных без блокировок.</li>
+<li><strong>Dual Write</strong> (попытка прямой записи в СУБД и брокер) — антипаттерн, приводящий к гарантированной рассинхронизации данных при сетевых сбоях.</li>
+<li><strong>Transactional Outbox</strong> обеспечивает 100% атомарность, сохраняя бизнес-сущность и событие в рамках одной локальной ACID-транзакции.</li>
+<li><strong>Relay-процесс</strong> асинхронно считывает события из таблицы <code>outbox</code> и гарантированно передает их в брокер сообщений.</li>
+<li><strong>Реализации Relay:</strong> для простых систем подходит <strong>Polling</strong> с блокировкой <code>FOR UPDATE SKIP LOCKED</code>; для HighLoad систем стандартом является <strong>CDC (Debezium)</strong> на базе журнала WAL базы данных.</li>
+<li><strong>Гарантии доставки:</strong> Outbox обеспечивает гарантию <strong>At-least-once</strong>. Консьюмеры обязаны быть готовы к приему дубликатов.</li>
 </ol>
-<p>Мы научились безопасно и консистентно <em>отправлять</em> сообщения в асинхронный мир, не боясь падения сети или базы. Но на принимающей стороне (у Консьюмера) есть зеркальная проблема: как гарантированно обработать сообщение ровно один раз, если брокер постоянно сыплет дубликатами? Защитный барьер на стороне приема обеспечивает паттерн-побратим, который мы разберем в следующей статье: <a href="7-inbox-pattern.html" class="wikilink">7. Inbox pattern</a>.</p>
+<p>Мы научились гарантированно и безопасно публиковать события наружу. Но как защитить принимающую сторону микросервиса от дубликатов, сбоев сети и повторных ретраев брокера? </p>
+<p>Об этом мы поговорим в следующей лекции: <a href="7-inbox-pattern.html" class="wikilink">7. Inbox pattern</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2443,7 +2509,7 @@ COMMIT;
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#proklyatie-dvoynoy-zapisi-dual-write">Проклятие двойной записи (Dual Write)</a></li><li class="toc-item toc-h2"><a href="#anatomiya-patterna-outbox">Анатомия паттерна Outbox</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-realizatsiya-zapisi-command-side">Идиоматичный Go: Реализация записи (Command Side)</a></li><li class="toc-item toc-h2"><a href="#mekhanizmy-relay-dostavka-iz-bazy-v-broker">Механизмы Relay (Доставка из базы в брокер)</a></li><li class="toc-item toc-h3"><a href="#podkhod-1-polling-publisher-opros-bd">Подход 1: Polling Publisher (Опрос БД)</a></li><li class="toc-item toc-h3"><a href="#podkhod-2-transaction-log-tailing-cdc-industrialnyy-standart">Подход 2: Transaction Log Tailing (CDC) — Индустриальный стандарт</a></li><li class="toc-item toc-h2"><a href="#ochistka-outbox-tablitsy">Очистка Outbox-таблицы</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#proklyatie-dvoynoy-zapisi-dual-write">Проклятие двойной записи (Dual Write)</a></li><li class="toc-item toc-h2"><a href="#anatomiya-patterna-outbox">Анатомия паттерна Outbox</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-realizatsiya-zapisi-command-side">Идиоматичный Go: Реализация записи (Command Side)</a></li><li class="toc-item toc-h2"><a href="#mekhanizmy-relay-dostavka-iz-bazy-v-broker">Механизмы Relay: Доставка из базы в брокер</a></li><li class="toc-item toc-h3"><a href="#podkhod-1-polling-publisher-opros-bazy-dannykh">Подход 1: Polling Publisher (Опрос базы данных)</a></li><li class="toc-item toc-h3"><a href="#podkhod-2-transaction-log-tailing-cdc-industrialnyy-standart">Подход 2: Transaction Log Tailing (CDC) — Индустриальный стандарт</a></li><li class="toc-item toc-h2"><a href="#ochistka-outbox-tablitsy-housekeeping">Очистка Outbox-таблицы (Housekeeping)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
