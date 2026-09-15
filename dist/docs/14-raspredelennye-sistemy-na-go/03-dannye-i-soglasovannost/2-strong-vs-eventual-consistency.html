@@ -2168,79 +2168,53 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Strong vs eventual consistency</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="1-consistency-modeli.html" class="wikilink">1. Consistency модели</a> мы разобрались, что согласованность — это контракт между распределенной базой данных и твоим кодом. Мы посмотрели на спектр этих моделей, от строгих до самых слабых. </p>
-<p>Теперь пришло время столкнуть лбами две самые популярные парадигмы, которые ты будешь встречать в 99% production-систем: <strong>Strong Consistency (Строгая согласованность / Линеаризуемость)</strong> и <strong>Eventual Consistency (Согласованность в конечном счете)</strong>. </p>
-<p>Выбор между ними — это не вопрос вкуса. Это инженерный компромисс, который диктует, как будет вести себя твой Go-код, сколько памяти он будет потреблять под нагрузкой и что увидят пользователи.</p>
+            <p>В прошлой статье <a href="1-consistency-modeli.html" class="wikilink">1. Consistency модели</a> мы выяснили, что согласованность — это строгий контракт между распределенной базой данных и кодом вашего приложения. Мы изучили всю шкалу возможных гарантий — от математически выверенной линеаризуемости до полного расслабления в eventual consistency.</p>
+<p>Теперь пришло время столкнуть лбами две ключевые парадигмы, вокруг которых крутятся 99% архитектурных баталий в современном бэкенде: <strong>Strong Consistency (Строгая согласованность / Линеаризуемость)</strong> и <strong>Eventual Consistency (Согласованность в конечном счете)</strong>.</p>
+<p>Выбор между ними — это не вопрос эстетики или личных симпатий к реляционным СУБД или NoSQL-решениям. Это фундаментальный инженерный расчет: сколько миллисекунд задержки готов терпеть пользователь, какую нагрузку выдержит пул соединений в Go, и готов ли бизнес к тому, что клиент на пару секунд увидит данные из прошлого.</p>
+<hr />
 <h2 id="strong-consistency-illyuziya-monolita">Strong Consistency: Иллюзия монолита</h2>
 
-<p><strong>Строгая согласованность (Linearizability)</strong> гарантирует: как только операция записи успешно завершена (клиент получил подтверждение), любое последующее чтение, к какому бы узлу кластера оно ни обратилось, вернет это новое значение. Система ведет себя так, словно существует всего одна копия данных.</p>
-<p>Это идеальный мир для разработчика. Тебе не нужно думать о конфликтах или устаревших данных. Но физику обмануть нельзя, и за эту иллюзию мы платим жесточайшим налогом на производительность.</p>
+<p><strong>Строгая согласованность (Linearizability)</strong> создает кристальную и надежную иллюзию: распределенная система ведет себя так, словно в природе существует <strong>всего одна-единственная физическая копия данных</strong>.</p>
+<p>Как только операция записи успешно завершена (клиент получил подтверждающий сетевой статус <code>HTTP 200 OK</code>), любое последующее чтение, к какому бы узлу кластера в любой точке планеты оно ни обратилось, гарантированно вернет именно это свежее значение.</p>
+<p>Для инженера-разработчика это райский сад:<br />
+* Код прост и линеен;<br />
+* Никаких состояний гонки на уровне чтения;<br />
+* Никаких «призрачных» откатов баланса;<br />
+* Бизнес-логика защищена от двойных трат и конфликтов.</p>
+<p>Но физические законы Вселенной и скорость распространения света в оптоволокне неумолимы. За эту идеальную иллюзию мы обязаны заплатить жесточайший налог на производительность.</p>
+<hr />
 <h3 id="mechanical-sympathy-nalog-na-sinkhronizatsiyu">Mechanical Sympathy: Налог на синхронизацию</h3>
 
-<p>Что происходит "под капотом", когда твой Go-бэкенд делает <code>INSERT</code> в строгую систему (например, в синхронный кластер PostgreSQL или etcd)?</p>
-<p>Твоя горутина вызывает <code>db.ExecContext(ctx, query)</code>. Рантайм Go делает системный вызов <code>write</code> в TCP-сокет и "паркует" горутину (она переходит в состояние <code>Gwaiting</code>, ожидая ответа через <code>netpoll</code>).</p>
-<p>А в это время на стороне базы данных разворачивается драма:<br />
-1. Master-узел получает запрос.<br />
-2. Он делает <code>write</code> и <code>fsync</code> в свой локальный WAL (Write-Ahead Log), сбрасывая кэши диска.<br />
-3. Он отправляет данные по сети на Реплики.<br />
-4. Реплики делают свои <code>write</code> и <code>fsync</code> на диск.<br />
-5. Реплики отправляют сетевой ACK -подтверждение- Мастеру.<br />
-6. Мастер убеждается, что собрал Кворум (большинство), и только после этого отправляет HTTP 200 OK твоему Go-коду.</p>
+<p>Давайте детально проследим, что происходит в «железе», сетевом стеке Linux и рантайме Go, когда ваш бэкенд выполняет операцию <code>INSERT</code> в строгую распределенную базу данных (например, кластер <code>etcd</code> или синхронную группу PostgreSQL).</p>
+<p>Ваша прикладная горутина вызывает метод:</p>
 
-<div class="mermaid-wrapper">
-  <div class="mermaid-header">
-    <div class="mermaid-title">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
-      <span>Архитектурная схема</span>
-    </div>
-    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
-      <span>На весь экран</span>
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
     </button>
   </div>
-  <pre class="mermaid">
-sequenceDiagram
-participant Go as Go Runtime -Client-
-participant L as Лидер -DB Master-
-participant F as Фолловер -DB Replica-
-
-Go-&gt;&gt;L: db.ExecContext
-Note over Go: Горутина засыпает в netpoll
-
-L-&gt;&gt;L: Локальный fsync WAL
-L-&gt;&gt;F: Репликация по сети
-
-F-&gt;&gt;F: Локальный fsync WAL
-F--&gt;&gt;L: Подтверждение ACK
-
-Note over L: Кворум достигнут
-L--&gt;&gt;Go: Успех -HTTP 200-
-Note over Go: Горутина просыпается
-  </pre>
+  <pre class="language-go"><code class="language-go">_, err := db.ExecContext(ctx, &quot;INSERT INTO accounts (id, balance) VALUES ($1, $2)&quot;, accountID, 1000)
+</code></pre>
 </div>
 
-
-<p><strong>Цена вопроса:</strong> Время выполнения твоего <code>db.ExecContext</code> — это сумма <code>RTT(до мастера) + Fsync(мастер) + RTT(до реплик) + Fsync(реплика) + RTT(обратно)</code>. <br />
-Это десятки миллисекунд. Твоя горутина всё это время висит в памяти. Да, горутины дешевые (~2 КБ), но <strong>соединения в пуле <code>database/sql</code> (или TCP-сокеты) ограничены</strong>. При скачке RPS (Requests Per Second) твой пул соединений мгновенно исчерпается, и система начнет отказывать новым клиентам. Строгая согласованность радикально снижает пропускную способность (Throughput) системы.</p>
-<h2 id="eventual-consistency-skorost-tsenoy-khaosa">Eventual Consistency: Скорость ценой хаоса</h2>
-
-<p><strong>Согласованность в конечном счете (Eventual Consistency)</strong> отказывается от иллюзии мгновенного распространения данных. Гарантия звучит так: <em>если новые записи прекратятся, то спустя некоторое время все узлы придут к единому состоянию</em>.</p>
-<p>Это AP-системы (Cassandra, DynamoDB, асинхронные реплики SQL баз). Они созданы для того, чтобы "съедать" гигантский трафик без задержек.</p>
-<h3 id="mechanical-sympathy-fire-and-forget">Mechanical Sympathy: Fire and Forget</h3>
-
-<p>Когда твой Go-код пишет в AP-базу данных (настроенную на Eventual Consistency, например, с Write Consistency Level = 1):</p>
 <ol>
-<li>Узел получает запрос.</li>
-<li>Он записывает данные в оперативную память (например, в Memtable в Cassandra) и, возможно, асинхронно сбрасывает в WAL без жесткого <code>fsync</code>.</li>
-<li>Узел <strong>мгновенно</strong> отвечает твоему Go-клиенту HTTP 200 OK. Твоя горутина просыпается через 1-2 миллисекунды. Соединение возвращается в пул.</li>
-<li>"Где-то в фоне" узел начинает рассылать эти данные соседям по кластеру (через протоколы Gossip / Anti-entropy).</li>
+<li><strong>Go Runtime:</strong> Драйвер базы данных формирует бинарный пакет и совершает системный вызов <code>write</code> в TCP-сокет. Планировщик Go немедленно переводит текущую горутину в состояние ожидания <code>Gwaiting</code> и паркует ее на системном селекторе <code>netpoll</code> (под капотом — Linux <code>epoll</code>). Поток ОС <code>M</code> освобождается и берет на исполнение другие задачи.</li>
+<li><strong>Master-узел СУБД:</strong> Сервер принимает пакет. Он не может просто записать данные в оперативную память. Он выполняет системный вызов <code>write</code> и тяжелейший <code>fsync</code> в локальный журнал упреждающей записи (<strong>Write-Ahead Log, WAL</strong>), принудительно сбрасывая кэш дискового контроллера.</li>
+<li><strong>Сетевой транзит к репликам:</strong> Мастер формирует репликационные пакеты и отправляет их через сетевые коммутаторы на подчиненные узлы (Фолловеры).</li>
+<li><strong>Реплики:</strong> Каждая реплика принимает изменения, выполняет локальный <code>write</code> и собственный <code>fsync</code> на свой физический накопитель.</li>
+<li><strong>Подтверждение (ACK):</strong> Реплики отправляют сетевой ответ с подтверждением Мастеру.</li>
+<li><strong>Кворум:</strong> Мастер подсчитывает голоса. Как только он убеждается, что строгое большинство узлов (Кворум) надежно зафиксировало байты на диске, он наконец-то отправляет ответный пакет в TCP-сокет вашего Go-приложения.</li>
+<li><strong>Пробуждение в Go:</strong> Системный вызов <code>epoll_wait</code> в потоке рантайма Go ловит событие поступления данных, горутина переводится из <code>Gwaiting</code> в <code>Grunnable</code>, подхватывается свободным процессором <code>P</code>, и функция <code>db.ExecContext(ctx, query)</code> завершает свою работу.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2256,39 +2230,104 @@ Note over Go: Горутина просыпается
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant Go as Go Runtime -Client-
-participant N1 as Узел 1
-participant N2 as Узел 2
+autonumber
+participant Go as Go Runtime (Client)
+participant L as Лидер (DB Master)
+participant F as Фолловер (DB Replica)
 
-Go-&gt;&gt;N1: db.ExecContext
-N1-&gt;&gt;N1: Запись в память
-N1--&gt;&gt;Go: Успех -HTTP 200- мгновенно
-Note over Go: Горутина свободна
+Go-&gt;&gt;L: db.ExecContext (INSERT)
+Note over Go: Горутина запаркована в netpoll (Gwaiting)
 
-N1-.-&gt;N2: Фоновая репликация Gossip
-Note over N2: Данные появятся&lt;br&gt;здесь позже
+L-&gt;&gt;L: Локальный WAL write + fsync
+L-&gt;&gt;F: Репликация по сети (AppendEntries)
+
+F-&gt;&gt;F: Локальный WAL write + fsync
+F--&gt;&gt;L: Подтверждение (ACK)
+
+Note over L: Кворум достигнут (большинство записало)
+L--&gt;&gt;Go: Успех (HTTP 200 OK)
+Note over Go: netpoll будит горутину (Grunnable)
   </pre>
 </div>
 
 
-<p>Система работает с бешеной скоростью. Твой сервис выдерживает десятки тысяч RPS. Но что видит бизнес?</p>
+<h4 id="tsena-voprosa-butylochnoe-gorlyshko-soedineniy">Цена вопроса: Бутылочное горлышко соединений</h4>
+
+<p>Реальная задержка вызова <code>db.ExecContext</code> складывается из физической цепочки:</p>
+<p>$$\text{Latency} = \text{RTT}<em>{\text{master}} + \text{Fsync}</em>{\text{master}} + \text{RTT}<em>{\text{replica}} + \text{Fsync}</em>{\text{replica}} + \text{RTT}_{\text{client}}$$</p>
+<p>В реальном облачном кластере это составляет от <strong>15 до 60 миллисекунд</strong> на каждый единичный чих!</p>
+<p>Горутины в Go стоят дешево (всего ~2–4 КБ на стек), и миллион спящих в <code>Gwaiting</code> горутин память не разорят. Но <strong>пул соединений к базе данных в стандартной библиотеке <code>database/sql</code> строго ограничен</strong> (параметры <code>SetMaxOpenConns</code> и <code>SetMaxIdleConns</code>)!</p>
+<p>Если ваш сервис испытывает всплеск входящей нагрузки до 10 000 RPS, а каждый запрос удерживает драгоценное TCP-соединение из пула на протяжении 40 миллисекунд в ожидании кворумного <code>fsync</code>, пул соединений мгновенно исчерпывается. Новые клиентские запросы выстраиваются в многотысячную очередь ожидания, таймеры контекстов начинают взрываться по <code>ctx.Err() == context.DeadlineExceeded</code>, и сервис захлебывается в каскадном отказе.</p>
+<p>Строгая согласованность всегда драматически ограничивает предельную пропускную способность (<strong>Throughput</strong>) системы.</p>
+<hr />
+<h2 id="eventual-consistency-skorost-tsenoy-khaosa">Eventual Consistency: Скорость ценой хаоса</h2>
+
+<p><strong>Согласованность в конечном счете (Eventual Consistency)</strong> смело срывает оковы синхронных блокировок. Гарантия звучит сдержанно:<br />
+<em>Если в систему перестанут поступать новые изменения, то спустя некоторое время все узлы кластера придут к абсолютно идентичному состоянию.</em></p>
+<p>Это царство высокодоступных AP-систем (Apache Cassandra, Amazon DynamoDB, ScyllaDB, асинхронные реплики PostgreSQL и Redis). Они спроектированы для того, чтобы утилизировать сетевой стек и многоядерные процессоры на 100%, перемалывая сотни тысяч запросов в секунду с минимальными задержками.</p>
+<hr />
+<h3 id="mechanical-sympathy-fire-and-forget">Mechanical Sympathy: Fire and Forget</h3>
+
+<p>Что происходит, когда Go-код пишет данные в AP-систему (например, в Cassandra с уровнем согласованности <code>Write Consistency = 1</code> или асинхронную очередь):</p>
+<ol>
+<li>Узел кластера принимает входящий пакет.</li>
+<li>Он мгновенно записывает структуру данных в быструю оперативную память (в Cassandra это кольцевой буфер <code>Memtable</code>) и дописывает байты в последовательный журнал без вызова блокирующего <code>fsync</code>.</li>
+<li>Узел <strong>немедленно</strong> отправляет вашему Go-клиенту успешный ответ.</li>
+<li>Ваша горутина в Go просыпается через <strong>0.8–1.5 миллисекунды</strong>! Соединение из <code>database/sql</code> тут же возвращается в пул и готово обслуживать следующего пользователя.</li>
+<li>И только потом, в фоновом режиме, узел начинает асинхронно распространять обновления соседям по кластеру (через протоколы Gossip, репликационные очереди или Anti-Entropy фоновые задачи).</li>
+</ol>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Go as Go Runtime (Client)
+participant N1 as Узел 1 (Координатор)
+participant N2 as Узел 2 (Реплика)
+
+Go-&gt;&gt;N1: db.ExecContext (INSERT)
+N1-&gt;&gt;N1: Быстрая запись в Memtable (RAM)
+N1--&gt;&gt;Go: Успех (HTTP 200 OK) за 1 ms!
+Note over Go: Горутина мгновенно свободна,&lt;br/&gt;пул соединений не забит!
+
+N1-.-&gt;N2: Фоновая асинхронная репликация (Gossip)
+Note over N2: Данные доберутся сюда&lt;br/&gt;через десятки миллисекунд...
+  </pre>
+</div>
+
+
+<p>Система демонстрирует ошеломляющую пропускную способность: 100 000 RPS утилизируют сервер без малейших признаков очередей. Но за все в жизни приходится платить.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Аномалии чтения (Read-After-Write)</span>
+    <span class="callout-title">Ловушка / Gotcha: Аномалия Read-After-Write</span>
   </div>
   <div class="callout-body">
-    <p>Клиент загружает новую аватарку. Go-бэкенд пишет её в Узел 1 и мгновенно возвращает успех. Мобильное приложение клиента делает редирект на главную страницу и запрашивает данные профиля. Балансировщик нагрузки отправляет этот запрос (GET) на Узел 2. <br />
-Фоновая репликация (Gossip) еще не успела донести данные до Узла 2. Узел 2 честно отдает <strong>старую</strong> аватарку. <br />
-Клиент в ярости: "Где моя фотография?! Ваша система глючит!".</p>
+    <p>Пользователь совершает покупку или меняет пароль. Go-бэкенд отправляет запись на Узел 1 и моментально отвечает клиенту: <em>«Успешно!»</em>. </p>
+<p>Мобильное приложение делает следующий шаг и обращается за профилем пользователя. Балансировщик нагрузки перенаправляет этот <code>GET</code>-запрос на Узел 2. </p>
+<p>Асинхронный Gossip-пакет еще не долетел до Узла 2. Узел 2 заглядывает в свое локальное хранилище и честно отвечает: <em>«Баланс старый, пароль не менялся»</em>. </p>
+<p>Пользователь в бешенстве пишет в техподдержку: <em>«Где мои деньги? Ваше приложение списало средства, но не выдало товар!»</em>. Инженеры начинают экстренно искать баги в логике, хотя это фундаментальное следствие физики Eventual Consistency.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kak-eto-vyglyadit-v-kode-emulyatsiya-podkhodov">Как это выглядит в коде (Эмуляция подходов)</h2>
 
-<p>Если бы мы писали брокер сообщений на Go, разница между этими подходами на уровне архитектуры рантайма выглядела бы так:</p>
+<p>Если бы мы разрабатывали собственный распределенный движок на Go, архитектурный водораздел между синхронной и асинхронной моделью выглядел бы следующим образом:</p>
+<hr />
 <h3 id="strogiy-podkhod-synchronous-replication">Строгий подход (Synchronous Replication)</h3>
-<p>Мы блокируем горутину клиента, пока не дождемся ответов от реплик.</p>
+
+<p>Мы держим горутину клиента на привязи до тех пор, пока большинство узлов кластера не подтвердят дисковую фиксацию:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2298,24 +2337,37 @@ Note over N2: Данные появятся&lt;br&gt;здесь позже
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (s *Server) HandleWriteStrong(ctx context.Context, data []byte) error {
-    // 1. Локальная запись
-    if err := s.wal.Write(data); err != nil {
-        return err
+  <pre class="language-go"><code class="language-go">package cluster
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+)
+
+type StrongServer struct {
+    wal      WALStorage
+    replicas []*ReplicaClient
+}
+
+func (s *StrongServer) HandleWriteStrong(ctx context.Context, data []byte) error {
+    // ШАГ 1: Локальная запись с обязательным сбросом кэша на диск
+    if err := s.wal.WriteAndFsync(data); err != nil {
+        return fmt.Errorf(&quot;локальная запись в WAL провалена: %w&quot;, err)
     }
 
-    // 2. Синхронная репликация
+    // ШАГ 2: Параллельная сетевая рассылка репликам
     ackCh := make(chan struct{}, len(s.replicas))
     for _, replica := range s.replicas {
-        go func(r *Replica) {
-            if err := r.Send(ctx, data); err == nil {
+        go func(r *ReplicaClient) {
+            // Выполняем синхронный RPC-вызов
+            if err := r.SendAppend(ctx, data); err == nil {
                 ackCh &lt;- struct{}{}
             }
         }(replica)
     }
 
-    // 3. Ждем кворума или таймаута
-    acks := 1 // Учитываем себя
+    // ШАГ 3: Блокирующее ожидание сбора Кворума большинства
+    acks := 1 // Учитываем собственный подтвержденный голос
     quorum := (len(s.replicas) / 2) + 1
 
     for acks &lt; quorum {
@@ -2323,17 +2375,21 @@ Note over N2: Данные появятся&lt;br&gt;здесь позже
         case &lt;-ackCh:
             acks++
         case &lt;-ctx.Done():
-            return fmt.Errorf(&quot;timeout waiting for quorum: %w&quot;, ctx.Err())
+            // Если сеть тормозит, клиент получает ошибку по таймауту!
+            return fmt.Errorf(&quot;таймаут сбора кворума: %w&quot;, ctx.Err())
         }
     }
 
-    return nil // Клиент получает Успех только после подтверждения большинства
+    // Клиент получает подтверждение ТОЛЬКО после согласия большинства
+    return nil
 }
 </code></pre>
 </div>
 
+<hr />
 <h3 id="eventual-podkhod-asynchronous-replication">Eventual подход (Asynchronous Replication)</h3>
-<p>Мы отпускаем клиента мгновенно, сбрасывая работу в фоновый воркер-пул.</p>
+
+<p>Мы мгновенно отпускаем клиентский запрос, сбрасывая задачу синхронизации в фоновый конвейер каналов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2343,32 +2399,53 @@ Note over N2: Данные появятся&lt;br&gt;здесь позже
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (s *Server) HandleWriteEventual(ctx context.Context, data []byte) error {
-    // 1. Быстрая локальная запись (возможно только в RAM)
-    if err := s.memtable.Write(data); err != nil {
+  <pre class="language-go"><code class="language-go">package cluster
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;log&quot;
+)
+
+type EventualServer struct {
+    memtable         MemoryStore
+    asyncQueue       chan []byte
+    replicas         []*ReplicaClient
+}
+
+func (s *EventualServer) HandleWriteEventual(ctx context.Context, data []byte) error {
+    // ШАГ 1: Молниеносная запись в оперативную память (RAM)
+    if err := s.memtable.Insert(data); err != nil {
         return err
     }
 
-    // 2. Ставим задачу в фоновую очередь репликации (канал)
+    // ШАГ 2: Сброс в асинхронную очередь репликации без блокировки
     select {
-    case s.asyncReplicationQueue &lt;- data:
-        // Отправили в фон
+    case s.asyncQueue &lt;- data:
+        // Успешно поставлено в очередь
     default:
-        // Очередь переполнена (Backpressure)
-        return errors.New(&quot;system overloaded&quot;)
+        // Защита от исчерпания памяти при переполнении буфера (Backpressure)
+        return errors.New(&quot;очередь репликации переполнена, сработал backpressure&quot;)
     }
 
-    // 3. Мгновенно возвращаем успех клиенту
-    return nil 
+    // ШАГ 3: Мгновенно возвращаем клиенту 200 OK (задержка &lt; 1 мс)
+    return nil
 }
 
-// Фоновый воркер, живущий отдельно от жизненного цикла клиентского запроса
-func (s *Server) backgroundReplicator() {
-    for data := range s.asyncReplicationQueue {
-        for _, replica := range s.replicas {
-            // Если реплика недоступна, данные не потеряются, 
-            // они будут доставлены позже через Gossip
-            _ = replica.Send(context.Background(), data) 
+// Фоновый воркер работает абсолютно независимо от пользовательских HTTP-горутин
+func (s *EventualServer) backgroundReplicationWorker(ctx context.Context) {
+    for {
+        select {
+        case &lt;-ctx.Done():
+            return
+        case entry := &lt;-s.asyncQueue:
+            for _, replica := range s.replicas {
+                // Ошибки репликации не аффектят клиента:
+                // реплика догонит состояние позже через механизмы Anti-Entropy
+                if err := replica.SendAsync(context.Background(), entry); err != nil {
+                    log.Printf(&quot;Внимание: реплика временно недоступна: %v&quot;, err)
+                }
+            }
         }
     }
 }
@@ -2381,57 +2458,71 @@ func (s *Server) backgroundReplicator() {
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Если мы используем Cassandra (Eventual Consistency), можем ли мы сделать запрос строго консистентным?<br />
-<strong>Ответ:</strong> Да. Модель согласованности в таких БД настраивается <strong>на уровне каждого запроса</strong> (Tunable Consistency). Если вы зададите <code>Write Consistency = QUORUM</code> и <code>Read Consistency = QUORUM</code>, система будет вести себя линеаризуемо (строго), но начнет тормозить. Главное правило: <code>R + W &gt; N</code> (где N - размер кластера). Мы подробно разберем эту математику в статье <a href="4-quorum.html" class="wikilink">4. Quorum</a>.</p>
+    <p><strong>Вопрос:</strong> Если мы развернули Apache Cassandra (классическую базу с Eventual Consistency), можем ли мы программно заставить отдельный критический запрос вести себя строго консистентно?</p>
+<p><strong>Ответ:</strong> Да! Модель согласованности в семействе Dynamo-подобных систем настраивается гибко <strong>на уровне каждого отдельного запроса</strong> (Tunable Consistency). </p>
+<p>Если вы укажете параметры <code>Write Consistency = QUORUM</code> и <code>Read Consistency = QUORUM</code>, система обеспечит строгую согласованность (Linearizability). </p>
+<p>Математическое условие пересечения кворумов выражается классической формулой:</p>
+<p>$$R + W &gt; N$$</p>
+<p>где $N$ — общее число реплик, $W$ — число узлов, подтвердивших запись, а $R$ — число узлов, опрошенных при чтении. Если сумма $R + W$ строго больше $N$, множество узлов записи и множество узлов чтения гарантированно пересекутся хотя бы по одному узлу, хранящему самую свежую версию данных! </p>
+<p>Подробно всю математику и физику кворумов мы разберем в статье <a href="4-quorum.html" class="wikilink">4. Quorum</a>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="sravnenie-lob-v-lob">Сравнение лоб в лоб</h2>
 
 <div class="table-container"><table>
 <thead>
 <tr>
-<th style="text-align: left;">Характеристика</th>
+<th style="text-align: left;">Критерий</th>
 <th style="text-align: left;">Strong Consistency (Строгая)</th>
 <th style="text-align: left;">Eventual Consistency (В конечном счете)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>Гарантии</strong></td>
-<td style="text-align: left;">Чтение всегда возвращает последнюю запись.</td>
-<td style="text-align: left;">Нет гарантий свежести данных.</td>
+<td style="text-align: left;"><strong>Гарантия корректности</strong></td>
+<td style="text-align: left;">Чтение в любой момент возвращает самую последнюю запись.</td>
+<td style="text-align: left;">Чтение может вернуть устаревшую версию данных.</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Latency (Задержка)</strong></td>
-<td style="text-align: left;">Высокая (ожидание сетевых RTT и дискового I/O).</td>
-<td style="text-align: left;">Очень низкая (отвечает мгновенно).</td>
+<td style="text-align: left;"><strong>Задержка (Latency)</strong></td>
+<td style="text-align: left;">Высокая: ожидание сетевых RTT и системных вызовов <code>fsync</code>.</td>
+<td style="text-align: left;">Минимальная: запись в память (RAM) за доли миллисекунды.</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Доступность (AP/CP)</strong></td>
-<td style="text-align: left;">Падает при разрыве сети (CP).</td>
-<td style="text-align: left;">Продолжает работать при разрыве сети (AP).</td>
+<td style="text-align: left;"><strong>Поведение при сбоях сети</strong></td>
+<td style="text-align: left;">Падение доступности в изолированном сегменте (CP).</td>
+<td style="text-align: left;">Непрерывная работа всех доступных сегментов (AP).</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Сложность бизнес-логики</strong></td>
-<td style="text-align: left;">Низкая. Система проста и предсказуема.</td>
-<td style="text-align: left;">Высокая. Нужно обрабатывать устаревшие данные и конфликты.</td>
+<td style="text-align: left;"><strong>Нагрузка на пул БД</strong></td>
+<td style="text-align: left;">Высокая: горутины подолгу удерживают открытые сокеты.</td>
+<td style="text-align: left;">Низкая: сокет освобождается почти мгновенно.</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Применение</strong></td>
-<td style="text-align: left;">Биллинг, банковские счета, блокировки, транзакции заказов.</td>
-<td style="text-align: left;">Лайки, аналитика, комментарии, IoT-телеметрия, ленты новостей.</td>
+<td style="text-align: left;"><strong>Сложность бизнес-кода</strong></td>
+<td style="text-align: left;">Минимальная: система предсказуема как локальная переменная.</td>
+<td style="text-align: left;">Высокая: необходимость версионирования, токенов и слияний.</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Где применять в проде?</strong></td>
+<td style="text-align: left;">Финансовые балансы, оформление заказов, складские остатки.</td>
+<td style="text-align: left;">Лайки, счетчики просмотров, комментарии, IoT-телеметрия.</td>
 </tr>
 </tbody>
 </table></div>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Strong Consistency</strong> бережет нервы разработчиков и бизнеса, но не прощает высоких нагрузок и сетевых проблем. Ты должен защищать такие сервисы Rate Limiter-ами и держать большой запас соединений.</li>
-<li><strong>Eventual Consistency</strong> позволяет системе масштабироваться до бесконечности, но заставляет клиента смириться с "призраками" старых данных.</li>
+<li><strong>Strong Consistency</strong> спасает от логических багов и бережет нервы продуктовой команды, но беспощадно наказывает задержками и исчерпанием пула соединений при высоких нагрузках.</li>
+<li><strong>Eventual Consistency</strong> позволяет бэкенду выдерживать миллионные потоки событий без деградации времени отклика, но требует применения сессионных паттернов для защиты пользовательского опыта.</li>
+<li>Профессиональный архитектор никогда не выбирает одну модель для всего монолита: внутри одной системы финансовые транзакции пишутся со строгим кворумом, а лента уведомлений — в режиме согласованности в конечном счете.</li>
 </ol>
-<p>Но остается открытым самый страшный вопрос Eventual Consistency. Если узлы обновляются асинхронно, что произойдет, если два пользователя одновременно изменят одни и те же данные на двух разных, не успевших синхронизироваться узлах? У нас возникнет <strong>Конфликт</strong>, и узлы начнут верить в разные версии реальности. </p>
-<p>Как распределенные системы чинят эти конфликты во время чтения данных? Узнаем в следующей статье: <a href="3-read-repair.html" class="wikilink">3. Read repair</a>.</p>
+<p>Но что происходит, если два независимых клиента в режиме Eventual Consistency одновременно обновят один и тот же ключ на разных репликах? В системе возникнет конфликт версий данных! </p>
+<p>Как распределенные системы обнаруживают такие расхождения прямо в момент чтения и тихо «залечивают» поврежденные реплики на лету? </p>
+<p>Об этом мы поговорим в следующей статье: <a href="3-read-repair.html" class="wikilink">3. Read repair</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2459,7 +2550,7 @@ func (s *Server) backgroundReplicator() {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#strong-consistency-illyuziya-monolita">Strong Consistency: Иллюзия монолита</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-nalog-na-sinkhronizatsiyu">Mechanical Sympathy: Налог на синхронизацию</a></li><li class="toc-item toc-h2"><a href="#eventual-consistency-skorost-tsenoy-khaosa">Eventual Consistency: Скорость ценой хаоса</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-fire-and-forget">Mechanical Sympathy: Fire and Forget</a></li><li class="toc-item toc-h2"><a href="#kak-eto-vyglyadit-v-kode-emulyatsiya-podkhodov">Как это выглядит в коде (Эмуляция подходов)</a></li><li class="toc-item toc-h3"><a href="#strogiy-podkhod-synchronous-replication">Строгий подход (Synchronous Replication)</a></li><li class="toc-item toc-h3"><a href="#eventual-podkhod-asynchronous-replication">Eventual подход (Asynchronous Replication)</a></li><li class="toc-item toc-h2"><a href="#sravnenie-lob-v-lob">Сравнение лоб в лоб</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#strong-consistency-illyuziya-monolita">Strong Consistency: Иллюзия монолита</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-nalog-na-sinkhronizatsiyu">Mechanical Sympathy: Налог на синхронизацию</a></li><li class="toc-item toc-h4"><a href="#tsena-voprosa-butylochnoe-gorlyshko-soedineniy">Цена вопроса: Бутылочное горлышко соединений</a></li><li class="toc-item toc-h2"><a href="#eventual-consistency-skorost-tsenoy-khaosa">Eventual Consistency: Скорость ценой хаоса</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-fire-and-forget">Mechanical Sympathy: Fire and Forget</a></li><li class="toc-item toc-h2"><a href="#kak-eto-vyglyadit-v-kode-emulyatsiya-podkhodov">Как это выглядит в коде (Эмуляция подходов)</a></li><li class="toc-item toc-h3"><a href="#strogiy-podkhod-synchronous-replication">Строгий подход (Synchronous Replication)</a></li><li class="toc-item toc-h3"><a href="#eventual-podkhod-asynchronous-replication">Eventual подход (Asynchronous Replication)</a></li><li class="toc-item toc-h2"><a href="#sravnenie-lob-v-lob">Сравнение лоб в лоб</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

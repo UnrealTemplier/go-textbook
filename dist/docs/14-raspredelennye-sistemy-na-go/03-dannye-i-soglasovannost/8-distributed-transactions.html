@@ -2168,55 +2168,159 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~9 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Distributed transactions</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Ты уже знаешь, как обеспечить консистентность отдельного ключа или объекта. Но в реальном бизнесе операции редко бывают атомарными. Классический пример: пользователь покупает товар. Нам нужно:<br />
-1. Списать деньги в <code>Billing Service</code>.<br />
-2. Забронировать товар в <code>Inventory Service</code>.<br />
-3. Создать запись в <code>Order Service</code>.</p>
-<p>В монолите ты бы просто открыл SQL-транзакцию, и база данных гарантировала бы <strong>ACID</strong>. В распределенной системе у каждого сервиса своя база данных. Если <code>Billing</code> прошел успешно, а <code>Inventory</code> упал — у нас проблема: деньги списаны, а товара нет.</p>
-<p><strong>Распределенная транзакция</strong> — это механизм, обеспечивающий выполнение набора операций на нескольких узлах (или сервисах) так, чтобы соблюдались свойства атомарности и согласованности.</p>
+            <p>В предыдущих главах мы научились обеспечивать консистентность отдельного ключа, регистра или документа. Мы изучили кворумы, векторные часы и структуры CRDT. Но в реальной бизнес-архитектуре операции редко замыкаются на одной строчке таблицы.</p>
+<p>Представьте классический сценарий покупки товара на маркетплейсе:<br />
+1. <strong><code>Billing Service</code>:</strong> Списать 5 000 рублей с кредитной карты пользователя.<br />
+2. <strong><code>Inventory Service</code>:</strong> Зарезервировать последнюю пару кроссовок на складе.<br />
+3. <strong><code>Order Service</code>:</strong> Создать заказ со статусом «Оплачен» и сформировать чек.</p>
+<p>В эпоху монолитных систем это решалось элементарно: вы открывали локальную транзакцию в PostgreSQL, выполняли три SQL-запроса и вызывали <code>COMMIT</code>. Если на шаге склада товар заканчивался, база данных откатывала транзакцию (<strong>Rollback</strong>), возвращая систему в исходное идеальное состояние. База данных гарантировала свойства <strong>ACID</strong> (Atomicity, Consistency, Isolation, Durability).</p>
+<p>Но в современном облачном бэкенде действует парадигма <strong>Database-per-Service</strong>: у каждого микросервиса — своя собственная, физически изолированная база данных.</p>
+<p>Если <code>Billing Service</code> успешно списал средства, а сетевой запрос к <code>Inventory Service</code> упал по таймауту из-за перегрузки склада — бизнес сталкивается с катастрофой: деньги у клиента списаны, а товара нет!</p>
+<p><strong>Распределенная транзакция</strong> — это набор согласованных операций над несколькими независимыми базами данных или микросервисами, обеспечивающий неделимость бизнес-процесса («все или ничего»).</p>
+<hr />
 <h2 id="1-problema-2pc-two-phase-commit">1. Проблема 2PC (Two-Phase Commit)</h2>
 
-<p>Исторический стандарт распределенных транзакций — протокол двухфазной фиксации (<strong>2PC</strong>).</p>
+<p>Историческим стандартом обеспечения атомарности между несколькими узлами является протокол двухфазной фиксации — <strong>Two-Phase Commit (2PC)</strong>, стандартизированный консорциумом X/Open (спецификация XA).</p>
+<hr />
 <h3 id="kak-eto-rabotaet">Как это работает:</h3>
+
+<p>В протоколе участвуют <strong>Координатор (Coordinator)</strong> и несколько участников (<strong>Participants</strong> / Ресурсов). Процесс разделен на две синхронные фазы:</p>
 <ol>
-<li><strong>Фаза подготовки (Prepare):</strong> Координатор спрашивает все узлы: "Можете ли вы закоммитить это?". Узлы захватывают локальные блокировки и отвечают "Да" или "Нет".</li>
-<li><strong>Фаза фиксации (Commit):</strong> Если <em>все</em> ответили "Да", координатор посылает команду "Commit". Если хоть один ответил "Нет" (или промолчал) — всем шлется "Rollback".</li>
+<li><strong>Фаза 1: Подготовка (Prepare Phase / Voting):</strong><br />
+   * Координатор отправляет всем участникам запрос: <em>«Готовы ли вы зафиксировать изменения?»</em>.<br />
+   * Каждый участник запускает локальную транзакцию, захватывает блокировки строк в БД, пишет данные в свой WAL и отвечает: <code>VOTE_COMMIT</code> (Да) или <code>VOTE_ABORT</code> (Нет).</li>
+<li><strong>Фаза 2: Фиксация (Commit Phase):</strong><br />
+   * Если <strong>все до единого</strong> участники ответили «Да», Координатор отправляет всем команду <code>GLOBAL_COMMIT</code>. Участники фиксируют транзакцию и снимают блокировки.<br />
+   * Если хотя бы один участник ответил «Нет» (или не ответил вовсе по таймауту сети), Координатор рассылает команду <code>GLOBAL_ROLLBACK</code>. Все узлы откатывают локальные изменения.</li>
 </ol>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Coord as Координатор (2PC)
+participant Billing as Billing DB
+participant Inv as Inventory DB
+
+Note over Coord: ФАЗА 1: Prepare (Голосование)
+Coord-&gt;&gt;Billing: Prepare (Lock balance)
+Coord-&gt;&gt;Inv: Prepare (Lock stock)
+
+Billing--&gt;&gt;Coord: Prepared: OK
+Inv--&gt;&gt;Coord: Prepared: OK
+
+Note over Coord: Все ответили ДА!&lt;br/&gt;ФАЗА 2: Commit (Фиксация)
+Coord-&gt;&gt;Billing: Commit
+Coord-&gt;&gt;Inv: Commit
+
+Billing--&gt;&gt;Coord: Committed (Lock released)
+Inv--&gt;&gt;Coord: Committed (Lock released)
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Почему 2PC почти не используют в Go-микросервисах</span>
+    <span class="callout-title">Ловушка / Gotcha: Почему 2PC — антипаттерн в микросервисах</span>
   </div>
   <div class="callout-body">
-    <p>2PC — это <strong>антипаттерн</strong> для высоконагруженных систем.<br />
-* <strong>Блокировки:</strong> Пока идет транзакция, строки в БД заблокированы. Если координатор упадет между фазами, ресурсы останутся заблокированными до ручного вмешательства.<br />
-* <strong>Latency:</strong> Мы ждем сетевой ответ от самого медленного участника.<br />
-* <strong>Масштабируемость:</strong> Вероятность сбоя растет экспоненциально с количеством участников.</p>
+    <p>В распределенных Go-микросервисах протокол 2PC практически <strong>никогда не используется</strong>, так как он парализует систему:<br />
+1. <strong>Блокирующие ресурсы:</strong> На протяжении обеих фаз строки в базах данных остаются заблокированными на чтение и запись. Если сеть моргнет, блокировки будут удерживаться секундами, исчерпывая пул соединений.<br />
+2. <strong>Зависание в неопределенности (In-Doubt State):</strong> Если Координатор падает между Фазой 1 и Фазой 2, участники остаются заблокированными навсегда: они не имеют права ни закоммитить, ни откатить транзакцию без решения координатора.<br />
+3. <strong>Катастрофическая задержка:</strong> Задержка всей транзакции равна сумме задержек самого медленного участника и двух последовательных сетевых RTT со сбросами <code>fsync</code> на каждом узле.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="2-pattern-saga-saga">2. Паттерн Saga (Сага)</h2>
 
-<p>В современной микросервисной архитектуре вместо блокировок (2PC) используют <strong>Saga</strong>. Сага — это последовательность локальных транзакций. Если одна из них падает, выполняются <strong>компенсирующие транзакции</strong> для отката изменений.</p>
-<p>Существует два способа координации Саги:</p>
+<p>В высоконагруженных микросервисных архитектурах жесткие блокировки (2PC) уступили место паттерну <strong>Saga (Сага)</strong>, предложенному Гектором Гарсиа-Молиной и Кеннетом Салемом еще в 1987 году.</p>
+<blockquote>
+<p><strong>Сага</strong> — это цепочка независимых локальных транзакций. Каждая транзакция обновляет локальную базу данных одного сервиса и публикует событие. </p>
+<p>Если какой-то шаг завершается ошибкой, Сага запускает цепочку <strong>компенсирующих транзакций (Compensating Transactions)</strong>, которые последовательно откатывают изменения предыдущих шагов в обратном порядке.</p>
+</blockquote>
+<p>Критически важно понимать: компенсирующая транзакция — это <strong>не SQL ROLLBACK</strong>. Она не может волшебно стереть прошлое. Это <em>семантическое действие</em>, компенсирующее эффект: например, возврат списанных денег на счет или отправка извинительного промокода.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Client as Клиент
+participant S1 as Order Service
+participant S2 as Billing Service
+participant S3 as Inventory Service (Сбой!)
+
+Client-&gt;&gt;S1: Создать заказ
+S1-&gt;&gt;S1: T1: Создать заказ (NEW)
+S1-&gt;&gt;S2: Вызов списания
+S2-&gt;&gt;S2: T2: Списать 5000 руб
+S2-&gt;&gt;S3: Вызов резерва склада
+
+Note over S3: ОШИБКА: Товар закончился!
+S3--&gt;&gt;S2: Fail (Out of stock)
+
+Note over S2,S1: Запуск компенсаций (Rollback)
+S2-&gt;&gt;S2: C2: Вернуть 5000 руб клиенту
+S2--&gt;&gt;S1: Отмена заказа
+S1-&gt;&gt;S1: C1: Перевести заказ в REJECTED
+  </pre>
+</div>
+
+
+<p>Существует два фундаментальных способа реализации Саг:</p>
+<hr />
 <h3 id="a-orkestratsiya-orchestration">А. Оркестрация (Orchestration)</h3>
-<p>Центральный сервис (Оркестратор) говорит всем, что делать. В Go это часто реализуется через <code>Temporal.io</code> или кастомный стейт-машину.</p>
+
+<p>При оркестрации процессом руководит <strong>центральный координатор (Оркестратор)</strong>. Он хранит стейт-машину саги, пошагово отдает приказы сервисам и в случае аварии запускает сценарии компенсации.</p>
+<p>В Go-экосистеме индустриальным стандартом для оркестрации саг стал движок <strong><code>Temporal.io</code></strong> (а также Cadence). Он позволяет писать отказоустойчивые распределенные саги как обычный синхронный Go-код, автоматически персистя каждый шаг и возобновляя выполнение при падении серверов.</p>
+<p><em>Плюсы:</em> Идеальная прозрачность, нет циклических зависимостей, легко отслеживать статус саги.</p>
+<hr />
 <h3 id="b-khoreografiya-choreography">Б. Хореография (Choreography)</h3>
-<p>Сервисы обмениваются событиями через брокер (Kafka/RabbitMQ). <code>Billing</code> списал деньги -&gt; бросил событие <code>MoneyCharged</code> -&gt; <code>Inventory</code> поймал его и забронировал товар.</p>
+
+<p>При хореографии центрального диспетчера нет. Сервисы общаются децентрализованно через брокер сообщений (Kafka или RabbitMQ).</p>
+<p>Каждый сервис подписывается на события коллег:<br />
+1. <code>Order Service</code> создает заказ и бросает событие <code>OrderCreated</code>.<br />
+2. <code>Billing Service</code> слушает топик, видит <code>OrderCreated</code>, списывает деньги и публикует событие <code>MoneyCharged</code>.<br />
+3. <code>Inventory Service</code> ловит <code>MoneyCharged</code>, видит нехватку товара и публикует событие <code>StockReservationFailed</code>.<br />
+4. <code>Billing Service</code> ловит ошибку и возвращает деньги на карту.</p>
+<p><em>Плюсы:</em> Слабая связанность (Loose Coupling), сервисы независимы.<br />
+<em>Минусы:</em> Сложно визуализировать граф бизнес-процесса; риск возникновения циклических зависимостей.</p>
 <hr />
 <h2 id="3-distributed-transactions-i-go-rantaym">3. Distributed Transactions и Go-рантайм</h2>
 
-<p>Реализация распределенных транзакций в Go требует маниакальной обработки ошибок. Ты не можешь просто вызвать три функции подряд.</p>
+<p>Реализация распределенных транзакций в Go требует маниакальной дисциплины при работе с внешними ресурсами. Вы не можете просто вызвать в цикле функцию базы данных, а следом отправить сообщение в Kafka!</p>
+<hr />
 <h3 id="mekhanicheskaya-simpatiya-outbox-pattern">Механическая симпатия: Outbox Pattern</h3>
-<p>Самая частая ошибка: обновить БД и отправить сообщение в Kafka в одном обработчике.</p>
+
+<p>Классическая ошибка разработчика — попытка выполнить двойную запись (<strong>Dual Write</strong>):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2226,45 +2330,94 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХО: Если Kafka упадет, БД уже обновлена. Если БД откатится, сообщение уже улетело.
-db.Exec(&quot;UPDATE balance ...&quot;)
-kafka.Send(&quot;balance_updated&quot;)
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Гарантированная потеря консистентности при сбое!
+func HandlePayment(ctx context.Context, db *sql.DB, kafkaProducer *kafka.Producer, orderID string) error {
+    // ШАГ 1: Обновляем БД
+    _, err := db.ExecContext(ctx, &quot;UPDATE billing SET status = 'CHARGED' WHERE order_id = $1&quot;, orderID)
+    if err != nil {
+        return err
+    }
+
+    // ШАГ 2: Шлем событие в брокер
+    // ЧТО ЕСЛИ СЕТЬ МОРГНЕТ ИЛИ ПРОЦЕСС УМРЕТ ПО OOM ЗДЕСЬ?!
+    // База обновлена, а событие MoneyCharged в Kafka никогда не уйдет!
+    return kafkaProducer.Send(&quot;MoneyCharged&quot;, orderID)
+}
 </code></pre>
 </div>
 
-<p><strong>Transactional Outbox</strong> решает это:<br />
-1. В одной транзакции с бизнес-данными ты записываешь сообщение в специальную таблицу <code>outbox</code> в той же БД.<br />
-2. Отдельный воркер (Relay) читает таблицу и перекладывает сообщения в Kafka. Это гарантирует доставку <strong>at-least-once</strong>.</p>
+<p>Решением является паттерн <strong>Transactional Outbox</strong>:<br />
+1. В рамках <strong>одной локальной ACID-транзакции</strong> вы сохраняете бизнес-данные и записываете полезную нагрузку будущего сообщения в служебную таблицу <code>outbox</code> в той же самой базе данных.<br />
+2. Отдельный фоновый процесс (Relay / Change Data Capture, например Debezium) вычитывает таблицу <code>outbox</code> и гарантированно отправляет сообщения в брокер с семантикой <strong>at-least-once</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+GoApp[&quot;Go Приложение&quot;] --&gt;|&quot;Единая транзакция&lt;br/&gt;BEGIN ... COMMIT&quot;| DB[(&quot;PostgreSQL&quot;)]
+
+subgraph DB [PostgreSQL]
+T1[&quot;Таблица Orders&lt;br/&gt;(Бизнес-данные)&quot;]
+T2[&quot;Таблица outbox&lt;br/&gt;(События для шины)&quot;]
+end
+
+Relay[&quot;Фоновый воркер&lt;br/&gt;(CDC / Relay в Go)&quot;] --&gt;|&quot;Вычитывает outbox&quot;| T2
+Relay --&gt;|&quot;Надежная отправка&quot;| Kafka[&quot;Kafka Broker&lt;br/&gt;(Topic: MoneyCharged)&quot;]
+  </pre>
+</div>
+
+
 <hr />
 <h2 id="4-tcc-try-confirm-cancel">4. TCC (Try-Confirm-Cancel)</h2>
 
-<p>Паттерн TCC — это программная реализация 2PC, но без блокировок на уровне БД.<br />
-1. <strong>Try:</strong> Резервируем ресурсы (например, ставим <code>balance_pending = 100</code>, но не списываем).<br />
-2. <strong>Confirm:</strong> Если всё хорошо, окончательно списываем.<br />
-3. <strong>Cancel:</strong> Если сбой — снимаем резерв.</p>
-<p>Этот подход требует, чтобы все твои API были <strong>идемпотентными</strong>. Если <code>Confirm</code> пришел дважды из-за ретраев сети, баланс не должен списаться дважды.</p>
+<p>Паттерн <strong>TCC</strong> — это элегантная реализация двухфазной фиксации, но перенесенная с уровня блокировок СУБД на <strong>уровень бизнес-логики приложения</strong>.</p>
+<p>Каждый участвующий сервис реализует три контракта API:<br />
+1. <strong>Try:</strong> Предварительное резервирование ресурсов. Например, сервис счетов переводит 100 рублей в поле <code>balance_pending = 100</code>, но не списывает их окончательно.<br />
+2. <strong>Confirm:</strong> Окончательное подтверждение операции. Снятие резерва и перевод денег получателю.<br />
+3. <strong>Cancel:</strong> Отмена резервирования в случае сбоя соседних сервисов.</p>
+<blockquote>
+<p><strong>Золотое правило TCC:</strong><br />
+Все методы <code>Try</code>, <code>Confirm</code> и <code>Cancel</code> <strong>обязаны быть строго идемпотентными</strong>. Если из-за сетевого ретрая метод <code>Confirm</code> выполнится три раза подряд, баланс не должен списаться трижды.</p>
+</blockquote>
 <hr />
+<h2 id="podvodnye-kamni-raspredelennykh-tranzaktsiy">Подводные камни распределенных транзакций</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что лучше для распределенной транзакции: 2PC или Saga?<br />
-<strong>Ответ:</strong> 2PC дает <strong>строгую консистентность</strong>, но убивает доступность и скорость (CP-система). Saga дает <strong>Eventual Consistency</strong>, высокую доступность и производительность (AP-система), но требует сложной логики компенсаций (откатов) и обработки промежуточных состояний (когда деньги уже списаны, а заказ еще не создан). В Go-бэкенде почти всегда выбирают Saga.</p>
+    <p><strong>Вопрос:</strong> Какой паттерн выбрать для распределенной транзакции: 2PC или Saga?</p>
+<p><strong>Ответ:</strong> <br />
+* <strong>2PC (Two-Phase Commit)</strong> обеспечивает <strong>строгую согласованность (ACID / CP)</strong>, но убивает масштабируемость, пропускную способность и доступность системы из-за синхронных блокировок. Применим только внутри узкоспециализированных распределенных баз данных (CockroachDB, Spanner).<br />
+* <strong>Saga</strong> обеспечивает <strong>согласованность в конечном счете (Eventual Consistency / AP)</strong>, гарантируя высокую доступность и низкую задержку. Платой за это является усложнение кода: необходимость реализации компенсирующих транзакций и аккуратная обработка промежуточных состояний (когда деньги списаны, а заказ еще оформляется). </p>
+<p>В подавляющем большинстве микросервисных систем на Go де-факто стандартом является <strong>Saga</strong>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Забудь про 2PC</strong>, если только ты не пишешь внутренности распределенной СУБД.</li>
-<li><strong>Saga</strong> — основной способ работы в микросервисах. Ошибки неизбежны, поэтому готовь компенсирующие действия.</li>
-<li><strong>Идемпотентность</strong> — твой лучший друг. Каждый шаг транзакции должен быть безопасен для повторного вызова.</li>
-<li>Используй <strong>Outbox Pattern</strong>, чтобы связать локальную БД и внешние сообщения.</li>
+<li><strong>Забудьте о 2PC в микросервисах:</strong> Блокировки строк через сеть парализуют масштабирование и создают точки каскадных отказов.</li>
+<li><strong>Saga — промышленный выбор:</strong> Разделяйте глобальную транзакцию на цепочку локальных шагов с обязательным проектированием компенсирующих действий.</li>
+<li><strong>Transactional Outbox:</strong> Единственный безопасный способ связать реляционную базу данных и брокер сообщений без риска потери событий.</li>
+<li><strong>Идемпотентность — фундамент надежности:</strong> Сетевые ретраи неизбежны, поэтому любой шаг саги и метод <code>Confirm</code>/<code>Cancel</code> в TCC обязан спокойно переносить дубликаты вызовов.</li>
 </ol>
-<p>Мы закончили блок "Данные и согласованность". Мы узнали, как данные реплицируются, как разрешаются конфликты и как проводятся транзакции. Теперь перейдем к самому важному инструменту в руках Go-разработчика — к тем самым "рабочим лошадкам", которые переносят эти данные между сервисами.</p>
-<p>Следующий раздел: <a href="../04-mikroservisy/1-chto-takoe-mikroservis.html" class="wikilink">1. Что такое микросервис</a>.</p>
+<p>Мы завершили фундаментальный подраздел «Данные и согласованность». Мы изучили, как данные реплицируются, как разрешаются неизбежные конфликты и как оркеструются сложные бизнес-транзакции.</p>
+<p>Теперь пора перейти к архитектурному каркасу, на котором строятся все эти механизмы в реальном продакшене. </p>
+<p>Что представляет собой микросервисная архитектура с точки зрения Go-инженера? </p>
+<p>Переходим к следующему подразделу: <a href="../04-mikroservisy/1-chto-takoe-mikroservis.html" class="wikilink">1. Что такое микросервис</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2292,7 +2445,7 @@ kafka.Send(&quot;balance_updated&quot;)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-problema-2pc-two-phase-commit">1. Проблема 2PC (Two-Phase Commit)</a></li><li class="toc-item toc-h3"><a href="#kak-eto-rabotaet">Как это работает:</a></li><li class="toc-item toc-h2"><a href="#2-pattern-saga-saga">2. Паттерн Saga (Сага)</a></li><li class="toc-item toc-h3"><a href="#a-orkestratsiya-orchestration">А. Оркестрация (Orchestration)</a></li><li class="toc-item toc-h3"><a href="#b-khoreografiya-choreography">Б. Хореография (Choreography)</a></li><li class="toc-item toc-h2"><a href="#3-distributed-transactions-i-go-rantaym">3. Distributed Transactions и Go-рантайм</a></li><li class="toc-item toc-h3"><a href="#mekhanicheskaya-simpatiya-outbox-pattern">Механическая симпатия: Outbox Pattern</a></li><li class="toc-item toc-h2"><a href="#4-tcc-try-confirm-cancel">4. TCC (Try-Confirm-Cancel)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-problema-2pc-two-phase-commit">1. Проблема 2PC (Two-Phase Commit)</a></li><li class="toc-item toc-h3"><a href="#kak-eto-rabotaet">Как это работает:</a></li><li class="toc-item toc-h2"><a href="#2-pattern-saga-saga">2. Паттерн Saga (Сага)</a></li><li class="toc-item toc-h3"><a href="#a-orkestratsiya-orchestration">А. Оркестрация (Orchestration)</a></li><li class="toc-item toc-h3"><a href="#b-khoreografiya-choreography">Б. Хореография (Choreography)</a></li><li class="toc-item toc-h2"><a href="#3-distributed-transactions-i-go-rantaym">3. Distributed Transactions и Go-рантайм</a></li><li class="toc-item toc-h3"><a href="#mekhanicheskaya-simpatiya-outbox-pattern">Механическая симпатия: Outbox Pattern</a></li><li class="toc-item toc-h2"><a href="#4-tcc-try-confirm-cancel">4. TCC (Try-Confirm-Cancel)</a></li><li class="toc-item toc-h2"><a href="#podvodnye-kamni-raspredelennykh-tranzaktsiy">Подводные камни распределенных транзакций</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
