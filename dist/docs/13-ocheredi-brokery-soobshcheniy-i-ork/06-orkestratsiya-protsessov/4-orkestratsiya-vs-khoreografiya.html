@@ -2168,22 +2168,26 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Оркестрация vs хореография</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы погрузились во внутреннее устройство Temporal (<a href="2-temporal-arkhitektura-i-kontseptsii.html" class="wikilink">2. Temporal. Архитектура и концепции</a>) и разобрали магию Event Sourcing в основе его работы (<a href="3-durable-execution.html" class="wikilink">3. Durable execution</a>). Однако внедрение такого сложного инструмента — это серьезный архитектурный шаг. </p>
-<p>В распределенных системах для управления сложными бизнес-транзакциями (например, паттерн Saga) исторически сложилось два фундаментально разных подхода: <strong>Хореография (Choreography)</strong> и <strong>Оркестрация (Orchestration)</strong>. </p>
-<p>В этой статье мы столкнем их лбами, разберем под капотом, как они утилизируют сеть и железо, и определим, когда какой подход выбирать.</p>
+            <h1>Оркестрация vs хореография</h1>
+<blockquote>
+<p><em>«В архитектуре программного обеспечения нет правильных и неправильных решений — есть только набор компромиссов, за каждый из которых приходится платить либо сложностью кода, либо ресурсами железа.»</em></p>
+</blockquote>
+<p>В предыдущих статьях мы погрузились во внутреннее устройство платформы Temporal (<a href="2-temporal-arkhitektura-i-kontseptsii.html" class="wikilink">2. Temporal. Архитектура и концепции</a>) и разобрали механику Event Sourcing и Replay, лежащую в основе бессмертных функций (<a href="3-durable-execution.html" class="wikilink">3. Durable execution</a>). Однако выбор между внедрением специализированного оркестратора и использованием привычных очередей сообщений — это один из самых фундаментальных архитектурных перекрестков в карьере любого бэкенд-инженера.</p>
+<p>В распределенных системах для реализации многоэтапных бизнес-транзакций (в частности, паттерна Saga) исторически сформировались две противоположные парадигмы: <strong>Хореография (Choreography)</strong> и <strong>Оркестрация (Orchestration)</strong>.</p>
+<p>В этой главе мы сопоставим оба подхода на уровне исходного кода, системных вызовов ядра ОС и сетевых пакетов, выясним, почему «чистая хореография» часто заводит команды в тупик, и выведем формулу надежной гибридной архитектуры.</p>
 <hr />
 <h2 id="1-khoreografiya-choreography-tanets-bez-dirizhera">1. Хореография (Choreography): Танец без дирижера</h2>
 
-<p>Хореография — это классическая <strong>Event-Driven Architecture</strong> (EDA). В этом подходе нет единого центра управления. Каждый микросервис работает автономно: он слушает события (Events) из брокера сообщений (RabbitMQ, Kafka), выполняет свою часть бизнес-логики и публикует новое событие о том, что он закончил.</p>
+<p>Хореография — это классическая <strong>событийно-ориентированная архитектура (Event-Driven Architecture, EDA)</strong>. В этой парадигме нет никакого центрального органа управления или координирующего сервиса. Каждый микросервис существует абсолютно автономно: он слушает события (Domain Events) из распределенного брокера (Apache Kafka, RabbitMQ, NATS), выполняет локальную транзакцию в собственной базе данных и выбрасывает в брокер новое событие о завершении своего шага.</p>
 <blockquote>
-<p>Фокус хореографии — <strong>События (Events)</strong>. Сервис А не говорит Сервису Б, что делать. Он просто кричит в пустоту: <em>"Я создал заказ!"</em>. А Сервис Б сам решает, реагировать на это или нет.</p>
+<p>Фокус хореографии — <strong>События (Events)</strong>. Сервис А никогда не приказывает Сервису Б, что тот обязан сделать. Он лишь констатирует свершившийся в прошлом факт: <em>«Я создал заказ (OrderCreated)!»</em>. А остальные участники системы сами решают, интересно ли им это событие.</p>
 </blockquote>
 
 <div class="mermaid-wrapper">
@@ -2198,44 +2202,91 @@
     </button>
   </div>
   <pre class="mermaid">
-graph LR
-O[&quot;Order Service&quot;] --&gt;|&quot;Publish&lt;br&gt;OrderCreatedEvent&quot;| Broker[(&quot;Message Broker&lt;br&gt;Kafka / RabbitMQ&quot;)]
-Broker --&gt;|&quot;Consume&quot;| P[&quot;Payment Service&quot;]
-P --&gt;|&quot;Publish&lt;br&gt;PaymentSuccessEvent&quot;| Broker
-Broker --&gt;|&quot;Consume&quot;| I[&quot;Inventory Service&quot;]
-I --&gt;|&quot;Publish&lt;br&gt;ItemsReservedEvent&quot;| Broker
+flowchart LR
+O[&quot;Order Service&quot;] --&gt;|&quot;1. Publish:&lt;br&gt;OrderCreatedEvent&quot;| Broker[(&quot;Message Broker&lt;br&gt;Kafka / RabbitMQ&quot;)]
+Broker --&gt;|&quot;2. Consume&quot;| P[&quot;Payment Service&quot;]
+P --&gt;|&quot;3. Publish:&lt;br&gt;PaymentSuccessEvent&quot;| Broker
+Broker --&gt;|&quot;4. Consume&quot;| I[&quot;Inventory Service&quot;]
+I --&gt;|&quot;5. Publish:&lt;br&gt;ItemsReservedEvent&quot;| Broker
+
+classDef srv fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef brk fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+class O,P,I srv;
+class Broker brk;
   </pre>
 </div>
 
 
+<hr />
 <h3 id="preimushchestva-pros">Преимущества (Pros)</h3>
+
 <ol>
-<li><strong>Слабая связность (Decoupling):</strong> Сервис заказов ничего не знает о существовании сервиса оплат или склада. Вы можете добавить новый сервис (например, сервис начисления бонусных баллов), который просто подпишется на <code>OrderCreatedEvent</code>, не меняя ни строчки кода в самом сервисе заказов.</li>
-<li><strong>Отсутствие единой точки отказа (SPOF):</strong> Нет "супер-сервиса", падение которого остановит вообще всё. Если упадет сервис склада, оплата все равно пройдет (а склад обработает очередь позже).</li>
-<li><strong>Производительность (Mechanical Sympathy):</strong> Взаимодействие происходит максимально быстро. Publish в RabbitMQ — это один системный вызов (запись в TCP-сокет), после чего горутина освобождается.</li>
+<li><strong>Слабая связность (Decoupling):</strong> Сервис заказов (<code>Order Service</code>) не имеет ни малейшего понятия о том, кто слушает его события. Если маркетинг решает внедрить сервис кэшбэка или систему персонализированных пуш-уведомлений, разработчики просто подписывают новый сервис на событие <code>OrderCreatedEvent</code>. В кодовой базе сервиса заказов не меняется ни единой строчки.</li>
+<li><strong>Отсутствие единой точки отказа (No Single Point of Failure):</strong> В системе нет выделенного «главного сервера», падение которого парализует все бизнес-процессы компании. Если сервис резервирования склада временно отключен на регламентные работы, брокер сохранит сообщения в очереди, а платежи продолжат приниматься в штатном режиме.</li>
+<li><strong>Производительность (Mechanical Sympathy):</strong> Взаимодействие предельно легковесно. Отправка события в RabbitMQ или Kafka — это сериализация структуры в Protobuf/JSON и обычный системный вызов <code>write()</code> в TCP-сокет (<code>Go -&gt; TCP -&gt; Erlang Process -&gt; TCP -&gt; Go</code>). Горутина отправителя освобождается практически мгновенно, сетевые задержки составляют доли миллисекунды.</li>
 </ol>
+<hr />
 <h3 id="nedostatki-pinball-architecture-arkhitektura-pinbola">Недостатки: Pinball Architecture (Архитектура Пинбола)</h3>
-<p>Когда бизнес-процесс состоит из 2-3 шагов, хореография прекрасна. Но когда шагов 10, и они включают ветвления и компенсации (откаты транзакций), система превращается в <strong>автомат для пинбола</strong>. </p>
+
+<p>Когда бизнес-сценарий прост и насчитывает 2–3 линейных шага, хореография выглядит идеальным решением. Но как только реальный бизнес начинает обрастать разветвленными условиями (ветвления <code>if/else</code>, циклы <code>for</code>, таймауты, проверка мошенничества, кредитный скоринг), архитектура стремительно вырождается в так называемый <strong>«автомат для пинбола» (Pinball Architecture)</strong>.</p>
+<p>События хаотично отскакивают от сервиса к сервису, логика бизнес-процесса оказывается фрагментированной и похороненной в недрах десятков независимых микросервисных репозиториев.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+E1[&quot;OrderCreated&quot;] --&gt; S_Pay[&quot;Payment Service&quot;]
+S_Pay --&gt;|&quot;Успех&quot;| E2[&quot;PaymentCaptured&quot;]
+S_Pay --&gt;|&quot;Отказ&quot;| E3[&quot;PaymentFailed&quot;]
+E2 --&gt; S_Inv[&quot;Inventory Service&quot;]
+S_Inv --&gt;|&quot;Нет товара&quot;| E4[&quot;OutOfStock&quot;]
+E4 --&gt; S_Comp[&quot;Compensation Handler&quot;]
+S_Comp --&gt;|&quot;Cancel&quot;| E5[&quot;OrderCancelledEvent&quot;]
+S_Comp --&gt;|&quot;Refund&quot;| E6[&quot;RefundPaymentEvent&quot;]
+E6 --&gt; S_Pay
+
+classDef ev fill:#1e293b,stroke:#ec4899,stroke-width:1px,color:#f8fafc;
+classDef svc fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+class E1,E2,E3,E4,E5,E6 ev;
+class S_Pay,S_Inv,S_Comp svc;
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Потеря контроля</span>
   </div>
   <div class="callout-body">
-    <p>Представьте, что клиент звонит в поддержку и спрашивает: <em>"Где мой заказ?"</em>.<br />
-В архитектуре хореографии <strong>никто не знает ответа</strong>. Состояние заказа размазано по базам данных пяти разных микросервисов. Чтобы собрать статус, вам нужна сложнейшая инфраструктура распределенной трассировки и агрегации логов (о чем мы упоминали в <a href="../05-patterny-i-arkhitektura/10-distributed-tracing-v-async-sistemakh.html" class="wikilink">10. Distributed tracing в async системах</a>).<br />
-Более того, если на 7-м шаге произошла ошибка, вам нужно сгенерировать <code>CompensationEvent</code>, который должны отловить предыдущие 6 сервисов и откатить свои локальные транзакции. Написать и протестировать это на горутинах и RabbitMQ — адская задача.</p>
+    <p>Представьте типичный звонок возмущенного клиента в службу поддержки: <em>«Я оплатил бронирование три часа назад, деньги с карты списались, но подтверждение на почту так и не пришло. Где мой заказ?»</em>.</p>
+<p>В чисто хореографической архитектуре <strong>ни один сервис в компании не знает ответа</strong>. <br />
+- Сервис заказов считает, что событие ушло.<br />
+- Сервис оплаты считает, что транзакция одобрена.<br />
+- Сервис склада застрял на переиндексации остатков.<br />
+- Сервис нотификаций упал с ошибкой парсинга шаблона.</p>
+<p>Чтобы восстановить цепочку событий, инженерам приходится вручную грепать логи ElasticSearch или разворачивать тяжелую и дорогостоящую инфраструктуру распределенного трейсинга OpenTelemetry (о которой мы говорили в <a href="../05-patterny-i-arkhitektura/10-distributed-tracing-v-async-sistemakh.html" class="wikilink">10. Distributed tracing в async системах</a>). </p>
+<p>Ситуация становится катастрофической, когда на 6-м шаге цепочки происходит ошибка, требующая компенсирующей транзакции: приходится публиковать каскад <code>CompensationEvent</code>, которые должны быть корректно обработаны пятью предыдущими сервисами с учетом возможных сетевых дублей, ретраев и рассинхронизации часов.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="2-orkestratsiya-orchestration-simfoniya-s-dirizherom">2. Оркестрация (Orchestration): Симфония с дирижером</h2>
 
-<p>Оркестрация решает проблему "пинбола" путем введения единого контроллера (Оркестратора). Этот контроллер содержит четкий алгоритм выполнения бизнес-процесса от начала до конца.</p>
+<p>Оркестрация решает проблему хаоса и фрагментации за счет введения явного центра координации — <strong>Оркестратора (Orchestrator)</strong>. </p>
+<p>В коде появляется единый алгоритмический дирижер (например, Workflow в Temporal или Zeebe), в котором от первой до последней строчки описан весь жизненный цикл транзакции.</p>
 <blockquote>
-<p>Фокус оркестрации — <strong>Команды (Commands)</strong>. Оркестратор явно говорит: <em>"Сервис оплат, спиши деньги. Сервис склада, зарезервируй товар"</em>.</p>
+<p>Фокус оркестрации — <strong>Команды (Commands)</strong>. Оркестратор не ждет случайных сигналов из космоса. Он берет управление на себя и отдает прямые императивные приказы исполнителям (Activity): <em>«Сервис склада, зарезервируй товар X. Сервис платежей, спиши 500 рублей с карты Y»</em>.</p>
 </blockquote>
-<p>В контексте Go мы говорим о движках вроде Temporal или Zeebe. Оркестратор вызывает Activity (функции в микросервисах) по очереди или параллельно, собирает результаты и двигает стейт-машину вперед.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2249,35 +2300,48 @@ I --&gt;|&quot;Publish&lt;br&gt;ItemsReservedEvent&quot;| Broker
     </button>
   </div>
   <pre class="mermaid">
-graph TD
-subgraph Control Plane
-O[&quot;Orchestrator&lt;br&gt;Temporal Workflow&quot;]
+flowchart TD
+subgraph ControlPlane[&quot;Control Plane (Оркестратор)&quot;]
+W[&quot;Order Workflow&lt;br&gt;(Единый поток управления)&quot;]
 end
 
-subgraph Data Plane
-O --&gt;|&quot;1 - Command- ReserveItems&quot;| I[&quot;Inventory Service&quot;]
-I -.-&gt;|&quot;2 - Success&quot;| O
-O --&gt;|&quot;3 - Command- ChargeCard&quot;| P[&quot;Payment Service&quot;]
-P -.-&gt;|&quot;4 - Success&quot;| O
+subgraph DataPlane[&quot;Data Plane (Сервисы-исполнители)&quot;]
+Inv[&quot;Inventory Service&lt;br&gt;(Activity Worker)&quot;]
+Pay[&quot;Payment Service&lt;br&gt;(Activity Worker)&quot;]
+Notif[&quot;Notification Service&lt;br&gt;(Activity Worker)&quot;]
 end
 
-classDef orch fill:#f9f,stroke:#333,stroke-width:2px;
-class O orch;
+W --&gt;|&quot;1. Command: ReserveItems&quot;| Inv
+Inv -.-&gt;|&quot;2. Result: Reserved OK&quot;| W
+W --&gt;|&quot;3. Command: ChargePayment&quot;| Pay
+Pay -.-&gt;|&quot;4. Result: Paid OK&quot;| W
+W --&gt;|&quot;5. Command: SendReceipt&quot;| Notif
+Notif -.-&gt;|&quot;6. Result: Sent&quot;| W
+
+classDef cp fill:#1e293b,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+classDef dp fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+class ControlPlane cp;
+class DataPlane dp;
   </pre>
 </div>
 
 
+<hr />
 <h3 id="preimushchestva-pros">Преимущества (Pros)</h3>
+
 <ol>
-<li><strong>Единый источник истины (Single Source of Truth):</strong> Бизнес-логика всего процесса описана в одном месте (в коде Workflow). Вы открываете файл в IDE и читаете процесс бронирования сверху вниз, с обычными <code>if</code> и <code>for</code>.</li>
-<li><strong>Прозрачность стейта:</strong> Вы всегда можете спросить оркестратор: <em>"В каком состоянии процесс №123?"</em>, и он точно ответит: <em>"Ждем ответа от платежного шлюза, уже было 3 ретрая"</em>.</li>
-<li><strong>Бесплатная отказоустойчивость:</strong> Если сервис склада лежит, оркестратор не падает. Он "замораживает" состояние (Durable Execution) и будет повторять вызов (Retry) по экспоненте, пока склад не поднимется.</li>
+<li><strong>Единый источник истины (Single Source of Truth):</strong> Весь бизнес-процесс сконцентрирован в одном файле исходного кода. Вы открываете Workflow в IDE и мгновенно видите весь сценарий: порядок шагов, ветвления <code>if/else</code>, условия тайм-аутов и логику компенсирующих действий при авариях.</li>
+<li><strong>Абсолютная наблюдаемость состояния:</strong> Состояние каждого процесса всегда прозрачно. Любой оператор или API-клиент может выполнить запрос к кластеру оркестратора по <code>WorkflowID</code> и получить исчерпывающий ответ: <em>«Заказ #4912 находится на шаге 3 (списание средств), платежный шлюз ответил 500 Internal Server Error, запущен 4-й автоматический повтор с интервалом 8 секунд»</em>.</li>
+<li><strong>Встроенная надежность и детерминизм (Durable Execution):</strong> Если сервис склада выйдет из строя на два часа, оркестратор не упадет и не потеряет контекст. Он заморозит выполнение процесса и будет аккуратно ретраить вызов по экспоненциальной кривой, гарантируя выполнение шага при восстановлении сервиса.</li>
 </ol>
+<hr />
 <h3 id="nedostatki-cons">Недостатки (Cons)</h3>
+
 <ol>
-<li><strong>Тесная связность (Coupling):</strong> Сервисы становятся "тупыми" исполнителями (Activity Workers). Оркестратор должен знать о существовании каждого сервиса и его API (сигнатурах Activity).</li>
-<li><strong>"Божественный сервис" (God Service):</strong> Если разработчики недисциплинированны, они начинают тянуть доменную логику внутрь Workflow (например, вычислять скидки прямо в оркестраторе), превращая систему в распределенный монолит. <em>Workflow должен заниматься только маршрутизацией и потоком управления, вся бизнес-логика должна быть внутри Activity.</em></li>
-<li><strong>Накладные расходы (Overhead):</strong> Оркестрация требует гораздо больше ресурсов под капотом.</li>
+<li><strong>Связанность контрактов (Coupling):</strong> Оркестратор обязан знать о существующих сервисах, их адресах (Task Queues) и форматах входных/выходных аргументов вызовов Activity.</li>
+<li><strong>Антипаттерн «Божественный сервис» (God Service):</strong> При отсутствии архитектурной дисциплины команды начинают переносить сложную предметную логику (например, расчет сложных скидок или налогов) прямо внутрь кода Workflow. Это превращает оркестратор в монолитного монстра.<br />
+<em>Золотое правило: Workflow управляет только маршрутизацией, порядком вызовов и обработкой ошибок; вся доменная бизнес-математика должна оставаться внутри сервисов-Activity.</em></li>
+<li><strong>Накладные расходы на инфраструктуру (Infrastructure Tax):</strong> Оркестрация требует существенных дисковых и сетевых ресурсов под капотом.</li>
 </ol>
 <div class="callout callout-info">
   <div class="callout-header">
@@ -2285,10 +2349,13 @@ class O orch;
     <span class="callout-title">Под капотом: Налог на инфраструктуру</span>
   </div>
   <div class="callout-body">
-    <p>Сравним отправку сообщения в RabbitMQ и вызов Activity в Temporal.<br />
-В RabbitMQ: <code>Go -&gt; TCP -&gt; Erlang Process -&gt; TCP -&gt; Go</code>. State хранится в оперативной памяти брокера (или в WAL на диске, если Quorum Queue).<br />
-В Temporal: <code>Go -&gt; gRPC -&gt; Frontend -&gt; gRPC -&gt; History Service -&gt; DB Write (Postgres/Cassandra) -&gt; gRPC -&gt; Matching Service -&gt; gRPC -&gt; Go</code>. <br />
-На каждый шаг оркестратора происходит синхронная транзакция в центральной БД (сохранение событий <code>ActivityTaskScheduled</code> и <code>ActivityTaskStarted</code>). Это сильно увеличивает <strong>Latency</strong> (задержку) и снижает максимальный <strong>Throughput</strong> (пропускную способность) по сравнению с асинхронными брокерами.</p>
+    <p>Сопоставим реальный стек операций при отправке сообщения в классический брокер и вызове Activity в оркестраторе:</p>
+<p><strong>В брокере RabbitMQ:</strong><br />
+<code>Go -&gt; TCP -&gt; Erlang Process -&gt; TCP -&gt; Go</code><br />
+Состояние хранится в оперативной памяти или асинхронном дисковом WAL брокера. Задержка минимальна.</p>
+<p><strong>В оркестраторе Temporal:</strong><br />
+<code>Go -&gt; gRPC -&gt; Frontend -&gt; gRPC -&gt; History Service -&gt; DB Write (Postgres/Cassandra) -&gt; gRPC -&gt; Matching Service -&gt; gRPC -&gt; Go</code><br />
+На каждый шаг оркестратора кластер выполняет транзакционную запись в СУБД с фиксацией на диске (<code>fsync</code> для <code>ActivityTaskScheduled</code> и <code>ActivityTaskStarted</code>). Это увеличивает время отклика шага (Latency) до 10–30 миллисекунд и снижает пиковый Throughput по сравнению с сырыми очередями брокеров.</p>
   </div>
 </div>
 
@@ -2298,59 +2365,130 @@ class O orch;
 <div class="table-container"><table>
 <thead>
 <tr>
-<th style="text-align: left;">Характеристика</th>
-<th style="text-align: left;">Хореография (RabbitMQ / Kafka)</th>
-<th style="text-align: left;">Оркестрация (Temporal / Zeebe)</th>
+<th>Характеристика</th>
+<th style="text-align: center;">Хореография (RabbitMQ / Kafka)</th>
+<th style="text-align: center;">Оркестрация (Temporal / Zeebe)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>Парадигма</strong></td>
-<td style="text-align: left;">Event-Driven (Реакция на события)</td>
-<td style="text-align: left;">Command-Driven (Явные приказы)</td>
+<td><strong>Основная концепция</strong></td>
+<td style="text-align: center;"><strong>События (Events)</strong> — реакция на изменения</td>
+<td style="text-align: center;"><strong>Команды (Commands)</strong> — директивное управление</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Связанность</strong></td>
-<td style="text-align: left;">Низкая (Сервисы не знают друг о друге)</td>
-<td style="text-align: left;">Высокая (Оркестратор знает обо всех)</td>
+<td><strong>Связанность сервисов</strong></td>
+<td style="text-align: center;"><strong>Слабая (Loose)</strong> — сервисы изолированы</td>
+<td style="text-align: center;"><strong>Умеренная</strong> — оркестратор координирует интерфейсы</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Контроль процесса</strong></td>
-<td style="text-align: left;">Децентрализованный</td>
-<td style="text-align: left;">Централизованный</td>
+<td><strong>Управление процессом</strong></td>
+<td style="text-align: center;">Децентрализованное (размазано по консьюмерам)</td>
+<td style="text-align: center;">Централизованное (собрано в Workflow)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Отладка и мониторинг</strong></td>
-<td style="text-align: left;">Очень сложно (нужен сложный Distributed Tracing)</td>
-<td style="text-align: left;">Легко (состояние процесса лежит в БД оркестратора)</td>
+<td><strong>Отслеживание состояния</strong></td>
+<td style="text-align: center;">Крайне сложно (требует распределенного трейсинга)</td>
+<td style="text-align: center;">Из коробки (инспектирование истории любого процесса)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Производительность</strong></td>
-<td style="text-align: left;">Экстремально высокая, низкий Latency</td>
-<td style="text-align: left;">Средняя, высокий overhead на БД и gRPC</td>
+<td><strong>Обработка сбоев (Saga)</strong></td>
+<td style="text-align: center;">Ручные компенсации через брокеры, высок риск гонок</td>
+<td style="text-align: center;">Встроенные автоматические Retry и цепочки компенсаций</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Идеально для...</strong></td>
-<td style="text-align: left;">Рассылка нотификаций, логи, инвалидация кэшей, потоки данных</td>
-<td style="text-align: left;">Оформление заказов, финансовые транзакции, onboarding пользователей</td>
+<td><strong>Задержки (Latency)</strong></td>
+<td style="text-align: center;">Микросекунды / единицы миллисекунд</td>
+<td style="text-align: center;">Десятки миллисекунд (накладные расходы на СУБД истории)</td>
+</tr>
+<tr>
+<td><strong>Где применять?</strong></td>
+<td style="text-align: center;">Телеметрия, нотификации, стриминг данных, Big Data</td>
+<td style="text-align: center;">Заказы, биллинг, provisioning инфраструктуры, KYC</td>
 </tr>
 </tbody>
 </table></div>
 <hr />
 <h2 id="pragmatichnyy-podkhod-gibridnaya-arkhitektura">Прагматичный подход: Гибридная архитектура</h2>
 
-<p>В суровой реальности Senior-разработчики редко выбирают что-то одно на уровне всей компании. Лучшие системы используют <strong>гибридный подход</strong>.</p>
-<p><strong>Правило большого пальца:</strong><br />
-1. <strong>Используйте Оркестрацию ВНУТРИ ограниченного контекста (Bounded Context) бизнес-процесса.</strong> Например, весь процесс <code>Checkout</code> (резерв на складе, списание денег, формирование чека) должен контролироваться Temporal. Нам критически важно знать, где деньги клиента.<br />
-2. <strong>Используйте Хореографию МЕЖДУ доменами (Cross-Domain).</strong> Когда Temporal Workflow завершает процесс <code>Checkout</code>, его последняя Activity делает <code>rabbit.Publish("OrderCompleted")</code>. А дальше сервисы нотификаций (email), аналитики и BI-системы слушают этот Event через RabbitMQ/Kafka, не утяжеляя основной бизнес-процесс.</p>
+<p>В зрелых инженерных организациях опытные архитекторы никогда не делают догматичный выбор «или только хореография, или только оркестрация». Практика показывает, что максимальная надежность и производительность достигаются через <strong>гибридную архитектуру (Hybrid Architecture)</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TB
+subgraph BoundedContext[&quot;Ограниченный контекст: Checkout (Оркестрация)&quot;]
+direction TB
+W[&quot;Temporal Workflow: Checkout&quot;]
+A1[&quot;Activity: Резерв товара&quot;]
+A2[&quot;Activity: Списание денег&quot;]
+A3[&quot;Activity: Создание накладной&quot;]
+W --&gt; A1 --&gt; A2 --&gt; A3
+end
+
+subgraph CrossDomain[&quot;Междоменное взаимодействие: Хореография&quot;]
+direction LR
+Broker[(&quot;Message Broker&lt;br&gt;(Kafka / RabbitMQ)&quot;)]
+Analytics[&quot;Сервис аналитики&quot;]
+Email[&quot;Сервис рассылки писем&quot;]
+Loyalty[&quot;Сервис программы лояльности&quot;]
+
+Broker --&gt; Analytics
+Broker --&gt; Email
+Broker --&gt; Loyalty
+end
+
+A3 --&gt;|&quot;rabbit.Publish(&#x27;OrderCompleted&#x27;)&quot;| Broker
+
+classDef bc fill:#1e293b,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+classDef cd fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+class BoundedContext bc;
+class CrossDomain cd;
+  </pre>
+</div>
+
+
+<h3 id="formula-starshego-inzhenera">Формула старшего инженера:</h3>
+<ol>
+<li><strong>Используйте Оркестрацию ВНУТРИ ограниченного контекста (Bounded Context):</strong><br />
+   Там, где крутятся реальные деньги, критические данные и жесткие бизнес-инварианты (процесс <code>Checkout</code>, бронирование билетов, выдача кредитов, отгрузка со склада), процессом обязан управлять оркестратор. Здесь критически важен единый источник правды, прозрачные таймауты и контролируемые транзакции отката.</li>
+<li><strong>Используйте Хореографию ДЛЯ МЕЖДОМЕННОГО оповещения (Cross-Domain Events):</strong><br />
+   Когда оркестратор успешно завершил критическую фазу <code>Checkout</code>, его финальная Activity вызывает: <code>rabbit.Publish("OrderCompleted")</code>.<br />
+<code>go
+   rabbit.Publish("OrderCompleted", payload)</code><br />
+   После этого событие отправляется в свободный полет по Kafka или RabbitMQ. Второстепенные сервисы (отправка поздравлений клиенту, расчет аналитических когорт, пересчет бонусов) асинхронно реагируют на это событие, не замедляя критический путь оформления заказа.</li>
+</ol>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> На System Design интервью вас просят спроектировать платформу заказа такси (Ride Hailing). Как вы распределите зоны ответственности между хореографией и оркестрацией?</p>
+<p><strong>Ответ:</strong><br />
+1. <strong>Хореография через брокеры сообщений (Kafka / NATS):</strong> Применяется для высоконагруженных потоков телеметрии: стриминг координат водителей (GPS-пинг каждые 2 секунды от 100 000 машин). Здесь критичны минимальный Latency и высокий Throughput; потеря единичного пинга геолокации не критична для системы.<br />
+2. <strong>Оркестрация через движок процессов (Temporal):</strong> Применяется для жизненного цикла конкретной поездки (Trip Workflow): поиск водителя $\to$ ожидание подачи $\to$ посадка $\to$ движение по маршруту $\to$ списание средств $\to$ чаевые. Здесь важен каждый шаг: если водитель отменил заказ, оркестратор обязан корректно запустить поиск следующего водителя, разморозить залог на карте пассажира и отправить водителю штрафные баллы.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Хореография</strong> быстра, слабо связана, но быстро превращается в неуправляемый хаос (Pinball) при росте сложности бизнес-транзакций.</li>
-<li><strong>Оркестрация</strong> дает абсолютный контроль, надежность и наблюдаемость, но требует дополнительной инфраструктуры (Control Plane) и накладывает пенальти на сетевые задержки и дисковый ввод-вывод.</li>
-<li>Проектируйте так, чтобы Оркестратор дирижировал критичными деньгами/данными, а брокеры сообщений раскидывали результаты (события) всем заинтересованным наблюдателям.</li>
+<li><strong>Хореография</strong> обеспечивает максимальную масштабируемость и низкую связанность сервисов, но сложна в отладке и превращается в неуправляемый хаос (Pinball Architecture) при реализации сложных цепочек компенсаций.</li>
+<li><strong>Оркестрация</strong> гарантирует детерминизм, централизованный контроль и наглядность бизнес-процессов, но требует выделенной инфраструктуры и накладывает накладные расходы на СУБД истории.</li>
+<li>Профессиональный архитектурный подход — <strong>гибридный</strong>: использовать оркестрацию внутри транзакционных бизнес-процессов, а результаты их завершения публиковать в брокеры для хореографического потребления остальной системой.</li>
 </ol>
-<p>Одной из главных причин выбора Оркестратора является элегантное решение проблемы частичных сбоев. Что делать, если на середине транзакции внешний сервис ответил ошибкой <code>500</code> или навсегда отказал в операции? Как правильно откатить предыдущие шаги в распределенной системе? Разберем это в следующей статье: <a href="5-retry-i-compensation-logic.html" class="wikilink">5. Retry и compensation logic</a>.</p>
+<p>Одним из главных достоинств оркестратора является прозрачное управление отказами. Что делать, если на середине пути сторонний шлюз вернул ошибку <code>500</code> или клиент передумал? Как правильно проектировать компенсирующие транзакции? Об этом мы поговорим в следующей статье: <a href="5-retry-i-compensation-logic.html" class="wikilink">5. Retry и compensation logic</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2378,7 +2516,7 @@ class O orch;
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-khoreografiya-choreography-tanets-bez-dirizhera">1. Хореография (Choreography): Танец без дирижера</a></li><li class="toc-item toc-h3"><a href="#preimushchestva-pros">Преимущества (Pros)</a></li><li class="toc-item toc-h3"><a href="#nedostatki-pinball-architecture-arkhitektura-pinbola">Недостатки: Pinball Architecture (Архитектура Пинбола)</a></li><li class="toc-item toc-h2"><a href="#2-orkestratsiya-orchestration-simfoniya-s-dirizherom">2. Оркестрация (Orchestration): Симфония с дирижером</a></li><li class="toc-item toc-h3"><a href="#preimushchestva-pros">Преимущества (Pros)</a></li><li class="toc-item toc-h3"><a href="#nedostatki-cons">Недостатки (Cons)</a></li><li class="toc-item toc-h2"><a href="#3-svodnoe-sravnenie-cheat-sheet">3. Сводное сравнение (Cheat Sheet)</a></li><li class="toc-item toc-h2"><a href="#pragmatichnyy-podkhod-gibridnaya-arkhitektura">Прагматичный подход: Гибридная архитектура</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-khoreografiya-choreography-tanets-bez-dirizhera">1. Хореография (Choreography): Танец без дирижера</a></li><li class="toc-item toc-h3"><a href="#preimushchestva-pros">Преимущества (Pros)</a></li><li class="toc-item toc-h3"><a href="#nedostatki-pinball-architecture-arkhitektura-pinbola">Недостатки: Pinball Architecture (Архитектура Пинбола)</a></li><li class="toc-item toc-h2"><a href="#2-orkestratsiya-orchestration-simfoniya-s-dirizherom">2. Оркестрация (Orchestration): Симфония с дирижером</a></li><li class="toc-item toc-h3"><a href="#preimushchestva-pros">Преимущества (Pros)</a></li><li class="toc-item toc-h3"><a href="#nedostatki-cons">Недостатки (Cons)</a></li><li class="toc-item toc-h2"><a href="#3-svodnoe-sravnenie-cheat-sheet">3. Сводное сравнение (Cheat Sheet)</a></li><li class="toc-item toc-h2"><a href="#pragmatichnyy-podkhod-gibridnaya-arkhitektura">Прагматичный подход: Гибридная архитектура</a></li><li class="toc-item toc-h3"><a href="#formula-starshego-inzhenera">Формула старшего инженера:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

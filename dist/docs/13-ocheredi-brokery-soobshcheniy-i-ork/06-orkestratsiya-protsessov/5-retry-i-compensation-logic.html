@@ -2168,164 +2168,28 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Retry и compensation logic</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="4-orkestratsiya-vs-khoreografiya.html" class="wikilink">4. Оркестрация vs хореография</a> мы выяснили, что оркестрация дает нам абсолютный контроль над распределенными бизнес-транзакциями. Но этот контроль ничего не стоит, если мы не умеем правильно обрабатывать ошибки.</p>
-<p>В микросервисной среде ошибки — это норма. Сеть может "моргнуть", база данных может временно заблокировать запись (deadlock), а сторонний API может вернуть <code>503 Service Unavailable</code>. В традиционном монолите мы бы просто сделали <code>tx.Rollback()</code>. В микросервисах у нас нет единой транзакции базы данных. </p>
-<p>Здесь на сцену выходят два важнейших механизма оркестраторов (таких как Temporal): <strong>Автоматические повторные попытки (Retries)</strong> для временных сбоев и <strong>Компенсации (Compensations)</strong> для постоянных сбоев бизнес-логики.</p>
+            <h1>Retry и compensation logic</h1>
+<blockquote>
+<p><em>«В распределенной системе всё, что может пойти не так, обязательно пойдет не так, причем именно в тот момент, когда половина шагов транзакции уже успешно зафиксирована.»</em></p>
+</blockquote>
+<p>В предыдущей статье <a href="4-orkestratsiya-vs-khoreografiya.html" class="wikilink">4. Оркестрация vs хореография</a> мы выяснили, что оркестрация предоставляет инженеру исчерпывающий контроль над сложными распределенными бизнес-процессами. Однако этот контроль теряет всякий практический смысл, если система не умеет элегантно и математически строго реагировать на отказы.</p>
+<p>В локальном монолитном приложении обработка ошибок тривиальна: при любом сбое вызывается <code>tx.Rollback()</code>, реляционная база данных мгновенно снимает блокировки строк, отбрасывает временные структуры в WAL и возвращает состояние к моменту до начала транзакции. </p>
+<p>В микросервисной архитектуре распределенной единой транзакции не существует: у каждого сервиса своя база данных, свои сетевые сокеты и свои сценарии частичной деградации. Сеть между серверами подвержена задержкам, базы данных ловят кратковременные deadlock'и, а внешние партнерские API возвращают статусы вроде <code>503 Service Unavailable</code>.</p>
+<p>В современных системах оркестрации (в первую очередь, в Temporal) управление распределенными сбоями опирается на два фундаментальных кита:<br />
+1. <strong>Автоматические повторы (Retry Logic)</strong> — для парирования временных инфраструктурных сбоев (Transient Errors).<br />
+2. <strong>Компенсирующие транзакции (Compensation Logic / Saga)</strong> — для обратного отката при возникновении неустранимых бизнес-ошибок.</p>
+<hr />
 <h2 id="1-retry-logic-strategii-povtornykh-popytok">1. Retry Logic (Стратегии повторных попыток)</h2>
 
-<p>Temporal (и подобные системы) проектируются с парадигмой: <strong>Activity должна падать, это нормально</strong>. Если Activity завершается с ошибкой, оркестратор не "роняет" весь Workflow. Он планирует повторное выполнение этой Activity.</p>
-<h3 id="nastroyka-retrypolicy-v-go">Настройка RetryPolicy в Go</h3>
-
-<p>Политика повторных попыток задается при конфигурации <code>ActivityOptions</code> перед вызовом самой активности.</p>
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">package app
-
-import (
-    &quot;time&quot;
-
-    &quot;go.temporal.io/sdk/temporal&quot;
-    &quot;go.temporal.io/sdk/workflow&quot;
-)
-
-func PaymentWorkflow(ctx workflow.Context, orderID string) error {
-    retryPolicy := &amp;temporal.RetryPolicy{
-        InitialInterval:    time.Second,       // Первая пауза перед ретраем (1 сек)
-        BackoffCoefficient: 2.0,               // Множитель (1s, 2s, 4s, 8s...)
-        MaximumInterval:    100 * time.Second, // Потолок паузы
-        MaximumAttempts:    0,                 // 0 = бесконечные попытки
-        NonRetryableErrorTypes: []string{
-            &quot;InsufficientFundsError&quot;, // Имя ошибки, при которой ретрай не нужен
-        },
-    }
-
-    ao := workflow.ActivityOptions{
-        StartToCloseTimeout: 10 * time.Second, // Таймаут на ОДНУ попытку
-        RetryPolicy:         retryPolicy,
-    }
-    ctx = workflow.WithActivityOptions(ctx, ao)
-
-    // Temporal будет бесконечно ретраить эту функцию при сетевых сбоях,
-    // пока не получит успех или NonRetryableError
-    return workflow.ExecuteActivity(ctx, ChargeClientActivity, orderID).Get(ctx, nil)
-}
-</code></pre>
-</div>
-
-<h3 id="mechanical-sympathy-kak-retrai-rabotayut-pod-kapotom">Mechanical Sympathy: Как ретраи работают под капотом?</h3>
-
-<p>Вспомним наши страдания из статьи <a href="../02-rabbitmq/8-retry-patterns-v-rabbitmq.html" class="wikilink">8. Retry patterns в RabbitMQ</a>. Там нам приходилось городить сложные топологии из очередей ожидания (Wait Queues) и плагинов с дисковой БД Mnesia, чтобы просто отложить сообщение на 5 секунд.</p>
-<p>В Temporal механика ретраев <strong>встроена на уровне ядра кластера (History Service)</strong>:<br />
-1. Activity падает и возвращает ошибку по gRPC в кластер.<br />
-2. Кластер смотрит на <code>RetryPolicy</code>.<br />
-3. Если нужен ретрай через 8 секунд, History Service просто создает <strong>внутренний Timer</strong> в своей базе данных (Cassandra/Postgres) и "забывает" про задачу.<br />
-4. Go-воркер в этот момент <strong>полностью свободен</strong>. Никаких блокировок, никаких <code>time.Sleep</code> в памяти.<br />
-5. Через 8 секунд база данных "выстреливает" таймер, задача снова ставится в Task Queue, и свободный воркер забирает её на вторую попытку.</p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: NonRetryableErrors и бизнес-логика</span>
-  </div>
-  <div class="callout-body">
-    <p>Если ваш платежный шлюз вернул ошибку "Недостаточно средств", делать <code>Retry</code> бессмысленно — денег на карте от этого не прибавится (это детерминированная ошибка бизнес-логики). <br />
-Вы <strong>обязаны</strong> возвращать из Activity ошибку, тип которой указан в <code>NonRetryableErrorTypes</code>. Temporal Go SDK позволяет сделать это элегантно через <code>temporal.NewNonRetryableApplicationError("Insufficient funds", "InsufficientFundsError", err, nil)</code>. Если этого не сделать, оркестратор будет долбить внешний API по экспоненте, сжигая ресурсы.</p>
-  </div>
-</div>
-
-<h2 id="2-compensation-logic-pattern-saga">2. Compensation Logic (Паттерн Saga)</h2>
-
-<p>Что делать, если мы исчерпали попытки ретраев (или получили <code>NonRetryableError</code>), но до этого момента Workflow уже успел успешно выполнить несколько других Activity?</p>
-<p>Например, мы бронируем тур:<br />
-1. Забронировали отель (Успех).<br />
-2. Забронировали авиабилет (Успех).<br />
-3. Пытаемся списать деньги... Ошибка (Недостаточно средств).</p>
-<p>У нас в системе "повисли" забронированные билеты и отели. Мы должны выполнить <strong>Компенсирующие транзакции</strong> — вызвать обратные операции (<code>CancelFlight</code>, <code>CancelHotel</code>), чтобы откатить распределенное состояние. Этот паттерн называется <strong>Saga</strong>.</p>
-<h3 id="idiomatichnaya-saga-v-temporal-go">Идиоматичная Saga в Temporal (Go)</h3>
-
-<p>В Go нет встроенных механизмов для отката распределенных процессов, но мы можем использовать мощь замыканий (closures) и паттерн, похожий на <code>defer</code>, для накопления компенсирующих действий.</p>
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">package app
-
-import (
-    &quot;go.temporal.io/sdk/workflow&quot;
-)
-
-func TourBookingWorkflow(ctx workflow.Context, req BookingRequest) error {
-    // Стек для хранения функций-компенсаций
-    var compensations []func(ctx workflow.Context) error
-
-    // Defer-блок, который выполнится при выходе из Workflow (в т.ч. при ошибке)
-    defer func() {
-        if err != nil {
-            // Отключаем отмену контекста для компенсаций!
-            // Если оригинальный контекст был отменен (Cancel/Timeout),
-            // компенсации всё равно ДОЛЖНЫ выполниться.
-            disconnectedCtx, _ := workflow.NewDisconnectedContext(ctx)
-
-            // Выполняем компенсации в обратном порядке (LIFO)
-            for i := len(compensations) - 1; i &gt;= 0; i-- {
-                errComp := compensations[i](disconnectedCtx)
-                if errComp != nil {
-                    // В реальности здесь нужно писать в лог или алертить,
-                    // так как падение компенсации - это критический инцидент.
-                    workflow.GetLogger(ctx).Error(&quot;Compensation failed&quot;, &quot;Error&quot;, errComp)
-                }
-            }
-        }
-    }()
-
-    // --- ШАГ 1: Бронируем отель ---
-    err = workflow.ExecuteActivity(ctx, BookHotelActivity, req).Get(ctx, nil)
-    if err != nil {
-        return err // Уходим, компенсаций еще нет
-    }
-    // Добавляем компенсацию (отмену отеля) в стек
-    compensations = append(compensations, func(c workflow.Context) error {
-        return workflow.ExecuteActivity(c, CancelHotelActivity, req).Get(c, nil)
-    })
-
-    // --- ШАГ 2: Бронируем перелет ---
-    err = workflow.ExecuteActivity(ctx, BookFlightActivity, req).Get(ctx, nil)
-    if err != nil {
-        return err // Уходим, сработает компенсация отеля
-    }
-    compensations = append(compensations, func(c workflow.Context) error {
-        return workflow.ExecuteActivity(c, CancelFlightActivity, req).Get(c, nil)
-    })
-
-    // --- ШАГ 3: Оплата (падает) ---
-    err = workflow.ExecuteActivity(ctx, ChargeCardActivity, req).Get(ctx, nil)
-    if err != nil {
-        return err // Уходим, сработают компенсации перелета, затем отеля
-    }
-
-    return nil
-}
-</code></pre>
-</div>
-
+<p>Философия оркестраторов формулируется парадоксальным, на первый взгляд, принципом: <strong>Activity обязана падать, и это абсолютно нормальная штатная ситуация</strong>. </p>
+<p>Если сторонний сервис недоступен, Activity-воркер не должен судорожно обрабатывать ошибку костылями или ронять родительский Workflow. Воркер просто возвращает ошибку кластеру, а оркестратор берет на себя интеллектуальное планирование повторов.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2339,16 +2203,251 @@ func TourBookingWorkflow(ctx workflow.Context, req BookingRequest) error {
     </button>
   </div>
   <pre class="mermaid">
-graph TD
-Start[&quot;Workflow- Бронь тура&quot;] --&gt; A1[&quot;Activity- Book Hotel&quot;]
-A1 --&gt;|&quot;Успех&quot;| A2[&quot;Activity- Book Flight&quot;]
-A2 --&gt;|&quot;Успех&quot;| A3[&quot;Activity- Charge Card&quot;]
-A3 -.-&gt;|&quot;Ошибка 402&lt;br&gt;Нет денег&quot;| C2[&quot;Compensation- Cancel Flight&quot;]
-C2 -.-&gt;|&quot;Успех отмены&quot;| C1[&quot;Compensation- Cancel Hotel&quot;]
-C1 -.-&gt; Fail[&quot;Workflow Завершен&lt;br&gt;С Ошибкой&quot;]
+flowchart TD
+Start[&quot;Вызов Activity&quot;] --&gt; Try1[&quot;Попытка 1&quot;]
+Try1 --&gt;|&quot;Сетевой сбой / 503&quot;| Check{&quot;Ошибка в&lt;br&gt;NonRetryableErrorTypes?&quot;}
+Check --&gt;|&quot;Да&quot;| Fail[&quot;Фатальный сбой&lt;br&gt;Возврат в Workflow&quot;]
+Check --&gt;|&quot;Нет&quot;| Timer[&quot;History Service:&lt;br&gt;Создание таймера (Backoff + Jitter)&quot;]
+Timer --&gt;|&quot;Таймер истек&quot;| Try2[&quot;Попытка 2 (Другой воркер)&quot;]
+Try2 --&gt;|&quot;Успех 200 OK&quot;| Success[&quot;Запись ActivityTaskCompleted&lt;br&gt;в History Service&quot;]
+
+classDef proc fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef err fill:#1e1e2e,stroke:#f43f5e,stroke-width:2px,color:#f8fafc;
+classDef ok fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+class Start,Try1,Timer,Try2 proc;
+class Check,Fail err;
+class Success ok;
   </pre>
 </div>
 
+
+<hr />
+<h3 id="nastroyka-retrypolicy-v-go">Настройка RetryPolicy в Go</h3>
+
+<p>Политика повторных попыток задается декларативно через структуру <code>ActivityOptions</code> в коде Workflow:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package billing
+
+import (
+    &quot;time&quot;
+
+    &quot;go.temporal.io/sdk/temporal&quot;
+    &quot;go.temporal.io/sdk/workflow&quot;
+)
+
+func PaymentWorkflow(ctx workflow.Context, orderID string, amount int64) error {
+    // Конфигурация экспоненциального бэкоффа с защитой от штормов
+    retryPolicy := &amp;temporal.RetryPolicy{
+        InitialInterval:    1 * time.Second,   // Начальная пауза перед первой перепопыткой
+        BackoffCoefficient: 2.0,               // Коэффициент роста интервала: 1s -&gt; 2s -&gt; 4s -&gt; 8s...
+        MaximumInterval:    60 * time.Second,  // Верхняя граница задержки
+        MaximumAttempts:    0,                 // 0 = бесконечные попытки до победного конца
+        NonRetryableErrorTypes: []string{
+            &quot;InsufficientFundsError&quot;,         // Нет смысла повторять, если на счете 0
+            &quot;CardExpiredError&quot;,               // Срок действия карты истек
+            &quot;FraudRejectedError&quot;,             // Отклонено антифрод-системой
+        },
+    }
+
+    ao := workflow.ActivityOptions{
+        StartToCloseTimeout: 15 * time.Second, // Таймаут на ОДНУ конкретную попытку
+        ScheduleToCloseTimeout: 1 * time.Hour, // Общий лимит времени со всеми ретраями
+        RetryPolicy:         retryPolicy,
+    }
+    ctx = workflow.WithActivityOptions(ctx, ao)
+
+    // Оркестратор будет надежно повторять вызов функции при сбоях сети или 500/503,
+    // пока не получит подтверждение успеха или NonRetryableError
+    return workflow.ExecuteActivity(ctx, ChargeClientActivity, orderID, amount).Get(ctx, nil)
+}
+</code></pre>
+</div>
+
+<hr />
+<h3 id="mechanical-sympathy-kak-retrai-rabotayut-pod-kapotom">Mechanical Sympathy: Как ретраи работают под капотом?</h3>
+
+<p>Вспомним, с какими мучениями связана реализация повторов в традиционных брокерах сообщений (как мы разбирали в <a href="../02-rabbitmq/8-retry-patterns-v-rabbitmq.html" class="wikilink">8. Retry patterns в RabbitMQ</a>). В RabbitMQ инженерам приходится создавать запутанные топологии: вспомогательные очереди ожидания (Wait Queues), Dead Letter Exchanges (DLX), настраивать TTL сообщений или подключать сторонние плагины на базе базы данных Mnesia. При этом сообщения летают по кругу, пожирая трафик и засоряя очереди.</p>
+<p>В Temporal механизм повторов <strong>встроен непосредственно в ядро распределенного конечного автомата (History Service)</strong>:<br />
+1. Воркер выполняет Activity, натыкается на сетевой сбой и сообщает серверу по gRPC: <em>«Activity упала с ошибкой Connection Reset»</em>.<br />
+2. History Service сверяется с заданной <code>RetryPolicy</code>.<br />
+3. Если требуется повторить попытку через 8 секунд, History Service не держит открытых сетевых сокетов и не спамит сообщениями. Он просто создает <strong>таймер в таблице персистентной СУБД</strong> (Cassandra / PostgreSQL) и переводит задачу в спящее состояние.<br />
+4. Go-воркер в этот момент <strong>мгновенно освобождается</strong>. В оперативной памяти приложения не висит никаких ждущих горутин и вызовов <code>time.Sleep</code>. Воркер готов обрабатывать другие клиентские запросы.<br />
+5. Ровно через 8 секунд внутренний таймер History Service срабатывает, задача помещается в соответствующую Task Queue, и любой свободный воркер забирает ее на повторное исполнение.</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: NonRetryableErrors и бизнес-логика</span>
+  </div>
+  <div class="callout-body">
+    <p>Если внешний платежный провайдер вернул ошибку «Недостаточно средств» (Insufficient Funds), продолжать <code>Retry</code> категорически бессмысленно: деньги на балансе клиента не возникнут из ниоткуда через 2 секунды. Это детерминированная ошибка предметной области.</p>
+<p>Если вы забудете объявить такие ошибки неретраябельными, оркестратор добросовестно начнет долбить партнерский API с частотой раз в минуту, сжигая CPU, засоряя аудит банка и вызывая законную блокировку ваших ключей за DDoS!</p>
+<p>В коде Activity используйте строго типизированные ошибки:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">if balance &lt; requiredAmount {
+    return temporal.NewNonRetryableApplicationError(
+        &quot;insufficient funds on customer account&quot;,
+        &quot;InsufficientFundsError&quot;,
+        nil,
+    )
+}
+</code></pre>
+</div>
+
+  </div>
+</div>
+
+<hr />
+<h2 id="2-compensation-logic-pattern-saga">2. Compensation Logic (Паттерн Saga)</h2>
+
+<p>Что делать, если все разрешенные повторы исчерпаны, или мы получили фатальную <code>NonRetryableError</code>, но до этой точки Workflow уже успел успешно выполнить несколько необратимых действий в других микросервисах?</p>
+<p>Классический сценарий бронирования отпуска:<br />
+1. Забронирован номер в гостинице (Успех: отель заморозил номер).<br />
+2. Забронирован авиабилет (Успех: авиакомпания выписала бронь).<br />
+3. Списание средств с карты... <strong>Отказ: банк отклонил транзакцию.</strong></p>
+<p>В распределенной системе зависли чужие ресурсы: отель и авиакомпания ждут подтверждения. Если бросить процесс в этом месте, бизнес понесет финансовые и юридические убытки.</p>
+<p>Единственный способ вернуть распределенную систему в согласованное состояние — выполнить цепочку обратных действий: <strong>компенсирующих транзакций (Compensating Transactions)</strong>. Этот архитектурный шаблон называется <strong>Saga</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant W as Tour Workflow
+participant Hotel as Hotel Service
+participant Flight as Flight Service
+participant Bank as Bank Service
+
+Note over W,Bank: Прямой ход транзакции (Forward Phase)
+W-&gt;&gt;Hotel: BookHotelActivity()
+Hotel--&gt;&gt;W: OK (BookingID: H-101)
+W-&gt;&gt;Flight: BookFlightActivity()
+Flight--&gt;&gt;W: OK (TicketID: F-202)
+W-&gt;&gt;Bank: ChargeCardActivity()
+Bank--&gt;&gt;W: 402 Payment Required (Non-Retryable!)
+
+Note over W,Bank: Фаза компенсации (Rollback Phase / LIFO)
+W-&gt;&gt;Flight: CancelFlightActivity(TicketID: F-202)
+Flight--&gt;&gt;W: OK (Билет аннулирован)
+W-&gt;&gt;Hotel: CancelHotelActivity(BookingID: H-101)
+Hotel--&gt;&gt;W: OK (Бронь снята)
+Note over W: Система вернулась в консистентный статус
+  </pre>
+</div>
+
+
+<hr />
+<h3 id="idiomatichnaya-saga-v-temporal-go">Идиоматичная Saga в Temporal (Go)</h3>
+
+<p>В языке Go нет встроенных синтаксических конструкций для отката распределенных транзакций, но мы можем элегантно реализовать паттерн Saga с помощью замыканий (closures), стека функций обратного вызова и ключевого слова <code>defer</code>.</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package travel
+
+import (
+    &quot;fmt&quot;
+    &quot;go.temporal.io/sdk/workflow&quot;
+)
+
+type TourRequest struct {
+    UserID   string
+    HotelID  string
+    FlightID string
+    Price    int64
+}
+
+func TourBookingWorkflow(ctx workflow.Context, req TourRequest) (err error) {
+    // Стек компенсирующих функций (LIFO)
+    var compensations []func(c workflow.Context) error
+
+    // Defer-блок: гарантированно выполняется при любом выходе из Workflow
+    defer func() {
+        if err != nil {
+            logger := workflow.GetLogger(ctx)
+            logger.Warn(&quot;Транзакция сорвалась, запускаем компенсацию Saga...&quot;, &quot;cause&quot;, err)
+
+            // ВАЖНО: Отключаем отмену контекста для компенсаций!
+            // Если исходный ctx был отменен по тайм-ауту или сигналом отмены,
+            // компенсирующие шаги ОБЯЗАНЫ выполниться до конца!
+            disconnectedCtx, _ := workflow.NewDisconnectedContext(ctx)
+
+            // Разматываем стек компенсаций строго в обратном порядке (LIFO)
+            for i := len(compensations) - 1; i &gt;= 0; i-- {
+                compErr := compensations[i](disconnectedCtx)
+                if compErr != nil {
+                    // Падение компенсации — критический инцидент (Incident Severity 1)
+                    logger.Error(&quot;КРИТИЧЕСКИЙ СБОЙ КОМПЕНСАЦИИ!&quot;, &quot;error&quot;, compErr)
+                }
+            }
+        }
+    }()
+
+    // --- ШАГ 1: Бронирование отеля ---
+    var hotelBookingID string
+    err = workflow.ExecuteActivity(ctx, BookHotelActivity, req.HotelID).Get(ctx, &amp;hotelBookingID)
+    if err != nil {
+        return fmt.Errorf(&quot;ошибка бронирования отеля: %w&quot;, err)
+    }
+    // Успешно: регистрируем обратную операцию в стеке компенсаций
+    compensations = append(compensations, func(c workflow.Context) error {
+        return workflow.ExecuteActivity(c, CancelHotelActivity, hotelBookingID).Get(c, nil)
+    })
+
+    // --- ШАГ 2: Бронирование авиаперелета ---
+    var flightBookingID string
+    err = workflow.ExecuteActivity(ctx, BookFlightActivity, req.FlightID).Get(ctx, &amp;flightBookingID)
+    if err != nil {
+        // Сработает defer: будет вызвана только отмена отеля (CancelHotel)
+        return fmt.Errorf(&quot;ошибка бронирования рейса: %w&quot;, err)
+    }
+    // Успешно: регистрируем обратную операцию
+    compensations = append(compensations, func(c workflow.Context) error {
+        return workflow.ExecuteActivity(c, CancelFlightActivity, flightBookingID).Get(c, nil)
+    })
+
+    // --- ШАГ 3: Списание средств с карты ---
+    var paymentID string
+    err = workflow.ExecuteActivity(ctx, ChargeCardActivity, req.UserID, req.Price).Get(ctx, &amp;paymentID)
+    if err != nil {
+        // Сработает defer: сначала отменится перелет (CancelFlight), затем отель (CancelHotel)
+        return fmt.Errorf(&quot;ошибка списания средств: %w&quot;, err)
+    }
+
+    return nil
+}
+</code></pre>
+</div>
 
 <div class="callout callout-info">
   <div class="callout-header">
@@ -2356,37 +2455,102 @@ C1 -.-&gt; Fail[&quot;Workflow Завершен&lt;br&gt;С Ошибкой&quot;
     <span class="callout-title">Под капотом: DisconnectedContext</span>
   </div>
   <div class="callout-body">
-    <p>Обратите внимание на <code>workflow.NewDisconnectedContext(ctx)</code>. Когда Workflow завершается с ошибкой или прерывается пользователем (Cancellation), его текущий <code>ctx</code> становится отмененным. Если вы передадите этот отмененный контекст в Activity <code>CancelHotelActivity</code>, она даже не попытается запуститься.<br />
-Создание "отсоединенного" контекста гарантирует, что фаза очистки/компенсации отработает до конца, несмотря на отмену родительского процесса.</p>
+    <p>Обратите пристальное внимание на вызов <code>workflow.NewDisconnectedContext(ctx)</code>.</p>
+<p>Если клиент нажал кнопку «Отменить бронирование» в мобильном приложении или истек общий дедлайн выполнения Workflow (<code>ScheduleToCloseTimeout</code>), родительский <code>ctx</code> переходит в отмененное состояние (<code>ctx.Err() != nil</code>).</p>
+<p>Если попытаться вызвать компенсацию <code>CancelHotelActivity</code>, передав туда оригинальный <code>ctx</code>, SDK Temporal моментально отклонит запуск Activity с ошибкой <code>CanceledError</code>. Процесс завершится, а забронированный отель так и останется висеть в чужой системе!</p>
+<p>Вызов <code>workflow.NewDisconnectedContext(ctx)</code> порождает независимый дочерний контекст, который сохраняет все переменные и трассировку, но <strong>сбрасывает флаг отмены</strong>, гарантируя, что фаза компенсации успешно доведет откат до конца.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="fundament-nadezhnosti-idempotentnost">Фундамент надежности: Идемпотентность</h2>
 
-<p>Ретраи и компенсации имеют темную сторону. Что если <code>ChargeCardActivity</code> успешно списала деньги в банке, но ответный HTTP-пакет потерялся из-за обрыва сети? </p>
-<p>Temporal посчитает, что Activity упала по таймауту, и <strong>запустит её снова</strong>. Если ваша логика не идемпотентна, вы спишете деньги у клиента дважды. Аналогично, компенсация <code>CancelFlight</code> может быть вызвана несколько раз, если падает сама функция отмены.</p>
-<p><strong>Любая Activity в оркестраторе ОБЯЗАНА быть идемпотентной.</strong> Подробнее про генерацию уникальных ключей и защиту от дублей на уровне БД читайте в статье <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>. Оркестратор предоставляет вам <code>workflow.GetInfo(ctx).WorkflowExecution.ID</code> (уникальный ID бизнес-процесса) и ID конкретной Activity, которые идеально подходят в качестве <code>Idempotency-Key</code> для внешних API.</p>
+<p>И повторные попытки (Retries), и компенсирующие транзакции таят в себе колоссальную скрытую опасность.</p>
+<p>Представьте ситуацию: воркер выполнил функцию <code>ChargeCardActivity</code>, банк успешно списал $1000, сформировал квитанцию, но в момент отправки HTTP-ответа на стороне провайдера моргнул сетевой кабель. TCP-соединение разорвалось по таймауту.</p>
+<p>Воркер возвращает оркестратору ошибку <code>DeadlineExceeded</code>. Temporal, руководствуясь <code>RetryPolicy</code>, добросовестно берет ту же самую Activity и отправляет ее на повторное исполнение на другой воркер. <strong>Если внешняя система не защищена от дублей, с карты клиента будут списаны повторные $1000.</strong></p>
+<p>Точно так же компенсация <code>CancelFlight</code> может вызываться повторно при сбоях сети во время отката.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+W[&quot;Workflow (Temporal)&quot;] --&gt;|&quot;1. Charge $1000&lt;br&gt;(Idempotency-Key: WF-991)&quot;| Bank[&quot;Банковский Шлюз&quot;]
+Bank --&gt;|&quot;Списание успешно&quot;| Split{Сетевой обрыв}
+Split -.-&gt;|&quot;Ответ потерян&quot;| W
+W --&gt;|&quot;2. Retry Charge $1000&lt;br&gt;(Idempotency-Key: WF-991)&quot;| Bank
+Bank --&gt;|&quot;Ключ найден в БД!&lt;br&gt;Дублирования нет&quot;| OK[&quot;200 OK (Тот же результат)&quot;]
+
+classDef ok fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+classDef warn fill:#1e1e2e,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+class W,Bank proc;
+class Split warn;
+class OK ok;
+  </pre>
+</div>
+
+
+<p><strong>Каждая Activity в распределенном оркестраторе ОБЯЗАНА быть строго идемпотентной.</strong><br />
+Подробно архитектурные механизмы идемпотентной обработки мы разбирали в статье <a href="../01-fundament-asinkhronnosti/10-idempotency-v-message-processing.html" class="wikilink">10. Idempotency в message processing</a>.</p>
+<p>В Temporal для формирования идеального ключа идемпотентности (<code>Idempotency-Key</code>) используются встроенные детерминированные метаданные:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Генерация уникального бизнес-ключа в Activity
+info := activity.GetInfo(ctx)
+idempotencyKey := fmt.Sprintf(&quot;%s:%s:%d&quot;, 
+    info.WorkflowExecution.ID, 
+    info.ActivityType.Name, 
+    info.Attempt,
+)
+</code></pre>
+</div>
+
+<p>Используя этот ключ в заголовках HTTP-запросов к внешним API или сохраняя его в уникальный индекс таблицы базы данных, вы гарантируете, что ни один ретрай не приведет к дублированию побочных эффектов.</p>
+<hr />
+<h2 id="podvodnye-kamni-i-voprosy-s-sobesedovaniy">Подводные камни и вопросы с собеседований</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы запустили компенсацию <code>CancelHotel</code>, но внешний API отеля лежит "намертво" и не отвечает уже два дня. Что произойдет с нашим Workflow?<br />
-<strong>Ответ:</strong> Это называется <em>Сбой компенсации</em>. В Temporal компенсация — это обычная Activity, у которой тоже есть свой <code>RetryPolicy</code>. Она будет ретраиться по экспоненте (например, раз в час). Все это время Workflow будет висеть в состоянии "Выполняется" (Running). Если вы ограничили количество попыток (MaximumAttempts) и они исчерпаны, Workflow завершится с ошибкой, а в системе останется неконсистентность (отель забронирован, хотя тур отменен). <br />
-<strong>Решение:</strong> Для компенсаций обычно ставят "бесконечные" ретраи (MaximumAttempts=0), чтобы система в конечном итоге сама пришла в консистентное состояние, или шлют алерт в DevOps для ручного вмешательства (Forward Recovery).</p>
+    <p><strong>Вопрос:</strong> Что произойдет в паттерне Saga, если компенсирующая транзакция <code>CancelHotel</code> сама падает с неустранимой ошибкой (например, отель закрылся или их API лежит третий день)?</p>
+<p><strong>Ответ:</strong><br />
+Эта ситуация называется <strong>«Сбоем компенсации» (Compensation Failure)</strong> — ночным кошмаром распределенных систем.</p>
+<ol>
+<li>В оркестраторах компенсация — это обычная Activity. Для нее настраивается агрессивная политика повторов (например, <code>MaximumAttempts: 0</code> — бесконечные попытки с бэкоффом до 1 часа). Оркестратор будет упорно долбить упавший сервис днями и неделями. Рано или поздно сервис поднимется, и компенсация завершится успешно.</li>
+<li>Если же ошибка носит перманентный характер (отель ликвидирован физически), бесконечный ретрай приведет к зависанию Workflow в статусе <code>Running</code>. В таких случаях в коде компенсации устанавливают алерт наивысшего приоритета (PagerDuty / Slack) и переводят процесс на ручное разрешение человеком (<strong>Forward Recovery / Manual Intervention</strong>). Менеджер связывается с отелем вручную, после чего оператор посылает в Workflow сигнал завершения через Temporal Web UI.</li>
+</ol>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Retries:</strong> Временные ошибки (Transient) решаются автоматическими повторами. В Temporal это "дешевая" операция, не блокирующая Go-воркеры.</li>
-<li><strong>Non-Retryable:</strong> Ошибки бизнес-логики (нет денег, юзер не найден) нельзя ретраить. Их нужно явно помечать в коде SDK.</li>
-<li><strong>Compensations:</strong> При необратимом падении на N-ном шаге, мы обязаны откатить предыдущие N-1 шагов. В Go это реализуется через стек функций в <code>defer</code>.</li>
-<li><strong>Идемпотентность:</strong> Без идемпотентности ретраи превратят вашу систему в генератор дубликатов.</li>
+<li><strong>Retry Logic</strong> устраняет временные инфраструктурные сбои (сеть, таймауты, <code>503 Service Unavailable</code>). В Temporal таймеры повторов работают в ядре кластера и не утилизируют память воркеров.</li>
+<li>Ошибки бизнес-правил (нет денег, отказ скоринга) должны маркироваться как <strong><code>NonRetryableError</code></strong>, иначе система уйдет в бесконечный деструктивный цикл повторов.</li>
+<li>Необратимые сбои на поздних этапах распределенных транзакций требуют применения <strong>паттерна Saga</strong>: отката ранее выполненных шагов в обратном порядке (LIFO) через стек замыканий в блоке <code>defer</code>.</li>
+<li>Компенсирующие транзакции обязаны запускаться в изолированном контексте <code>workflow.NewDisconnectedContext(ctx)</code>, защищенном от отмены родительского процесса.</li>
+<li>И повторы, и компенсации несут смертельный риск дублирования операций, если функции не защищены сквозным механизмом <strong>идемпотентности</strong> с уникальными ключами <code>Idempotency-Key</code>.</li>
 </ol>
-<p>Мы разобрали, как Temporal решает самые сложные проблемы распределенных транзакций. Однако Temporal не единственный игрок на рынке. У него есть "младший брат" Cadence и мощные конкуренты из мира BPMN. В следующей статье мы проведем исторический и архитектурный анализ рынка оркестраторов: <a href="6-temporal-vs-cadence.html" class="wikilink">6. Temporal vs Cadence</a>.</p>
+<p>Мы изучили передовые практики отказоустойчивости на базе Temporal. Но как Temporal соотносится со своим историческим предком — проектом Cadence? В чем разница их протоколов и архитектур? Об этом — в следующей лекции: <a href="6-temporal-vs-cadence.html" class="wikilink">6. Temporal vs Cadence</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2414,7 +2578,7 @@ C1 -.-&gt; Fail[&quot;Workflow Завершен&lt;br&gt;С Ошибкой&quot;
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-retry-logic-strategii-povtornykh-popytok">1. Retry Logic (Стратегии повторных попыток)</a></li><li class="toc-item toc-h3"><a href="#nastroyka-retrypolicy-v-go">Настройка RetryPolicy в Go</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-kak-retrai-rabotayut-pod-kapotom">Mechanical Sympathy: Как ретраи работают под капотом?</a></li><li class="toc-item toc-h2"><a href="#2-compensation-logic-pattern-saga">2. Compensation Logic (Паттерн Saga)</a></li><li class="toc-item toc-h3"><a href="#idiomatichnaya-saga-v-temporal-go">Идиоматичная Saga в Temporal (Go)</a></li><li class="toc-item toc-h2"><a href="#fundament-nadezhnosti-idempotentnost">Фундамент надежности: Идемпотентность</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-retry-logic-strategii-povtornykh-popytok">1. Retry Logic (Стратегии повторных попыток)</a></li><li class="toc-item toc-h3"><a href="#nastroyka-retrypolicy-v-go">Настройка RetryPolicy в Go</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-kak-retrai-rabotayut-pod-kapotom">Mechanical Sympathy: Как ретраи работают под капотом?</a></li><li class="toc-item toc-h2"><a href="#2-compensation-logic-pattern-saga">2. Compensation Logic (Паттерн Saga)</a></li><li class="toc-item toc-h3"><a href="#idiomatichnaya-saga-v-temporal-go">Идиоматичная Saga в Temporal (Go)</a></li><li class="toc-item toc-h2"><a href="#fundament-nadezhnosti-idempotentnost">Фундамент надежности: Идемпотентность</a></li><li class="toc-item toc-h2"><a href="#podvodnye-kamni-i-voprosy-s-sobesedovaniy">Подводные камни и вопросы с собеседований</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

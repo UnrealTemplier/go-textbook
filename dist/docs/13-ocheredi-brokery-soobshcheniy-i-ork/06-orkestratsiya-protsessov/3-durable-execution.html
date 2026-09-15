@@ -2168,30 +2168,76 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 13</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Durable execution</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="2-temporal-arkhitektura-i-kontseptsii.html" class="wikilink">2. Temporal. Архитектура и концепции</a> мы разделили оркестратор на Control Plane (кластер Temporal) и Data Plane (наши Go-воркеры). Мы узнали, что Workflow не имеет права ходить в сеть напрямую, а должен делегировать эту работу Activity.</p>
-<p>Теперь пришло время заглянуть под капот главной киллер-фичи современных оркестраторов — <strong>Durable Execution (Надежное выполнение)</strong>. Как именно Temporal добивается того, что наша Go-функция может выполняться месяцами, переживая десятки перезагрузок серверов, деплоев и сетевых сбоев, не теряя ни байта из своих локальных переменных?</p>
-<h2 id="event-sourcing-vmesto-dampov-pamyati">Event Sourcing вместо дампов памяти</h2>
+            <h1>Durable Execution: Механика бессмертных функций</h1>
+<blockquote>
+<p><em>«Сложнейшие проблемы компьютерных наук решаются не усложнением железа, а сменой угла зрения: вместо того чтобы пытаться сохранить состояние, сохраните историю его возникновения.»</em></p>
+</blockquote>
+<p>В предыдущей лекции <a href="2-temporal-arkhitektura-i-kontseptsii.html" class="wikilink">2. Temporal. Архитектура и концепции</a> мы разделили архитектуру оркестратора на Control Plane (высоконадежный кластер хранения состояния) и Data Plane (наши прикладные Go-воркеры). Мы усвоили фундаментальное правило: функция Workflow является детерминированным дирижером и не имеет права совершать прямой сетевой ввод-вывод, делегируя все внешние взаимодействия исполнителям — Activity.</p>
+<p>Теперь настало время заглянуть в самое сердце современной оркестрации — концепцию <strong>Durable Execution (Надежное непрерывное выполнение)</strong>. Как именно рантайм Temporal добивается того, что обычная функция на языке Go может выполняться месяцами, переживать десятки аварийных перезагрузок серверов, смену версий Kubernetes-подов и миграции между дата-центрами, не теряя ни единого байта своих локальных переменных?</p>
+<hr />
+<h2 id="event-sourcing-vmesto-dampov-operativnoy-pamyati">Event Sourcing вместо дампов оперативной памяти</h2>
 
-<p>Интуитивный подход к "заморозке" процесса — это сделать дамп его оперативной памяти (snapshot) и сохранить на диск, как это делает ОС при гибернации. <br />
-Однако в распределенных системах этот подход не работает: дамп памяти слишком тяжелый, он жестко привязан к архитектуре процессора и версии бинарника. Вы не сможете сделать дамп на ARM-сервере и поднять его на x86, или обновить версию Go-компилятора.</p>
-<p>Поэтому Temporal использует архитектурный паттерн <strong>Event Sourcing (Порождение событий)</strong>.</p>
-<p>Вместо сохранения <em>состояния</em> (переменных в RAM), кластер Temporal сохраняет <em>историю действий</em>, которые привели к этому состоянию. База данных Temporal (Cassandra/PostgreSQL) работает как append-only лог (журнал).</p>
-<h3 id="mekhanika-replay-vosproizvedenie">Механика Replay (Воспроизведение)</h3>
+<p>Первая интуитивная мысль, которая приходит в голову инженеру при мысли о «заморозке» и «пробуждении» работающей программы: <em>«Давайте снимем дамп оперативной памяти (RAM Memory Dump / Core Snapshot), запишем его на диск, а при необходимости восстановим регистры процессора и стек вызовов»</em>. Ровно так работает режим гибернации в операционных системах ноутбуков (ACPI S4).</p>
+<p>Однако в мире распределенных микросервисных систем этот подход оказывается тупиковым по четырем причинам:<br />
+1. <strong>Колоссальный объем:</strong> Если у вас активно 1 000 000 параллельных процессов заказов, хранить на диске миллион дампов памяти даже по 10–50 МБ каждый — непозволительная трата дискового пространства и пропускной способности сети.<br />
+2. <strong>Аппаратная несовместимость:</strong> Дамп памяти жестко привязан к архитектуре CPU (x86-64 vs ARM64) и конкретному лейауту указателей в виртуальной памяти. Вы не сможете сделать snapshot на Intel Xeon и восстановить его на AWS Graviton.<br />
+3. <strong>Хрупкость рантайма Go:</strong> Дамп зависит от точной версии компилятора Go, метаданных сборщика мусора (GC) и структуры внутренних структур рантайма (<code>m</code>, <code>g</code>, <code>p</code>).<br />
+4. <strong>Невозможность эволюции кода:</strong> Вы не можете обновить бизнес-логику в бинарнике, если восстанавливаете скомпилированный машинный код из старого слепка памяти.</p>
+<p>Поэтому Temporal использует элегантный архитектурный паттерн — <strong>Event Sourcing (Событийно-ориентированное состояние)</strong>.</p>
 
-<p>Когда ваш Go-воркер падает посреди выполнения Workflow (например, пришел OOM-killer), кластер понимает, что соединение с воркером разорвано. Кластер ждет, пока появится любой другой свободный воркер с таким же кодом, и отправляет ему задачу на выполнение, прикрепляя к ней <strong>всю историю событий</strong> этого Workflow.</p>
-<p>Новый воркер начинает выполнять вашу функцию Workflow <strong>с самой первой строчки</strong>, с самого начала. Этот процесс называется <strong>Replay</strong>.</p>
-<p>Алгоритм Replay внутри Go SDK:<br />
-1. Выполняется строчка кода.<br />
-2. Если строчка вызывает инфраструктурную команду (например, запуск Activity или запуск Таймера), SDK ставит выполнение на паузу и <strong>заглядывает во входящую Историю (History)</strong>.<br />
-3. Если в Истории записано, что эта Activity <em>уже была успешно выполнена</em> в прошлом, SDK <strong>не делает реального сетевого вызова</strong>. Он просто берет результат (JSON-ответ) из Истории, десериализует его в Go-переменную и мгновенно переходит к следующей строчке кода.<br />
-4. Если в Истории этой команды нет, значит Replay "догнал" реальное время. SDK отправляет команду в кластер Temporal (Control Plane) и блокирует горутину, ожидая результата.</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph BadApproach[&quot;Наивный подход: Memory Snapshots&quot;]
+direction TB
+RAM[&quot;RAM State (10-50 MB)&lt;br&gt;Стек, куча, регистры CPU&quot;]
+Dump[(&quot;Дисковый дамп&lt;br&gt;Привязан к x86/ARM и версии Go&quot;)]
+RAM --&gt;|&quot;Тяжелый snapshot&quot;| Dump
+end
+
+subgraph EventSourcingApproach[&quot;Подход Temporal: Event Sourcing&quot;]
+direction TB
+Events[(&quot;Журнал событий (Event History)&lt;br&gt;Атомарный лог: 2-5 KB JSON/Protobuf&quot;)]
+ReplayEngine[&quot;Replay Engine (Go SDK)&lt;br&gt;Воспроизведение детерминированного кода&quot;]
+Events --&gt;|&quot;Воспроизведение (Replay)&quot;| ReplayEngine
+end
+
+classDef bad fill:#1e1e2e,stroke:#f43f5e,stroke-width:2px;
+classDef good fill:#0f172a,stroke:#10b981,stroke-width:2px;
+class BadApproach bad;
+class EventSourcingApproach good;
+  </pre>
+</div>
+
+
+<p>Вместо сохранения тяжелого <em>состояния</em> памяти кластер Temporal протоколирует компактный, неизменяемый, упорядоченный список <strong>дискретных действий (Event History)</strong>, которые привели к текущему состоянию. База данных кластера (PostgreSQL, Cassandra, MySQL) выступает в роли масштабируемого append-only журнала.</p>
+<hr />
+<h2 id="mekhanika-replay-vosproizvedenie">Механика Replay (Воспроизведение)</h2>
+
+<p>Что происходит, когда Go-воркер падает посреди выполнения длинного Workflow (например, из-за вытеснения пода нодой Kubernetes или физического сбоя питания)?</p>
+<ol>
+<li>Кластер Temporal фиксирует обрыв gRPC-стрима и потерю heartbeat.</li>
+<li>Задача по продолжению процесса помещается в соответствующую <code>Task Queue</code>.</li>
+<li>Любой свободный Go-воркер (на любом другом сервере или процессоре другой архитектуры) забирает эту задачу. Вместе с задачей кластер передает ему <strong>всю накопленную историю событий (Event History)</strong> данного Workflow.</li>
+<li>Новый воркер запускает вашу функцию Workflow <strong>с самой первой строчки кода</strong>, начиная процесс, называемый <strong>Replay (Воспроизведение)</strong>.</li>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2206,52 +2252,76 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
+autonumber
 participant W as Go Worker
-participant S as Temporal History Service
+participant H as Temporal History Service
+participant DB as Persistence DB
 
-Note over W,S: Первоначальный запуск
-S-&gt;&gt;W: Start Workflow Task
-W-&gt;&gt;W: Строка 1- ExecuteActivity-Charge
-W-&gt;&gt;S: Command- ScheduleActivity-Charge
-Note over S: Сохранение в БД-&lt;br&gt;ActivityScheduled
+Note over W,H: Этап 1: Нормальное выполнение до сбоя
+H-&gt;&gt;W: WorkflowTask(Start)
+W-&gt;&gt;W: Строка 1: workflow.ExecuteActivity(ChargeCard)
+W-&gt;&gt;H: Command: ScheduleActivityTask(ChargeCard)
+H-&gt;&gt;DB: Запись события: ActivityTaskScheduled
+Note over W: ... Сервер убит аварийно (SIGKILL / OOM) ...
 
-Note over W,S: ... Воркер жестко убит -SIGKILL- ...
-Note over W,S: Перезапуск на новом сервере -Replay-
-
-S-&gt;&gt;W: Start Workflow Task&lt;br&gt;History- Charge Completed -Result- OK-
-W-&gt;&gt;W: Строка 1- ExecuteActivity-Charge
-W-&gt;&gt;W: Проверка History...
-Note over W: Найдено в истории!&lt;br&gt;Сетевой вызов блокируется.
-W-&gt;&gt;W: Строка 2- ExecuteActivity-SendEmail
-W-&gt;&gt;S: Command- ScheduleActivity-SendEmail
+Note over W,H: Этап 2: Восстановление на новом сервере (Replay)
+H-&gt;&gt;W: WorkflowTask(Replay) + Full Event History
+W-&gt;&gt;W: Строка 1: workflow.ExecuteActivity(ChargeCard)
+Note over W: Проверка Event History:&lt;br&gt;Шаг уже выполнен! Результат: &quot;OK&quot;&lt;br&gt;Сетевой вызов блокируется!
+W-&gt;&gt;W: Строка 2: workflow.ExecuteActivity(SendReceipt)
+Note over W: Шага нет в истории. Replay завершен!&lt;br&gt;Переход в режим живого исполнения.
+W-&gt;&gt;H: Command: ScheduleActivityTask(SendReceipt)
   </pre>
 </div>
 
 
+<h3 id="algoritmicheskiy-tsikl-replay-vnutri-go-sdk">Алгоритмический цикл Replay внутри Go SDK:</h3>
+<ol>
+<li>Выполняется очередная инструкция функции Workflow.</li>
+<li>Всякий раз, когда строка кода вызывает рантайм-команду (<code>workflow.ExecuteActivity(...)</code>, <code>workflow.Sleep(ctx, ...)</code>, <code>workflow.GetSignalChannel(...)</code>), SDK временно приостанавливает выполнение и <strong>заглядывает в переданную Историю (History)</strong>.</li>
+<li>Если в Истории зафиксировано, что эта Activity уже была запущена и завершена в прошлом, SDK <strong>не делает реального сетевого вызова</strong>. Он берет сериализованный результат (Protobuf/JSON) прямо из истории, десериализует его в целевую Go-переменную и мгновенно переходит к следующей строчке кода.</li>
+<li>Этот процесс повторяется со скоростью миллионов операций в секунду, пока SDK не дойдет до первой команды, которой еще нет в Истории событий.</li>
+<li>В этот момент SDK понимает: <em>«Replay завершен, мы догнали настоящее время»</em>. Теперь команда упаковывается в gRPC-запрос, отправляется на сервер Temporal, а воркер блокирует выполнение до получения реального результата.</li>
+</ol>
+<hr />
 <h2 id="mechanical-sympathy-planirovshchik-vnutri-planirovshchika">Mechanical Sympathy: Планировщик внутри Планировщика</h2>
 
-<p>Как это реализовано на уровне рантайма Go? Мы знаем, что Workflow должен блокироваться при ожидании Activity, но при этом воркер не должен тратить ресурсы (CPU и память), если ожидание длится 30 дней.</p>
+<p>Как эта схема работает на уровне оперативной памяти и горутин Go? Мы знаем, что Workflow может заснуть на месяц вызовом <code>workflow.Sleep(ctx, 30*24*time.Hour)</code>. Если бы под капотом создавалась обычная горутина с <code>time.Sleep(...)</code>, воркер держал бы в памяти стек вызовов и дескрипторы на протяжении 30 дней. При сотнях тысяч заказов память сервера мгновенно исчерпалась бы.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Coroutine Scheduler</span>
   </div>
   <div class="callout-body">
-    <p>Temporal Go SDK реализует собственный кооперативный планировщик поверх стандартных горутин Go. <br />
-Когда вы вызываете <code>workflow.Sleep(ctx, ...)</code> или <code>workflow.ExecuteActivity(...)</code>, под капотом вызывается функция <code>coroutine.Yield()</code>. <br />
-Ваш код "отдает" управление планировщику SDK. Планировщик собирает все команды, которые сгенерировал Workflow, пакует их в gRPC-сообщение и отправляет в кластер Temporal. <br />
-Самое важное: <strong>горутина Workflow после этого завершается (уничтожается)</strong>. В памяти вашего сервера не висит никаких ждущих горутин. Память освобождается.</p>
+    <p>Temporal Go SDK содержит <strong>собственный кооперативный планировщик корутин</strong>, работающий поверх рантайма Go.</p>
+<p>Когда ваш код вызывает <code>workflow.Sleep(ctx, ...)</code> или <code>workflow.ExecuteActivity(...)</code>, под капотом срабатывает вызов:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">coroutine.Yield()
+</code></pre>
+</div>
+
+<p>Ваша управляющая функция передает управление внутреннему планировщику SDK. Планировщик собирает список сгенерированных за квант времени команд, упаковывает их в Protobuf-пакет и отправляет в кластер Temporal по gRPC.</p>
+<p>И вот здесь кроется ключевая деталь: <strong>горутина воркера после этого завершается и уничтожается!</strong> В памяти вашего сервера не остается «висящих» горутин или заблокированных стеков. Все ресурсы процессора и RAM немедленно освобождаются.</p>
+<p>Когда через 30 дней кластер будит процесс, на воркере выделяется <em>абсолютно свежая</em> горутина, которая за миллисекунды «проматывает» Replay до точки сна и продолжает выполнение.</p>
   </div>
 </div>
 
-<p>Когда кластер получает результат Activity, он снова связывается с воркером, воркер выделяет <em>новую</em> горутину, и процесс Replay повторяется с нуля, чтобы восстановить стек вызовов.</p>
+<hr />
 <h2 id="zhiznenno-vazhnoe-pravilo-strogiy-determinizm">Жизненно важное правило: Строгий Детерминизм</h2>
 
-<p>Механизм Replay накладывает фундаментальное ограничение на разработчика. Чтобы "перемотка" истории работала, код Workflow должен быть <strong>абсолютно детерминированным</strong>. <br />
-Если при первом запуске функция пошла по ветке <code>if A { ... }</code>, то при Replay (через месяц) она обязана снова пойти по ветке <code>if A { ... }</code>.</p>
+<p>Концепция Replay держится на одном жестком математическом допущении: <strong>код Workflow обязан быть на 100% детерминированным</strong>.</p>
+<p>Если при первоначальном запуске функция при определенных входных данных пошла по ветке <code>if A { ... }</code>, то при повторном запуске (Replay) через час, день или год она обязана пойти ровно по той же ветке <code>if A { ... }</code>.</p>
 <h3 id="chto-proizoydet-esli-narushit-pravilo">Что произойдет, если нарушить правило?</h3>
 
-<p>Представим код новичка:</p>
+<p>Рассмотрим хрестоматийный пример ошибки начинающего разработчика:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2262,7 +2332,7 @@ W-&gt;&gt;S: Command- ScheduleActivity-SendEmail
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func MyWorkflow(ctx workflow.Context) error {
-    // ОШИБКА: Использование нативного времени
+    // КАТАСТРОФА: Использование системного времени ОС
     if time.Now().Hour() &lt; 12 {
         workflow.ExecuteActivity(ctx, MorningTask)
     } else {
@@ -2273,32 +2343,34 @@ W-&gt;&gt;S: Command- ScheduleActivity-SendEmail
 </code></pre>
 </div>
 
-<ol>
-<li><strong>Первый запуск (11:00 утра):</strong> Код идет в первую ветку. Запускается <code>MorningTask</code>. В историю записывается: <code>ActivityScheduled: MorningTask</code>. Воркер падает.</li>
-<li><strong>Replay (13:00 дня):</strong> Код выполняется заново. <code>time.Now().Hour()</code> возвращает <code>13</code>. Код идет во <em>вторую</em> ветку и пытается выполнить <code>EveningTask</code>.</li>
-<li><strong>Катастрофа:</strong> SDK Temporal заглядывает в Историю и видит, что следующим шагом в прошлом была <code>MorningTask</code>, а сейчас код просит <code>EveningTask</code>. </li>
-<li><strong>Результат:</strong> SDK выбрасывает критическую панику <code>NonDeterministicWorkflowError</code>. Workflow блокируется навсегда.</li>
-</ol>
+<p>Разберем сценарий аварии шаг за шагом:<br />
+1. <strong>Первоначальный запуск (11:00 утра):</strong> Системное время меньше 12. Код идет по первой ветке <code>if</code>. Планируется Activity <code>MorningTask</code>. В кластер Temporal отправляется команда, и в истории фиксируется запись: <code>ActivityScheduled: MorningTask</code>. Воркер успешно выполняет задачу, но перед следующим шагом падает по OOM.<br />
+2. <strong>Восстановление через Replay (13:00 дня):</strong> На новом воркере поднимается задача. Код Workflow начинает исполняться с нулевой строки. Наступает проверка <code>time.Now().Hour() &lt; 12</code>. Системное время на часах машины равно <code>13</code>. Условие ложно!<br />
+3. Код идет во вторую ветку и вызывает <code>EveningTask</code>.<br />
+4. <strong>Крах системы:</strong> SDK берет команду <code>ScheduleActivity(EveningTask)</code> и сравнивает ее с журналом истории. А в истории на этом шаге записано: <code>ActivityScheduled: MorningTask</code>!<br />
+5. Последовательность событий нарушена. SDK не имеет права угадывать намерения программиста и немедленно бросает паническую ошибку: <strong><code>NonDeterministicWorkflowError</code></strong>. Workflow блокируется намертво, и спасти его можно только ручным вмешательством или откатом кода.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Скрытые источники недетерминизма</span>
   </div>
   <div class="callout-body">
-    <p>Помимо очевидных <code>time.Now()</code> или <code>rand.Int()</code>, в Go есть коварные места:<br />
-1. <strong>Итерация по <code>map</code></strong>: В Go обход <code>for k, v := range myMap</code> намеренно рандомизирован (hash seed меняется при старте процесса). Если внутри цикла вы запускаете Activity, порядок их запуска при Replay изменится, что приведет к <code>NonDeterministicWorkflowError</code>. Для сортировки итерируйтесь только по слайсам (slice).<br />
-2. <strong>Нативные горутины</strong>: Использование <code>go func()</code> внутри Workflow запрещено, так как планировщик Go не гарантирует порядок выполнения потоков. Используйте только <code>workflow.Go(ctx, func)</code>.</p>
+    <p>Помимо очевидных вызовов <code>time.Now()</code> или <code>rand.Int()</code>, в языке Go есть коварные встроенные конструкции, ломающие детерминизм:<br />
+1. <strong>Итерация по <code>map</code>:</strong> В рантайме Go обход хэш-таблицы:<br />
+<code>go
+   for k, v := range myMap { ... }</code><br />
+   намеренно рандомизируется (hash seed меняется при каждом перезапуске процесса для защиты от HashDoS-атак). Если внутри такого цикла вы вызываете Activity, то при Replay порядок их вызова будет случайным, что приведет к мгновенному <code>NonDeterministicWorkflowError</code>! Для детерминированного обхода ключи мапы необходимо предварительно собрать в слайс и отсортировать.<br />
+2. <strong>Нативные горутины:</strong> Запуск фоновых операций через <code>go func()</code> внутри Workflow запрещен. Планировщик рантайма Go переключает потоки асинхронно и недетерминированно. Для параллельных веток оркестрации всегда используйте кооперативный примитив <code>workflow.Go(ctx, func)</code>.<br />
+3. <strong>Глобальные переменные:</strong> Не мутируйте переменные уровня пакета.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="problema-evolyutsii-koda-versioning">Проблема эволюции кода: Versioning</h2>
 
-<p>Если код должен быть строго детерминированным и повторять исторические пути, возникает серьезная инженерная проблема: <strong>Как выкатывать обновления бизнес-логики?</strong></p>
-<p>Представьте, что у вас есть длительный Workflow "Ипотека", который работает 15 лет. Через 2 года бизнес-требования изменились: перед выдачей денег теперь нужно вызывать новую Activity <code>CheckCreditHistory</code>.</p>
-<p>Если вы просто добавите <code>workflow.ExecuteActivity(ctx, CheckCreditHistory)</code> в код и задеплоите новую версию, все уже запущенные "старые" Workflow (тысячи инстансов) при следующем Replay упадут с ошибкой детерминизма (так как в их старой истории нет этого шага).</p>
-<h3 id="reshenie-workflow-getversion">Решение: workflow.GetVersion</h3>
-
-<p>Чтобы безопасно вносить изменения, Temporal предоставляет API версионирования. Вы явно описываете в коде развилки для старых и новых инстансов.</p>
+<p>Если код обязан с абсолютной точностью воспроизводить свое прошлое поведение, перед архитекторами встает фундаментальный практический вопрос: <strong>Как обновлять код бизнес-процессов в production?</strong></p>
+<p>Представьте процесс выдачи банковской ипотеки («Mortgage Workflow»), рассчитанный на 20 лет. Через полгода после запуска в продакшене выходит новое распоряжение регулятора: перед перечислением денег необходимо вызвать дополнительную Activity проверки кредитной истории — <code>CheckCreditHistory</code>.</p>
+<p>Если мы просто добавим строку:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2308,48 +2380,88 @@ W-&gt;&gt;S: Command- ScheduleActivity-SendEmail
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func MortgageWorkflow(ctx workflow.Context) error {
-    // ... предыдущие шаги ...
+  <pre class="language-go"><code class="language-go">workflow.ExecuteActivity(ctx, CheckCreditHistory)
+</code></pre>
+</div>
 
-    // Запрашиваем версию. 
-    // &quot;CreditCheckFeature&quot; - это ID нашего изменения.
-    // Если Workflow стартовал ДО внедрения фичи, он получит версию DefaultVersion.
-    // Если стартовал ПОСЛЕ, получит версию 1.
+<p>и выкатим новый бинарник воркера, произойдет катастрофа: десятки тысяч уже запущенных ипотечных процессов при очередном Replay не найдут этот шаг в своей исторической записи и упадут с фатальной ошибкой <code>NonDeterministicWorkflowError</code>.</p>
+<h3 id="reshenie-workflow-getversion">Решение: workflow.GetVersion</h3>
+
+<p>Для безопасного изменения логики «на лету» Temporal Go SDK предоставляет мощный API версионирования. Инженер явно маркирует участки кода, указывая идентификатор изменения и допустимые версии:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func MortgageWorkflow(ctx workflow.Context, applicantID string) error {
+    // 1. Старые шаги, общие для всех версий
+    var approved bool
+    err := workflow.ExecuteActivity(ctx, ValidateApplication, applicantID).Get(ctx, &amp;approved)
+    if err != nil || !approved {
+        return err
+    }
+
+    // 2. Точка эволюции логики
+    // &quot;CreditCheckFeature&quot; — уникальный идентификатор изменения (ChangeID).
+    // workflow.DefaultVersion (-1) — версия для уже идущих старых процессов.
+    // 1 — целевая новая версия.
     v := workflow.GetVersion(ctx, &quot;CreditCheckFeature&quot;, workflow.DefaultVersion, 1)
 
     if v == 1 {
-        // Выполняем только для новых Workflow
-        workflow.ExecuteActivity(ctx, CheckCreditHistory)
+        // Выполняется ТОЛЬКО для новых процессов, стартовавших после релиза,
+        // а также записывается в историю событий как MarkerRecorded.
+        err = workflow.ExecuteActivity(ctx, CheckCreditHistory, applicantID).Get(ctx, nil)
+        if err != nil {
+            return err
+        }
     }
 
-    // ... следующие шаги (общие для всех) ...
-    workflow.ExecuteActivity(ctx, IssueMoney)
-
-    return nil
+    // 3. Финальный шаг (общий для всех)
+    return workflow.ExecuteActivity(ctx, IssueMoney, applicantID).Get(ctx, nil)
 }
 </code></pre>
 </div>
 
+<p>Как это работает под капотом:<br />
+- Для старого Workflow при Replay метод <code>workflow.GetVersion</code> видит, что в истории нет маркера изменения <code>CreditCheckFeature</code>. Он возвращает <code>workflow.DefaultVersion</code>, и ветка <code>if v == 1</code> безопасно пропускается.<br />
+- Для нового Workflow при первом прогоне метод возвращает версию <code>1</code> и записывает в историю маркер <code>MarkerRecorded(CreditCheckFeature, 1)</code>. При последующих Replay этот маркер считывается из истории, гарантируя детерминированное выполнение ветки <code>if v == 1</code>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Если я использую <code>workflow.GetVersion</code>, мой код со временем превратится в помойку из сотен <code>if v == 1</code>. Как с этим бороться?<br />
-<strong>Ответ:</strong> Старые версии (ветки <code>DefaultVersion</code>) можно удалять из кода только тогда, когда в кластере Temporal <strong>не останется ни одного активного (Open) Workflow</strong>, который был запущен на старой версии. Встроенные метрики Temporal позволяют легко найти такие "зависшие" процессы. Когда их количество равно нулю, код можно почистить.</p>
+    <p><strong>Вопрос:</strong> Если мы постоянно используем <code>workflow.GetVersion</code>, через пару лет активной разработки кодовая база замусорится десятками устаревших веток <code>if v == 1</code>. Как правильно проводить рефакторинг и очистку (Sanitization) такого кода?</p>
+<p><strong>Ответ:</strong> <br />
+Процедура очистки версионированного кода проводится строго в три этапа:<br />
+1. <strong>Анализ открытых процессов:</strong> С помощью CLI Temporal или Prometheus-метрик инженеры проверяют количество незавершенных (Open) Workflow, запущенных до внедрения фичи:<br />
+<code>bash
+   temporal workflow list --query 'WorkflowType="MortgageWorkflow" AND ExecutionStatus="Running"'</code><br />
+2. <strong>Удаление старой ветки:</strong> Когда метрики подтверждают, что в системе <strong>не осталось ни одного активного инстанса</strong>, созданного на <code>DefaultVersion</code>, вызов <code>workflow.GetVersion</code> заменяется на константу:<br />
+<code>go
+   // Защита от случайных древних Replay
+   _ = workflow.GetVersion(ctx, "CreditCheckFeature", 1, 1)
+   // Прямой вызов без if
+   workflow.ExecuteActivity(ctx, CheckCreditHistory, applicantID)</code><br />
+3. <strong>Финальная зачистка:</strong> Спустя еще один релизный цикл, когда все процессы гарантированно содержат маркер версии <code>1</code>, строка с <code>GetVersion</code> удаляется окончательно.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Durable Execution</strong> достигается за счет паттерна <strong>Event Sourcing</strong> и механизма <strong>Replay</strong>.</li>
-<li>Воркеры не держат стейт в RAM (Sleep не блокирует память ОС). Они перематывают историю с нуля при каждом возобновлении работы.</li>
-<li>Код Workflow обязан быть <strong>100% детерминированным</strong>. Любые side-effects (походы в сеть, нативное время, рандом, итерации по мапам) запрещены.</li>
-<li>Изменение бизнес-логики в долгоживущих процессах требует использования <strong>Versioning API</strong>, чтобы не сломать Replay для уже запущенных процессов.</li>
+<li><strong>Durable Execution</strong> достигается за счет синергии <strong>Event Sourcing</strong> (запись действий в кластере) и детерминированного <strong>Replay</strong> (воспроизведение логики на воркерах).</li>
+<li>Temporal не сохраняет тяжелые дампы оперативной памяти (RAM Core Snapshots), что обеспечивает независимость от архитектуры процессоров (x86/ARM) и экономит сетевой трафик.</li>
+<li>Собственный <strong>кооперативный планировщик корутин</strong> освобождает память серверов во время пауз и ожиданий (<code>coroutine.Yield()</code>), позволяя обслуживать миллионы открытых процессов на скромном оборудовании.</li>
+<li>Любое недетерминированное поведение (системные часы, случайные числа, горутины, обход мап) неизбежно ведет к критическому сбою <strong><code>NonDeterministicWorkflowError</code></strong>.</li>
+<li>Эволюция бизнес-правил в долгоживущих процессах реализуется через <strong>API версионирования</strong> (<code>workflow.GetVersion</code>), обеспечивающий бесшовное сосуществование старых и новых версий кода в рамках одной очереди задач.</li>
 </ol>
-<p>Теперь мы понимаем "магию" оркестраторов изнутри. Мы видим, насколько это мощный, но жестко регламентированный инструмент. В какой момент нам стоит выбрать эту тяжелую артиллерию, а когда лучше обойтись простыми консьюмерами в RabbitMQ? Для ответа на этот архитектурный вопрос мы переходим к статье: <a href="4-orkestratsiya-vs-khoreografiya.html" class="wikilink">4. Оркестрация vs хореография</a>.</p>
+<p>Понимая мощь и строгие правила надежного выполнения, мы подошли к главному архитектурному выбору: когда распределенную систему стоит строить на тяжелом оркестраторе, а когда достаточно легкой хореографии событий? Ответ — в следующей лекции: <a href="4-orkestratsiya-vs-khoreografiya.html" class="wikilink">4. Оркестрация vs хореография</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2377,7 +2489,7 @@ W-&gt;&gt;S: Command- ScheduleActivity-SendEmail
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#event-sourcing-vmesto-dampov-pamyati">Event Sourcing вместо дампов памяти</a></li><li class="toc-item toc-h3"><a href="#mekhanika-replay-vosproizvedenie">Механика Replay (Воспроизведение)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-planirovshchik-vnutri-planirovshchika">Mechanical Sympathy: Планировщик внутри Планировщика</a></li><li class="toc-item toc-h2"><a href="#zhiznenno-vazhnoe-pravilo-strogiy-determinizm">Жизненно важное правило: Строгий Детерминизм</a></li><li class="toc-item toc-h3"><a href="#chto-proizoydet-esli-narushit-pravilo">Что произойдет, если нарушить правило?</a></li><li class="toc-item toc-h2"><a href="#problema-evolyutsii-koda-versioning">Проблема эволюции кода: Versioning</a></li><li class="toc-item toc-h3"><a href="#reshenie-workflow-getversion">Решение: workflow.GetVersion</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#event-sourcing-vmesto-dampov-operativnoy-pamyati">Event Sourcing вместо дампов оперативной памяти</a></li><li class="toc-item toc-h2"><a href="#mekhanika-replay-vosproizvedenie">Механика Replay (Воспроизведение)</a></li><li class="toc-item toc-h3"><a href="#algoritmicheskiy-tsikl-replay-vnutri-go-sdk">Алгоритмический цикл Replay внутри Go SDK:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-planirovshchik-vnutri-planirovshchika">Mechanical Sympathy: Планировщик внутри Планировщика</a></li><li class="toc-item toc-h2"><a href="#zhiznenno-vazhnoe-pravilo-strogiy-determinizm">Жизненно важное правило: Строгий Детерминизм</a></li><li class="toc-item toc-h3"><a href="#chto-proizoydet-esli-narushit-pravilo">Что произойдет, если нарушить правило?</a></li><li class="toc-item toc-h2"><a href="#problema-evolyutsii-koda-versioning">Проблема эволюции кода: Versioning</a></li><li class="toc-item toc-h3"><a href="#reshenie-workflow-getversion">Решение: workflow.GetVersion</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
