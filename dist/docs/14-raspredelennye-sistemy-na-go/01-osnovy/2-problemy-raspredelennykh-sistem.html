@@ -2168,37 +2168,99 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Проблемы распределенных систем</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье мы затронули базовые отличия вызова функции в памяти от вызова по сети. Теперь, когда мы приняли тот факт, что сеть — это враждебная среда, давай посмотрим на архитектурные и инженерные проблемы, которые неизбежно возникают, когда мы режем монолит на части.</p>
-<p>В распределенной системе компоненты работают на разных физических машинах, управляются разными процессами и общаются через ненадежные каналы связи. Это ломает множество привычных абстракций.</p>
+            <div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Связи:</strong> Эта статья продолжает вводный блок и опирается на принципы из <a href="1-obzor-razdela-pochemu-raspredelennye-sistemy-slozhny.html" class="wikilink">1. Обзор раздела. Почему распределенные системы сложны</a>. Мы систематизируем ключевые болезни микросервисной архитектуры и готовимся к детальному разбору заблуждений о сети в <a href="3-latency-i-network-fallacies.html" class="wikilink">3. Latency и network fallacies</a>, а также анализу частичных отказов в <a href="4-partial-failure.html" class="wikilink">4. Partial failure</a>.</p>
+  </div>
+</div>
+
+<p>В прошлой лекции мы выяснили, что сетевой вызов — это не просто медленный переход по указателю, а стохастическая физическая операция передачи квантов электромагнитного поля по проводам. Сеть капризна, задержки непредсказуемы, а удаленный узел в любой момент может оказаться мертвым или заблокированным.</p>
+<p>Теперь посмотрим правде в глаза: что происходит с архитектурой программного обеспечения, когда мы бережно распиливаем уютный монолит на десятки микросервисов?</p>
+<p>На бумаге и на слайдах архитекторов все выглядит заманчиво: независимые релизы, гибкий стек, изоляция доменов. Но в реальности инженер сталкивается с букетом системных патологий: каскадными авариями, потерей ACID-транзакционности, призрачными багами, которые воспроизводятся только при 10 000 RPS, и феноменом расщепления сознания кластера (<code>Split-Brain</code>).</p>
+<p>Разберем четыре главные архитектурные проблемы распределенных систем и научимся противостоять им средствами Go.</p>
+<hr />
 <h2 id="1-otsutstvie-globalnogo-sostoyaniya-i-tranzaktsionnosti">1. Отсутствие глобального состояния и транзакционности</h2>
 
-<p>В монолите у нас есть роскошь в виде одной реляционной базы данных. Если нужно списать деньги с баланса пользователя и создать запись о заказе, мы просто открываем транзакцию. База данных (благодаря ACID) гарантирует: либо произойдет и то, и другое, либо ничего.</p>
-<p>В микросервисной архитектуре база данных заказа лежит в <code>Order Service</code> (например, PostgreSQL), а баланс — в <code>Billing Service</code> (Redis или другая БД). </p>
-<p><strong>Проблема:</strong> Классические транзакции (BEGIN ... COMMIT) работают только в рамках одного инстанса БД. Как гарантировать консистентность, если после создания заказа <code>Billing Service</code> упал или сеть моргнула?</p>
+<p>В монолите разработчик избалован роскошью реляционной базы данных. Если нужно списать баланс клиента за покупку смартфона и одновременно уменьшить остаток товара на складе, мы открываем локальную транзакцию:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">BEGIN TRANSACTION;
+UPDATE accounts SET balance = balance - 50000 WHERE user_id = 42;
+UPDATE inventory SET count = count - 1 WHERE item_id = 101;
+COMMIT;
+</code></pre>
+</div>
+
+<p>Благодаря гарантиям ACID реляционная база данных дает математическую клятву: либо выполнятся обе операции, либо ни одна. Если посреди транзакции вырубится электричество, журнал упреждающей записи WAL (Write-Ahead Log) при перезапуске откатит незавершенные изменения.</p>
+<p>В распределенной микросервисной архитектуре складской учет находится в <code>Order Service</code> (PostgreSQL), а балансы пользователей — в <code>Billing Service</code> (микросервис с Redis или шардированным хранилищем).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Client[&quot;Клиент&quot;] --&gt;|&quot;Купить товар&quot;| API[&quot;API Gateway&quot;]
+API --&gt;|&quot;1. Создать заказ&quot;| OS[&quot;Order Service&lt;br&gt;(PostgreSQL)&quot;]
+OS --&gt;|&quot;2. Списать баланс&quot;| BS[&quot;Billing Service&lt;br&gt;(Custom Store)&quot;]
+BS -.-&gt;|&quot;Сеть оборвалась / Crash!&quot;| OS
+  </pre>
+</div>
+
+
+<p><strong>Проблема:</strong> Межсервисные транзакции (BEGIN ... COMMIT) не пересекают границы сокетов и физических машин. Что делать, если заказ в <code>Order Service</code> успешно создан, но сетевой вызов к <code>Billing Service</code> оборвался по таймауту? <br />
+- Если ничего не делать, склад зарезервирует товар бесплатно.<br />
+- Если попытаться откатить заказ локально, мы рискуем: вдруг деньги в биллинге на самом деле успешно списались, а потерялся лишь ответный пакет?</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Двухфазный коммит и его смерть</span>
   </div>
   <div class="callout-body">
-    <p>Исторически эту проблему пытались решать через 2PC (Two-Phase Commit). Координатор транзакций опрашивал все БД: "Вы готовы закоммитить?". Если все отвечали "Да", отправлялась команда "Коммит". <br />
-На уровне ОС и сети это означает удержание жестких блокировок (locks) на строках в разных базах данных <em>в ожидании сетевых ответов</em>. Если координатор падал между фазами, базы данных оставались заблокированными навсегда, убивая пропускную способность всей системы. В современном Go-бэкенде 2PC практически не используется, уступая место асинхронным паттернам вроде <code>Saga</code> и <code>Eventual Consistency</code>.</p>
+    <p>В 1980-х годах эту проблему пытались решать протоколом <strong>двухфазного коммита (2PC — Two-Phase Commit)</strong>. В системе выделялся специальный Координатор Транзакций.<br />
+1. <strong>Фаза Prepare:</strong> Координатор спрашивает все БД: «Вы готовы закоммитить?». Базы данных блокируют нужные строки (<code>SELECT ... FOR UPDATE</code>) и отвечают «Ready».<br />
+2. <strong>Фаза Commit:</strong> Если все ответили положительно, координатор отправляет команду «Commit».</p>
+<p>На бумаге это работало. В реальности 2PC в высоконагруженных веб-системах умер. Почему?<br />
+Потому что базы данных удерживают <strong>эксклюзивные блокировки строк в оперативной памяти</strong> на все время сетевого раундтрипа координатора! Если координатор упал или между узлами возникла сетевая задержка в 500 мс, все соседние транзакции встают в глухую очередь ожидания блокировок. Пропускная способность СУБД падает до нуля.</p>
+<p>В современном Go-бэкенде вместо 2PC стандартом стали распределенные саги (<code>Saga</code>) с компенсирующими транзакциями и парадигма <strong>согласованности в конечном счете (<code>Eventual Consistency</code>)</strong>, разобранные в нашем практическом курсе.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="2-kaskadnye-otkazy-i-ischerpanie-resursov">2. Каскадные отказы и исчерпание ресурсов</h2>
 
-<p>В распределенной системе отказ одного минорного компонента может повалить весь кластер, как карточный домик. Это называется каскадным отказом (Cascading Failure).</p>
-<p>Представь цепочку: <code>API Gateway</code> -&gt; <code>Order Service</code> -&gt; <code>Recommendation Service</code>. <br />
-Внезапно <code>Recommendation Service</code> начинает отвечать не за 50 миллисекунд, а за 30 секунд (например, из-за долгой сборки мусора или неудачного релиза). </p>
-<p>Что происходит на уровне Go-рантайма в <code>Order Service</code>?</p>
+<p>В монолите ошибка обычно изолирована: если модуль формирования PDF упал с паникой, HTTP-сервер перехватит ее и вернет ошибку <code>500 Internal Server Error</code>, а соседние запросы на оформление заказа продолжат выполняться.</p>
+<p>В распределенной системе отказ второстепенного, незначительного компонента способен по принципу домино уничтожить весь продуктовый кластер. Это явление называется <strong>каскадным отказом (Cascading Failure)</strong>.</p>
+<p>Рассмотрим хрестоматийный сценарий в интернет-магазине:<br />
+<code>API Gateway</code> $\to$ <code>Order Service</code> $\to$ <code>Recommendation Service</code>.</p>
+<p>Сервис рекомендаций <code>Recommendation Service</code> — абсолютно некритичный компонент: если виджет «С этим товаром также покупают» не отобразится на экране, клиент все равно сможет оформить покупку.</p>
+<p>Внезапно <code>Recommendation Service</code> деградирует: например, сборщик мусора встал в долгую паузу, или база данных рекомендаций уперлась в лимит соединений. Вместо привычных 20 мс сервис начинает отвечать за <strong>30 секунд</strong> (по таймауту сокета).</p>
+<p>Что происходит внутри рантайма Go в основном сервисе заказов <code>Order Service</code>?</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2213,18 +2275,25 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Client[&quot;Клиенты&quot;] --&gt;|&quot;1000 RPS&quot;| API[&quot;API Gateway&quot;]
-API --&gt;|&quot;1000 RPS&quot;| Order[&quot;Order Service&lt;br&gt;Go Runtime&quot;]
-
-subgraph GoRuntime [&quot;Order Service (Go)&quot;]
-G1[&quot;Горутина 1&quot;] --&gt; HTTPClient[&quot;http.Client&quot;]
-G2[&quot;Горутина 2&quot;] --&gt; HTTPClient
-GN[&quot;Горутина N...&quot;] --&gt; HTTPClient
+subgraph Ingress [&quot;Входящий трафик&quot;]
+C[&quot;Пользователи&quot;] --&gt;|&quot;1000 RPS&quot;| GW[&quot;API Gateway&quot;]
+GW --&gt;|&quot;1000 RPS&quot;| OS[&quot;Order Service (Go)&quot;]
 end
 
-Order --&gt;|&quot;Запросы висят&quot;| Rec[&quot;Recommendation Service&lt;br&gt;ТОРМОЗИТ&quot;]
+subgraph GoRuntime [&quot;Order Service: Удушение рантайма&quot;]
+OS --&gt;|&quot;Каждый запрос = Горутина&quot;| Pool[&quot;Пул горутин растет: 10k... 50k...&quot;]
+Pool --&gt;|&quot;Удержание ресурсов&quot;| FD[&quot;Сетевые дескрипторы (ulimit -n)&quot;]
+Pool --&gt;|&quot;Заняты коннекты&quot;| DB[&quot;database/sql Connection Pool&quot;]
+Pool --&gt;|&quot;http.Client Do()&quot;| Ext[&quot;Зависание на сокете к Rec Service&quot;]
+end
 
-HTTPClient -.-&gt;|&quot;Блокировка сокетов&lt;br&gt;Ожидание ответа&quot;| Rec
+subgraph Downstream [&quot;Сбойный сервис&quot;]
+Ext -.-&gt;|&quot;RTT = 30 сек!&quot;| Rec[&quot;Recommendation Service (Тормозит)&quot;]
+end
+
+FD --&gt; Crash[&quot;🔥 Crash: Too many open files / OOM&quot;]
+DB --&gt; Starvation[&quot;🔥 База данных заказов парализована&quot;]
+Crash --&gt; TotalDown[&quot;🔥 API Gateway падает вслед за заказами&quot;]
   </pre>
 </div>
 
@@ -2232,10 +2301,10 @@ HTTPClient -.-&gt;|&quot;Блокировка сокетов&lt;br&gt;Ожида
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha: Дефолтный HTTP клиент</span>
+    <span class="callout-title">Ловушка / Gotcha: Смертельный дефолтный HTTP-клиент</span>
   </div>
   <div class="callout-body">
-    <p>Самая частая ошибка Junior/Middle Go-разработчиков — использование <code>http.DefaultClient</code> (или <code>http.Get()</code>) для походов во внешние сервисы.</p>
+    <p>Самый распространенный грех начинающих Go-разработчиков — использование стандартного клиента <code>http.DefaultClient</code> или функций-оберток <code>http.Get()</code>, <code>http.Post()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2245,70 +2314,234 @@ HTTPClient -.-&gt;|&quot;Блокировка сокетов&lt;br&gt;Ожида
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ОПАСНО: Если сервис висит, горутина зависнет навсегда
-resp, err := http.Get(&quot;http://recommendation/api/v1/items&quot;)
+  <pre class="language-go"><code class="language-go">// КАТАСТРОФА: Запрос зависнет навсегда при сбое сети!
+resp, err := http.Get(&quot;http://recommendation-service/api/v1/items&quot;)
 </code></pre>
 </div>
 
-<p>В исходниках Go у <code>http.DefaultClient</code> таймаут равен <strong>нулю</strong> (то есть бесконечность). Горутина, сделавшая такой вызов, засыпает в <code>netpoll</code>, ожидая данные из сокета, которые никогда не придут.</p>
+<p>Заглянем в исходники стандартной библиотеки Go (<code>src/net/http/client.go</code>):</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">var DefaultClient = &amp;Client{} // Timeout равен ровно 0 (БЕСКОНЕЧНОСТЬ!)
+</code></pre>
+</div>
+
+<p>Значение <code>Timeout: 0</code> означает, что горутина будет спать в <code>netpoll</code>, бесконечно ожидая данных из TCP-сокета. Если удаленный сервер молчит, горутина останется в памяти навсегда.</p>
   </div>
 </div>
 
-<p><strong>Физика каскадного отказа:</strong><br />
-1. Запросы продолжают поступать (1000 RPS).<br />
-2. Под каждый запрос <code>Order Service</code> плодит новую горутину (сама горутина весит всего ~2 КБ, это дешево).<br />
-3. Но каждая зависшая горутина удерживает:<br />
-   - Открытый файловый дескриптор (TCP-сокет).<br />
-   - Объекты запроса в куче (heap), которые не может собрать Garbage Collector.<br />
-   - Соединения с базой данных (из пула <code>database/sql</code>), если они были взяты до HTTP-вызова.<br />
-4. Вскоре <code>Order Service</code> упирается либо в лимит ОС на открытые файлы (<code>ulimit -n</code>, обычно 65535), либо в лимит пула БД, либо в OOM (Out of Memory).<br />
-5. <code>Order Service</code> падает. Теперь <code>API Gateway</code> не может достучаться до заказов и тоже начинает копить горутины. Система мертва.</p>
+<h3 id="mekhanika-katastrofy-kak-ischerpyvayutsya-resursy-os">Механика катастрофы: как исчерпываются ресурсы ОС</h3>
+
+<ol>
+<li>Входящий поток заказов стабилен: $1000\text{ RPS}$.</li>
+<li>За 30 секунд зависания внешнего сервиса <code>Order Service</code> создает:<br />
+   $$1000\text{ запросов/сек} \times 30\text{ сек} = 30\,000\text{ активных горутин!}$$</li>
+<li>Сама горутина в Go легковесна ($\approx 2$ КБ), 30 000 горутин займут всего 60 МБ оперативной памяти. Казалось бы, ерунда?</li>
+<li><strong>Но каждая зависшая горутина удерживает:</strong><br />
+   - <strong>Файловый дескриптор сокета:</strong> 30 000 открытых TCP-сокетов. Процесс мгновенно упирается в системный лимит ядра операционной системы <code>ulimit -n</code> (обычно 1024 по умолчанию или 65535 в контейнере) и падает с системной ошибкой: <code>accept: too many open files</code>.<br />
+   - <strong>Пул соединений с БД (<code>database/sql</code>):</strong> Если транзакция в PostgreSQL была открыта <em>до</em> вызова рекомендаций, все 50–100 коннектов пула базы данных оказываются заблокированными зависшими горутинами. Новые заказы не могут даже прочитать данные из локальной БД.<br />
+   - <strong>Нагрузка на кучу и память:</strong> Зависшие буферы запросов и ответов удерживаются в куче, не давая Garbage Collector освободить страницы памяти.</li>
+<li>Сервис <code>Order Service</code> погибает под грузом заблокированных дескрипторов. </li>
+<li><code>API Gateway</code> больше не может достучаться до <code>Order Service</code>, его собственные горутины начинают забивать сокеты — и шторм каскадного отказа валит всю инфраструктуру компании.</li>
+</ol>
+<hr />
 <h2 id="3-nedeterminirovannost-i-slozhnost-otladki">3. Недетерминированность и сложность отладки</h2>
 
-<p>Если в локальном коде есть баг, ты можешь написать юнит-тест или запустить <code>dlv</code> (Delve debugger), поставить брейкпоинт и пошагово посмотреть состояние регистров и памяти. </p>
-<p>В распределенной системе баг — это часто <strong>эмерджентное свойство</strong>. Он возникает не из-за ошибки в одном куске кода, а из-за специфического тайминга взаимодействия пяти разных сервисов под определенной нагрузкой. </p>
-<ul>
-<li>Ты не можешь поставить систему на паузу брейкпоинтом: TCP-соединения отвалятся по таймауту, и стейт системы изменится.</li>
-<li>Порядок событий не гарантирован. Сообщение B может прийти раньше сообщения A, хотя было отправлено позже.</li>
-<li>Логи размазаны по десяткам серверов, и без проброса единого <code>TraceID</code> (Correlation ID) через HTTP-заголовки и контекст восстановить цепочку событий невозможно.</li>
-</ul>
-<h2 id="4-problema-glukhogo-telefona-otsutstvie-edinogo-istochnika-istiny">4. Проблема "Глухого телефона" (Отсутствие единого источника истины)</h2>
+<p>В локальном приложении программист находится в детерминированном раю:<br />
+- Код компилируется в один бинарник.<br />
+- Баг можно воспроизвести локально, запустив отладчик Delve (<code>dlv</code>).<br />
+- Можно поставить контрольную точку (Breakpoint), заморозить выполнение и исследовать значения регистров процессора и переменных на стеке.</p>
+<p>В распределенной системе баг — это часто <strong>эмерджентное свойство (Emergent Property)</strong>. Он не содержится в конкретной строчке кода сервиса А или сервиса Б. Он рождается на стыке сложного стохастического взаимодействия пяти сервисов, рассинхронизации их внутренних очередей, алгоритмов планировщика Go и всплесков сетевой задержки.</p>
 
-<p>Каждый узел в распределенной системе видит мир только через призму сообщений, которые он получает по сети. </p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph &quot;Почему классическая отладка бессильна?&quot;
+D1[&quot;Поставить брейкпоинт в dlv?&quot;] --&gt;|&quot;Пауза на 5 сек&quot;| D2[&quot;Heartbeat отваливается по таймауту&quot;]
+D2 --&gt; D3[&quot;Кластер считает узел мертвым&lt;br&gt;Запускается ребалансировка / сплит&quot;]
+
+L1[&quot;Где логировать проблему?&quot;] --&gt; L2[&quot;Логи на 50 серверах в разных временных поясах&quot;]
+L2 --&gt; L3[&quot;Без единого TraceID логи невозможно связать&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Почему традиционные подходы к отладке терпят фиаско:<br />
+1. <strong>Невозможность паузы:</strong> Если вы остановите горутину через <code>dlv</code> на 3 секунды, фоновый пинг брокера (Kafka heartbeat или Consul healthcheck) сочтет сервис погибшим. Кластер исключит узел из балансировки, разорвет тысячи TCP-сессий, и вы будете отлаживать уже последствия паники кластера, а не исходный дефект.<br />
+2. <strong>Нелинейность времени:</strong> Пакет Б может обогнать пакет А в сетевых маршрутизаторах, нарушив предполагаемую очередность обработки бизнес-событий.<br />
+3. <strong>Разорванный контекст:</strong> Без автоматического проброса сквозного мета-идентификатора <code>TraceID</code> (Correlation ID) через заголовки HTTP/gRPC и <code>context.Context</code> расследование ночной аварии превращается в хаотичный поиск по терабайтам разрозненных файлов логов.</p>
+<hr />
+<h2 id="4-problema-glukhogo-telefona-otsutstvie-edinogo-istochnika-istiny">4. Проблема «Глухого телефона» (Отсутствие единого источника истины)</h2>
+
+<p>Каждый распределенный узел изолирован в собственной виртуальной машине или контейнере. Он судит о состоянии внешнего мира исключительно по тем скудным пакетам данных, которые долетают до него через сетевой интерфейс.</p>
+<p>Если пакеты перестали приходить, узел не способен понять:<br />
+- Соседний сервер действительно сгорел?<br />
+- Или соседний сервер абсолютно здоров и обрабатывает запросы, но между ними перегрелся коммутатор в стойке?</p>
+<p>Эта неопределенность порождает один из самых страшных кошмаров распределенных архитекторов — <strong>Split-Brain (Расщепление сознания)</strong>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Что такое Split-Brain и как защитить кластер?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что такое <code>Split-Brain</code> и почему это опасно?<br />
-<strong>Ответ:</strong> Представьте кластер базы данных из двух Master-узлов (A и B), которые реплицируют данные друг другу. Внезапно свитч между ними сгорает. Узел A жив и принимает запросы клиентов. Узел B жив и тоже принимает запросы. Но они не могут связаться друг с другом. <br />
-Каждый из них думает, что второй умер, и берет на себя роль единственного лидера. В итоге они параллельно перезаписывают одни и те же данные (например, списывают деньги). Когда сеть восстановится, мы получим конфликт данных, который невозможно разрешить автоматически.</p>
+    <p><strong>Вопрос:</strong> Что такое Split-Brain («расщепление сознания» кластера) и к каким катастрофическим последствиям оно приводит?</p>
+<p><strong>Ответ:</strong> Представьте кластер базы данных из двух узлов (Node 1 и Node 2), работающих в схеме Primary-Secondary. Сервер 1 принимает записи клиентов и реплицирует их на Сервер 2.<br />
+Внезапно магистральный сетевой кабель между серверами перерубает экскаватор (Network Partition).<br />
+- Сервер 1 не видит Сервер 2, но доступен для клиентов зоны А. Он продолжает принимать записи.<br />
+- Сервер 2 теряет связь с Сервером 1, решает, что лидер погиб, и автоматически назначает самого себя новым Primary (Лидером) для клиентов зоны Б.</p>
+<p>В системе образуются <strong>два независимых лидера</strong>, каждый из которых считает себя единственным законным хозяином данных. Пользователи параллельно списывают одни и те же деньги, меняют один и тот же статус заказа в противоположные значения.</p>
+<p>Когда через 2 часа кабель срастят, кластер обнаружит две совершенно разные, конфликтующие истории вселенной, которые математически невозможно объединить без ручного вмешательства и финансовых потерь бизнеса.</p>
+<p><strong>Защита:</strong> Split-Brain предотвращается требованием <strong>строгого большинства (Кворума)</strong>:<br />
+$$\text{Quorum} = \left\lfloor \frac{N}{2} \right\rfloor + 1$$<br />
+Кластер из нечетного числа узлов (минимум 3 или 5) может выбрать лидера только в той половине, которая содержит большинство живых узлов. Меньшинство узлов обязано заблокировать операции записи.</p>
   </div>
 </div>
 
-<p>В Go эта проблема часто всплывает при реализации систем кэширования в памяти (in-memory cache) на нескольких инстансах приложения. Если инстансы не синхронизируют инвалидацию кэша (например, через Redis Pub/Sub), разные пользователи, балансируемые на разные поды в Kubernetes, будут видеть абсолютно разные, противоречивые данные.</p>
+<p>В микросервисной практике на Go проблема «глухого телефона» регулярно проявляется при наивной реализации локальных кэшей в памяти (<code>in-memory cache</code> на базе <code>sync.Map</code>). Если сервис каталога запущен в 10 подах Kubernetes, и товар изменил цену, обновление кэша в одном поде оставит 9 остальных со старыми ценами. Разные пользователи, балансируемые случайным образом, будут видеть разные ценники на одной и той же секунде.</p>
+<hr />
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Механическое сочувствие к сетевому стеку Linux — агония TIME_WAIT</span>
+  </div>
+  <div class="callout-body">
+    <p>Почему частые исходящие HTTP-соединения убивают производительность бэкенда?</p>
+<p>Если вы создаете новый HTTP-клиент на каждый запрос (вместо переиспользования единого <code>http.Client</code> с пулом соединений через <code>sync.Pool</code> или глобальный синглтон), процесс закрывает TCP-соединение первым.</p>
+<p>Согласно спецификации TCP (RFC 793), сторона, инициировавшая закрытие сокета, обязана перевести его в состояние <code>TIME_WAIT</code> на время $2 \times \text{MSL}$ (Maximum Segment Lifetime, в Linux по умолчанию — 60 секунд). Это необходимо, чтобы блуждающие в сети старые пакеты не повредили новое соединение с тем же кортежем адресов:<br />
+<code>(Source IP, Source Port, Dest IP, Dest Port)</code>.</p>
+<p>Диапазон эфемерных портов Linux по умолчанию ограничен:<br />
+<code>/proc/sys/net/ipv4/ip_local_port_range</code> (около 28 000 портов).</p>
+<p>Если ваш сервис делает всего 500 запросов в секунду к соседнему микросервису без Keep-Alive, за 60 секунд в системе накопится:<br />
+$$500 \times 60 = 30\,000\text{ сокетов в статусе TIME_WAIT!}$$</p>
+<p>Эфемерные порты полностью исчерпываются. Рантайм Go падает с системной ошибкой ядра Linux:<br />
+<code>dial tcp: cannot assign requested address</code>. Сервер физически не может связаться ни с одной внешней системой, хотя CPU загружен на 1%!</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="idiomatichnyy-go-protiv-khaosa">Идиоматичный Go против хаоса</h2>
 
-<p>Go предоставляет отличные инструменты для купирования этих проблем прямо из коробки:</p>
-<ol>
-<li><strong><code>context.Context</code></strong>: Фундамент устойчивости. Мы обязаны прокидывать контекст с таймаутом во все сетевые и IO-вызовы. Если родительский сервис отменил запрос (пользователь закрыл страницу), <code>Context</code> отменит все порожденные запросы вниз по цепочке, освобождая ресурсы.<br />
-   ```go<br />
-   ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)<br />
-   defer cancel()</li>
-</ol>
-<p>req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)<br />
-   resp, err := client.Do(req) // Отвалится ровно через 2 секунды<br />
-<code>``
-2. **</code>sync.Pool`<strong>: Для снижения нагрузки на GC при огромном количестве сетевых запросов мы переиспользуем буферы памяти для сериализации JSON/Protobuf.<br />
-3. </strong>Каналы (Channels) и Select**: Позволяют легко реализовывать паттерны вроде таймаутов, fallback-ответов и лимитирования конкурентности (worker pools), чтобы не положить соседний сервис.</p>
+<p>Язык Go создавался людьми, которые проектировали крупнейшие распределенные кластеры на планете. В стандартную библиотеку заложены проверенные архитектурные паттерны противодействия хаосу:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph &quot;Инженерный арсенал Go&quot;
+C1[&quot;context.WithTimeout&lt;br&gt;Пресечение каскадных зависаний&quot;]
+C2[&quot;Custom http.Client&lt;br&gt;Жесткие лимиты Transport &amp; IdleConns&quot;]
+C3[&quot;sync.Pool + Channels&lt;br&gt;Ограничение параллелизма (Worker Pool)&lt;br&gt;и переиспользование буферов&quot;]
+end
+  </pre>
+</div>
+
+
+<h3 id="1-zhestkaya-nastroyka-http-klienta">1. Жесткая настройка HTTP-клиента</h3>
+<p>Никогда не используйте дефолтный транспорт. Задавайте все уровни таймаутов явно:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package client
+
+import (
+    &quot;net&quot;
+    &quot;net/http&quot;
+    &quot;time&quot;
+)
+
+func NewResilientHTTPClient() *http.Client {
+    return &amp;http.Client{
+        Timeout: 5 * time.Second, // Общий таймаут от начала запроса до вычитки тела
+        Transport: &amp;http.Transport{
+            Proxy: http.ProxyFromEnvironment,
+            DialContext: (&amp;net.Dialer{
+                Timeout:   1 * time.Second, // Таймаут установки TCP-соединения
+                KeepAlive: 30 * time.Second,
+            }).DialContext,
+            MaxIdleConns:        100,              // Пул готовых соединений
+            MaxIdleConnsPerHost: 20,               // Коннекты к одному хосту
+            IdleConnTimeout:     90 * time.Second, // Время жизни простаивающего сокета
+            TLSHandshakeTimeout: 1 * time.Second,  // Таймаут TLS-рукопожатия
+        },
+    }
+}
+</code></pre>
+</div>
+
+<h3 id="2-totalnoe-rasprostranenie-context-context">2. Тотальное распространение `context.Context`</h3>
+<p>Контекст с дедлайном — главный щит против утечек горутин и каскадных аварий:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func FetchData(ctx context.Context, client *http.Client, url string) ([]byte, error) {
+    // Ограничиваем операцию 800 миллисекундами
+    reqCtx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+    defer cancel()
+
+    req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+    if err != nil {
+        return nil, err
+    }
+
+    resp, err := client.Do(req)
+    if err != nil {
+        // Если время вышло, netpoll прервет сокет, не давая зависнуть горутине
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    return io.ReadAll(resp.Body)
+}
+</code></pre>
+</div>
+
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Переход к распределенным системам заставляет нас сменить парадигму:<br />
-- Мы больше не пишем код так, как будто он выполнится успешно. Мы пишем код вокруг <strong>стратегий обработки отказов</strong> (Retry, Circuit Breaker, Fallback).<br />
-- Состояние размазано во времени и пространстве.<br />
-- Локальная оптимизация (быстрый парсинг JSON) ничего не значит, если сервис-сосед висит в <code>TIME_WAIT</code> и не отдает данные.</p>
-<p>Все эти проблемы растут из фундаментальных физических ограничений сети. Чтобы проектировать устойчивую архитектуру, нужно знать врага в лицо. В следующей статье мы погрузимся в самые опасные сетевые иллюзии: <a href="3-latency-i-network-fallacies.html" class="wikilink">3. Latency и network fallacies</a>.</p>
+<p>Переход к распределенным системам требует фундаментальной ломки психологического майндсета инженера:<br />
+1. <strong>Отказ от парадигмы успеха:</strong> Мы больше не пишем код в предположении «сетевой вызов выполнится штатно». Мы проектируем архитектуру вокруг стратегий локализации сбоев: таймаутов, автоматических выключателей (Circuit Breaker), очередей повторов (Retry) и деградации функционала (Graceful Degradation).<br />
+2. <strong>Размазанное состояние:</strong> Не существует единого глобального времени и мгновенных транзакций. Мир живет по законам согласованности в конечном счете.<br />
+3. <strong>Ресурсы конечны:</strong> Зависший удаленный сервис мгновенно высасывает сокетные дескрипторы и память вызывающего сервиса. Изолируйте вызовы через явные таймауты и ограниченные пулы соединений.</p>
+<p>Корни всех этих проблем кроются в фундаментальных законах физики и иллюзиях, которыми люди наделяют компьютерные сети. В следующей лекции мы детально разберем знаменитые заблуждения распределенных вычислений: <a href="3-latency-i-network-fallacies.html" class="wikilink">3. Latency и network fallacies</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2336,7 +2569,7 @@ resp, err := http.Get(&quot;http://recommendation/api/v1/items&quot;)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-otsutstvie-globalnogo-sostoyaniya-i-tranzaktsionnosti">1. Отсутствие глобального состояния и транзакционности</a></li><li class="toc-item toc-h2"><a href="#2-kaskadnye-otkazy-i-ischerpanie-resursov">2. Каскадные отказы и исчерпание ресурсов</a></li><li class="toc-item toc-h2"><a href="#3-nedeterminirovannost-i-slozhnost-otladki">3. Недетерминированность и сложность отладки</a></li><li class="toc-item toc-h2"><a href="#4-problema-glukhogo-telefona-otsutstvie-edinogo-istochnika-istiny">4. Проблема &quot;Глухого телефона&quot; (Отсутствие единого источника истины)</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-protiv-khaosa">Идиоматичный Go против хаоса</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-otsutstvie-globalnogo-sostoyaniya-i-tranzaktsionnosti">1. Отсутствие глобального состояния и транзакционности</a></li><li class="toc-item toc-h2"><a href="#2-kaskadnye-otkazy-i-ischerpanie-resursov">2. Каскадные отказы и исчерпание ресурсов</a></li><li class="toc-item toc-h3"><a href="#mekhanika-katastrofy-kak-ischerpyvayutsya-resursy-os">Механика катастрофы: как исчерпываются ресурсы ОС</a></li><li class="toc-item toc-h2"><a href="#3-nedeterminirovannost-i-slozhnost-otladki">3. Недетерминированность и сложность отладки</a></li><li class="toc-item toc-h2"><a href="#4-problema-glukhogo-telefona-otsutstvie-edinogo-istochnika-istiny">4. Проблема «Глухого телефона» (Отсутствие единого источника истины)</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-go-protiv-khaosa">Идиоматичный Go против хаоса</a></li><li class="toc-item toc-h3"><a href="#1-zhestkaya-nastroyka-http-klienta">1. Жесткая настройка HTTP-клиента</a></li><li class="toc-item toc-h3"><a href="#2-totalnoe-rasprostranenie-context-context">2. Тотальное распространение context.Context</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
