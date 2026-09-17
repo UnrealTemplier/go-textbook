@@ -349,31 +349,47 @@ class MarkdownConverter:
     def _enhance_code_blocks(self, html_text: str) -> str:
         """
         Улучшение блоков кода: добавление шапки с языком и кнопкой копирования.
+        Поддерживает как блоки с явным языком, так и блоки без языка (text/diagram).
         """
-        pattern = re.compile(r'<pre><code class="language-([a-zA-Z0-9_-]+)">(.*?)</code></pre>', re.DOTALL)
+        pattern = re.compile(r'<pre><code(?:\s+class="language-([a-zA-Z0-9_-]+)")?>(.*?)</code></pre>', re.DOTALL)
 
         def repl(match):
-            lang = match.group(1).lower()
+            lang_match = match.group(1)
             code_body = match.group(2)
-            display_lang = {
-                "go": "Go",
-                "c": "C",
-                "cpp": "C++",
-                "bash": "Bash",
-                "sh": "Shell",
-                "python": "Python",
-                "sql": "SQL",
-                "yaml": "YAML",
-                "json": "JSON",
-                "nasm": "Assembly (x86)",
-                "asm": "Assembly"
-            }.get(lang, lang.upper())
+            
+            if lang_match:
+                lang = lang_match.lower()
+                display_lang = {
+                    "go": "Go",
+                    "c": "C",
+                    "cpp": "C++",
+                    "bash": "Bash",
+                    "sh": "Shell",
+                    "python": "Python",
+                    "sql": "SQL",
+                    "yaml": "YAML",
+                    "json": "JSON",
+                    "nasm": "Assembly (x86)",
+                    "asm": "Assembly",
+                    "text": "Text",
+                    "txt": "Text",
+                    "ascii": "ASCII Diagram"
+                }.get(lang, lang.upper())
+            else:
+                # Если язык не указан, проверяем наличие символов псевдографики
+                ascii_chars = set("┌┐└┘├┤┬┴┼─│═║╔╗╚╝╠╣╦╩╬►◄▲▼")
+                if any(c in code_body for c in ascii_chars):
+                    lang = "ascii"
+                    display_lang = "DIAGRAM"
+                else:
+                    lang = "text"
+                    display_lang = "TEXT"
 
             return f"""
 <div class="code-block" data-lang="{lang}">
   <div class="code-header">
     <span class="code-lang-tag">{display_lang}</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать код">
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
