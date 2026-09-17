@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Тестирование goroutines</h1>
@@ -2178,27 +2178,65 @@
           <div class="article-markdown">
             <h2 id="upravlenie-zhiznennym-tsiklom-i-kontrol-khaosa">Управление жизненным циклом и контроль хаоса</h2>
 
-<p>Мы уже разобрали, как выявлять зависания (<a href="4-deadlock-detection.html" class="wikilink">4. Deadlock detection</a>) и тестировать коммуникацию (<a href="5-testirovanie-kanalov.html" class="wikilink">5. Тестирование каналов</a>). Но сами по себе мьютексы и каналы — это лишь инфраструктура. Основными «акторами», выполняющими полезную работу в Go, являются горутины. </p>
-<p>Дешевизна создания горутин (всего около 2 КБ памяти на старте) часто играет с разработчиками злую шутку. Ключевое слово <code>go</code> разбрасывается по коду без оглядки, что в условиях высоких нагрузок приводит к OOM (Out Of Memory) или исчерпанию пула соединений БД. </p>
-<p>Тестирование горутин — это не просто проверка того, что асинхронная задача выполнилась. Это строгий аудит <strong>жизненного цикла</strong>:<br />
-1. Соблюдается ли лимит (Concurrency Bounding)?<br />
-2. Корректно ли горутины реагируют на отмену (Cancellation)?<br />
-3. Не остаются ли они «орфанами» (Orphans - сиротами) при ошибках в соседних воркерах?</p>
+<p>В предыдущих главах мы детально исследовали диагностику взаимных блокировок в <a href="4-deadlock-detection.html" class="wikilink">4. Deadlock detection</a> и технику безопасного взаимодействия через потоки данных в <a href="5-testirovanie-kanalov.html" class="wikilink">5. Тестирование каналов</a>. Однако мьютексы, каналы и атомики — это всего лишь синхронизирующая арматура. Главными действующими лицами (акторами), выполняющими всю полезную вычислительную работу в рантайме Go, являются легковесные сопрограммы — <strong>горутины</strong> (<code>goroutines</code>).</p>
+<p>Низкая стоимость создания горутины в Go (стартовый размер стека составляет всего около 2 КБ в сравнении с 1–8 МБ у потока ОС <code>pthread</code>) нередко усыпляет бдительность разработчиков. Ключевое слово <code>go</code> начинает щедро разбрасываться по кодовой базе по принципу «fire-and-forget» (выстрелил и забыл). Но когда нагрузка в продакшене подскакивает, этот легкомысленный подход оборачивается катастрофой: лавинообразным ростом потребления RAM, деградацией работы сборщика мусора (GC), исчерпанием пула соединений с СУБД и внезапным аварийным завершением процесса по OOM (Out Of Memory).</p>
+<p>Тестирование горутин — это не банальная проверка того, что фоновая задача «в конце концов выполнилась». Это строгий, бескомпромиссный инженерный аудит <strong>жизненного цикла конкурентных акторов</strong>:<br />
+1. <strong>Соблюдение лимитов (Concurrency Bounding):</strong> Гарантирует ли компонент, что количество одновременно работающих горутин жестко ограничено сверху даже при шквале входящих запросов?<br />
+2. <strong>Управление отменой (Context Cancellation):</strong> Реагируют ли горутины на отзыв контекста мгновенно, не оставаясь заблокированными на системных вызовах или каналах?<br />
+3. <strong>Предотвращение сиротства (Orphan Prevention):</strong> Завершаются ли зависимые воркеры при возникновении критической ошибки в соседней ветке пайплайна (паттерн Fail-Fast)?</p>
+<hr />
 <h2 id="mechanical-sympathy-globalnyy-schetchik-gorutin">Mechanical Sympathy: Глобальный счетчик горутин</h2>
 
-<p>В Go есть встроенная функция <code>runtime.NumGoroutine()</code>, которая возвращает количество активных горутин в данный момент времени. </p>
+<p>Язык Go предоставляет инженеру низкоуровневый инструмент наблюдения — функцию <code>runtime.NumGoroutine()</code>, возвращающую мгновенное число активных горутин в текущем процессе.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Как работает NumGoroutine</span>
   </div>
   <div class="callout-body">
-    <p>На уровне рантайма планировщик (Scheduler) хранит глобальный атомарный счетчик и список всех когда-либо созданных горутин <code>allgs</code>. При вызове <code>runtime.NumGoroutine()</code> рантайм не обходит все треды ОС. Он использует быстрый атомарный лоад (atomic load) внутренних счетчиков: от количества запущенных горутин отнимается количество системных и количество горутин, находящихся в кэше свободных горутин (<code>gFree</code>). <br />
-Это очень быстрая операция ($O(1)$), и её можно без опасений использовать в тестах. Однако горутина переходит в состояние <code>_Gdead</code> и попадает в <code>gFree</code> не мгновенно, а на этапе работы планировщика, что требует аккуратности при написании ассертов.</p>
+    <p>На уровне рантайма планировщик Go (M:N Scheduler) ведет глобальный учет всех порожденных горутин через слайс <code>allgs</code> (файл <code>runtime/proc.go</code>). <br />
+Когда вызывается функция <code>runtime.NumGoroutine()</code>, планировщик не итерируется по спискам дескрипторов потоков ОС в ядре Linux. Он выполняет быструю атомарную операцию чтения (atomic load) внутреннего счетчика <code>sched.gcount</code>, вычитая из него количество системных горутин рантайма (<code>sched.ngsys</code>) и горутины, находящиеся в пуле повторного использования <code>gFree</code>.</p>
+<p>Это операция константной сложности $O(1)$, безопасная для использования в тестах. Однако важно помнить о цикле жизни: когда функция горутины завершается, переход из рабочего состояния в терминальный статус <code>_Gdead</code> с последующим перемещением в стек <code>gFree</code> происходит во время фазы планирования. Это требует аккуратности и учета задержек при построении ассертов.</p>
   </div>
 </div>
 
-<p>Начинающие разработчики часто пытаются использовать <code>runtime.NumGoroutine()</code> для проверки утечек:</p>
+<p>Жизненный цикл горутины и её отражение в счетчиках рантайма представлены на схеме:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">                      Жизненный цикл горутины в рантайме Go
+
+      +------------------+
+      |      _Gidle      | (Аллокация структуры g в памяти)
+      +--------+---------+
+               | newproc (go func())
+               v
+      +------------------+     Планировщик (M/P)     +------------------+
+      |    _Grunnable    | ------------------------&gt; |     _Grunning    |
+      +--------+---------+ &lt;------------------------ +--------+---------+
+               ^               sysmon / прерывание            |
+               |                                              | gopark (канал, мьютекс)
+               | goready                                      v
+               |                                     +------------------+
+               +------------------------------------ |     _Gwaiting    |
+                                                     +------------------+
+                                                              |
+                                             Завершение работы|
+                                                              v
+      +------------------+      Очистка стека        +------------------+
+      |   Пул gFree      | &lt;------------------------ |      _Gdead      |
+      +------------------+                           +------------------+
+        (g готова к reuse)                             (Уменьшает NumGoroutine)
+</code></pre>
+</div>
+
+<p>Начинающие разработчики часто пытаются использовать <code>runtime.NumGoroutine()</code> для наивного поиска утечек:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2208,14 +2246,14 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХОЙ ПАТТЕРН ТЕСТИРОВАНИЯ
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Хрупкая проверка утечки через глобальный счетчик
 func TestWorker_BadLeakCheck(t *testing.T) {
-    t.Parallel() // &lt;-- ГЛАВНАЯ ОШИБКА ЗДЕСЬ
+    t.Parallel() // &lt;-- ФАТАЛЬНАЯ ОШИБКА: Разрушение изоляции!
     startGoroutines := runtime.NumGoroutine()
 
     runWorker()
 
-    // Если горутин стало больше, значит есть утечка?
+    // Считать, что разница точно равна нулю — опасная иллюзия
     require.Equal(t, startGoroutines, runtime.NumGoroutine()) 
 }
 </code></pre>
@@ -2227,16 +2265,19 @@ func TestWorker_BadLeakCheck(t *testing.T) {
     <span class="callout-title">Ловушка / Gotcha: Глобальное состояние и t.Parallel</span>
   </div>
   <div class="callout-body">
-    <p>Функция <code>runtime.NumGoroutine()</code> возвращает <strong>глобальное</strong> количество горутин для всего процесса <code>go test</code>. <br />
-Если вы используете <code>t.Parallel()</code>, в фоне работают десятки других тестов, которые постоянно создают и уничтожают свои горутины. Измерение <code>NumGoroutine</code> в параллельном тесте приведет к классическим Flaky тестам (плавающим ошибкам). <br />
-<strong>Правило:</strong> Если тест полагается на <code>runtime.NumGoroutine()</code>, он <strong>не должен</strong> использовать <code>t.Parallel()</code>. Для параллельных тестов следует применять библиотеку <code>goleak</code> (как обсуждалось ранее), которая умеет фильтровать системные и тестовые горутины.</p>
+    <p>Функция <code>runtime.NumGoroutine()</code> возвращает <strong>глобальное</strong> число горутин для всего процесса <code>go test</code>. <br />
+Если тест запускается с флагом <code>t.Parallel()</code>, в этом же адресном пространстве параллельно выполняются десятки других тестовых сценариев пакета. Они непрерывно создают и уничтожают собственные воркеры, дергают HTTP-клиенты и фоновые таймеры. </p>
+<p>Замер <code>NumGoroutine</code> внутри параллельного теста превращает тестирование в рулетку: тесты становятся классическими «флакающими» (Flaky tests).</p>
+<p><strong>Железное правило:</strong> Если тестовый сценарий опирается на интроспекцию <code>runtime.NumGoroutine()</code>, он <strong>ни в коем случае не должен</strong> содержать <code>t.Parallel()</code>. Для параллельных проверок следует применять библиотеку <code>goleak</code>, анализирующую дампы стеков конкретных горутин.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="pattern-1-testirovanie-bounded-concurrency-limity">Паттерн 1: Тестирование Bounded Concurrency (Лимиты)</h2>
 
-<p>Одна из главных задач Senior-разработчика — защитить систему от неконтролируемого роста горутин. Для этого реализуются Worker Pools или семафоры на базе каналов. Как протестировать, что ваш Worker Pool действительно не создает больше воркеров, чем разрешено?</p>
-<p>Мы отказываемся от <code>t.Parallel()</code> для этого конкретного теста и замеряем пиковое значение.</p>
+<p>Один из краеугольных камней надежной бэкенд-архитектуры — ограничение параллелизма (Bounded Concurrency). Для защиты вышестоящих сервисов применяются пулы воркеров (Worker Pools) или семафоры на базе буферизованных каналов. </p>
+<p>Как доказать тестом, что пул воркеров ни при каких обстоятельствах не породит больше фоновых горутин, чем установлено конфигурацией?</p>
+<p>Для такого сценария мы сознательно отказываемся от параллельного запуска (<code>t.Parallel()</code>) и замеряем пиковое значение горутин под стрессовой нагрузкой.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2255,17 +2296,18 @@ import (
     &quot;testing&quot;
     &quot;time&quot;
 
-    &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
+    &quot;github.com/stretchr/testify/require&quot;
     &quot;yourproject/internal/pool&quot;
 )
 
 func TestWorkerPool_ConcurrencyLimit(t *testing.T) {
-    // ВАЖНО: Без t.Parallel()
+    // ВАЖНО: Запуск строго последовательный (без t.Parallel())
+    // для обеспечения чистоты метрик runtime.NumGoroutine()
 
     const maxWorkers = 5
     const totalTasks = 50
 
-    // Фиксируем базовое количество горутин (рантайм + сам тест)
+    // Фиксируем исходное состояние горутин до старта пула
     baseGoroutines := runtime.NumGoroutine()
 
     p := pool.NewWorkerPool(maxWorkers)
@@ -2273,37 +2315,41 @@ func TestWorkerPool_ConcurrencyLimit(t *testing.T) {
 
     var activeTasks int32
 
-    // Act: Отправляем шквал задач
+    // Act: Направляем массированный шквал задач в очередь
     for i := 0; i &lt; totalTasks; i++ {
         p.Submit(func() {
             atomic.AddInt32(&amp;activeTasks, 1)
-            time.Sleep(50 * time.Millisecond) // Имитируем долгую работу
+            time.Sleep(50 * time.Millisecond) // Имитируем тяжелый I/O или вычисления
             atomic.AddInt32(&amp;activeTasks, -1)
         })
     }
 
-    // Даем воркерам время на запуск
+    // Даем планировщику Go время на развертывание пула
     time.Sleep(10 * time.Millisecond) 
 
-    // Assert 1: Проверяем физический лимит горутин
-    // Количество горутин не должно превышать: база + maxWorkers + возможно пара системных/управляющих
+    // Assert 1: Проверяем физический лимит горутин рантайма.
+    // Количество горутин не должно превышать: база + maxWorkers + диспетчер
     currentGoroutines := runtime.NumGoroutine()
-    require.LessOrEqual(t, currentGoroutines, baseGoroutines+maxWorkers+2, &quot;Worker Pool превысил лимит горутин!&quot;)
+    require.LessOrEqual(t, currentGoroutines, baseGoroutines+maxWorkers+2, 
+        &quot;Worker Pool превысил физический лимит выделенных горутин!&quot;)
 
-    // Assert 2: Проверяем логический лимит (атомик)
-    require.LessOrEqual(t, int(atomic.LoadInt32(&amp;activeTasks)), maxWorkers)
+    // Assert 2: Проверяем логический лимит одновременно выполняемых задач
+    require.LessOrEqual(t, int(atomic.LoadInt32(&amp;activeTasks)), maxWorkers,
+        &quot;Превышен лимит параллельно обрабатываемых задач!&quot;)
 
-    p.Stop() // Дожидаемся завершения
+    p.Stop() // Корректно останавливаем пул и дожидаемся завершения
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="pattern-2-testirovanie-graceful-shutdown">Паттерн 2: Тестирование Graceful Shutdown</h2>
 
-<p>При остановке микросервиса (сигнал <code>SIGTERM</code>) мы должны завершить работу всех горутин корректно (дописать данные в БД, закрыть сокеты). Этот процесс называется <strong>Graceful Shutdown</strong>.</p>
-<p>В Go стандартом управления жизненным циклом является <code>context.Context</code>. Тест на Graceful Shutdown должен проверять:<br />
-1. Что горутины действительно реагируют на <code>ctx.Done()</code>.<br />
-2. Что горутины успевают завершить работу за отведенное время.</p>
+<p>В облачной инфраструктуре (Kubernetes, Docker) контейнеры непрерывно перезапускаются и перебалансируются. При получении операционной системой сигнала <code>SIGTERM</code> процесс обязан инициировать процедуру <strong>Graceful Shutdown</strong>: остановить прием новых запросов, корректно дообработать текущие транзакции, сбросить буферы в БД и штатно закрыть сокеты.</p>
+<p>В Go каноническим механизмом оркестрации жизненного цикла выступает <code>context.Context</code>. Тест на корректное завершение обязан гарантировать:<br />
+1. Что все запущенные воркеры действительно перехватывают сигнал отмены <code>ctx.Done()</code>.<br />
+2. Что горутины успевают освободить ресурсы за отведенный интервал времени (SLA на завершение), не требуя принудительного аварийного убийства процесса.</p>
+<p>Взаимодействие при остановке иллюстрируется следующей диаграммой:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2336,7 +2382,9 @@ Test-&gt;&gt;Test: wg.Wait() с таймаутом
 </div>
 
 
-<p>Идиоматичная реализация теста:</p>
+<h3 id="idiomatichnyy-test-graceful-shutdown">Идиоматичный тест Graceful Shutdown</h3>
+
+<p>Чтобы превратить потенциально блокирующий вызов синхронизации <code>sync.WaitGroup</code> в безопасную операцию с контролем таймаута, мы используем паттерн сигнального канала:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2352,29 +2400,29 @@ Test-&gt;&gt;Test: wg.Wait() с таймаутом
     ctx, cancel := context.WithCancel(context.Background())
     svc := service.NewBackgroundService()
 
-    // Запускаем сервис (внутри он создает множество горутин)
-    // Функция Start должна быть неблокирующей
+    // Запускаем фоновый сервис. Метод Start обязан быть неблокирующим:
+    // он поднимает рабочие горутины и возвращает управление.
     svc.Start(ctx)
 
-    // Имитируем полезную нагрузку
+    // Даем сервису время перейти в устойчивое рабочее состояние
     time.Sleep(10 * time.Millisecond)
 
-    // Act: инициируем shutdown
+    // Act: Инициируем остановку через контекстную отмену
     cancel()
 
-    // Assert: сервис должен корректно остановиться за разумное время
-    // Используем канал для превращения блокирующего Wait в неблокирующий select
+    // Assert: сервис обязан полностью завершить работу за отведенный бюджет времени.
+    // Оборачиваем синхронное ожидание svc.Wait() в отдельную горутину с сигнальным каналом
     done := make(chan struct{})
     go func() {
-        svc.Wait() // Дожидается внутренних wg.Wait()
+        svc.Wait() // Внутри ожидает завершения внутренней sync.WaitGroup
         close(done)
     }()
 
     select {
     case &lt;-done:
-        // Успех! Все горутины завершились
+        // Превосходно: все воркеры штатно отреагировали на cancel() и завершились
     case &lt;-time.After(500 * time.Millisecond):
-        t.Fatal(&quot;Graceful Shutdown провалился: горутины не завершили работу за 500мс&quot;)
+        t.Fatal(&quot;Graceful Shutdown провалился: фоновые горутины зависли и не завершились за 500мс&quot;)
     }
 }
 </code></pre>
@@ -2386,15 +2434,19 @@ Test-&gt;&gt;Test: wg.Wait() с таймаутом
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между <code>sync.WaitGroup</code> и <code>errgroup.Group</code> из пакета <code>golang.org/x/sync/errgroup</code>, и что лучше использовать для оркестрации воркеров?<br />
-<strong>Ответ:</strong> <code>WaitGroup</code> просто ведет счетчик горутин. Если один воркер упадет с ошибкой, остальные продолжат работу, тратя ресурсы впустую. <br />
-<code>errgroup.Group</code> (созданная через <code>WithContext</code>) связывает все горутины единым контекстом. Если хотя бы одна функция, переданная в <code>eg.Go(...)</code>, возвращает <code>error</code>, <code>errgroup</code> автоматически <strong>отменяет контекст</strong> для всех остальных горутин в группе. Это позволяет реализовать паттерн "Fail-Fast" и мгновенно освободить ресурсы, что делает <code>errgroup</code> стандартом де-факто для сложных конкурентных пайплайнов в Production.</p>
+    <p><strong>Вопрос:</strong> В чем фундаментальная разница между <code>sync.WaitGroup</code> и <code>errgroup.Group</code> из пакета <code>golang.org/x/sync/errgroup</code>, и какой примитив предпочтительнее для продакшен-пайплайнов?<br />
+<strong>Ответ:</strong> Классический <code>sync.WaitGroup</code> реализует исключительно примитивный счетчик активных задач. Он ничего не знает об ошибках: если один из десяти воркеров упадет с критической ошибкой базы данных, остальные девять продолжат бессмысленно молотить вычисления и удерживать сетевые сокеты.</p>
+<p>Структура <code>errgroup.Group</code>, сконструированная через <code>errgroup.WithContext(ctx)</code>, связывает все дочерние горутины общим контекстом. Если любая задача, переданная в метод <code>eg.Go(...)</code>, возвращает непустую <code>error</code>:<br />
+1. <code>errgroup</code> сохраняет первую возникшую ошибку;<br />
+2. Немедленно <strong>отменяет общий контекст</strong> для всех остальных горутин группы (паттерн Fail-Fast).<br />
+Это предотвращает утечку ресурсов и холостой ход системы, делая <code>errgroup</code> индустриальным стандартом для параллельной обработки данных.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="testirovanie-slozhnoy-orkestratsii-errgroup">Тестирование сложной оркестрации: ErrGroup</h2>
 
-<p>Давайте посмотрим, как протестировать поведение "Fail-Fast", о котором мы только что говорили. Нам нужно убедиться, что ошибка в одной горутине действительно прерывает работу остальных.</p>
+<p>Продемонстрируем, как написать строгий тест на паттерн «Fail-Fast» с использованием <code>errgroup</code>. Наша цель — верифицировать, что авария в одном воркере мгновенно сворачивает выполнение параллельных веток, не дожидаясь их естественного завершения.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2407,43 +2459,46 @@ Test-&gt;&gt;Test: wg.Wait() с таймаутом
   <pre class="language-go"><code class="language-go">func TestDataPipeline_FailFast(t *testing.T) {
     t.Parallel()
 
-    // Мокаем зависимости
+    // Конструируем моки зависимостей
     processor := mocks.NewMockProcessor(t)
 
-    // Воркер 1: Зависнет навсегда, пока не отменят контекст
+    // Воркер 1: Имитирует медленную операцию, которая зависнет навсегда без отмены контекста
     processor.EXPECT().Process(gomock.Any(), &quot;task_1&quot;).DoAndReturn(func(ctx context.Context, _ string) error {
-        &lt;-ctx.Done() // Ждем отмены
+        &lt;-ctx.Done() // Ожидаем сигнала прерывания от соседней упавшей ветки
         return ctx.Err()
     })
 
-    // Воркер 2: Сразу возвращает критическую ошибку
-    expectedErr := errors.New(&quot;critical DB error&quot;)
+    // Воркер 2: Моментально терпит аварию и возвращает критическую ошибку
+    expectedErr := errors.New(&quot;critical DB connection lost&quot;)
     processor.EXPECT().Process(gomock.Any(), &quot;task_2&quot;).Return(expectedErr)
 
     pipeline := worker.NewPipeline(processor)
 
-    // Act
+    // Act: Фиксируем время выполнения пайплайна
     start := time.Now()
     err := pipeline.RunAll(context.Background(), []string{&quot;task_1&quot;, &quot;task_2&quot;})
 
-    // Assert
-    require.ErrorIs(t, err, expectedErr, &quot;Пайплайн должен вернуть ошибку от task_2&quot;)
+    // Assert: Проверяем каскадный эффект отмены
+    require.ErrorIs(t, err, expectedErr, &quot;Пайплайн обязан вернуть исходную ошибку от task_2&quot;)
 
-    // Если бы fail-fast не сработал, task_1 висел бы вечно (или до глобального таймаута)
-    require.Less(t, time.Since(start), 100*time.Millisecond, &quot;Пайплайн должен был упасть мгновенно&quot;)
+    // Если бы механизм fail-fast не сработал, воркер task_1 выполнялся бы до глобального таймаута.
+    // Мы доказываем, что отмена произошла практически мгновенно:
+    require.Less(t, time.Since(start), 100*time.Millisecond, 
+        &quot;Пайплайн обязан был прекратить работу немедленно после сбоя task_2&quot;)
 }
 </code></pre>
 </div>
 
-<p>В этом тесте мы элегантно проверяем сложную оркестрацию: мы гарантируем, что ошибка во второй горутине привела к отмене контекста первой горутины, и метод <code>RunAll</code> не заблокировался.</p>
+<p>В этом сценарии юнит-тест доказывает устойчивость архитектуры: падение воркера <code>task_2</code> каскадно отозвало контекст у <code>task_1</code>, и функция <code>RunAll</code> немедленно вернула управление, не расходуя память и такты процессора.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ol>
-<li><strong><code>runtime.NumGoroutine()</code></strong> — отличный инструмент для тестирования лимитов (Bounded Concurrency), но он ломается при использовании <code>t.Parallel()</code>. Используйте его только в изолированных (последовательных) тестах.</li>
-<li><strong>Graceful Shutdown</strong> — это не опция, а необходимость. Тесты должны доказывать, что отмена <code>context.Context</code> каскадно "сворачивает" все фоновые процессы за предсказуемое время без утечек.</li>
-<li><strong>Оркестрация</strong> проверяется через имитацию зависаний. Если один воркер падает, качественный тест докажет, что остальные не продолжили бессмысленно сжигать процессорное время (Fail-Fast).</li>
-</ol>
-<p>Горутины и каналы дают нам контроль над логикой. Но мы все еще сильно зависим от воли планировщика ОС (Scheduler), который решает, какая горутина будет выполняться в данную микросекунду. Эта недетерминированность делает конкурентные тесты хрупкими. О том, можно ли взять планировщик под контроль и заставить конкурентный код выполняться предсказуемо шаг за шагом, мы поговорим в следующей статье: <a href="7-deterministic-concurrency-testing.html" class="wikilink">7. Deterministic concurrency testing</a>.</p>
+<p>Контроль жизненного цикла горутин — ключевое отличие зрелого инженера:<br />
+1. <strong>Интроспекция через <code>runtime.NumGoroutine()</code></strong> — мощный рычаг для контроля лимитов параллелизма (Bounded Concurrency), но он категорически несовместим с параллельными тестами <code>t.Parallel()</code>.<br />
+2. <strong>Graceful Shutdown</strong> обязан проверяться строгими тестами с контролем SLA: отмена <code>context.Context</code> должна сворачивать все дерево горутин за жестко регламентированный квант времени.<br />
+3. <strong>Оркестрация через <code>errgroup</code></strong> позволяет воплотить принцип Fail-Fast. Качественный тест обязан моделировать ошибки в отдельных ветках и доказывать, что остальные задачи не остаются работать «вхолостую».</p>
+<p>Горутины и каналы дают нам выразительный инструментарий. Однако мы по-прежнему находимся во власти стохастической природы планировщика Go и ядра Linux, решающих, в каком порядке квантовать время между потоками. Эта недетерминированность порождает плавающие баги, ускользающие от стандартных тестов. </p>
+<p>Можно ли полностью подчинить себе время, заморозить планировщик и заставить конкурентный код выполняться строго детерминированно шаг за шагом? Об этом мы поговорим в финальной главе раздела: <a href="7-deterministic-concurrency-testing.html" class="wikilink">7. Deterministic concurrency testing</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2471,7 +2526,7 @@ Test-&gt;&gt;Test: wg.Wait() с таймаутом
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#upravlenie-zhiznennym-tsiklom-i-kontrol-khaosa">Управление жизненным циклом и контроль хаоса</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-globalnyy-schetchik-gorutin">Mechanical Sympathy: Глобальный счетчик горутин</a></li><li class="toc-item toc-h2"><a href="#pattern-1-testirovanie-bounded-concurrency-limity">Паттерн 1: Тестирование Bounded Concurrency (Лимиты)</a></li><li class="toc-item toc-h2"><a href="#pattern-2-testirovanie-graceful-shutdown">Паттерн 2: Тестирование Graceful Shutdown</a></li><li class="toc-item toc-h2"><a href="#testirovanie-slozhnoy-orkestratsii-errgroup">Тестирование сложной оркестрации: ErrGroup</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#upravlenie-zhiznennym-tsiklom-i-kontrol-khaosa">Управление жизненным циклом и контроль хаоса</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-globalnyy-schetchik-gorutin">Mechanical Sympathy: Глобальный счетчик горутин</a></li><li class="toc-item toc-h2"><a href="#pattern-1-testirovanie-bounded-concurrency-limity">Паттерн 1: Тестирование Bounded Concurrency (Лимиты)</a></li><li class="toc-item toc-h2"><a href="#pattern-2-testirovanie-graceful-shutdown">Паттерн 2: Тестирование Graceful Shutdown</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-test-graceful-shutdown">Идиоматичный тест Graceful Shutdown</a></li><li class="toc-item toc-h2"><a href="#testirovanie-slozhnoy-orkestratsii-errgroup">Тестирование сложной оркестрации: ErrGroup</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Тестирование каналов</h1>
@@ -2178,27 +2178,54 @@
           <div class="article-markdown">
             <h2 id="paradigma-csp-v-usloviyakh-izolyatsii">Парадигма CSP в условиях изоляции</h2>
 
-<p>В философии Go красной нитью проходит правило: <em>"Не общайтесь через разделяемую память; разделяйте память через общение"</em>. Имплементацией этой парадигмы (CSP — Communicating Sequential Processes) являются каналы. </p>
-<p>Мы уже обсудили проблемы блокировок и утечек в <a href="4-deadlock-detection.html" class="wikilink">4. Deadlock detection</a>. Но тестирование кода, который активно использует каналы, бросает нам новый вызов. Канал — это синхронный примитив. Неправильное тестирование канала в лучшем случае приведет к падению <code>go test</code> по таймауту, а в худшем — скроет серьезный архитектурный баг, связанный с утечкой ресурсов.</p>
-<p>В этой статье мы разберем паттерны тестирования двух главных сценариев: когда тестируемый код является <strong>Продюсером</strong> (возвращает канал) и когда он является <strong>Консьюмером</strong> (принимает канал).</p>
+<p>В философии Go красной нитью проходит знаменитое правило Роба Пайка: <em>"Не общайтесь через разделяемую память; разделяйте память через общение"</em> (<em>"Do not communicate by sharing memory; instead, share memory by communicating"</em>). Фундаментальной реализацией этой парадигмы — модели взаимодействующих последовательных процессов (CSP, Communicating Sequential Processes Тони Хоара) — в языке Go служат первоклассные каналы (<code>chan</code>).</p>
+<p>Мы уже исследовали механизмы взаимных блокировок и утечек ресурсов в <a href="4-deadlock-detection.html" class="wikilink">4. Deadlock detection</a>. Однако тестирование программного кода, пронизанного каналами, бросает инженеру совершенно особый вызов. Канал в Go — это не бестелесная абстракция и не сетевой сокет; это строгий синхронизирующий примитив рантайма. Ошибка в организации взаимодействия с каналом внутри юнит-теста в лучшем сценарии обернется аварийным падением <code>go test</code> по таймауту, а в худшем — замаскирует коварный дефект многопоточности, породив зомби-горутины, незаметно сжирающие процессорное время и дескрипторы в продакшене.</p>
+<p>В этой главе мы подробно разберем паттерны тестирования двух фундаментальных ролей: когда тестируемый компонент выступает <strong>Продюсером</strong> (порождает поток данных и возвращает канал) и когда он является <strong>Консьюмером</strong> (принимает канал и вычитывает задачи).</p>
+<hr />
 <h2 id="mechanical-sympathy-chto-takoe-kanal-v-pamyati">Mechanical Sympathy: Что такое канал в памяти?</h2>
 
-<p>Чтобы понимать, как ломаются тесты с каналами, нужно знать устройство канала в рантайме.</p>
+<p>Чтобы безошибочно диагностировать зависания и падения тестов, необходимо снять покров тайны с внутренней механики рантайма и заглянуть в реализацию канала в исходных кодах Go.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Структура hchan</span>
   </div>
   <div class="callout-body">
-    <p>Когда вы делаете <code>make(chan int, 3)</code>, рантайм аллоцирует в куче (Heap) структуру <code>hchan</code> (лежит в <code>runtime/chan.go</code>).<br />
-Она содержит:<br />
-1. <code>buf</code>: Кольцевой буфер (Ring Buffer) для хранения данных (если канал буферизован).<br />
-2. <code>sendq</code> и <code>recvq</code>: Двусвязные списки (Wait Queues). Если горутина пытается прочитать из пустого канала, планировщик создает структуру <code>sudog</code>, оборачивает в нее текущую горутину <code>g</code>, кладет в <code>recvq</code> и <strong>паркует</strong> (усыпляет) горутину.<br />
-3. <code>lock</code>: Обычный <code>runtime.mutex</code>. <strong>Каналы не lock-free!</strong> Любое обращение к каналу захватывает этот мьютекс.</p>
-<p>Когда ваш тест делает <code>&lt;-ch</code>, а бизнес-код ничего туда не пишет, горутина теста (<code>g_test</code>) ложится в <code>recvq</code> и засыпает. Если бизнес-код завершился с ошибкой и не закрыл канал, горутина теста не проснется <strong>никогда</strong>. Это вызывает таймаут CI-пайплайна.</p>
+    <p>Когда вы выполняете аллокацию <code>make(chan int, 3)</code>, рантайм Go выделяет в куче (Heap) заголовочную структуру <code>hchan</code> (исходный код расположен в <code>runtime/chan.go</code>).<br />
+Она содержит ключевые поля:<br />
+1. <code>buf</code>: Указатель на циклический буфер (Ring Buffer) в непрерывном массиве памяти для хранения переданных элементов (если канал создан буферизованным).<br />
+2. <code>sendq</code> и <code>recvq</code>: Двусвязные списки очередей ожидания (Wait Queues). Если горутина пытается прочитать из пустого канала (<code>&lt;-ch</code>), планировщик не сжигает циклы CPU в спинлоке. Он аллоцирует структуру <code>sudog</code>, связывает ее с текущей горутиной <code>g</code>, помещает в хвост очереди <code>recvq</code> и переводит горутину вызовом <code>gopark</code> в состояние <code>Gwaiting</code> (паркует ее).<br />
+3. <code>lock</code>: Обычный спин-мьютекс <code>runtime.mutex</code>. <strong>Каналы в Go не являются lock-free структурами!</strong> Любая операция чтения, записи или закрытия канала монопольно захватывает этот внутренний мьютекс.</p>
+<p>Когда ваш тест выполняет операцию <code>&lt;-ch</code>, а тестируемый бизнес-код по причине бага ничего туда не пишет, горутина теста (<code>g_test</code>) заворачивается в <code>sudog</code>, становится в <code>recvq</code> и засыпает. Если бизнес-код завершился с ошибкой или вышел по <code>return</code>, так и не закрыв канал, тестовая горутина не проснется <strong>никогда</strong>. Это приводит к зависанию тестового бинарника и мучительному таймауту CI-пайплайна.</p>
   </div>
 </div>
 
+<p>Взглянем на внутреннюю организацию структуры <code>hchan</code> в оперативной памяти:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">                          Структура hchan (runtime/chan.go)
+    +-------------------------------------------------------------------+
+    | lock (runtime.mutex) | qcount: uint | dataqsiz: uint | elemsize   |
+    +-------------------------------------------------------------------+
+    | closed: uint32       | elemtype: *_type             | sendx/recvx |
+    +-------------------------------------------------------------------+
+    | buf (unsafe.Pointer) ----&gt; [ Elem 0 ][ Elem 1 ][ Elem 2 ] (Ring)  |
+    +-------------------------------------------------------------------+
+    | recvq (waitq)        ----&gt; sudog &lt;-&gt; sudog &lt;-&gt; sudog (Gwaiting)   |
+    +-------------------------------------------------------------------+
+    | sendq (waitq)        ----&gt; sudog &lt;-&gt; sudog &lt;-&gt; sudog (Gwaiting)   |
+    +-------------------------------------------------------------------+
+</code></pre>
+</div>
+
+<p>Схема прохождения данных и синхронизации горутин через очереди ожидания наглядно демонстрирует эту механику:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2225,10 +2252,13 @@ H --&gt; I[&quot;goready - пробуждение теста&quot;]
 </div>
 
 
+<p>Обратите внимание: рантайм оптимизирует передачу данных — если в <code>recvq</code> уже ждет спящая горутина, пишущая горутина копирует байты напрямую из своего стека в стек читателя через указатель в <code>sudog</code>, минуя промежуточный кольцевой буфер <code>buf</code>!</p>
+<hr />
 <h2 id="pattern-1-testirovanie-prodyuserov">Паттерн 1: Тестирование Продюсеров</h2>
 
-<p>Продюсер — это функция, которая делает какую-то асинхронную работу и возвращает канал для чтения результатов (часто используется паттерн Generator).</p>
-<p><strong>Проблема:</strong> Как убедиться, что продюсер отдал все данные и корректно закрыл канал, не повесив при этом тест?</p>
+<p>Продюсер — это функция или метод, запускающий асинхронную обработку и возвращающий канал только для чтения (<code>&lt;-chan T</code>). В инженерной практике этот подход чаще всего реализует паттерн «Генератор» (Generator) или конвейерную обработку (Pipeline).</p>
+<p><strong>Главная дилемма:</strong> Как верифицировать, что продюсер отправил строго ожидаемую последовательность элементов и корректно сигнализировал об окончании передачи, закрыв канал, не рискуя заморозить тестовый раннер навечно?</p>
+<p>Рассмотрим типичный продюсер:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2238,11 +2268,13 @@ H --&gt; I[&quot;goready - пробуждение теста&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Бизнес-логика (Продюсер)
+  <pre class="language-go"><code class="language-go">// GenerateNumbers порождает последовательность чисел в отдельной горутине.
 func GenerateNumbers(ctx context.Context, max int) &lt;-chan int {
     out := make(chan int)
     go func() {
-        defer close(out) // КРИТИЧЕСКИ ВАЖНО для потребителей
+        // КРИТИЧЕСКИ ВАЖНО: defer close(out) гарантирует оповещение подписчиков
+        // о завершении генерации даже при возникновении паники
+        defer close(out)
         for i := 1; i &lt;= max; i++ {
             select {
             case out &lt;- i:
@@ -2256,8 +2288,9 @@ func GenerateNumbers(ctx context.Context, max int) &lt;-chan int {
 </code></pre>
 </div>
 
-<p><strong>Идиоматичный тест:</strong><br />
-Мы используем цикл <code>for-select</code> с жестким таймаутом и проверяем признак закрытия канала (<code>ok</code>).</p>
+<h3 id="idiomatichnyy-test-prodyusera">Идиоматичный тест продюсера</h3>
+
+<p>Для тестирования такого генератора применяется паттерн <code>for-select</code> с защитным таймером <code>time.NewTimer</code> и контролем флага валидности чтения (<code>ok</code>):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2274,7 +2307,7 @@ import (
     &quot;testing&quot;
     &quot;time&quot;
 
-    &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
+    &quot;github.com/stretchr/testify/require&quot;
     &quot;yourproject/internal/worker&quot;
 )
 
@@ -2282,14 +2315,14 @@ func TestGenerateNumbers_Success(t *testing.T) {
     t.Parallel()
 
     ctx, cancel := context.WithCancel(context.Background())
-    defer cancel() // Хороший тон - всегда очищать контекст
+    defer cancel() // Хороший инженерный тон — всегда освобождать ресурсы контекста
 
     ch := worker.GenerateNumbers(ctx, 3)
 
     var results []int
 
-    // Используем Timer для всего теста, а не time.After на каждую итерацию,
-    // чтобы избежать утечек таймеров
+    // Создаем единый таймер на весь сценарий вычитки вместо вызова time.After
+    // на каждой итерации, что предотвращает утечку ресурсов таймеров в рантайме.
     timeout := time.NewTimer(1 * time.Second)
     defer timeout.Stop()
 
@@ -2298,7 +2331,7 @@ loop:
         select {
         case val, ok := &lt;-ch:
             if !ok {
-                // Канал закрыт - продюсер корректно завершил работу
+                // Канал закрыт: продюсер полностью передал данные и выполнил close(ch)
                 break loop
             }
             results = append(results, val)
@@ -2318,8 +2351,8 @@ loop:
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как неблокирующим образом проверить в тесте, закрыт ли канал?<br />
-<strong>Ответ:</strong> Использовать <code>select</code> с веткой <code>default</code>.</p>
+    <p><strong>Вопрос:</strong> Как неблокирующим образом проверить в тесте, закрыт ли канал, не зависая на пустом канале?<br />
+<strong>Ответ:</strong> Применить конструкцию <code>select</code> с веткой <code>default</code>. Конструкция <code>select</code> попытается извлечь значение из канала. Если канал пуст, но открыт, сработает ветка <code>default</code>. Если же канал был закрыт через <code>close(ch)</code>, чтение вернет дефолтное значение типа и <code>ok == false</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2345,10 +2378,12 @@ default:
   </div>
 </div>
 
+<hr />
 <h2 id="pattern-2-testirovanie-konsyumerov">Паттерн 2: Тестирование Консьюмеров</h2>
 
-<p>Консьюмер — это функция или горутина, которая вычитывает данные из переданного ей канала.</p>
-<p><strong>Проблема:</strong> Разработчики часто забывают закрыть канал <em>со стороны теста</em>. Если консьюмер использует <code>for val := range ch</code>, он будет бесконечно ждать новых данных, пока канал не закроют. Это приведет к утечке горутины в тесте (которую поймает <code>goleak</code>, как мы обсуждали ранее).</p>
+<p>Консьюмер — это функция или фоновый воркер, принимающий входной канал <code>&lt;-chan T</code> и обрабатывающий поступающий поток сообщений.</p>
+<p><strong>Подводный камень:</strong> Инженеры нередко забывают закрыть входной канал <em>со стороны самого теста</em>. Если консьюмер считывает данные через идиоматичный цикл <code>for val := range ch</code>, он будет бесконечно заблокирован в ожидании следующей порции данных до тех пор, пока отправитель явно не выполнит закрытие канала. В результате горутина консьюмера зависает навсегда, вызывая утечку памяти (которую выявляет библиотека <code>goleak</code>, как мы рассматривали в предыдущих статьях).</p>
+<p>Изучим тестируемый консьюмер:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2358,11 +2393,10 @@ default:
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Бизнес-логика (Консьюмер)
-// Функция читает задачи, выполняет их и возвращает сумму результатов
+  <pre class="language-go"><code class="language-go">// ProcessTasks вычитывает задачи из канала, вычисляет сумму и завершается
 func ProcessTasks(in &lt;-chan int) int {
     sum := 0
-    // Цикл завершится ТОЛЬКО когда канал 'in' будет закрыт
+    // Цикл range завершится ТОЛЬКО тогда, когда канал 'in' будет закрыт отправителем!
     for val := range in {
         sum += val
     }
@@ -2371,8 +2405,9 @@ func ProcessTasks(in &lt;-chan int) int {
 </code></pre>
 </div>
 
-<p><strong>Идиоматичный тест:</strong><br />
-В тесте мы должны сами создать канал, отправить туда данные, <strong>обязательно закрыть его</strong>, а затем сверить результат.</p>
+<h3 id="idiomatichnyy-test-konsyumera">Идиоматичный тест консьюмера</h3>
+
+<p>В тестовом сценарии мы обязаны инициализировать канал, заполнить его тестовыми данными, <strong>обязательно закрыть его</strong>, и лишь затем передать на обработку:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2385,23 +2420,23 @@ func ProcessTasks(in &lt;-chan int) int {
   <pre class="language-go"><code class="language-go">func TestProcessTasks(t *testing.T) {
     t.Parallel()
 
-    // 1. Arrange: Создаем буферизованный канал.
-    // Буфер защищает нас от дедлока, если мы хотим сначала записать всё, 
-    // а потом отдать канал консьюмеру.
+    // 1. Arrange: Создаем буферизованный канал подходящей емкости.
+    // Буфер защищает тест от взаимной блокировки (deadlock), позволяя
+    // полностью заполнить канал данными до передачи его консьюмеру.
     inCh := make(chan int, 3)
 
     inCh &lt;- 10
     inCh &lt;- 20
     inCh &lt;- 30
 
-    // КРИТИЧЕСКИ ВАЖНО: Закрываем канал перед (или сразу после) передачи!
-    // Если этого не сделать, ProcessTasks зависнет навсегда.
+    // КРИТИЧЕСКИ ВАЖНО: Закрываем канал до передачи в синхронный консьюмер!
+    // Если опустить close(inCh), цикл range в ProcessTasks зависнет навечно.
     close(inCh) 
 
-    // 2. Act
+    // 2. Act: Запускаем обработку
     result := worker.ProcessTasks(inCh)
 
-    // 3. Assert
+    // 3. Assert: Сверяем накопительный результат
     require.Equal(t, 60, result)
 }
 </code></pre>
@@ -2413,9 +2448,9 @@ func ProcessTasks(in &lt;-chan int) int {
     <span class="callout-title">Ловушка / Gotcha: Буферизованные vs Небуферизованные каналы в тестах</span>
   </div>
   <div class="callout-body">
-    <p>Если бы мы в тесте выше создали канал <code>make(chan int)</code> (без буфера) и попытались сделать три записи <code>inCh &lt;- 10</code>, наш <strong>тест ушел бы в Deadlock</strong> на строке первой записи!<br />
-Запись в небуферизованный канал блокирует писателя, пока читатель не заберет данные. Но читатель (<code>ProcessTasks</code>) еще даже не запущен!</p>
-<p>Правило: Если в тесте вы пишете в канал <em>до</em> запуска горутины-читателя в том же потоке, канал <strong>обязан</strong> быть буферизованным. Если размер данных динамический, запускайте писателя в отдельной горутине:</p>
+    <p>Если бы мы в тесте выше создали синхронный канал без буфера через <code>make(chan int)</code> и попытались выполнить последовательную запись <code>inCh &lt;- 10</code>, наш <strong>тест мгновенно ушел бы в Deadlock</strong> прямо на первой инструкции записи!</p>
+<p>Согласно спецификации Go, операция отправки в небуферизованный канал паркует пишущую горутину до тех пор, пока читающая горутина не выполнит операцию приема. Но читатель (<code>ProcessTasks</code>) еще даже не получил управление, поскольку находится строкой ниже в том же самом потоке исполнения!</p>
+<p><strong>Золотое правило:</strong> Если в теле теста вы отправляете данные в канал <em>до</em> старта горутины-читателя в том же самом потоке, канал <strong>обязан</strong> быть буферизованным (<code>make(chan int, 3)</code>). Если же объем передаваемых данных заранее неизвестен или динамичен, запускайте писателя в отдельной горутине:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2427,10 +2462,10 @@ func ProcessTasks(in &lt;-chan int) int {
   </div>
   <pre class="language-go"><code class="language-go">inCh := make(chan int)
 go func() {
-    defer close(inCh) // Закрываем по окончании записи
+    defer close(inCh) // Гарантированно закрываем канал по окончании отправки
     inCh &lt;- 10
 }()
-// Теперь можно безопасно вызывать читателя
+// Теперь читатель может безопасно принимать данные синхронно
 ProcessTasks(inCh)
 </code></pre>
 </div>
@@ -2438,9 +2473,11 @@ ProcessTasks(inCh)
   </div>
 </div>
 
+<hr />
 <h2 id="testirovanie-otmeny-konteksta-context-cancellation">Тестирование отмены контекста (Context Cancellation)</h2>
 
-<p>Любой production-ready код с каналами обязан уважать <code>context.Context</code>. Мы должны тестировать, что горутина не зависнет на записи в канал, если клиент (консьюмер) отвалился. Это классический баг утечки памяти (Memory Leak) в веб-серверах на Go.</p>
+<p>Любой надежный продакшен-код на Go, работающий с конкурентными каналами, обязан поддерживать прерывание по сигналам от <code>context.Context</code>. Мы обязаны покрывать тестами ситуации, когда отправка в канал не должна подвешивать горутину, если потребитель досрочно разорвал соединение или истек таймаут HTTP-запроса. Зависшая на записи горутина — это классический источник утечек памяти (Goroutine Leak) в микросервисах.</p>
+<p>Рассмотрим продюсер с поддержкой контекстной отмены:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2450,21 +2487,21 @@ ProcessTasks(inCh)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Функция, которая может зависнуть, если читатель перестанет читать из out
+  <pre class="language-go"><code class="language-go">// FlakyProducer демонстрирует безопасную отправку с обработкой ctx.Done()
 func FlakyProducer(ctx context.Context, out chan&lt;- int) {
-    // Долгая работа...
+    // Имитация полезной вычислительной нагрузки...
     result := 42
 
     select {
-    case out &lt;- result: // Запишем, если есть читатель
-    case &lt;-ctx.Done():  // Выйдем, если читатель отменил контекст
+    case out &lt;- result: // Успешная отправка, если читатель готов принять значение
+    case &lt;-ctx.Done():  // Немедленный выход без утечки, если контекст отменен
         return
     }
 }
 </code></pre>
 </div>
 
-<p>Тест на проверку отмены:</p>
+<p>Тест на подтверждение корректной отмены:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2478,30 +2515,30 @@ func FlakyProducer(ctx context.Context, out chan&lt;- int) {
     t.Parallel()
 
     ctx, cancel := context.WithCancel(context.Background())
-    out := make(chan int) // Небуферизованный
+    out := make(chan int) // Небуферизованный канал: читателя нет, запись заблокируется
 
-    // Запускаем продюсера. Он заблокируется, так как мы не читаем из 'out'.
+    // Запускаем продюсера в фоне. Он неизбежно заблокируется на select,
+    // так как из канала 'out' никто не вычитывает.
     go worker.FlakyProducer(ctx, out)
 
-    // Имитируем, что клиент отвалился спустя 10мс
+    // Имитируем прерывание операции клиентом спустя 10 миллисекунд
     time.Sleep(10 * time.Millisecond)
     cancel()
 
-    // Как проверить, что FlakyProducer реально завершился, а не завис?
-    // Используем библиотеку goleak (из прошлой статьи) 
-    // или явно передаем done-канал:
-
-    // Для простоты примера: если бы FlakyProducer не имел case &lt;-ctx.Done(),
-    // он бы завис навсегда. goleak поймал бы это в конце теста.
+    // Как верифицировать, что FlakyProducer реально завершился, а не остался висеть?
+    // Интегрируем библиотеку goleak (как показано в предыдущих главах),
+    // либо отслеживаем завершение через дополнительный сигнальный done-канал.
+    // Если бы в коде отсутствовала ветка case &lt;-ctx.Done(),
+    // горутина продюсера зависла бы навсегда в recvq/sendq, и goleak зафиксировал бы сбой.
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="otlov-paniki-zapis-v-zakrytyy-kanal">Отлов паники: Запись в закрытый канал</h2>
 
-<p>Одна из архитектурных особенностей Go: запись в закрытый канал вызывает <code>panic: send on closed channel</code>.<br />
-Часто это происходит при неправильном управлении каналами с множеством писателей (Multiple Writers).</p>
-<p>Если вам нужно покрыть такую ситуацию тестом (чтобы убедиться, что ваша обертка над каналами безопасно обрабатывает панику через <code>recover</code>), используйте функцию <code>require.Panics</code>.</p>
+<p>Фундаментальная особенность архитектуры каналов в Go гласит: попытка записи в уже закрытый канал вызывает фатальную панику рантайма <code>panic: send on closed channel</code>. Попытка повторного закрытия закрытого канала аналогично инициирует <code>panic: close of closed channel</code>.</p>
+<p>Чаще всего эта ошибка всплывает при некорректном управлении жизненным циклом каналов в архитектурах с несколькими параллельными отправителями (Multiple Writers). Если ваша внутренняя библиотека реализует потокобезопасный брокер сообщений или декоратор над каналами, перехватывающий подобные сбои через механизм <code>recover</code>, поведение необходимо строго валидировать с помощью инструмента <code>require.Panics</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2512,25 +2549,28 @@ func FlakyProducer(ctx context.Context, out chan&lt;- int) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestSafeSender_PanicsOnClosed(t *testing.T) {
-    ch := make(chan int)
-    close(ch) // Канал уже закрыт!
+    t.Parallel()
 
+    ch := make(chan int)
+    close(ch) // Канал предварительно закрыт!
+
+    // Проверяем, что рантайм Go генерирует ожидаемую панику
     require.Panics(t, func() {
-        ch &lt;- 1 // Вызовет панику на уровне рантайма
+        ch &lt;- 1 // Вызовет мгновенную панику на уровне рантайма (runtime/chan.go)
     }, &quot;Ожидалась паника при записи в закрытый канал&quot;)
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ol>
-<li><strong>Каналы — это мьютексы и очереди.</strong> Неправильная работа с ними в тестах гарантированно усыпляет горутины.</li>
-<li>При тестировании <strong>Продюсеров</strong> всегда используйте <code>select</code> с таймаутами (<code>time.NewTimer</code>), чтобы тест падал с понятной ошибкой, а не висел бесконечно.</li>
-<li>При тестировании <strong>Консьюмеров</strong> не забывайте вызывать <code>close(ch)</code> на стороне теста, иначе консьюмер (использующий <code>range</code>) уйдет в Deadlock.</li>
-<li>Помните о буферизации: запись в небуферизованный канал без запущенного в фоне читателя мгновенно заблокирует ваш тест.</li>
-</ol>
-<p>Каналы — это средство коммуникации. Но сами акторы, выполняющие работу — это горутины. Как проверить, что вы не наплодили лишних воркеров, как тестировать паттерны Worker Pool и управлять их жизненным циклом (graceful shutdown)? Об этом мы подробно поговорим в следующей статье: <a href="6-testirovanie-goroutines.html" class="wikilink">6. Тестирование goroutines</a>.</p>
+<p>Работа с каналами требует глубокого механического сочувствия к структурам данных рантайма:<br />
+1. <strong>Каналы — это не магия, а мьютексы и списки ожидания.</strong> Любое некорректное предположение об их состоянии в тестах переводит горутины в состояние <code>Gwaiting</code>, приводя к таймаутам.<br />
+2. При тестировании <strong>Продюсеров</strong> всегда оборачивайте чтение в конструкцию <code>for-select</code> с защитным таймером <code>time.NewTimer</code> и анализом флага закрытия <code>ok</code>, чтобы тест падал информативно и предсказуемо.<br />
+3. При тестировании <strong>Консьюмеров</strong> неукоснительно выполняйте <code>close(ch)</code> на стороне теста, иначе циклы <code>range</code> консьюмеров спровоцируют дедлок и утечку горутин.<br />
+4. Помните о семантике буфера: синхронная отправка <code>inCh &lt;- 10</code> в небуферизованный канал <code>make(chan int)</code> без параллельного фонового читателя мгновенно парализует тестовый поток.</p>
+<p>Каналы служат лишь транспортными артериями в модели CSP. Реальными же вычислительными акторами выступают сами горутины. Как проверить, что воркеры не плодятся бесконтрольно, как надежно тестировать паттерны пулов рабочих потоков (Worker Pool) и валидировать грациозное завершение (Graceful Shutdown)? Этим жизненно важным практикам посвящена следующая статья: <a href="6-testirovanie-goroutines.html" class="wikilink">6. Тестирование goroutines</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2558,7 +2598,7 @@ func FlakyProducer(ctx context.Context, out chan&lt;- int) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#paradigma-csp-v-usloviyakh-izolyatsii">Парадигма CSP в условиях изоляции</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-takoe-kanal-v-pamyati">Mechanical Sympathy: Что такое канал в памяти?</a></li><li class="toc-item toc-h2"><a href="#pattern-1-testirovanie-prodyuserov">Паттерн 1: Тестирование Продюсеров</a></li><li class="toc-item toc-h2"><a href="#pattern-2-testirovanie-konsyumerov">Паттерн 2: Тестирование Консьюмеров</a></li><li class="toc-item toc-h2"><a href="#testirovanie-otmeny-konteksta-context-cancellation">Тестирование отмены контекста (Context Cancellation)</a></li><li class="toc-item toc-h2"><a href="#otlov-paniki-zapis-v-zakrytyy-kanal">Отлов паники: Запись в закрытый канал</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#paradigma-csp-v-usloviyakh-izolyatsii">Парадигма CSP в условиях изоляции</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-takoe-kanal-v-pamyati">Mechanical Sympathy: Что такое канал в памяти?</a></li><li class="toc-item toc-h2"><a href="#pattern-1-testirovanie-prodyuserov">Паттерн 1: Тестирование Продюсеров</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-test-prodyusera">Идиоматичный тест продюсера</a></li><li class="toc-item toc-h2"><a href="#pattern-2-testirovanie-konsyumerov">Паттерн 2: Тестирование Консьюмеров</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-test-konsyumera">Идиоматичный тест консьюмера</a></li><li class="toc-item toc-h2"><a href="#testirovanie-otmeny-konteksta-context-cancellation">Тестирование отмены контекста (Context Cancellation)</a></li><li class="toc-item toc-h2"><a href="#otlov-paniki-zapis-v-zakrytyy-kanal">Отлов паники: Запись в закрытый канал</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

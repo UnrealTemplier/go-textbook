@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Тестирование конкурентного кода</h1>
@@ -2178,13 +2178,17 @@
           <div class="article-markdown">
             <h2 id="perekhod-v-nelineynyy-mir">Переход в нелинейный мир</h2>
 
-<p>Мы закончили тестирование синхронных HTTP-эндпоинтов и внешних API. Там всё было предсказуемо: мы отправили запрос, заблокировались в ожидании ответа, получили результат, написали <code>require.Equal</code>. Парадигма <strong>Arrange-Act-Assert</strong> (Подготовка-Действие-Проверка) работала безупречно.</p>
-<p>Но как только в вашем бизнес-коде появляется ключевое слово <code>go</code> (запуск горутины), линейное время ломается. Ваш тест больше не контролирует поток выполнения. Если вы не умеете правильно тестировать конкурентный код, вы получите ложноположительные тесты (тест "зеленый", хотя логика сломана) и плавающие ошибки (flaky tests), которые будут сводить с ума вашу команду в CI/CD.</p>
-<p>Тестирование конкурентности требует глубокого понимания того, как рантайм Go управляет горутинами, и строгой дисциплины при написании ассертов.</p>
+<p>До сих пор наше знакомство с тестированием развивалось в уютном, однопоточном и строго детерминированном мире. Мы отправляли синхронные сетевые запросы, блокировались в ожидании ответа, сверяли полученный результат с эталоном и вызывали привычный <code>require.Equal</code>. Классическая триада <strong>Arrange-Act-Assert</strong> (Подготовка-Действие-Проверка) работала предсказуемо, словно швейцарские часы.</p>
+<p>Но стоит в кодовой базе появиться ключевому слову <code>go</code> (запуск независимой горутины), как линейное восприятие времени немедленно разрушается.</p>
+<p>Поток управления разветвляется. Ваш тестовый раннер больше не является единовластным хозяином процессора. Если инженер пытается тестировать конкурентный код наивными линейными методами, он мгновенно попадает в капкан двух крайностей:<br />
+1. <strong>Ложноположительные тесты:</strong> сьют победно рапортует об успехе, в то время как фоновые горутины падают с критическими ошибками или застревают в вечных блокировках.<br />
+2. <strong>Мерцающие тесты (Flaky Tests):</strong> проверки то проходят, то падают в CI-пайплайне в зависимости от микросекундных сдвигов в планировщике операционной системы.</p>
+<p>Тестирование конкурентности в Go требует глубокого понимания механики рантайма (M:N планировщика), строгой дисциплины синхронизации и трезвого осознания того, как устроена структура <code>testing.T</code>.</p>
+<hr />
 <h2 id="glavnaya-illyuziya-test-proshel-uspeshno">Главная иллюзия: "Тест прошел успешно"</h2>
 
-<p>Самая частая ошибка Junior/Middle разработчиков при тестировании асинхронного кода — забыть о синхронизации на уровне самого теста.</p>
-<p>Рассмотрим классический баг. У нас есть функция, которая асинхронно пишет в базу данных:</p>
+<p>Самая распространенная ошибка при проверке асинхронной логики — иллюзия завершенности. Тест проверяет лишь то, что видит его собственная горутина.</p>
+<p>Взглянем на хрестоматийный антипаттерн «выстрелил и забыл» (Fire-and-Forget). Функция выполняет сохранение данных в фоновом режиме:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2196,15 +2200,15 @@
   </div>
   <pre class="language-go"><code class="language-go">func SaveAsync(data string) {
     go func() {
-        // Имитация долгой работы
-        time.Sleep(100 * time.Millisecond)
-        panic(&quot;Упс! База данных упала&quot;) // Имитация критической ошибки
+        // Имитация фоновой сетевой активности или дисковой задержки
+        time.Sleep(50 * time.Millisecond)
+        panic(&quot;Фатальный сбой: база данных недоступна!&quot;) // Скрытая авария
     }()
 }
 </code></pre>
 </div>
 
-<p>А вот как её "тестируют":</p>
+<p>А вот как эту функцию наивно пытается проверить неопытный разработчик:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2216,29 +2220,32 @@
   </div>
   <pre class="language-go"><code class="language-go">func TestSaveAsync_Bad(t *testing.T) {
     SaveAsync(&quot;test data&quot;)
-    // Тест мгновенно завершается со статусом PASS!
+    // Функция отработала мгновенно, тестовая функция завершается
+    // В логах: PASS!
 }
 </code></pre>
 </div>
 
+<p>Тестовый раннер радостно выводит <code>PASS</code>, метрика тестового покрытия (Code Coverage) гордо показывает 100%, но при выводе сервиса в продакшен приложение немедленно падает от необработанной паники. Почему?</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Рантайм и тестирование</span>
   </div>
   <div class="callout-body">
-    <p>Когда вы запускаете <code>go test</code>, бинарник тестов создает главную горутину для выполнения вашей тестовой функции (назовем её <code>G_test</code>). <br />
-Функция <code>SaveAsync</code> спавнит новую горутину (<code>G_worker</code>). Планировщик Go помещает <code>G_worker</code> в локальную очередь выполнения (Local Run Queue) текущего процессора (<code>P</code>). <br />
-Но <code>G_test</code> не ждет завершения <code>G_worker</code>. Она доходит до конца функции <code>TestSaveAsync_Bad</code> и рапортует об успехе. К моменту, когда планировщик решит выделить квант времени для <code>G_worker</code> (и тот запаникует), сам тест уже давно завершен. </p>
+    <p>Когда запускается команда <code>go test</code>, исполняемый бинарник выделяет для выполнения каждого теста отдельную главную горутину — назовем её <code>G_test</code>. </p>
+<p>Внутри теста вызов <code>SaveAsync</code> порождает дочернюю горутину <code>G_worker</code>. Планировщик Go помещает её в локальную очередь выполнения (Local Run Queue) логического процессора <code>P</code>. </p>
+<p>Однако горутина <code>G_test</code> ни секунды не ожидает завершения <code>G_worker</code>! Она моментально доходит до закрывающей фигурной скобки функции <code>TestSaveAsync_Bad</code>, рапортует об успехе и передает управление следующему тесту. </p>
+<p>К тому моменту, когда планировщик наконец переключит поток ядра <code>M</code> на исполнение <code>G_worker</code> (где происходит <code>time.Sleep</code> и выброс паники), сам тест уже считается успешно завершенным, либо процесс аварийно завершается вне контекста конкретного теста.</p>
   </div>
 </div>
 
-<p>Вы задеплоите этот код, и ваш Production будет падать, хотя Coverage показывает 100%, а тесты зеленые.</p>
+<hr />
 <h2 id="idiomatichnaya-sinkhronizatsiya-v-testakh">Идиоматичная синхронизация в тестах</h2>
 
-<p>Тест обязан дождаться завершения всех порожденных им процессов (или дождаться конкретного результата), прежде чем делать Assert и завершаться.</p>
-<p>Если бизнес-код не предоставляет механизма синхронизации (например, не возвращает канал или не принимает <code>*sync.WaitGroup</code>), <strong>это проблема дизайна бизнес-кода</strong>, а не теста. Код с неуправляемыми горутинами ("fire and forget") считается нетестируемым антипаттерном.</p>
-<p>Правильный дизайн функции:</p>
+<p>Фундаментальный закон тестирования конкурентности гласит: <strong>тест обязан детерминированно дождаться завершения всех порожденных им горутин, прежде чем выполнять Assert и завершать работу.</strong></p>
+<p>Если тестируемый метод не предоставляет точки синхронизации (не возвращает сигнальный канал, контекст или не принимает барьер синхронизации <code>*sync.WaitGroup</code>), <strong>это фундаментальный архитектурный дефект бизнес-кода</strong>. Код без возможности контроля времени жизни горутин является принципиально нетестируемым.</p>
+<p>Перепроектируем бизнес-функцию так, чтобы она возвращала канал ошибки:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2248,20 +2255,20 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Функция возвращает канал, который закроется после завершения работы
+  <pre class="language-go"><code class="language-go">// SaveAsyncWaitable возвращает канал только для чтения, гарантируя управляемость
 func SaveAsyncWaitable(data string) &lt;-chan error {
     errCh := make(chan error, 1)
     go func() {
         defer close(errCh)
         time.Sleep(10 * time.Millisecond)
-        errCh &lt;- errors.New(&quot;ошибка БД&quot;) // Имитация ошибки
+        errCh &lt;- errors.New(&quot;ошибка БД: таймаут записи&quot;)
     }()
     return errCh
 }
 </code></pre>
 </div>
 
-<p>Правильный тест:</p>
+<p>Идиоматичный тест блокируется на чтении из канала, гарантируя фиксацию реального результата:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2272,21 +2279,24 @@ func SaveAsyncWaitable(data string) &lt;-chan error {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestSaveAsync_Good(t *testing.T) {
+    t.Parallel()
+
     errCh := SaveAsyncWaitable(&quot;test data&quot;)
 
-    // Тест блокируется в ожидании результата из канала
+    // Тестовая горутина блокируется до момента фиксации результата
     err := &lt;-errCh
 
     require.Error(t, err)
-    require.EqualError(t, err, &quot;ошибка БД&quot;)
+    require.EqualError(t, err, &quot;ошибка БД: таймаут записи&quot;)
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="lovushka-t-fatal-vnutri-gorutiny">Ловушка t.Fatal() внутри горутины</h2>
 
-<p>Это один из самых популярных вопросов на Senior-собеседованиях, на котором "сыпятся" многие кандидаты.</p>
-<p>Представьте, что вы тестируете Worker Pool и пишете ассерты прямо внутри горутины, используя <code>t.Fatal</code> (или <code>require</code> из <code>testify</code>, который под капотом использует <code>t.FailNow</code>).</p>
+<p>Это один из классических вопросов на собеседованиях уровня Senior, ставящий в тупик даже опытных инженеров.</p>
+<p>Представьте, что вы тестируете параллельный пул воркеров с помощью барьера <code>sync.WaitGroup</code>. Внутри дочерней горутины при обнаружении ошибки разработчик вызывает привычный <code>t.Fatal</code> (или методы библиотеки <code>require</code> из <code>testify</code>, которые под капотом обращаются к <code>t.FailNow</code>):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2304,7 +2314,7 @@ func SaveAsyncWaitable(data string) &lt;-chan error {
         defer wg.Done()
         result := doWork()
         if result != &quot;ok&quot; {
-            // КАТАСТРОФА: t.Fatal внутри дочерней горутины!
+            // КАТАСТРОФА: t.Fatal внутри порожденной горутины!
             t.Fatalf(&quot;Ожидали ok, получили %s&quot;, result) 
         }
     }()
@@ -2314,20 +2324,24 @@ func SaveAsyncWaitable(data string) &lt;-chan error {
 </code></pre>
 </div>
 
+<p>Что произойдет, если <code>result != "ok"</code>? Большинство кандидатов уверенно отвечают: «Тест упадет с ошибкой». Но в реальности поведение рантайма оказывается шокирующим.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Смерть горутины, а не теста</span>
   </div>
   <div class="callout-body">
-    <p>Использование <code>t.Fatal()</code> или <code>t.FailNow()</code> внутри отдельной горутины <strong>строго запрещено</strong>.<br />
-Под капотом <code>t.FailNow()</code> вызывает <code>runtime.Goexit()</code>. Эта функция немедленно завершает <strong>текущую</strong> горутину (выполняя все её <code>defer</code>), но она <strong>не завершает сам тест</strong>.</p>
-<p>В примере выше, если <code>result != "ok"</code>, сработает <code>t.Fatalf</code>. Дочерняя горутина умрет, но перед смертью выполнит <code>defer wg.Done()</code>. Главная горутина теста пройдет барьер <code>wg.Wait()</code>, увидит, что всё ок, и тест завершится... УСПЕШНО! (Хотя в логах вы увидите сообщение об ошибке, сам статус <code>go test</code> может быть <code>PASS</code> в некоторых версиях, или поведение будет непредсказуемым).</p>
+    <p>Использование <code>t.Fatal()</code>, <code>t.Fatalf()</code> или <code>t.FailNow()</code> внутри дочерней горутины <strong>строго запрещено спецификацией пакета testing</strong>!</p>
+<p>Под капотом метод <code>t.FailNow()</code> вызывает низкоуровневую функцию рантайма <code>runtime.Goexit()</code>. </p>
+<p>Функция <code>runtime.Goexit()</code> немедленно завершает <strong>исключительно текущую горутину</strong> (аккуратно раскручивая её цепочку <code>defer</code>). Однако она не способна прервать выполнение родительской горутины теста!</p>
+<p>В приведенном фрагменте дочерняя горутина умирает, но перед смертью добросовестно выполняет <code>defer wg.Done()</code>. Счетчик барьера <code>WaitGroup</code> сбрасывается в ноль. Главная горутина беспрепятственно проскакивает барьер <code>wg.Wait()</code> и... завершает тест со статусом <code>PASS</code>! Сообщение об ошибке появится в выводе, но статус бинарника тестов останется нулевым (успешным).</p>
   </div>
 </div>
 
-<p><strong>Как правильно?</strong><br />
-Методы <code>t.Error()</code>, <code>t.Errorf()</code> и <code>t.Fail()</code> являются потокобезопасными (thread-safe). Внутри пакета <code>testing</code> их состояние защищено мьютексом. Вы можете использовать <code>t.Error</code> внутри горутин, чтобы зафиксировать провал теста, а затем через канал или <code>WaitGroup</code> дать сигнал главной горутине корректно завершиться. (Методы <code>assert.*</code> из testify используют <code>t.Errorf</code>, поэтому их использовать безопасно).</p>
+<h3 id="kak-testirovat-korrektno">Как тестировать корректно?</h3>
+
+<p>Методы <code>t.Error()</code>, <code>t.Errorf()</code> и <code>t.Fail()</code> в структуре <code>testing.T</code> (а также функции <code>assert.*</code> из библиотеки <code>testify</code>) являются <strong>потокобезопасными (Thread-Safe)</strong>. Внутри рантайма доступ к полям состояния <code>t.T</code> синхронизируется мьютексом.</p>
+<p>Они помечают тест как проваленный, но не прерывают горутину вызовом <code>runtime.Goexit()</code>. Завершение теста делегируется главной горутине:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2338,29 +2352,48 @@ func SaveAsyncWaitable(data string) &lt;-chan error {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestWorker_GoodAssert(t *testing.T) {
+    t.Parallel()
+
     var wg sync.WaitGroup
     wg.Add(1)
 
     go func() {
         defer wg.Done()
         result := doWork()
-        // assert не прерывает выполнение (как t.Error), но помечает тест как Failed
+        // assert.* использует t.Errorf: тест будет помечен как Failed,
+        // но горутина корректно дойдет до конца
         assert.Equal(t, &quot;ok&quot;, result) 
     }()
 
     wg.Wait()
-    // Если assert внутри горутины провалился, тест упадет здесь.
+    // Если проверка внутри горутины не удалась, тест гарантированно упадет здесь!
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="testirovanie-s-taymautami-deadlock-prevention">Тестирование с таймаутами (Deadlock Prevention)</h2>
 
-<p>При тестировании конкурентного кода вы обязательно столкнетесь с ситуацией, когда дочерняя горутина зависла (Deadlock) или канал никогда не получит сообщение. </p>
-<p>Если вы напишете <code>&lt;-ch</code>, а в канал никто ничего не запишет, ваш тест зависнет навсегда (точнее, до дефолтного таймаута <code>go test</code> в 10 минут). Для быстрого CI это неприемлемо. Любое ожидание в конкурентных тестах должно быть ограничено таймаутом.</p>
+<p>При тестировании конкурентного кода неизбежны сбои, когда из-за логической ошибки дочерняя горутина зависает навсегда (Deadlock) или сообщение так и не отправляется в канал.</p>
+<p>Если написать простое чтение:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">res := &lt;-ch
+</code></pre>
+</div>
+
+<p>и в канал никто ничего не запишет, тестовый раннер намертво зависнет на 10 минут (стандартный таймаут <code>go test</code>). Для быстрого CI это недопустимо. Любое конкурентное ожидание в тестах обязано быть защищено жестким дедлайном.</p>
+<hr />
 <h3 id="pattern-select-time-after">Паттерн: select + time.After</h3>
 
-<p>Идиоматичный способ ограничить ожидание в тесте — использование конструкции <code>select</code>.</p>
+<p>Идиоматичный подход к ограничению времени ожидания — неблокирующая мультиплексирующая конструкция <code>select</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2371,13 +2404,15 @@ func SaveAsyncWaitable(data string) &lt;-chan error {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestProducer(t *testing.T) {
+    t.Parallel()
+
     resultCh := startProducer()
 
     select {
     case res := &lt;-resultCh:
         require.Equal(t, &quot;success&quot;, res)
-    case &lt;-time.After(100 * time.Millisecond): // Жесткий таймаут для теста
-        t.Fatal(&quot;Таймаут: продюсер не вернул результат за 100мс&quot;)
+    case &lt;-time.After(100 * time.Millisecond): // Страховочный таймаут
+        t.Fatal(&quot;Таймаут: продюсер не вернул результат за отведенные 100мс&quot;)
     }
 }
 </code></pre>
@@ -2397,10 +2432,12 @@ func SaveAsyncWaitable(data string) &lt;-chan error {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Тест запущен&quot;] --&gt; B[&quot;startProducer&quot;]
-B --&gt; C[&quot;select блокировка&quot;]
-C --&gt;|&quot;Канал resultCh вернул данные&quot;| D[&quot;Проверка require.Equal&quot;]
-C --&gt;|&quot;Прошло 100мс - time.After&quot;| E[&quot;t.Fatal - Провал теста&quot;]
+Start[&quot;Запуск теста: startProducer()&quot;] --&gt; Sel[&quot;select { case &lt;-resultCh / case &lt;-time.After }&quot;]
+
+Sel --&gt;|&quot;Данные пришли вовремя&quot;| Ok[&quot;require.Equal: Успех&quot;]
+Sel --&gt;|&quot;Истекло 100мс&quot;| Timeout[&quot;t.Fatal: Падение по таймауту&quot;]
+
+Timeout -.-&gt;|&quot;Защита CI от зависания&quot;| Exit[&quot;Аварийная остановка теста&quot;]
   </pre>
 </div>
 
@@ -2411,17 +2448,21 @@ C --&gt;|&quot;Прошло 100мс - time.After&quot;| E[&quot;t.Fatal - Про
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мы используем <code>time.After(1 * time.Second)</code> в цикле <code>select</code> внутри долгоживущего worker'а, который обрабатывает тысячи сообщений. Чем это грозит?<br />
-<strong>Ответ:</strong> Утечкой памяти (Memory Leak). Функция <code>time.After</code> создает новый таймер под капотом. Этот таймер не будет собран Garbage Collector'ом, пока не истечет время, даже если вы вышли из <code>select</code> по другой ветке. В высоконагруженном коде нужно использовать <code>timer := time.NewTimer(...)</code> и явно вызывать <code>timer.Stop()</code>. <br />
-Однако, <strong>в рамках тестирования</strong> (когда тест длится доли секунды), использование <code>time.After</code> абсолютно безопасно и идиоматично.</p>
+    <p><strong>Вопрос:</strong> Мы используем конструкцию <code>time.After(1 * time.Second)</code> в цикле <code>select</code> внутри фонового воркера, обрабатывающего миллионы событий в секунду. Чем это грозит в Production?</p>
+<p><strong>Ответ:</strong> Тяжелой утечкой памяти (Memory Leak). </p>
+<p>Функция <code>time.After</code> под капотом инстанциирует новый экземпляр таймера <code>time.NewTimer</code> и регистрирует его в глобальной очереди таймеров рантайма. Этот объект памяти не может быть собран Garbage Collector'ом до тех пор, пока таймер физически не сработает через 1 секунду — даже если ветка <code>select</code> мгновенно вышла по приходу сообщения из канала! Под высокой нагрузкой в куче накапливаются миллионы неудаленных таймеров. </p>
+<p>В высоконагруженном коде следует переиспользовать таймер: <code>timer := time.NewTimer(...)</code> с обязательным вызовом <code>timer.Stop()</code>. <br />
+Однако <strong>в рамках тестов</strong>, где таймер создается однократно на весь тест, использование <code>time.After</code> является абсолютно идиоматичным и безопасным.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kontroliruemyy-determinizm-controlled-determinism">Контролируемый детерминизм (Controlled Determinism)</h2>
 
-<p>Природа конкурентности — недетерминированность. Горутины могут выполняться в любом порядке. Если ваш тест зависит от того, что горутина А выполнится строго раньше горутины Б, это плохой код (или плохой тест).</p>
-<p>Но иногда нам нужно протестировать логику, где порядок важен. В таких случаях мы используем искусственные точки синхронизации — <strong>каналы-сигналы</strong>.</p>
-<p>Представьте, что мы тестируем кэш, где первый запрос должен пойти в БД, а второй, конкурентный, должен заблокироваться и дождаться результата первого (Паттерн Singleflight).</p>
+<p>Главное свойство конкурентности — недетерминированность. Горутины планируются операционной системой и рантаймом в произвольном порядке. </p>
+<p>Попытка заставить горутины выполняться в нужном порядке с помощью «магических пауз» <code>time.Sleep(10 * time.Millisecond)</code> — один из худших антипаттернов. На быстром компьютере разработчика паузы хватит с запасом, а на перегруженном раннере CI (где делятся виртуальные vCPU) горутина опоздает на одну миллисекунду, и тест упадет.</p>
+<p>Вместо ненадежного ожидания по времени применяется <strong>оркестрация через сигнальные каналы (<code>chan struct{}</code>)</strong>.</p>
+<p>Рассмотрим тестирование кэша с подавлением дублирующих запросов (паттерн Singleflight): первый запрос должен пойти в медленную БД, а второй конкурентный запрос обязан заблокироваться и дождаться ответа первого, не нагружая хранилище повторно.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2432,54 +2473,59 @@ C --&gt;|&quot;Прошло 100мс - time.After&quot;| E[&quot;t.Fatal - Про
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestSingleflight_Cache(t *testing.T) {
+    t.Parallel()
     cache := NewCache()
 
-    // Каналы для синхронизации шагов теста
+    // Каналы для пошаговой синхронизации сценария
     dbCallStarted := make(chan struct{})
     releaseDBCall := make(chan struct{})
 
-    // Мокаем БД так, чтобы контролировать её из теста
+    // Настраиваем мок БД под управление тестом
     cache.SetDBFunc(func(key string) string {
-        close(dbCallStarted) // Сигнализируем тесту, что пошли в БД
+        close(dbCallStarted) // Рапортуем тесту: горутина дошла до БД!
         &lt;-releaseDBCall      // Блокируем горутину, пока тест не разрешит продолжить
         return &quot;data from DB&quot;
     })
 
-    // Запускаем первого клиента
+    // 1. Запускаем первого клиента в фоне
     go cache.Get(&quot;key1&quot;)
 
-    // Тест ждет, пока первый клиент не дойдет до &quot;базы&quot;
+    // 2. Тест детерминированно ждет входа первого клиента в БД
     &lt;-dbCallStarted
 
-    // Запускаем второго клиента (он должен упереться в мьютекс кэша / singleflight)
+    // 3. Запускаем второго конкурентного клиента (он обязан заблокироваться на Singleflight)
     var wg sync.WaitGroup
     wg.Add(1)
     var secondResult string
 
     go func() {
         defer wg.Done()
-        secondResult = cache.Get(&quot;key1&quot;) // Этот вызов не должен дойти до БД
+        // Этот вызов не должен дойти до БД; он ждет результат первого вызова
+        secondResult = cache.Get(&quot;key1&quot;)
     }()
 
-    // Даем зеленый свет первому клиенту завершить поход в БД
+    // 4. Разрешаем первому клиенту завершить чтение из БД
     close(releaseDBCall)
 
+    // Дожидаемся завершения второго клиента
     wg.Wait()
-    require.Equal(t, &quot;data from DB&quot;, secondResult)
+
+    require.Equal(t, &quot;data from DB&quot;, secondResult, &quot;Второй клиент обязан получить данные первого&quot;)
 }
 </code></pre>
 </div>
 
-<p>Этот подход убирает "магические" <code>time.Sleep(10 * time.Millisecond)</code> из тестов. Слипы (sleeps) в тестах — это зло. На медленном CI слипа может не хватить, и тест упадет. Сигнальные каналы гарантируют 100% детерминизм на любом железе.</p>
+<p>Никаких <code>time.Sleep(10 * time.Millisecond)</code>! Тест выполняется за микросекунды и на 100% стабилен на любом оборудовании.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Никаких Fire-and-Forget</strong>: Тест всегда должен дожидаться завершения фоновых процессов, которые он породил.</li>
-<li><strong>Потокобезопасность <code>t.T</code></strong>: Использовать <code>t.Error</code> и <code>assert</code> в дочерних горутинах можно, но <code>t.Fatal</code> или <code>require</code> вызовут <code>runtime.Goexit()</code>, тихо убив горутину и исказив результаты теста.</li>
-<li><strong>Таймауты</strong>: Все ожидания конкурентных событий (чтение из канала, ожидание WG) оборачивайте в <code>select</code> с <code>time.After</code>, чтобы не повесить CI.</li>
-<li><strong>Детерминизм</strong>: Избегайте <code>time.Sleep</code> для синхронизации горутин в тестах. Используйте каналы-сигналы (<code>chan struct{}</code>).</li>
+<li><strong>Никаких бесконтрольных горутин (Fire-and-Forget):</strong> Любой асинхронный процесс, запущенный в тесте, обязан иметь точку синхронизации для гарантированного ожидания.</li>
+<li><strong>Потокобезопасность <code>t.T</code>:</strong> Вызовы <code>t.Error</code>, <code>t.Errorf</code> и <code>assert</code> в дочерних горутинах безопасны. Вызовы <code>t.Fatal</code>, <code>t.FailNow</code> и <code>require</code> внутри горутин строго запрещены, так как они завершают только текущую горутину через <code>runtime.Goexit()</code>, порождая ложноположительный статус <code>PASS</code>.</li>
+<li><strong>Защита от дедлоков:</strong> Любое чтение из канала в тестах должно оборачиваться в конструкцию <code>select</code> с тайм-аутом <code>time.After</code>.</li>
+<li><strong>Контролируемый детерминизм:</strong> Исключите использование <code>time.Sleep</code> для выстраивания порядка выполнения горутин. Синхронизируйте сценарии с помощью сигнальных каналов нулевого размера (<code>chan struct{}</code>).</li>
 </ol>
-<p>Мы научились вручную синхронизировать горутины в тестах и избегать базовых логических ошибок. Но язык Go имеет встроенный, крайне мощный инструмент на уровне компилятора, который позволяет находить скрытые ошибки доступа к памяти при конкурентной работе — ошибки, которые невозможно поймать обычным assert-ом. Об этом инструменте и о том, как он работает на уровне памяти, мы поговорим в следующей статье: <a href="2-data-race-i-race-detector.html" class="wikilink">2. Data race и race detector</a>.</p>
+<p>Мы научились дисциплинированно управлять конкурентными потоками. Однако конкурентность таит в себе еще более опасного врага — одновременный несинхронизированный доступ к разделяемой памяти. В следующей лекции мы детально исследуем гонки данных и познакомимся с мощнейшим инструментом компилятора Go: <a href="2-data-race-i-race-detector.html" class="wikilink">2. Data race и race detector</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2507,7 +2553,7 @@ C --&gt;|&quot;Прошло 100мс - time.After&quot;| E[&quot;t.Fatal - Про
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#perekhod-v-nelineynyy-mir">Переход в нелинейный мир</a></li><li class="toc-item toc-h2"><a href="#glavnaya-illyuziya-test-proshel-uspeshno">Главная иллюзия: &quot;Тест прошел успешно&quot;</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-sinkhronizatsiya-v-testakh">Идиоматичная синхронизация в тестах</a></li><li class="toc-item toc-h2"><a href="#lovushka-t-fatal-vnutri-gorutiny">Ловушка t.Fatal() внутри горутины</a></li><li class="toc-item toc-h2"><a href="#testirovanie-s-taymautami-deadlock-prevention">Тестирование с таймаутами (Deadlock Prevention)</a></li><li class="toc-item toc-h3"><a href="#pattern-select-time-after">Паттерн: select + time.After</a></li><li class="toc-item toc-h2"><a href="#kontroliruemyy-determinizm-controlled-determinism">Контролируемый детерминизм (Controlled Determinism)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#perekhod-v-nelineynyy-mir">Переход в нелинейный мир</a></li><li class="toc-item toc-h2"><a href="#glavnaya-illyuziya-test-proshel-uspeshno">Главная иллюзия: &quot;Тест прошел успешно&quot;</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-sinkhronizatsiya-v-testakh">Идиоматичная синхронизация в тестах</a></li><li class="toc-item toc-h2"><a href="#lovushka-t-fatal-vnutri-gorutiny">Ловушка t.Fatal() внутри горутины</a></li><li class="toc-item toc-h3"><a href="#kak-testirovat-korrektno">Как тестировать корректно?</a></li><li class="toc-item toc-h2"><a href="#testirovanie-s-taymautami-deadlock-prevention">Тестирование с таймаутами (Deadlock Prevention)</a></li><li class="toc-item toc-h3"><a href="#pattern-select-time-after">Паттерн: select + time.After</a></li><li class="toc-item toc-h2"><a href="#kontroliruemyy-determinizm-controlled-determinism">Контролируемый детерминизм (Controlled Determinism)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
