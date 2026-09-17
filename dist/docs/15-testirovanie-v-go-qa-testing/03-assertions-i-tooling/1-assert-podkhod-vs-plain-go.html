@@ -2169,26 +2169,29 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Assert подход vs plain Go</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Разработчики, приходящие в Go из экосистем Java (JUnit), C# (NUnit), Python (pytest) или PHP (PHPUnit), испытывают культурный шок в первый же день написания тестов. Они инстинктивно ищут в стандартной библиотеке функции вроде <code>assertEquals</code>, <code>assertTrue</code> или <code>assertThrows</code>. И не находят их.</p>
-<p>В Go "из коробки" нет никаких assert-функций. Вместо этого язык предлагает использовать обычные конструкции управления потоком — <code>if</code>, <code>for</code> и операторы сравнения, вызывая <code>t.Errorf</code> при несовпадении ожиданий. Этот подход называется <strong>Plain Go</strong>. </p>
-<p>В этой статье мы разберем философские причины такого решения, посмотрим, как устроены assert-библиотеки "под капотом", и выясним, какую цену на уровне CPU мы платим за сокращение бойлерплейта.</p>
+            <p>Разработчики, приходящие в Go из экосистем Java (JUnit), C# (NUnit), Python (pytest) или PHP (PHPUnit), испытывают настоящий мировоззренческий шок в первый же день знакомства с тестированием. Они инстинктивно ищут в стандартной библиотеке привычные функции вроде <code>assertEquals</code>, <code>assertTrue</code> или <code>assertThrows</code> — и с удивлением обнаруживают их полное отсутствие.</p>
+<p>В Go «из коробки» нет никаких встроенных assertion-макросов. Вместо них язык предлагает писать тесты на том же самом чистом Go, используя обычные управляющие конструкции — условный оператор <code>if</code>, циклы <code>for</code>, бинарные операторы сравнения и явные вызовы <code>t.Errorf</code> или <code>t.Fatalf()</code>. Этот стиль в сообществе принято называть <strong>Plain Go</strong>.</p>
+<p>В этой главе мы разберем философские мотивы создателей Go, препарируем устройство assertion-библиотек под капотом, оценим накладные расходы рантайм-рефлексии на уровне микроархитектуры и определим границы применимости обоих подходов.</p>
+<hr />
 <h2 id="filosofiya-plain-go-pochemu-v-standartnoy-biblioteke-net-assert">Философия Plain Go: Почему в стандартной библиотеке нет assert?</h2>
 
-<p>Создатели Go (в частности, Роб Пайк) намеренно отказались от включения встроенных assert-ов. Их аргументация базируется на следующих инженерных принципах:</p>
+<p>Создатели языка (Роб Пайк, Кен Томпсон) осознанно отвергли концепцию встроенных assertion-библиотек. Их аргументация базируется на строгих инженерных принципах Bell Labs:</p>
 <ol>
-<li><strong>Отказ от мини-языков (DSL):</strong> Assert-фреймворки часто эволюционируют в собственные предметно-ориентированные языки. Разработчику приходится учить конструкции вроде <code>assert.That(result).IsInstanceOf(User.class).And().HasField("Age").GreaterThan(18)</code>. В Go философия иная: если вы умеете писать код на Go, вы уже умеете писать тесты на Go. </li>
-<li><strong>Обработка ошибок как значений:</strong> Концепция "Errors are values" пронизывает весь язык. Если функция возвращает ошибку, вы проверяете её обычным <code>if err != nil</code>. Тесты не должны быть исключением.</li>
-<li><strong>Контекст падения:</strong> Простой <code>assert.Equal</code> часто выводит сухую констатацию факта: <code>Expected 4, got 5</code>. При использовании <code>t.Errorf</code> разработчик вынужден (или имеет возможность) написать осмысленное сообщение, объясняющее, <em>почему</em> этот тест важен и что именно пошло не так в контексте бизнес-логики.</li>
+<li><strong>Отказ от специализированных псевдоязыков (DSL):</strong> Сторонние assertion-фреймворки со временем неизбежно мутируют в громоздкие предметно-ориентированные диалекты вроде <code>assert.That(x).IsEqualTo(y).And().IsNotNull()</code>. Программисту приходится тратить умственные ресурсы на изучение синтаксического сахара вместо сути теста. В Go действует закон: <em>если вы умеете программировать на Go, вы уже умеете писать тесты на Go</em>.</li>
+<li><strong>Ошибки как обычные значения (Errors are values):</strong> Этот принцип пронизывает всю архитектуру Go. Если функция возвращает ошибку, она проверяется явным условием <code>if err != nil</code>. Тестовый код не должен становиться исключением из правил языка.</li>
+<li><strong>Осознанный диагностический контекст:</strong> Автоматический <code>assert.Equal</code> при сбое обычно выводит бездушную сухую констатацию факта: <code>Expected 4, got 5</code>. При использовании <code>t.Errorf</code> разработчик формулирует осмысленное инженерное сообщение, объясняющее бизнесовый контекст ошибки и причины расхождения.</li>
 </ol>
+<hr />
 <h3 id="kak-vyglyadit-plain-go-podkhod">Как выглядит Plain Go подход</h3>
 
+<p>Взглянем на эталонный тест, написанный в строгом стиле Plain Go:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2198,16 +2201,22 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func TestCalculateDiscount_PlainGo(t *testing.T) {
+  <pre class="language-go"><code class="language-go">package discount_test
+
+import (
+    &quot;testing&quot;
+)
+
+func TestCalculateDiscount_PlainGo(t *testing.T) {
     got, err := CalculateDiscount(100, &quot;PROMO20&quot;)
 
-    // Явная обработка ошибки
+    // Явная и прозрачная обработка ошибки
     if err != nil {
-        t.Fatalf(&quot;unexpected error during calculation: %v&quot;, err)
+        t.Fatalf(&quot;непредвиденная ошибка при расчете скидки: %v&quot;, err)
     }
 
     want := 80.0
-    // Явное сравнение
+    // Прямое сравнение значений через стандартный оператор
     if got != want {
         t.Errorf(&quot;CalculateDiscount(100, PROMO20) = %f; want %f&quot;, got, want)
     }
@@ -2215,11 +2224,26 @@
 </code></pre>
 </div>
 
-<p>Все прозрачно, типизировано на этапе компиляции и работает со скоростью света, так как используются нативные инструкции процессора для сравнения чисел (например, ассемблерная инструкция <code>CMP</code>).</p>
+<p>Код кристально прозрачен, типизирован на этапе компиляции и выполняется со скоростью света. На уровне ассемблера процессор выполняет прямые аппаратные инструкции сравнения регистров (например, машинную инструкцию <code>CMP</code> на архитектуре x86-64 или ARM64).</p>
+<hr />
 <h2 id="poyavlenie-assert-podkhoda">Появление Assert-подхода</h2>
 
-<p>Несмотря на красивую философию, реальность коммерческой разработки диктует свои правила. Когда вам нужно проверить вложенную JSON-подобную структуру из 20 полей, написание Plain Go проверок превращается в генерацию десятков строк однотипного <code>if got.Field != want.Field</code> бойлерплейта.</p>
-<p>Сообщество ответило на это созданием сторонних библиотек, самой популярной из которых стала <code>testify</code> (от команды stretchr).</p>
+<p>Несмотря на чистоту философии Plain Go, коммерческая бэкенд-разработка диктует свои условия. Когда требуется протестировать комплексную структуру или сложный JSON-ответ из 25 полей, написание проверок в стиле Plain Go превращается в изнурительную рутину:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">if got.Field != want.Field { ... }
+</code></pre>
+</div>
+
+<p>Десятки строк однотипного кода рассеивают внимание инженера. Ответом сообщества стало создание сторонних библиотек ассертов, безоговорочным лидером среди которых стала библиотека <code>testify</code> (пакеты <code>assert</code> и <code>require</code>).</p>
+<hr />
 <h3 id="kak-vyglyadit-assert-podkhod">Как выглядит Assert подход</h3>
 
 
@@ -2231,53 +2255,63 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import &quot;[github.com/stretchr/testify/assert](https://github.com/stretchr/testify/assert)&quot;
-import &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
+  <pre class="language-go"><code class="language-go">package discount_test
+
+import (
+    &quot;testing&quot;
+
+    &quot;github.com/stretchr/testify/assert&quot;
+    &quot;github.com/stretchr/testify/require&quot;
+)
 
 func TestCalculateDiscount_Assert(t *testing.T) {
     got, err := CalculateDiscount(100, &quot;PROMO20&quot;)
 
-    // require прерывает тест (эквивалент t.Fatalf)
-    require.NoError(t, err, &quot;calculation should not fail&quot;)
+    // require немедленно останавливает тест при ошибке (эквивалент t.Fatalf)
+    require.NoError(t, err, &quot;расчет скидки не должен возвращать ошибку&quot;)
 
-    // assert продолжает тест при ошибке (эквивалент t.Errorf)
-    assert.Equal(t, 80.0, got, &quot;discount should be correctly applied&quot;)
+    // assert фиксирует расхождение и продолжает тест (эквивалент t.Errorf)
+    assert.Equal(t, 80.0, got, &quot;размер скидки должен быть рассчитан корректно&quot;)
 }
 </code></pre>
 </div>
 
-<p>Код становится в два раза короче. Он читается как английский текст. Но за эту лаконичность приходится платить абстракцией.</p>
+<p>Тест становится вдвое компактнее, читаясь как декларативное предложение на английском языке. Однако за эту визуальную краткость приходится платить вычислительными абстракциями.</p>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между пакетами <code>assert</code> и <code>require</code> в библиотеке testify?<br />
-<strong>Ответ:</strong> Пакет <code>assert</code> при провале проверки вызывает <code>t.Errorf()</code> — то есть тест помечается как упавший, но выполнение текущей горутины продолжается. Пакет <code>require</code> вызывает <code>t.Fatalf()</code>, что немедленно прерывает выполнение теста (вызывая <code>runtime.Goexit()</code>). Если ошибка фатальна (например, не удалось открыть тестовую БД), нужно использовать <code>require</code>, иначе последующие <code>assert</code>-проверки приведут к <code>panic: nil pointer dereference</code>.</p>
+    <p><strong>Вопрос:</strong> В чем заключается фундаментальная разница между пакетами <code>assert</code> и <code>require</code> в библиотеке <code>testify</code>?<br />
+<strong>Ответ:</strong> При несовпадении условий функции пакета <code>assert</code> вызывают <code>t.Errorf()</code>: тест помечается как проваленный, но выполнение текущей горутины продолжается.<br />
+Функции пакета <code>require</code> вызывают метод <code>t.Fatalf()</code>, который через системную функцию <code>runtime.Goexit()</code> немедленно прерывает выполнение текущего сценария.<br />
+<strong>Правило безопасности:</strong> Если вы проверяете указатель на валидность или результат подключения к базе данных, <strong>всегда</strong> используйте <code>require</code> (например, <code>require.NoError</code>). Если пропустить ошибку и продолжить тест с <code>assert</code>, последующее обращение к полям приведет к панике: <code>panic: nil pointer dereference</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-tsena-refleksii">Mechanical Sympathy: Цена рефлексии</h2>
 
-<p>Чтобы написать функцию <code>assert.Equal</code>, которая может принимать <em>любые</em> типы данных (от <code>int</code> до сложных вложенных структур с мапами и слайсами), до появления дженериков в Go 1.18 был только один путь — <strong>Рефлексия (Reflection)</strong>. Пакет <code>testify</code> до сих пор обильно использует пакет <code>reflect</code> и функцию <code>reflect.DeepEqual</code>.</p>
+<p>Чтобы универсальная функция <code>assert.Equal</code> могла сравнивать аргументы любых типов — от примитивного <code>int</code> до вложенных срезов, ассоциативных массивов <code>map</code> и сложных структур — создатели библиотек опираются на механизм <strong>рефлексии (Reflection)</strong> через пакет <code>reflect</code> и вызов <code>reflect.DeepEqual</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Как работает условный <code>assert.Equal</code> на уровне рантайма?<br />
-1. Аргументы <code>got</code> и <code>want</code> передаются как пустые интерфейсы <code>interface{}</code>.<br />
-2. Компилятор не может доказать время жизни этих переменных (Escape Analysis), поэтому они <strong>гарантированно аллоцируются в куче (Heap)</strong>.<br />
-3. Рантайм распаковывает структуру интерфейса (<code>eface</code>), извлекая указатели на типы.<br />
-4. <code>reflect.DeepEqual</code> рекурсивно обходит структуру. Для каждого поля он делает динамические проверки типов (Type Assertions), прежде чем выполнить фактическое сравнение.</p>
+    <p>Что в действительности происходит в рантайме при вызове <code>assert.Equal(t, a, b)</code>?<br />
+1. Аргументы <code>got</code> и <code>want</code> упаковываются в пустые интерфейсы <code>interface{}</code>.<br />
+2. Компилятор не может доказать ограниченность времени жизни этих параметров через Escape Analysis, в результате чего они <strong>неизбежно аллоцируются в динамической памяти (Heap)</strong>.<br />
+3. Рантайм распаковывает 16-байтную структуру интерфейса (<code>eface</code>), считывая дескриптор типа и указатель на данные.<br />
+4. Функция <code>reflect.DeepEqual</code> рекурсивно обходит поля, выполняя динамические проверки типов (Type Assertions) для каждого элемента.</p>
   </div>
 </div>
 
-<p>Сравним это с Plain Go:<br />
-* <strong>Plain Go <code>a == b</code>:</strong> Выполняется за <strong>~1 наносекунду</strong>. Никаких аллокаций. Данные лежат в регистрах CPU или L1-кэше.<br />
-* <strong><code>assert.Equal(t, a, b)</code>:</strong> Выполняется за <strong>сотни наносекунд или микросекунды</strong> в зависимости от сложности структуры. Порождает аллокации, нагружает Garbage Collector.</p>
+<p>Сравним вычислительную стоимость:<br />
+* <strong>Plain Go <code>a == b</code>:</strong> Исполняется за <strong>~1 наносекунду</strong>. Ноль аллокаций. Данные остаются в регистрах CPU или кэше L1.<br />
+* <strong><code>assert.Equal(t, a, b)</code>:</strong> Исполняется за <strong>сотни наносекунд или микросекунды</strong>, порождает множественные аллокации в куче и нагружает Garbage Collector.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2293,37 +2327,43 @@ func TestCalculateDiscount_Assert(t *testing.T) {
   <pre class="mermaid">
 flowchart TD
 subgraph Plain [&quot;Plain Go подход&quot;]
-A[&quot;if a != b&quot;] --&gt;|&quot;Прямая инструкция CPU - CMP&quot;| B[&quot;Zero Allocations&lt;br&gt;Сверхвысокая скорость&quot;]
+P1[&quot;if a != b&quot;] --&gt;|&quot;Прямая инструкция CPU (CMP)&quot;| P2[&quot;Zero Allocations&lt;br/&gt;Выполнение за 1 ns в регистрах&quot;]
 end
 
-subgraph Assert [&quot;Assert библиотека&quot;]
-C[&quot;assert.Equal&quot;] --&gt;|&quot;Упаковка в interface{}&quot;| D[&quot;Аллокация в Heap&quot;]
-D --&gt;|&quot;reflect.DeepEqual&quot;| E[&quot;Рекурсивный обход типов&lt;br&gt;Динамическая диспетчеризация&quot;]
-E --&gt; F[&quot;Вызов t.Helper и t.Errorf&quot;]
+subgraph Assert [&quot;Библиотека Assert (testify)&quot;]
+A1[&quot;assert.Equal(got, want)&quot;] --&gt;|&quot;Упаковка в interface{} (eface)&quot;| A2[&quot;Аллокация структуры в Heap&quot;]
+A2 --&gt;|&quot;reflect.DeepEqual&quot;| A3[&quot;Рекурсивный обход метаданных типов&lt;br/&gt;Динамическая диспетчеризация&quot;]
+A3 --&gt; A4[&quot;t.Helper() + форматирование diff&quot;]
 end
 
-style Plain fill:#e6f3ff,stroke:#0066cc
-style Assert fill:#fff2e6,stroke:#ff9933
+classDef plain fill:#064e3b,stroke:#10b981,stroke-width:1px,color:#ecfdf5;
+classDef assert fill:#1e293b,stroke:#f59e0b,stroke-width:1px,color:#fbbf24;
+
+class P1,P2 plain;
+class A1,A2,A3,A4 assert;
   </pre>
 </div>
 
 
+<hr />
 <h3 id="vazhno-li-eto-dlya-testov">Важно ли это для тестов?</h3>
 
-<p>Для 99% модульных и интеграционных тестов — <strong>абсолютно не важно</strong>. Ваш тест скорее всего ходит в БД (что занимает миллисекунды), поэтому микросекунды, потраченные на рефлексию, теряются как капля в море. Экономия времени разработчика на написание и чтение тестов окупает затраты CPU.</p>
+<p>Для 99% интеграционных и функциональных тестов эта разница <strong>абсолютно несущественна</strong>. Если тест обращается к СУБД или делает сетевой запрос, операция занимает миллисекунды (тысячи микросекунд). Несколько микросекунд, потраченных на рефлексию <code>assert.Equal</code>, теряются в статистической погрешности сети. Экономия времени разработчика и читаемость кода многократно перевешивают затраты CPU.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Единственное место, где <strong>категорически запрещено</strong> использовать библиотеки вроде <code>testify</code> — это внутри цикла <code>b.N</code> в <strong>Benchmark-тестах</strong> (см. <a href="../02-testing-paket/10-benchmark-testy.html" class="wikilink">10. Benchmark тесты</a>). Если вы обернете результат функции в <code>assert.Equal</code> внутри бенчмарка, вы будете измерять не скорость вашего алгоритма, а скорость работы пакета <code>reflect</code> и давление на Garbage Collector, создаваемое самим ассертом. В бенчмарках используйте только Plain Go.</p>
+    <p>Единственное место, где применение assertion-библиотек <strong>категорически недопустимо</strong> — это адаптивный цикл <code>b.N</code> внутри <strong>Benchmark-тестов</strong> (см. главу <a href="../02-testing-paket/10-benchmark-testy.html" class="wikilink">10. Benchmark тесты</a>).<br />
+Если вы вызовете <code>assert.Equal</code> внутри цикла бенчмарка, вы будете измерять не скорость вашего сервиса, а накладные расходы пакета <code>reflect</code> и аллокации интерфейсов <code>eface</code>. В бенчмарках применяйте исключительно чистый Plain Go.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="anatomiya-pravilnogo-assert-khelpera">Анатомия правильного Assert-хелпера</h2>
 
-<p>Если вы все же решили написать собственный специализированный assert-хелпер (например, для проверки сложной доменной структуры, где <code>testify</code> выдает нечитаемый diff), помните про правило из статьи <a href="../02-testing-paket/7-helper-funktsii-i-t-helper.html" class="wikilink">7. Helper функции и t.Helper</a>.</p>
+<p>Если вам требуется написать собственный специализированный хелпер валидации для предметной области, объединяющий типобезопасность Plain Go с компактностью ассертов, используйте дженерики Go 1.18+ и метод <code>t.Helper()</code> (см. <a href="../02-testing-paket/7-helper-funktsii-i-t-helper.html" class="wikilink">7. Helper функции и t.Helper</a>):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2333,30 +2373,28 @@ style Assert fill:#fff2e6,stroke:#ff9933
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Идиоматичный доменный хелпер (Go 1.18+ с дженериками)
-func AssertUserValid[T any](t *testing.T, user *User) {
-    t.Helper() // КРИТИЧЕСКИ ВАЖНО для правильного Stack Trace
+  <pre class="language-go"><code class="language-go">// Идиоматичный доменный валидатор на дженериках
+func AssertValidEntity[T any](t *testing.T, entity T, isValid bool) {
+    t.Helper() // Обязательно исключаем хелпер из трассировки стека ошибок!
 
-    if user.ID &lt;= 0 {
-        t.Errorf(&quot;user ID must be positive, got %d&quot;, user.ID)
-    }
-    if user.Email == &quot;&quot; {
-        t.Errorf(&quot;user Email cannot be empty&quot;)
+    if !isValid {
+        t.Errorf(&quot;сущность типа %T не прошла валидацию инвариантов&quot;, entity)
     }
 }
 </code></pre>
 </div>
 
-<p>Использование дженериков <code>[T any]</code> в новых версиях Go позволяет писать типобезопасные хелперы, которые избегают аллокаций <code>interface{}</code>, объединяя скорость Plain Go с лаконичностью Assert-подхода.</p>
+<p>Параметризация через <code>[T any]</code> предотвращает избыточное боксирование в <code>interface{}</code>, сохраняя строгую типизацию на этапе компиляции.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Plain Go</strong> — это идиоматичный стандарт, продвигаемый создателями языка. Он заставляет писать тесты как обычный код, исключает "магию" и работает максимально быстро, без аллокаций.</li>
-<li><strong>Assert-библиотеки</strong> — это ответ индустрии на необходимость сокращения бойлерплейта. Они экономят часы разработки ценой использования рефлексии под капотом.</li>
-<li>В production-бэкенде абсолютным стандартом стало смешение подходов: базовые вещи (например, ошибки) проверяются через <code>require.NoError</code>, а сложная логика — через <code>assert.Equal</code>.</li>
-<li>В бенчмарках использование assert-ов под запретом из-за колоссального оверхеда рефлексии.</li>
+<li><strong>Plain Go</strong> — эталонный идиоматичный стиль Go. Он отвергает тяжеловесные DSL, трактует проверки как обычный код и работает с максимальной наносекундной скоростью без аллокаций памяти.</li>
+<li><strong>Assert-библиотеки (<code>testify</code>)</strong> — признанный промышленный стандарт для сокращения бойлерплейта при валидации сложных доменных моделей.</li>
+<li>В промышленном бэкенде принят сбалансированный гибридный подход: критические предусловия (проверки ошибок) отсекаются через <code>require.NoError</code>, а сопоставление полей сущностей производится через <code>assert.Equal</code>.</li>
+<li>В нагрузочных микро-бенчмарках использование сторонних ассертов строго запрещено из-за искажения замеров рефлексией.</li>
 </ol>
-<p>Поскольку <code>testify</code> стал де-факто индустриальным стандартом для Go-разработчиков, мы обязаны рассмотреть его инструментарий под микроскопом. В следующей статье мы подробно разберем его функционал, разницу пакетов и подводные камни сравнения сложных структур: <a href="2-testify-assert-i-require.html" class="wikilink">2. Testify. assert и require</a>.</p>
+<p>Поскольку библиотека <code>testify</code> де-факто стала вторым стандартным тестовым пакетом в Go, мы обязаны детально разобрать ее архитектуру и тонкости практического применения. Переходим к следующей главе: <a href="2-testify-assert-i-require.html" class="wikilink">2. Testify. assert и require</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
