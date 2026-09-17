@@ -2169,21 +2169,26 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">11. Пример benchmarking и анализ результатов</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статье <a href="10-benchmark-testy.html" class="wikilink">10. Benchmark тесты</a> мы разобрали теорию: как работает адаптивный цикл <code>b.N</code>, как изолировать время инициализации и почему количество аллокаций (allocs/op) часто важнее чистой скорости (ns/op).</p>
-<p>Теория мертва без практики. Сегодня мы наденем халат хирурга, возьмем типичную задачу из бэкенда, напишем для нее наивный код, измерим его, а затем шаг за шагом оптимизируем до состояния Zero-Allocation, заглядывая под капот рантайма Go. </p>
+            <p>В предыдущей главе <a href="10-benchmark-testy.html" class="wikilink">10. Benchmark тесты</a> мы детально исследовали фундаментальную теорию: как устроен адаптивный цикл <code>b.N</code>, как изолировать накладные расходы инициализации через сброс таймеров и почему метрика аллокаций (<code>allocs/op</code>) часто важнее чистой скорости исполнения (<code>ns/op</code>).</p>
+<p>Однако теория без реальной практики мертва. Сегодня мы наденем халат инженера-исследователя, возьмем классическую повседневную задачу бэкенда, напишем наивную реализацию, препарируем ее в бенчмарках, а затем последовательно оптимизируем алгоритм до состояния практически нулевых аллокаций (Near-Zero Allocation), изучая поведение рантайма Go под микроскопом.</p>
+<hr />
 <h2 id="zadacha-sborka-id-dlya-sql-zaprosa">Задача: Сборка ID для SQL-запроса</h2>
 
-<p><strong>Сценарий:</strong> Вы пишете метод репозитория. К вам приходит слайс <code>[]int{10, 42, 999, ...}</code> (например, ID пользователей). Вам нужно склеить их в строку <code>"10,42,999"</code> для подстановки в SQL-условие <code>WHERE id IN (...)</code>.</p>
+<p><strong>Типичный производственный сценарий:</strong> В метод репозитория передается срез целочисленных идентификаторов:<br />
+<code>[]int{10, 42, 999, ...}</code><br />
+Задача сервиса — сформировать компактную строку вида <code>"10,42,999"</code> для динамической подстановки в SQL-предикат:<br />
+<code>WHERE id IN (...)</code></p>
+<hr />
 <h3 id="iteratsiya-1-naivnyy-podkhod-uroven-junior">Итерация 1: Наивный подход (Уровень Junior)</h3>
 
-<p>Самое очевидное решение — использовать оператор <code>+</code> для конкатенации строк внутри цикла.</p>
+<p>Самое естественное решение, которое пишет начинающий программист — последовательное сложение строк через оператор <code>+</code> внутри цикла:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2193,11 +2198,11 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// concat.go
-package optimize
+  <pre class="language-go"><code class="language-go">package optimize
 
 import &quot;strconv&quot;
 
+// BuildIDsNaive — наивная сборка через конкатенацию строк
 func BuildIDsNaive(ids []int) string {
     var res string
     for i, id := range ids {
@@ -2211,7 +2216,7 @@ func BuildIDsNaive(ids []int) string {
 </code></pre>
 </div>
 
-<p>Напишем для него бенчмарк:</p>
+<p>Спроектируем строгий бенчмарк для замера производительности:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2221,18 +2226,17 @@ func BuildIDsNaive(ids []int) string {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// concat_test.go
-package optimize_test
+  <pre class="language-go"><code class="language-go">package optimize_test
 
 import (
     &quot;testing&quot;
-    &quot;myproject/optimize&quot; // Импортируем наш пакет
+    &quot;myproject/optimize&quot;
 )
 
 var Result string // Защита от Dead Code Elimination (DCE)
 
 func BenchmarkBuildIDsNaive(b *testing.B) {
-    // 1. Инициализация (не входит в зачет)
+    // 1. Предварительная инициализация тестового набора
     ids := make([]int, 1000)
     for i := range ids {
         ids[i] = i
@@ -2242,7 +2246,7 @@ func BenchmarkBuildIDsNaive(b *testing.B) {
     b.ReportAllocs()
 
     var r string
-    // 2. Измеряемый цикл
+    // 2. Измеряемый адаптивный цикл
     for i := 0; i &lt; b.N; i++ {
         r = optimize.BuildIDsNaive(ids)
     }
@@ -2251,7 +2255,21 @@ func BenchmarkBuildIDsNaive(b *testing.B) {
 </code></pre>
 </div>
 
-<p><strong>Результат <code>go test -bench=Naive -benchmem</code>:</strong></p>
+<p>Запускаем профилирование командой:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -bench=Naive -benchmem
+</code></pre>
+</div>
+
+<p><strong>Протокол измерений:</strong></p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2265,12 +2283,14 @@ func BenchmarkBuildIDsNaive(b *testing.B) {
 </code></pre>
 </div>
 
-<p><strong>Анализ:</strong> 88 микросекунд на 1000 элементов. Полмегабайта (515 KB) аллоцированной памяти и 1999 объектов в куче (Heap) на <em>каждый</em> вызов функции! Если этот метод вызывается 1000 раз в секунду, ваш сервис будет генерировать 500 МБ мусора в секунду, уничтожая производительность постоянными запусками сборщика мусора (GC).</p>
-<p><strong>Mechanical Sympathy (Почему так плохо?):</strong> Строки в Go <strong>иммутабельны (immutable)</strong>. Когда вы делаете <code>res += ","</code>, процессор не добавляет байт в конец существующей строки. Рантайм Go вынужден выделить в куче новый блок памяти, скопировать туда старую строку и добавить новый символ. На 1000 элементов это происходит 1999 раз (для чисел и для запятых), создавая квадратичную сложность копирования памяти ($O(N^2)$).</p>
+<h3 id="analiz-katastrofy">Анализ катастрофы:</h3>
+<p>88 микросекунд на скромную тысячу чисел. Более полумегабайта (515 КБ) аллоцированной динамической памяти и <strong>1 999 отдельных объектов в куче</strong> на каждый вызов метода! Если в высоконагруженном сервисе такой запрос выполняется 1 000 раз в секунду, метод будет генерировать более 500 МБ мусора ежесекундно, гарантированно парализуя работу сервиса паузами Garbage Collector.</p>
+<p><strong>Mechanical Sympathy (Механическое сочувствие к памяти):</strong><br />
+Строка (<code>string</code>) в Go является неизменяемой структурой данных (<strong>immutable</strong>). Когда код выполняет инструкцию <code>res += ","</code>, рантайм Go не может дописать символ в конец существующего буфера. Он вынужден выделить в куче новый блок памяти, скопировать туда все предыдущие байты и дописать новый символ. На 1 000 элементов это перевыделение происходит 1 999 раз, порождая квадратичную вычислительную сложность по объему копируемой памяти ($O(N^2)$).</p>
 <hr />
 <h3 id="iteratsiya-2-strings-builder-uroven-middle">Итерация 2: strings.Builder (Уровень Middle)</h3>
 
-<p>Раз строки иммутабельны, нам нужен мутабельный буфер. В стандартной библиотеке для этого есть <code>strings.Builder</code>.</p>
+<p>Поскольку строки неизменяемы, для накопления данных требуется изменяемый буфер в памяти. В стандартном пакете <code>strings</code> для этого существует специализированная структура <code>strings.Builder</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2280,7 +2300,12 @@ func BenchmarkBuildIDsNaive(b *testing.B) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import &quot;strings&quot;
+  <pre class="language-go"><code class="language-go">package optimize
+
+import (
+    &quot;strconv&quot;
+    &quot;strings&quot;
+)
 
 func BuildIDsBuilder(ids []int) string {
     var b strings.Builder
@@ -2295,7 +2320,7 @@ func BuildIDsBuilder(ids []int) string {
 </code></pre>
 </div>
 
-<p><strong>Результат бенчмарка:</strong></p>
+<p><strong>Результаты повторного бенчмарка:</strong></p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2309,27 +2334,30 @@ func BuildIDsBuilder(ids []int) string {
 </code></pre>
 </div>
 
-<p><strong>Анализ:</strong> Скорость выросла в 14 раз! Потребление памяти упало в 25 раз. Но у нас всё еще ~1000 аллокаций. Откуда они берутся?<br />
-1. Внутренний буфер <code>strings.Builder</code> динамически расширяется (подобно слайсу через <code>append</code>). Когда емкости не хватает, он выделяет в два раза больше памяти и копирует данные. Это дает около 12 аллокаций.<br />
-2. <code>strconv.Itoa(id)</code> возвращает <code>string</code>. Каждое число превращается в новую строку, которая аллоцируется в куче (Escape Analysis не может удержать ее на стеке, так как она передается в метод интерфейса или "утекает"). Это дает ровно 1000 аллокаций.</p>
+<h3 id="analiz-uluchsheniy">Анализ улучшений:</h3>
+<p>Время выполнения сократилось в 14 раз (с 88 мкс до 6.3 мкс), а объем потребляемой памяти уменьшился в 25 раз! Однако счетчик аллокаций по-прежнему показывает 1 012 операций на вызов. Откуда берутся эти аллокации?<br />
+1. Внутренний срез структуры <code>strings.Builder</code> динамически растет по алгоритму <code>append</code>. При исчерпании емкости рантайм выделяет новый вдвое больший массив и копирует данные (около 12 аллокаций). Это можно оптимизировать вызовом <code>.Grow()</code> (метод <code>Grow()</code>).<br />
+2. Функция <code>strconv.Itoa(id)</code> возвращает <code>string</code>. Каждое число преобразуется в отдельный строковый объект, который аллоцируется в куче, создавая 1 000 лишних аллокаций.</p>
+<hr />
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Магия b.String()</span>
   </div>
   <div class="callout-body">
-    <p>Почему мы используем <code>strings.Builder</code>, а не <code>bytes.Buffer</code>?<br />
-Если вы посмотрите в исходники пакета <code>strings</code>, метод <code>String()</code> реализован так:<br />
+    <p>Почему в современном Go для конкатенации строк всегда выбирают <code>strings.Builder</code>, а не устаревший <code>bytes.Buffer</code>?<br />
+Если заглянуть в исходный код стандартной библиотеки, реализация метода <code>String()</code> у <code>strings.Builder</code> выглядит так:<br />
 <code>return unsafe.String(unsafe.SliceData(b.buf), len(b.buf))</code><br />
-Он берет внутренний байтовый слайс <code>buf</code> и через <code>unsafe</code> заставляет рантайм считать его строкой <strong>без копирования памяти</strong> (Zero-Copy). <code>bytes.Buffer.String()</code> так не умеет и всегда делает копию.</p>
+Метод берет внутренний срез байтов <code>buf</code> и через возможности пакета <code>unsafe</code> формирует заголовок строки <code>string</code>, ссылающийся <strong>на тот же самый сегмент памяти без создания копии (Zero-Copy)</strong>!<br />
+В то же время метод <code>bytes.Buffer.String()</code> такого трюка сделать не может: он обязан выделить новую память и побайтово скопировать буфер, гарантируя изоляцию.</p>
   </div>
 </div>
 
 <hr />
 <h3 id="iteratsiya-3-pred-allokatsiya-i-byte-slice-uroven-senior">Итерация 3: Пред-аллокация и byte slice (Уровень Senior)</h3>
 
-<p>Мы знаем длину массива. Мы можем предсказать примерный размер итоговой строки: в среднем около 4 символов на число + запятая = 5 байт на элемент. <br />
-Мы используем метод <code>Grow()</code> у билдера, чтобы избежать динамического расширения, и заменим аллоцирующий <code>strconv.Itoa</code> на <code>strconv.AppendInt</code>, который пишет числа прямо в существующий байтовый слайс!</p>
+<p>Мы знаем точное количество элементов в срезе. Мы можем оценить среднюю длину числа: в среднем 4 символа на ID + 1 запятая = 5 байт на элемент.<br />
+Мы применим предварительную аллокацию среза байтов <code>make([]byte, 0, cap)</code> (где <code>capacity := len(ids) * 5</code>) и заменим аллоцирующий вызов <code>strconv.Itoa</code> на функцию <code>strconv.AppendInt</code>, которая дописывает текстовые байты числа напрямую в существующий срез без единой аллокации!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2339,30 +2367,32 @@ func BuildIDsBuilder(ids []int) string {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func BuildIDsZeroAlloc(ids []int) string {
-    // Предрасчет емкости
-    // 5 байт на ID - это эвристика. Если ID длинные, можно взять больше.
+  <pre class="language-go"><code class="language-go">package optimize
+
+import &quot;strconv&quot;
+
+func BuildIDsZeroAlloc(ids []int) string {
+    // 1. Предварительный расчет емкости буфера
     capacity := len(ids) * 5 
 
-    // Используем сырой слайс байтов для работы с AppendInt
+    // 2. Выделение единого непрерывного буфера в памяти
     buf := make([]byte, 0, capacity)
 
     for i, id := range ids {
-        // AppendInt пишет байты числа прямо в конец buf БЕЗ аллокаций
+        // strconv.AppendInt форматирует число прямо в конец buf БЕЗ аллокаций!
         buf = strconv.AppendInt(buf, int64(id), 10)
         if i &lt; len(ids)-1 {
             buf = append(buf, ',')
         }
     }
 
-    // Итоговая конвертация []byte -&gt; string вызовет ровно ОДНУ аллокацию
-    // для обеспечения иммутабельности строки.
+    // 3. Единственная контролируемая аллокация для создания итоговой строки
     return string(buf) 
 }
 </code></pre>
 </div>
 
-<p><strong>Результат бенчмарка:</strong></p>
+<p><strong>Результаты финального бенчмарка:</strong></p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2376,7 +2406,8 @@ func BuildIDsBuilder(ids []int) string {
 </code></pre>
 </div>
 
-<p><strong>Анализ:</strong> Мы добились <strong>1 аллокации</strong> (итоговая строка) и ускорили изначальный код в <strong>55 раз</strong>. Мы полностью избавились от давления на Garbage Collector.</p>
+<h3 id="analiz-pobedy">Анализ победы:</h3>
+<p>Мы добились <strong>ровно 1 аллокации</strong> на весь вызов (под итоговую строку) и ускорили исходный код в <strong>55 раз</strong>! Нагрузка на сборщик мусора сведена к абсолютному минимуму.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2391,52 +2422,60 @@ func BuildIDsBuilder(ids []int) string {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Входящий []int&quot;] --&gt; B[&quot;make-byte, 0, 5000-&quot;]
+A[&quot;Входной срез []int (1000 ID)&quot;] --&gt; B[&quot;make([]byte, 0, 5000)&quot;]
 
-subgraph Iteration [&quot;Цикл (Без аллокаций)&quot;]
-B --&gt;|strconv.AppendInt| C[&quot;buf: &#x27;10&#x27;&quot;]
-C --&gt;|append-&#x27;-&#x27;-| D[&quot;buf: &#x27;10,&#x27;&quot;]
+subgraph ZeroAllocLoop [&quot;Цикл без аллокаций в памяти&quot;]
+B --&gt; C[&quot;strconv.AppendInt(buf, id, 10)&quot;]
+C --&gt; D[&quot;buf = append(buf, &#x27;,&#x27;)&quot;]
 end
 
-Iteration --&gt;|Цикл завершен| E[&quot;string-buf-&quot;]
-E --&gt;|&quot;Единственная аллокация&lt;br&gt;в Heap (8KB)&quot;| F[&quot;Result string&quot;]
+ZeroAllocLoop --&gt; E[&quot;Завершение обхода&quot;]
+E --&gt; F[&quot;Конвертация string(buf)&quot;]
+F --&gt; G[&quot;Итоговая строка (Единственная аллокация 8 KB в куче)&quot;]
 
-style B fill:#e6f3ff,stroke:#0066cc
-style E fill:#fff2e6,stroke:#ff9933
-style F fill:#ccffcc,stroke:#009900
+classDef proc fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+classDef loop fill:#0f172a,stroke:#f59e0b,stroke-width:1px,color:#fbbf24;
+classDef win fill:#064e3b,stroke:#10b981,stroke-width:1px,color:#ecfdf5;
+
+class A,B,E proc;
+class ZeroAllocLoop,C,D loop;
+class F,G win;
   </pre>
 </div>
 
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Можно ли избавиться вообще от всех аллокаций и сделать 0 allocs/op в этом кейсе?<br />
-<strong>Ответ:</strong> Да. В Go 1.20+ добавили функцию <code>unsafe.String(&amp;buf[0], len(buf))</code>. Она превратит наш байтовый слайс в строку без аллокации копии. <strong>Но делать это категорически опасно</strong>, если вы передадите этот буфер куда-то еще или измените его, так как вы нарушите иммутабельность строк в Go, что приведет к трудноотловимым глитчам в памяти (Data Corruption). Одной предсказуемой аллокации <code>string(buf)</code> для production-кода более чем достаточно.</p>
+    <p><strong>Вопрос:</strong> Можно ли полностью избавиться от последней аллокации и получить абсолютные <code>0 allocs/op</code> в этой задаче?<br />
+<strong>Ответ:</strong> Технически — да. В Go 1.20+ доступна функция <code>unsafe.String(&amp;buf[0], len(buf))</code>. Она возвращает строку, напрямую оборачивающую переданный срез байтов <code>buf</code> без аллокации в куче.<br />
+<strong>Однако в промышленном коде это сопряжено с колоссальным риском!</strong> Если кто-либо сохранит ссылку на исходный слайс <code>buf</code> и модифицирует его байты, нарушится фундаментальная гарантия неизменяемости строк в Go, что приведет к непредсказуемым гонкам данных и разрушению памяти (Memory Corruption). Использование канонической конвертации <code>string(buf)</code> с одной чистой аллокацией является образцом надежности для production-бэкенда.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="benchstat-nauchnyy-podkhod-k-izmereniyam">benchstat: Научный подход к измерениям</h2>
 
-<p>Senior-инженер никогда не говорит: «Я запустил бенчмарк, и код стал быстрее на глаз». В многозадачных ОС (Linux, macOS) на результаты тестов влияют фоновые процессы, троттлинг процессора от перегрева и работа планировщика.</p>
-<p>Чтобы доказать свою правоту в Pull Request, вы должны использовать утилиту <strong><code>benchstat</code></strong> (разрабатывается командой Go). Она использует статистические методы (U-критерий Манна — Уитни), чтобы исключить погрешности (шум).</p>
-<p><strong>Как это работает:</strong></p>
+<p>Зрелый инженер никогда не опирается на субъективные ощущения вроде «по-моему, стало работать быстрее». В реальных операционных системах на единичный прогон влияют десятки фоновых факторов: прерывания ядра, троттлинг ядер от перегрева и переключение контекста.</p>
+<p>Для строгого доказательства эффективности оптимизаций в Pull Request используется официальная утилита <strong><code>benchstat</code></strong>, разработанная командой Go. Она применяет методы математической статистики (U-критерий Манна — Уитни) для отсечения случайных флуктуаций.</p>
+<h3 id="reglament-provedeniya-statisticheskogo-zamera">Регламент проведения статистического замера:</h3>
+
 <ol>
-<li>Сохраняем результаты старого кода (минимум 10 прогонов для статистики):<br />
+<li><strong>Замер старой версии (серия из 10 запусков):</strong><br />
 <code>bash
    go test -bench=BenchmarkBuildIDsBuilder -benchmem -count=10 &gt; old.txt</code></li>
-<li>Сохраняем результаты нового кода:<br />
+<li><strong>Замер оптимизированной версии (серия из 10 запусков):</strong><br />
 <code>bash
    go test -bench=BenchmarkBuildIDsZeroAlloc -benchmem -count=10 &gt; new.txt</code></li>
-<li>Сравниваем:<br />
+<li><strong>Статистическое сравнение через benchstat:</strong><br />
 <code>bash
    benchstat old.txt new.txt</code></li>
 </ol>
-<p><strong>Пример вывода benchstat:</strong></p>
+<p><strong>Итоговый отчет benchstat:</strong></p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2457,27 +2496,27 @@ BuildIDs-10            1.01k ± 0%     1.00 ± 0%  -99.90%  (p=0.000 n=10+10)
 </code></pre>
 </div>
 
-<p>Метрика <strong><code>p=0.000</code></strong> (P-value) означает, что статистическая значимость изменений абсолютна (изменение реально, а не является системным шумом). Улучшение производительности составило 75%, а количество аллокаций упало на 99.9%. Вы великолепны.</p>
+<p>Значение <strong><code>p=0.000</code></strong> (P-value) математически доказывает, что наблюдаемая разница статистически достоверна и не является результатом системного шума. Прирост скорости составил 75%, а число аллокаций сократилось на 99.9%!</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Перед запуском бенчмарков с флагом <code>-count=10</code> обязательно закройте браузер, Docker-контейнеры и Slack. Любой "тяжелый" процесс, проснувшийся во время тестов, создаст всплеск latency, который <code>benchstat</code> определит как аномалию (outlier).</p>
+    <p>Перед запуском бенчмарков с флагом <code>-count=10</code> обязательно закройте браузеры, IDE-индексаторы и тяжелые Docker-контейнеры. Внезапный скачок фоновой нагрузки процессора приведет к статистическому выбросу (Outlier), исказив дисперсию в расчетах <code>benchstat</code>. Также не забывайте проверять корректность работы функций через обычные модульные проверки (<code>if got != want</code>).</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Наивная конкатенация строк в циклах убивает производительность бэкенда за счет квадратичного роста аллокаций.</li>
-<li><code>strings.Builder</code> решает проблему иммутабельности строк, но использование его без <code>.Grow()</code> и в связке с возвращающими строки функциями (<code>strconv.Itoa</code>) все равно создает мусор.</li>
-<li>Истинный Zero-Allocation (минимальный) достигается комбинацией пред-аллоцированного слайса байтов (<code>make([]byte, 0, cap)</code>) и функций типа <code>strconv.AppendInt</code>.</li>
-<li>Для доказательства оптимизаций всегда используйте <code>benchstat</code> с <code>-count=10</code>, а не одиночные запуски.</li>
+<li>Конкатенация строк через оператор <code>+</code> в циклах — верный способ обрушить пропускную способность сервиса за счет квадратичного роста аллокаций.</li>
+<li><code>strings.Builder</code> кардинально ускоряет работу, однако без предварительного резервирования памяти через <code>.Grow()</code> и в сочетании с аллоцирующими утилитами (<code>strconv.Itoa</code>) продолжает нагружать GC.</li>
+<li>Профессиональный уровень оптимизации достигается предварительным расчетом емкости среза байтов (<code>make([]byte, 0, cap)</code>) и использованием inplace-форматирования через <code>strconv.AppendInt</code>.</li>
+<li>Любые оптимизации производительности обязаны доказываться статистически через утилиту <code>benchstat</code> на выборках не менее 10 прогонов (<code>-count=10</code>).</li>
 </ol>
-<p>Мы закончили разбор встроенного инструментария пакета <code>testing</code>. Мы научились структурировать тесты, запускать их параллельно, бороться с нестабильностью и выжимать из процессора каждую наносекунду. </p>
-<p>Но стандартные <code>if got != want</code> иногда становятся слишком громоздкими, особенно при сравнении сложных вложенных структур. В следующем разделе мы поговорим о том, как сделать код тестов чище и выразительнее с помощью сторонних инструментов: <a href="../03-assertions-i-tooling/1-assert-podkhod-vs-plain-go.html" class="wikilink">1. Assert подход vs plain Go</a>.</p>
+<p>Мы полностью завершили глубокое погружение в возможности стандартного пакета <code>testing</code>. Мы изучили архитектуру раннера, параллелизм, работу с ресурсами и микропрофилирование. Однако при проверке сложных структур стандартные условные операторы <code>if got != want</code> могут разрастаться в громоздкие блоки кода. В следующем подразделе мы рассмотрим современные библиотеки ассертов и сопоставим их с чистым стилем Go: <a href="../03-assertions-i-tooling/1-assert-podkhod-vs-plain-go.html" class="wikilink">1. Assert подход vs plain Go</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2505,7 +2544,7 @@ BuildIDs-10            1.01k ± 0%     1.00 ± 0%  -99.90%  (p=0.000 n=10+10)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#zadacha-sborka-id-dlya-sql-zaprosa">Задача: Сборка ID для SQL-запроса</a></li><li class="toc-item toc-h3"><a href="#iteratsiya-1-naivnyy-podkhod-uroven-junior">Итерация 1: Наивный подход (Уровень Junior)</a></li><li class="toc-item toc-h3"><a href="#iteratsiya-2-strings-builder-uroven-middle">Итерация 2: strings.Builder (Уровень Middle)</a></li><li class="toc-item toc-h3"><a href="#iteratsiya-3-pred-allokatsiya-i-byte-slice-uroven-senior">Итерация 3: Пред-аллокация и byte slice (Уровень Senior)</a></li><li class="toc-item toc-h2"><a href="#benchstat-nauchnyy-podkhod-k-izmereniyam">benchstat: Научный подход к измерениям</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#zadacha-sborka-id-dlya-sql-zaprosa">Задача: Сборка ID для SQL-запроса</a></li><li class="toc-item toc-h3"><a href="#iteratsiya-1-naivnyy-podkhod-uroven-junior">Итерация 1: Наивный подход (Уровень Junior)</a></li><li class="toc-item toc-h3"><a href="#analiz-katastrofy">Анализ катастрофы:</a></li><li class="toc-item toc-h3"><a href="#iteratsiya-2-strings-builder-uroven-middle">Итерация 2: strings.Builder (Уровень Middle)</a></li><li class="toc-item toc-h3"><a href="#analiz-uluchsheniy">Анализ улучшений:</a></li><li class="toc-item toc-h3"><a href="#iteratsiya-3-pred-allokatsiya-i-byte-slice-uroven-senior">Итерация 3: Пред-аллокация и byte slice (Уровень Senior)</a></li><li class="toc-item toc-h3"><a href="#analiz-pobedy">Анализ победы:</a></li><li class="toc-item toc-h2"><a href="#benchstat-nauchnyy-podkhod-k-izmereniyam">benchstat: Научный подход к измерениям</a></li><li class="toc-item toc-h3"><a href="#reglament-provedeniya-statisticheskogo-zamera">Регламент проведения статистического замера:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

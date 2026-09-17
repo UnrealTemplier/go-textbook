@@ -2169,26 +2169,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~20 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Параллельные тесты t.Parallel</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Если ваш CI/CD пайплайн выполняется дольше пяти минут, вы теряете деньги бизнеса и фокус разработчиков. В бэкенде микросервисы часто обращаются к базам данных, внешним API и файловой системе. Тесты становятся I/O-bound (ограниченными вводом-выводом). Запускать такие тесты последовательно — значит заставлять современный многоядерный процессор простаивать в ожидании сетевых ответов.</p>
-<p>В Go параллелизм тестов встроен прямо в стандартную библиотеку. Всего один вызов метода <code>t.Parallel()</code> способен сократить время прогона тестов в десятки раз. Но эта мощь требует идеальной изоляции состояния и понимания того, как работает рантайм.</p>
-<p>В этой статье мы разберем механику <code>t.Parallel()</code>, ловушки планировщика и архитектурные антипаттерны, которые приводят к плавающим (flaky) багам.</p>
+            <p>Медленный тестовый сьют — это скрытый и безжалостный налог на продуктивность инженерной команды. Если сборка и тестирование в CI/CD занимают пятнадцать-двадцать минут, разработчики перестают прогонять тесты локально, теряют фокус и отправляют изменения наугад. В современных микросервисах значительная часть сценариев упирается во взаимодействие с базами данных, внешними API и сетевыми сокетами — тесты становятся выраженно I/O-bound. Заставлять современный многоядерный процессор простаивать в ожидании ответов от сетевого стека — непозволительная роскошь.</p>
+<p>В стандартной библиотеке Go параллелизм тестов реализован на уровне ядра тулчейна. Вызов метода <code>t.Parallel()</code> способен сократить время прогона тестового набора в разы. Однако многопоточная среда не прощает ошибок: она мгновенно обнажает любые дефекты изоляции, разделяемого состояния и координации ресурсов.</p>
+<p>В этой главе мы препарируем устройство метода <code>t.Parallel()</code>, разберем двухфазную диспетчеризацию рантайма и изучим правила безопасного параллельного исполнения тестов.</p>
+<hr />
 <h2 id="kak-rabotaet-t-parallel-pod-kapotom">Как работает t.Parallel() под капотом</h2>
 
-<p>Многие разработчики ошибочно полагают, что <code>t.Parallel()</code> мгновенно порождает новую горутину и продолжает выполнение. Это не так. Рантайм пакета <code>testing</code> жестко разделяет выполнение на две фазы: <strong>Последовательную</strong> (Sequential) и <strong>Параллельную</strong> (Parallel).</p>
-<p>Когда вы запускаете <code>go test</code>, все тесты по умолчанию запускаются последовательно.</p>
-<p>Если внутри теста вызывается <code>t.Parallel()</code>, происходит следующее:<br />
-1. Вызов помечает текущий тест как "параллельный".<br />
-2. Рантайм вызывает <code>runtime.Goexit()</code>. Выполнение текущей горутины <strong>мгновенно приостанавливается</strong> (замораживается), а сам тест помещается во внутреннюю очередь (queue).<br />
-3. Планировщик тестов переходит к выполнению следующего последовательного теста в пакете.<br />
-4. Только когда <strong>все</strong> последовательные тесты (или фазы) в пакете завершат свою работу, рантайм разблокирует очередь параллельных тестов.<br />
-5. Параллельные тесты запускаются конкурентно в новых горутинах. Максимальное количество одновременно работающих тестов ограничено флагом <code>-parallel</code> (по умолчанию равно значению <code>GOMAXPROCS</code>, то есть количеству ядер CPU).</p>
+<p>Распространенное заблуждение среди новичков: вызов <code>t.Parallel()</code> якобы просто запускает новую горутину и немедленно продолжает выполнение сценария. В реальности всё устроено значительно строже. Движок пакета <code>testing</code> четко разделяет процесс тестирования пакета на две изолированные фазы: <strong>Последовательную (Sequential Phase)</strong> и <strong>Конкурентную (Parallel Phase)</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2203,47 +2197,73 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Start[&quot;go test&quot;] --&gt; SeqPhase[&quot;Последовательная фаза&quot;]
+Start[&quot;Запуск go test в пакете&quot;] --&gt; SeqPhase[&quot;Фаза 1: Последовательное исполнение&quot;]
 
-SeqPhase --&gt; T1[&quot;TestA&lt;br&gt;Обычный тест&quot;]
-SeqPhase --&gt; T2[&quot;TestB&lt;br&gt;вызывает t.Parallel&quot;]
-SeqPhase --&gt; T3[&quot;TestC&lt;br&gt;вызывает t.Parallel&quot;]
-SeqPhase --&gt; T4[&quot;TestD&lt;br&gt;Обычный тест&quot;]
+SeqPhase --&gt; T1[&quot;TestA (Обычный тест)&lt;br/&gt;Выполняется немедленно&quot;]
+SeqPhase --&gt; T2[&quot;TestB (вызывает t.Parallel)&lt;br/&gt;Остановка через runtime.Goexit()&quot;]
+SeqPhase --&gt; T3[&quot;TestC (вызывает t.Parallel)&lt;br/&gt;Остановка через runtime.Goexit()&quot;]
+SeqPhase --&gt; T4[&quot;TestD (Обычный тест)&lt;br/&gt;Выполняется немедленно&quot;]
 
-T2 --&gt;|&quot;Приостановка runtime.Goexit&quot;| Queue[&quot;Очередь параллельных тестов&quot;]
-T3 --&gt;|&quot;Приостановка runtime.Goexit&quot;| Queue
+T2 --&gt;|&quot;Парковка горутины&quot;| Queue[&quot;Очередь отложенных параллельных тестов&quot;]
+T3 --&gt;|&quot;Парковка горутины&quot;| Queue
 
-T1 --&gt; Wait[&quot;Ожидание завершения&lt;br&gt;всех последовательных тестов&quot;]
+T1 --&gt; Wait[&quot;Ожидание завершения&lt;br/&gt;всех последовательных сценариев&quot;]
 T4 --&gt; Wait
 
-Wait --&gt;|&quot;Запуск конкурентной фазы&quot;| ParPhase[&quot;Параллельная фаза&lt;br&gt;Лимит одновременных: GOMAXPROCS&quot;]
+Wait --&gt;|&quot;Все последовательные тесты завершены&quot;| ParPhase[&quot;Фаза 2: Конкурентное исполнение&lt;br/&gt;Лимит одновременных: GOMAXPROCS&quot;]
 Queue --&gt; ParPhase
 
-ParPhase --&gt; P_T2[&quot;TestB возобновлен&quot;]
-ParPhase --&gt; P_T3[&quot;TestC возобновлен&quot;]
+ParPhase --&gt; P_T2[&quot;TestB: Возобновление горутины&quot;]
+ParPhase --&gt; P_T3[&quot;TestC: Возобновление горутины&quot;]
 
-style SeqPhase fill:#fff2e6,stroke:#ff9933
-style ParPhase fill:#e6f3ff,stroke:#0066cc
-style Queue fill:#f9f9f9,stroke:#666
+classDef phase fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#38bdf8;
+classDef test fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+classDef queue fill:#1e293b,stroke:#f59e0b,stroke-width:1px,color:#fbbf24;
+
+class SeqPhase,ParPhase phase;
+class T1,T4,P_T2,P_T3 test;
+class Queue queue;
   </pre>
 </div>
 
 
+<h3 id="anatomiya-dvukhfaznogo-progona">Анатомия двухфазного прогона:</h3>
+
+<ol>
+<li><strong>Маркировка и парковка:</strong> Когда внутри теста вызывается <code>t.Parallel()</code>, рантайм Go вызывает низкоуровневую функцию <code>runtime.Goexit()</code>. Горутина текущего теста немедленно замораживается и помещается в очередь ожидания параллельных тестов.</li>
+<li><strong>Последовательный прогон:</strong> Диспетчер тестов переходит к следующему тесту в пакете. Все тесты без вызова <code>t.Parallel()</code> выполняются строго по очереди.</li>
+<li><strong>Активация параллельного пула:</strong> Только когда <strong>все</strong> последовательные тесты пакета успешно или аварийно завершились, раннер открывает шлюз для очереди параллельных тестов.</li>
+<li><strong>Конкурентное пробуждение:</strong> Отложенные тесты пробуждаются и начинают выполняться конкурентно в пуле горутин.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Что значит ограничение <code>-parallel</code>? <br />
-Представьте, что у вас 1000 тестов с <code>t.Parallel()</code>, а у процессора 8 ядер (<code>GOMAXPROCS=8</code>). Пакет <code>testing</code> не создаст 1000 горутин сразу, чтобы не спровоцировать "шторм" (Goroutine storm) и не исчерпать ресурсы (например, пул подключений к БД). Он использует семафор (канал с буфером 8). Только 8 тестов будут физически выполняться одновременно. Когда один завершается, его место занимает следующий из очереди.</p>
+    <p>Что именно ограничивает флаг <code>-parallel</code>?<br />
+Представьте, что в крупном монорепозитории 1 000 тестов вызывают <code>t.Parallel()</code>, а на сервере доступно 8 процессорных ядер (<code>GOMAXPROCS=8</code>). Пакет <code>testing</code> не выбрасывает 1 000 горутин в планировщик одновременно, чтобы не вызвать лавину переключений контекста (Goroutine Storm) и не исчерпать файловые дескрипторы сокетов.<br />
+Рантайм использует внутренний семафор (буферизованный канал емкостью <code>GOMAXPROCS</code>). Одновременно в активной фазе исполнения находятся максимум 8 горутин. По мере завершения одного теста семафор освобождает слот для следующего. Вы можете изменить этот лимит через флаг командной строки:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -parallel 16 ./...
+</code></pre>
+</div>
+
   </div>
 </div>
 
+<hr />
 <h2 id="pravilnoe-ispolzovanie-s-t-run-subtests">Правильное использование с t.Run (Subtests)</h2>
 
-<p>Самый частый сценарий использования <code>t.Parallel()</code> — внутри табличных тестов (Table Driven Tests). Но здесь кроется нюанс с областью видимости и иерархией.</p>
-<p>Чтобы подтесты выполнялись параллельно друг другу, нужно вызвать <code>t.Parallel()</code> <strong>внутри</strong> замыкания <code>t.Run</code>.</p>
+<p>Самый популярный сценарий применения <code>t.Parallel()</code> — распараллеливание строк в табличных тестах (Table-Driven Tests). Здесь критически важно понимать иерархию вызовов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2254,10 +2274,10 @@ style Queue fill:#f9f9f9,stroke:#666
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestProcessor(t *testing.T) {
-    // 1. Опционально: делаем сам родительский тест параллельным
+    // 1. Делаем родительский тест параллельным по отношению к другим тестам пакета
     t.Parallel() 
 
-    tests := []struct{
+    tests := []struct {
         name  string
         input string
     }{
@@ -2267,10 +2287,9 @@ style Queue fill:#f9f9f9,stroke:#666
 
     for _, tt := range tests {
         t.Run(tt.name, func(t *testing.T) {
-            // 2. Делаем подтесты параллельными между собой
+            // 2. Делаем подтесты параллельными между собой!
             t.Parallel() 
 
-            // Выполнение логики
             process(tt.input) 
         })
     }
@@ -2278,22 +2297,23 @@ style Queue fill:#f9f9f9,stroke:#666
 </code></pre>
 </div>
 
-<p><strong>Mechanical Sympathy этого паттерна:</strong><br />
-Если вы не вызовете <code>t.Parallel()</code> в родительском тесте (пункт 1), <code>TestProcessor</code> запустится в последовательной фазе, дойдет до цикла, зарегистрирует все подтесты как параллельные и... <strong>заблокируется</strong>, ожидая их завершения. Да, подтесты "case 1" и "case 2" будут работать параллельно друг другу, но следующий верхнеуровневый тест в файле не начнется, пока <code>TestProcessor</code> не завершится. <br />
-Добавление <code>t.Parallel()</code> в корень теста позволяет планировщику отложить весь этот блок целиком и не блокировать другие тесты пакета.</p>
+<h3 id="mekhanicheskoe-sochuvstvie-mechanical-sympathy-ierarkhii">Механическое сочувствие (Mechanical Sympathy) иерархии:</h3>
+<p>Если вы не вызовете <code>t.Parallel()</code> на уровне родительской функции <code>TestProcessor</code> (строка 1), родительский тест будет выполняться в последовательной фазе. Дойдя до цикла <code>for</code>, он зарегистрирует все параллельные подтесты и <strong>заблокируется</strong>, ожидая их полного окончания.<br />
+Хотя подтесты <code>"case 1"</code> и <code>"case 2"</code> будут работать конкурентно между собой, следующий независимый тест в пакете не начнется, пока <code>TestProcessor</code> целиком не завершит работу. Объявление родителя параллельным позволяет раннеру отложить весь тестовый узел целиком, не задерживая последовательный пайплайн.</p>
+<hr />
 <h2 id="lovushki-konkurentnosti">Ловушки конкурентности</h2>
 
-<p>Когда ваш код начинает работать параллельно, любые архитектурные огрехи немедленно приводят к состоянию гонки (Data Race).</p>
+<p>Как только тесты начинают выполняться одновременно, любые изъяны архитектуры мгновенно превращаются в гонки данных (Data Races).</p>
 <h3 id="1-peremennaya-tsikla-loop-closure-bug">1. Переменная цикла (Loop Closure Bug)</h3>
 
-<p>Как мы упоминали в статье про табличные тесты, в версиях Go до 1.22 замыкание переменной цикла в асинхронной функции приводит к тому, что все тесты используют последнее значение итератора.</p>
+<p>Классическая ловушка замкнутой переменной цикла в кодовых базах, написанных до версии Go 1.22:</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Если вы поддерживаете legacy-проект на Go 1.21 и ниже:</p>
+    <p>Если вы поддерживаете проекты на Go 1.21 или более старых версиях:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2304,43 +2324,61 @@ style Queue fill:#f9f9f9,stroke:#666
     </button>
   </div>
   <pre class="language-go"><code class="language-go">for _, tt := range tests {
-    tt := tt // КРИТИЧЕСКИ ВАЖНО для Go &lt; 1.22
+    tt := tt // КРИТИЧЕСКИ НЕОБХОДИМО для версий Go &lt; 1.22!
     t.Run(tt.name, func(t *testing.T) {
         t.Parallel()
-        // Использование tt
+        process(tt)
     })
 }
 </code></pre>
 </div>
 
-<p>В Go 1.22+ семантика <code>for</code> изменилась, и переменная <code>tt</code> пересоздается на каждой итерации автоматически. Костыль больше не нужен, но на собеседованиях об этом всё ещё спрашивают.</p>
+<p>Без затенения <code>tt := tt</code> все горутины, замороженные вызовом <code>t.Parallel()</code>, захватывали единственный адрес переменной <code>tt</code>. К моменту их пробуждения цикл уже заканчивался, и абсолютно все горутины читали значение последней итерации!<br />
+В <strong>Go 1.22+</strong> переменная цикла <code>tt</code> создается заново на каждом шаге цикла <code>for</code>, навсегда устранив эту проблему.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="2-t-setenv-i-globalnoe-sostoyanie-sredy">2. t.Setenv и глобальное состояние среды</h3>
 
-<p>Тестирование конфигураций часто требует изменения переменных окружения. В Go 1.17 добавили метод <code>t.Setenv()</code>, который безопасно меняет переменную и возвращает её в исходное состояние после теста.</p>
-<p>Но переменные окружения ОС — это глобальное состояние всего процесса.</p>
+<p>Тестирование парсеров конфигурации часто требует изменения переменных окружения процесса. Стандартный метод <code>t.Setenv()</code> меняет переменную и гарантирует ее возврат в исходное состояние после теста.</p>
+<p>Однако переменные среды в ОС — это единая глобальная таблица дескрипторов (<code>os.Environ</code>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдет, если вызвать <code>t.Setenv("KEY", "VAL")</code> в тесте, который помечен как <code>t.Parallel()</code>?<br />
-<strong>Ответ:</strong> Тест немедленно завершится с <strong>паникой</strong> (<code>panic: testing: t.Setenv called after t.Parallel</code>). <br />
-Рантайм Go защищает вас от Data Race на уровне ядра ОС. Если два параллельных теста попытаются одновременно изменить <code>os.Environ</code>, они перезапишут данные друг друга, что приведет к недетерминированному поведению. <strong>Правило:</strong> Тесты, меняющие переменные окружения или глобальные переменные в памяти (Singleton), должны запускаться только последовательно.</p>
+    <p><strong>Вопрос:</strong> Что произойдет, если вызвать <code>t.Setenv("KEY", "VAL")</code> (или <code>t.Setenv</code>) внутри теста, который уже помечен как <code>t.Parallel()</code>?<br />
+<strong>Ответ:</strong> Рантайм Go немедленно прервет тест фатальной паникой:<br />
+<code>panic: testing: t.Setenv called after t.Parallel</code>.<br />
+Рантайм Go защищает программиста от гонок данных на уровне адресного пространства операционной системы. Если два параллельных теста попытаются одновременно изменить окружение через <code>os.Environ</code>, они перезапишут чужие данные и сломают логику соседей.<br />
+<strong>Правило:</strong> Любые тесты, изменяющие переменные окружения или глобальные синглтоны в памяти, обязаны запускаться <strong>строго последовательно</strong>.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="3-obshchie-io-resursy-i-porty">3. Общие I/O ресурсы и порты</h3>
 
-<p>Если ваши параллельные интеграционные тесты поднимают HTTP-сервер, вы не можете использовать фиксированный порт (например, <code>8080</code>). Второй запустившийся тест упадет с ошибкой <code>bind: address already in use</code>.<br />
-Всегда используйте эфемерные порты ОС (<code>:0</code>), как мы обсуждали в разделе про изоляцию. То же самое касается временных файлов — используйте <code>t.TempDir()</code>, чтобы каждый параллельный тест имел свою изолированную песочницу на диске.</p>
+<p>Если параллельные интеграционные тесты поднимают локальный сетевой слушатель, использование фиксированного порта вроде <code>8080</code> приведет к гарантированному падению второго теста с ошибкой ядра:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">bind: address already in use
+</code></pre>
+</div>
+
+<p>Всегда используйте динамические эфемерные порты (<code>:0</code>), позволяя операционной системе назначить свободный сокет. Аналогично, при работе с диском используйте метод <code>t.TempDir()</code>, выделяющий каждому тесту изолированную временную песочницу на файловой системе.</p>
+<hr />
 <h2 id="teardown-defer-vs-t-cleanup-v-parallelnoy-srede">Teardown: defer vs t.Cleanup в параллельной среде</h2>
 
-<p>Это самая частая причина утечки ресурсов (например, незакрытых соединений с БД) в CI-пайплайнах на Go.</p>
-<p>Посмотрите на этот код:</p>
+<p>Это главная причина утечек дескрипторов соединений и внезапных падений в CI-пайплайнах:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2352,25 +2390,31 @@ style Queue fill:#f9f9f9,stroke:#666
   </div>
   <pre class="language-go"><code class="language-go">func TestWithDB(t *testing.T) {
     db := startTestDB()
-    defer db.Close() // ОШИБКА АРХИТЕКТУРЫ
+    defer db.Close() // АРХИТЕКТУРНЫЙ КРАХ!
 
     t.Run(&quot;parallel query 1&quot;, func(t *testing.T) {
         t.Parallel()
-        db.Query(&quot;...&quot;)
+        db.Query(&quot;SELECT 1&quot;)
     })
 
     t.Run(&quot;parallel query 2&quot;, func(t *testing.T) {
         t.Parallel()
-        db.Query(&quot;...&quot;)
+        db.Query(&quot;SELECT 2&quot;)
     })
 }
 </code></pre>
 </div>
 
-<p>Поскольку подтесты вызывают <code>t.Parallel()</code>, они замораживают свое выполнение через <code>runtime.Goexit()</code>. Родительский тест <code>TestWithDB</code> мгновенно завершает выполнение своего тела, так как все его подтесты отложены. <br />
-Что происходит при завершении функции? Вызывается <code>defer db.Close()</code>.<br />
-База данных закрывается <strong>ДО</strong> того, как подтесты физически начнут выполняться. Когда рантайм разбудит подтесты в параллельной фазе, они попытаются сделать <code>db.Query</code> в закрытое соединение и упадут.</p>
-<p><strong>Идиоматичное решение:</strong></p>
+<h3 id="mekhanika-sboya">Механика сбоя:</h3>
+<ol>
+<li>Вызовы <code>t.Parallel()</code> внутри подтестов немедленно замораживают их горутины через <code>runtime.Goexit()</code>.</li>
+<li>Функция <code>t.Run</code> возвращает управление родителю <code>TestWithDB</code>.</li>
+<li>Поскольку все дочерние тесты отложены, функция <code>TestWithDB</code> достигает своего конца и завершается.</li>
+<li>При выходе из стека срабатывает <code>defer db.Close()</code>. База данных закрыта!</li>
+<li>Позже, в конкурентной фазе, планировщик будит подтесты, они вызывают <code>db.Query</code> в закрытый пул и падают с ошибкой <code>sql: database is closed</code>.</li>
+</ol>
+<h3 id="idiomatichnoe-reshenie-cherez-t-cleanup">Идиоматичное решение через t.Cleanup:</h3>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2383,26 +2427,31 @@ style Queue fill:#f9f9f9,stroke:#666
   <pre class="language-go"><code class="language-go">func TestWithDB(t *testing.T) {
     db := startTestDB()
 
-    // t.Cleanup гарантированно дождется завершения 
-    // ВСЕХ параллельных подтестов перед выполнением.
+    // t.Cleanup гарантированно вызывается ТОЛЬКО после того,
+    // как завершатся ВСЕ параллельные подтесты
     t.Cleanup(func() {
-        db.Close()
+        _ = db.Close()
     })
-    // ...
+
+    t.Run(&quot;parallel query 1&quot;, func(t *testing.T) {
+        t.Parallel()
+        db.Query(&quot;SELECT 1&quot;)
+    })
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><code>t.Parallel()</code> разделяет прогон тестов на последовательную и конкурентную фазы, останавливая горутину через <code>runtime.Goexit()</code>.</li>
-<li>Максимальный параллелизм ограничен <code>GOMAXPROCS</code> (или флагом <code>-parallel</code>), предотвращая истощение ресурсов ОС.</li>
-<li>Для параллельных табличных тестов в старых версиях Go (&lt; 1.22) обязательно теневое копирование переменной итератора (<code>tt := tt</code>).</li>
-<li>Параллельные тесты не совместимы с мутацией глобального состояния (<code>t.Setenv</code>, глобальные переменные, статические порты).</li>
-<li>При использовании <code>t.Parallel()</code> в подтестах, очистка ресурсов родителя должна выполняться строго через <code>t.Cleanup</code>, а не <code>defer</code>.</li>
+<li><code>t.Parallel()</code> разделяет прогон на последовательную и параллельную фазы, паркуя горутины вызовом <code>runtime.Goexit()</code>.</li>
+<li>Лимит одновременно работающих тестов регулируется переменной <code>GOMAXPROCS</code> и флагом <code>-parallel</code>.</li>
+<li>В табличных тестах на версиях Go до 1.22 обязателен шэдоуинг переменной цикла (<code>tt := tt</code>).</li>
+<li>Параллельные тесты несовместимы с мутацией глобального состояния процесса (<code>t.Setenv</code>, статические порты <code>8080</code>).</li>
+<li>В тестах с параллельными подтестами освобождение ресурсов родителя выполняется исключительно через <code>t.Cleanup</code>, а не <code>defer</code>.</li>
 </ol>
-<p>Мы разобрались, как управлять потоком выполнения, запускать подтесты и распараллеливать нагрузку. Но по мере роста тестовой базы вы начнете писать вспомогательные утилиты для генерации данных и проверок. Как сделать так, чтобы эти утилиты не ломали навигацию по ошибкам в IDE? Об этом — в следующей статье: <a href="7-helper-funktsii-i-t-helper.html" class="wikilink">7. Helper функции и t.Helper</a>.</p>
+<p>По мере масштабирования кодовой базы ваши тесты обрастут вспомогательными функциями для генерации сущностей и верификации данных. Как научить тулчейн правильно отображать стек вызовов при падении внутри таких утилит? Об этом пойдет речь в следующей главе: <a href="7-helper-funktsii-i-t-helper.html" class="wikilink">7. Helper функции и t.Helper</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2430,7 +2479,7 @@ style Queue fill:#f9f9f9,stroke:#666
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#kak-rabotaet-t-parallel-pod-kapotom">Как работает t.Parallel() под капотом</a></li><li class="toc-item toc-h2"><a href="#pravilnoe-ispolzovanie-s-t-run-subtests">Правильное использование с t.Run (Subtests)</a></li><li class="toc-item toc-h2"><a href="#lovushki-konkurentnosti">Ловушки конкурентности</a></li><li class="toc-item toc-h3"><a href="#1-peremennaya-tsikla-loop-closure-bug">1. Переменная цикла (Loop Closure Bug)</a></li><li class="toc-item toc-h3"><a href="#2-t-setenv-i-globalnoe-sostoyanie-sredy">2. t.Setenv и глобальное состояние среды</a></li><li class="toc-item toc-h3"><a href="#3-obshchie-io-resursy-i-porty">3. Общие I/O ресурсы и порты</a></li><li class="toc-item toc-h2"><a href="#teardown-defer-vs-t-cleanup-v-parallelnoy-srede">Teardown: defer vs t.Cleanup в параллельной среде</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#kak-rabotaet-t-parallel-pod-kapotom">Как работает t.Parallel() под капотом</a></li><li class="toc-item toc-h3"><a href="#anatomiya-dvukhfaznogo-progona">Анатомия двухфазного прогона:</a></li><li class="toc-item toc-h2"><a href="#pravilnoe-ispolzovanie-s-t-run-subtests">Правильное использование с t.Run (Subtests)</a></li><li class="toc-item toc-h3"><a href="#mekhanicheskoe-sochuvstvie-mechanical-sympathy-ierarkhii">Механическое сочувствие (Mechanical Sympathy) иерархии:</a></li><li class="toc-item toc-h2"><a href="#lovushki-konkurentnosti">Ловушки конкурентности</a></li><li class="toc-item toc-h3"><a href="#1-peremennaya-tsikla-loop-closure-bug">1. Переменная цикла (Loop Closure Bug)</a></li><li class="toc-item toc-h3"><a href="#2-t-setenv-i-globalnoe-sostoyanie-sredy">2. t.Setenv и глобальное состояние среды</a></li><li class="toc-item toc-h3"><a href="#3-obshchie-io-resursy-i-porty">3. Общие I/O ресурсы и порты</a></li><li class="toc-item toc-h2"><a href="#teardown-defer-vs-t-cleanup-v-parallelnoy-srede">Teardown: defer vs t.Cleanup в параллельной среде</a></li><li class="toc-item toc-h3"><a href="#mekhanika-sboya">Механика сбоя:</a></li><li class="toc-item toc-h3"><a href="#idiomatichnoe-reshenie-cherez-t-cleanup">Идиоматичное решение через t.Cleanup:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

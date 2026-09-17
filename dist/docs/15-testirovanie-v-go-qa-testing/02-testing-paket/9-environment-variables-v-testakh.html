@@ -2169,24 +2169,25 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">9. Environment variables в тестах</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Любое бэкенд-приложение зависит от конфигурации. Мы передаем ключи доступа к AWS, адреса баз данных, уровни логирования и флаги (feature toggles) через переменные окружения (Environment Variables). Это стандарт де-факто (The Twelve-Factor App). </p>
-<p>Но когда дело доходит до тестирования, переменные окружения превращаются в архитектурный кошмар. Переменные окружения — это <strong>глобальное мутабельное состояние</strong>, разделяемое между всеми горутинами в рамках одного процесса операционной системы. </p>
-<p>В этой статье мы разберем, как безопасно тестировать код, зависящий от конфигурации, как рантайм Go защищает вас от выстрела в ногу, и почему <code>os.Getenv</code> глубоко в бизнес-логике — это преступление против тестируемости.</p>
+            <p>Любое зрелое бэкенд-приложение зависит от динамической конфигурации. Мы передаем учетные данные баз данных, токены авторизации, флаги фичей и уровни журналирования через переменные окружения операционной системы (Environment Variables). Методология двенадцати факторов (The Twelve-Factor App) возвела этот подход в абсолютный стандарт современной облачной разработки.</p>
+<p>Однако в контексте автоматизированного тестирования переменные окружения — это волк в овечьей шкуре. С точки зрения архитектуры рантайма переменные среды представляют собой <strong>разделяемое глобальное мутабельное состояние</strong>, доступное абсолютно всем потокам и горутинам в рамках текущего процесса ОС. Попытка небрежно мутировать это состояние в конкурентных тестах мгновенно оборачивается плавающими багами и повреждением данных.</p>
+<p>В этой главе мы препарируем устройство системных переменных окружения, разберем возможности метода <code>t.Setenv()</code>, поймем природу защитных паник в рантайме Go и сформулируем канонический архитектурный паттерн работы с конфигурацией.</p>
+<hr />
 <h2 id="anatomiya-peremennykh-okruzheniya">Анатомия переменных окружения</h2>
 
-<p>С точки зрения операционной системы (будь то Linux, macOS или Windows), переменные окружения — это массив строк формата <code>KEY=VALUE</code>, который передается процессу при его запуске через системный вызов (например, <code>execve</code> в POSIX-системах). </p>
-<p>Этот массив (Environment Block) копируется в адресное пространство процесса (в User Space). </p>
-<p>Когда вы вызываете <code>os.Getenv</code> или <code>os.Setenv</code> в Go, вы обращаетесь к этой области памяти. Операция записи (<code>setenv</code>) не является потокобезопасной на уровне стандарта C POSIX, поэтому рантайм Go вынужден использовать внутренние глобальные блокировки (<code>sync.RWMutex</code> внутри пакета <code>syscall</code>), чтобы избежать Segmentation Fault при конкурентном доступе.</p>
+<p>С точки зрения ядра операционной системы (Linux, macOS, Windows) окружение процесса — это массив указателей на нуль-терминированные строки формата <code>KEY=VALUE</code>. Этот массив формируется ядром при порождении процесса системным вызовом <code>execve</code> и копируется в адресное пространство процесса (User Space).</p>
+<p>Когда в Go-коде вызываются стандартные функции <code>os.Getenv</code> или <code>os.Setenv</code>, они обращаются именно к этой общей области памяти. Системная операция записи <code>setenv</code> в стандарте C POSIX исторически не является потокобезопасной. Чтобы предотвратить аппаратные сбои (Segmentation Fault) при одновременном чтении и записи строк окружения из конкурирующих потоков, рантайм Go вынужден использовать глобальную блокировку <code>sync.RWMutex</code> внутри низкоуровневого пакета <code>syscall</code>.</p>
+<hr />
 <h2 id="nasledie-temnye-veka-do-go-1-17">Наследие: Темные века до Go 1.17</h2>
 
-<p>Раньше, чтобы протестировать функцию, которая читает конфиг из <code>os.Getenv</code>, разработчикам приходилось писать тонны хрупкого бойлерплейта:</p>
+<p>До выхода Go 1.17 тестирование модулей, считывающих конфигурацию через <code>os.Getenv</code>, требовало громоздких и хрупких ручных манипуляций:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2196,15 +2197,22 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Старый способ работы с env (До Go 1.17)
+  <pre class="language-go"><code class="language-go">package config_test
+
+import (
+    &quot;os&quot;
+    &quot;testing&quot;
+)
+
+// АНТИПАТТЕРН: Ручное восстановление окружения (до Go 1.17)
 func TestLegacyEnv(t *testing.T) {
-    // 1. Сохраняем старое значение
+    // 1. Запоминаем исходное состояние
     oldDBHost, exists := os.LookupEnv(&quot;DB_HOST&quot;)
 
-    // 2. Устанавливаем новое для теста
+    // 2. Мутируем окружение для текущего теста
     os.Setenv(&quot;DB_HOST&quot;, &quot;localhost:5432&quot;)
 
-    // 3. Гарантируем возврат состояния
+    // 3. Пытаемся гарантировать возврат состояния через defer
     defer func() {
         if exists {
             os.Setenv(&quot;DB_HOST&quot;, oldDBHost)
@@ -2213,15 +2221,16 @@ func TestLegacyEnv(t *testing.T) {
         }
     }()
 
-    // Выполняем тест...
+    // Тестирование функции чтения конфигурации...
 }
 </code></pre>
 </div>
 
-<p>Этот код не только уродлив, он опасен. Если вы забудете восстановить переменную, все последующие тесты в пакете начнут подключаться к <code>localhost:5432</code> и падать с ошибками сети. </p>
+<p>Этот паттерн не просто уродлив и загроможден бойлерплейтом — он опасен. Если разработчик допускал ошибку в блоке очистки, переменная <code>DB_HOST</code> оставалась равной <code>localhost:5432</code>, и все последующие независимые тесты пакета начинали ломиться в локальную базу данных, падая с таймаутами сети.</p>
+<hr />
 <h2 id="sovremennyy-standart-t-setenv">Современный стандарт: t.Setenv()</h2>
 
-<p>Начиная с Go 1.17, стандартная библиотека забрала эту боль на себя. Метод <code>t.Setenv(key, value)</code> делает ровно то, что мы писали выше, но элегантно и безопасно.</p>
+<p>Начиная с релиза Go 1.17, стандартная библиотека взяла управление окружением на себя. Метод <code>t.Setenv(key, value)</code> (или <code>t.Setenv</code>) решает задачу мутации в одну строчку с автоматической гарантией отката:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2232,13 +2241,13 @@ func TestLegacyEnv(t *testing.T) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestModernEnv(t *testing.T) {
-    // t.Setenv автоматически сохраняет старое значение 
-    // и восстанавливает его после завершения теста (через t.Cleanup)
+    // t.Setenv автоматически фиксирует исходное значение
+    // и регистрирует безусловный откат через t.Cleanup()
     t.Setenv(&quot;DB_HOST&quot;, &quot;localhost:5432&quot;)
 
     host := os.Getenv(&quot;DB_HOST&quot;)
     if host != &quot;localhost:5432&quot; {
-        t.Fatalf(&quot;unexpected host: %s&quot;, host)
+        t.Fatalf(&quot;Неожиданное значение хоста: %s&quot;, host)
     }
 }
 </code></pre>
@@ -2250,15 +2259,16 @@ func TestLegacyEnv(t *testing.T) {
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Как работает <code>t.Setenv</code>?<br />
-Когда вы вызываете этот метод, структура <code>testing.T</code> запоминает, что вы изменили переменную. Внутри себя она регистрирует функцию восстановления через <code>t.Cleanup()</code>. </p>
-<p>Более того, <code>t.Setenv</code> отслеживает <strong>первичное</strong> состояние переменной. Если вы вызовете <code>t.Setenv("KEY", "A")</code>, а потом <code>t.Setenv("KEY", "B")</code> в одном и том же тесте, при очистке рантайм восстановит изначальное состояние (до "A"), а не промежуточное. Это гарантирует абсолютную изоляцию.</p>
+    <p>Как устроен метод <code>t.Setenv</code> изнутри?<br />
+При первом обращении структура <code>testing.T</code> запоминает первичное состояние целевой переменной и регистрирует функцию восстановления в стеке финализации <code>t.Cleanup()</code>.  </p>
+<p>Более того, алгоритм учитывает цепочки перезаписи: если в рамках одного теста последовательно вызвать <code>t.Setenv("KEY", "A")</code>, а затем <code>t.Setenv("KEY", "B")</code>, в момент завершения теста рантайм восстановит то первоначальное состояние, которое существовало <strong>до вызова "A"</strong>, а не промежуточное "B". Это гарантирует абсолютную стерильность последующих тестов.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="lovushka-t-parallel-i-t-setenv">Ловушка: t.Parallel() и t.Setenv()</h2>
 
-<p>Здесь начинается хардкорная инженерия. Что произойдет, если вы захотите ускорить выполнение и запустите тесты с подменой окружения параллельно?</p>
+<p>А теперь исследуем границу между многопоточностью и глобальным состоянием. Что произойдет, если попытаться совместить распараллеливание тестов с подменой переменных среды?</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2269,8 +2279,8 @@ func TestLegacyEnv(t *testing.T) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestConfigParallel(t *testing.T) {
-    t.Parallel() // Включаем конкурентность
-    t.Setenv(&quot;LOG_LEVEL&quot;, &quot;DEBUG&quot;) // ОШИБКА! ПАНИКА!
+    t.Parallel() // Запуск теста в конкурентной фазе
+    t.Setenv(&quot;LOG_LEVEL&quot;, &quot;DEBUG&quot;) // АРХИТЕКТУРНЫЙ КРАХ!
     // ...
 }
 </code></pre>
@@ -2282,17 +2292,20 @@ func TestLegacyEnv(t *testing.T) {
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Вызов <code>t.Setenv()</code> в тесте, который помечен как <code>t.Parallel()</code>, вызывает немедленную панику: <code>panic: testing: t.Setenv called after t.Parallel</code>.</p>
-<p><strong>Почему авторы Go так жестоки?</strong><br />
-Представьте, что рантайм разрешил бы это. Тест A ставит <code>LOG_LEVEL=DEBUG</code>, а Тест B, бегущий на другом ядре CPU, в этот же момент ставит <code>LOG_LEVEL=ERROR</code>. Так как переменные окружения — это глобальный словарь всего процесса ОС, возникает классическое состояние гонки (Data Race). Тест A прочитал бы <code>ERROR</code> вместо <code>DEBUG</code> и упал. <br />
-В Go "panicking early" — это философия дизайна. Лучше уронить тест сразу с четким сообщением, чем позволить инженеру тратить часы на поиск плавающего (flaky) бага в CI.</p>
+    <p>Попытка вызова <code>t.Setenv()</code> внутри теста, помеченного как <code>t.Parallel()</code>, немедленно прерывает выполнение фатальной паникой:<br />
+<code>panic: testing: t.Setenv called after t.Parallel</code>.</p>
+<p><strong>Почему создатели Go пошли на такой бескомпромиссный шаг?</strong><br />
+Представьте, что рантайм разрешил бы одновременное изменение окружения. Тест A устанавливает флаг <code>LOG_LEVEL=DEBUG</code> (<code>DEBUG</code>), а параллельный Тест B на соседнем процессорном ядре выставляет <code>LOG_LEVEL=ERROR</code> (<code>ERROR</code>). Поскольку блок окружения <code>os.Environ</code> глобален для всего адресного пространства процесса ОС, Тест A считывает <code>ERROR</code> вместо ожидаемого <code>DEBUG</code> и завершается ложным сбоем.<br />
+Философия Go требует раннего падения (Fail Fast): лучше сразу уронить тест с однозначным диагностическим сообщением, чем обрекать инженеров на многочасовую ловлю мигающих багов в CI/CD пайплайнах.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="arkhitekturnyy-vykhod-dependency-injection-di">Архитектурный выход: Dependency Injection (DI)</h2>
 
-<p>Как тогда тестировать конкурентный код? Ответ прост: <strong>ваш код вообще не должен знать о существовании <code>os.Getenv</code></strong>.</p>
-<p>Чтение переменных окружения в случайных местах бизнес-логики — это антипаттерн (Hidden Dependency). Функция, которая делает системный вызов для получения конфига, становится привязанной к глобальному состоянию ОС.</p>
+<p>Как же тогда тестировать сервисы конкурентно на всех доступных ядрах процессора?<br />
+Фундаментальный ответ: <strong>бизнес-логика вообще не должна знать о существовании вызова <code>os.Getenv</code></strong>!</p>
+<p>Прямой вызов системных функций чтения окружения в глубине доменных сервисов — это антипаттерн скрытой зависимости (Hidden Dependency). Он намертво привязывает чистую бизнес-логику к состоянию операционной системы.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2307,27 +2320,33 @@ func TestLegacyEnv(t *testing.T) {
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph Bad[&quot;Плохой дизайн: Связность с ОС&quot;]
-App1[&quot;func ProcessData&quot;] --&gt;|&quot;os.Getenv-DB_HOST-&quot;| OS[&quot;OS Environment Block&lt;br&gt;Глобальное состояние&quot;]
+subgraph Bad[&quot;Плохой дизайн: Жесткая связность с ОС&quot;]
+App1[&quot;Функция ProcessData()&quot;] --&gt;|&quot;Прямой вызов os.Getenv(&#x27;DB_HOST&#x27;)&quot;| OS[&quot;Таблица окружения ОС&lt;br/&gt;(Глобальное мутабельное состояние)&quot;]
 end
 
-subgraph Good[&quot;Тестируемый дизайн: DI&quot;]
-Main[&quot;func main&quot;] --&gt;|&quot;Читает os.Getenv 1 раз&quot;| Config[&quot;struct Config&quot;]
-Config --&gt;|&quot;Инжектится явно&quot;| App2[&quot;func ProcessData-cfg Config-&quot;]
+subgraph Good[&quot;Чистый дизайн: Внедрение зависимостей (DI)&quot;]
+Main[&quot;main.go / пакет config&quot;] --&gt;|&quot;Чтение os.Getenv 1 раз на старте&quot;| Config[&quot;Типизированная структура Config&quot;]
+Config --&gt;|&quot;Передача через конструктор&quot;| App2[&quot;Функция ProcessData(cfg Config)&quot;]
 end
 
-style OS fill:#ffe6e6,stroke:#cc0000
-style Config fill:#e6f3ff,stroke:#0066cc
+classDef bad fill:#7f1d1d,stroke:#f87171,stroke-width:1px,color:#fff;
+classDef good fill:#064e3b,stroke:#10b981,stroke-width:1px,color:#ecfdf5;
+classDef block fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+
+class OS bad;
+class Config good;
+class App1,App2,Main block;
   </pre>
 </div>
 
 
+<hr />
 <h3 id="pravilnyy-pattern-raboty-s-konfiguratsiey">Правильный паттерн работы с конфигурацией</h3>
 
 <ol>
-<li><strong>Единая точка входа:</strong> Переменные окружения читаются ровно один раз при старте приложения (в <code>main.go</code> или пакете <code>config</code>).</li>
-<li><strong>Парсинг в структуру:</strong> Данные перекладываются в строго типизированную структуру <code>Config</code> (с использованием библиотек типа <code>envconfig</code> или <code>viper</code>).</li>
-<li><strong>DI:</strong> Эта структура передается во все компоненты приложения как зависимость.</li>
+<li><strong>Единая точка сборки:</strong> Переменные окружения парсятся ровно один раз при старте процесса в <code>main.go</code> или специализированном пакете <code>config</code>.</li>
+<li><strong>Типизация данных:</strong> Значения валидируются и преобразуются в типизированную структуру <code>Config</code> (с помощью проверенных библиотек вроде <code>envconfig</code> или <code>viper</code>).</li>
+<li><strong>Внедрение через конструктор:</strong> Созданный объект <code>cfg Config</code> передается компонентам как явная зависимость.</li>
 </ol>
 
 <div class="code-block" data-lang="go">
@@ -2338,13 +2357,17 @@ style Config fill:#e6f3ff,stroke:#0066cc
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// 1. Типизированный конфиг
+  <pre class="language-go"><code class="language-go">package service
+
+import &quot;testing&quot;
+
+// 1. Строго типизированная конфигурация
 type Config struct {
-    DBHost string
+    DBHost   string
     LogLevel string
 }
 
-// 2. Бизнес-логика зависит ТОЛЬКО от структуры
+// 2. Бизнес-компонент зависит только от интерфейса или структуры данных
 type Service struct {
     cfg Config
 }
@@ -2353,48 +2376,55 @@ func NewService(cfg Config) *Service {
     return &amp;Service{cfg: cfg}
 }
 
-func (s *Service) DoWork() string {
-    return &quot;Connecting to &quot; + s.cfg.DBHost
+func (s *Service) ConnectionString() string {
+    return &quot;postgres://&quot; + s.cfg.DBHost
 }
 
-// 3. Тест становится простым и параллельным
-func TestService_DoWork(t *testing.T) {
-    t.Parallel() // Теперь это АБСОЛЮТНО безопасно
+// 3. Тест становится предельно простым, изолированным и параллельным!
+func TestService_ConnectionString(t *testing.T) {
+    t.Parallel() // Полная безопасность при конкурентном прогоне!
 
-    // Конструируем любое окружение прямо в памяти
-    svc := NewService(Config{
-        DBHost: &quot;test-db:5432&quot;,
+    // Создаем тестовую конфигурацию локально на стеке горутины:
+    testCfg := Config{
+        DBHost:   &quot;test-cluster:5432&quot;,
         LogLevel: &quot;DEBUG&quot;,
-    })
+    }
 
-    got := svc.DoWork()
-    if got != &quot;Connecting to test-db:5432&quot; {
-        t.Errorf(&quot;unexpected output: %s&quot;, got)
+    svc := NewService(testCfg)
+    got := svc.ConnectionString()
+    want := &quot;postgres://test-cluster:5432&quot;
+
+    if got != want {
+        t.Fatalf(&quot;ConnectionString() = %s; want %s&quot;, got, want)
     }
 }
 </code></pre>
 </div>
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между использованием глобального <code>var Cfg *Config</code> и инъекцией <code>cfg Config</code> в конструкторы?<br />
-<strong>Ответ:</strong> Использование глобальной переменной <code>Cfg</code> (даже если она прочитана из переменных окружения один раз) переносит проблему на уровень памяти Go. Конкурентные тесты, изменяющие поля <code>Cfg.DBHost</code>, вызовут Data Race в куче (Heap), а не в ядре ОС. <code>go test -race</code> немедленно поймает это. Инъекция зависимости (DI) позволяет каждому подтесту создать свой собственный, локальный на стеке экземпляр конфига, гарантируя 100% изоляцию и максимальную скорость выполнения через <code>t.Parallel()</code>.</p>
+    <p><strong>Вопрос:</strong> В чем заключается опасность паттерна с глобальной переменной <code>var Cfg *Config</code> по сравнению с явной передачей <code>cfg Config</code> в конструктор?<br />
+<strong>Ответ:</strong> Использование глобального указателя <code>var Cfg *Config</code> переносит проблему из системного блока окружения ОС в общую кучу памяти (Heap) рантайма Go.<br />
+Если параллельные тесты начнут одновременно модифицировать поля вроде <code>Cfg.DBHost</code>, в кодовой базе возникнет гонка данных в памяти. Инструмент <code>go test -race</code> немедленно зафиксирует Data Race.<br />
+Явная передача конфигурации (DI) позволяет каждому тесту формировать собственный независимый экземпляр <code>Config</code> на стеке, гарантируя 100% изоляцию и беспрепятственное масштабирование через <code>t.Parallel()</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Переменные окружения — это глобальное состояние процесса. Работа с ними в тестах требует осторожности.</li>
-<li>Используйте <code>t.Setenv()</code> для безопасной мутации и автоматической очистки окружения.</li>
-<li>Рантайм Go намеренно роняет тесты, если вы комбинируете <code>t.Setenv()</code> и <code>t.Parallel()</code>, чтобы защитить вас от Data Race.</li>
-<li>Единственный правильный способ работы с конфигурацией — парсить <code>os.Getenv</code> на самом верху приложения и передавать параметры через Dependency Injection. Это отвязывает бизнес-логику от ОС и позволяет распараллелить 100% тестов.</li>
+<li>Переменные окружения операционной системы представляют собой разделяемое глобальное состояние процесса, не предназначенное для частых конкурентных мутаций.</li>
+<li>Для последовательных тестов метод <code>t.Setenv()</code> обеспечивает безопасную подмену значений с автоматическим возвратом исходного состояния через <code>t.Cleanup()</code>.</li>
+<li>Комбинация <code>t.Setenv()</code> и <code>t.Parallel()</code> намеренно заблокирована рантаймом через вызов <code>panic</code>, предотвращая неуловимые гонки данных.</li>
+<li>Профессиональный архитектурный стандарт: считывать окружение единожды на границе приложения и передавать параметры через Dependency Injection. Это освобождает тесты от зависимости от ОС и делает их полностью параллельными.</li>
 </ol>
-<p>На этом мы завершаем разбор функционального тестирования в пакете <code>testing</code>. Вы научились изолировать тесты, управлять потоком выполнения, работать с IO и конфигурацией. Но бэкенд на Go должен работать не только правильно, но и быстро. Пришло время перейти к инструментам оценки производительности. В следующей статье мы разберем: <a href="10-benchmark-testy.html" class="wikilink">10. Benchmark тесты</a>.</p>
+<p>На этом мы завершаем фундаментальный цикл функционального тестирования в пакете <code>testing</code>. Мы изучили жизненный цикл тестов, табличный дизайн, изоляцию файлов, горутины и конфигурацию. Однако серверный Go обязан быть не просто корректным, но и молниеносно быстрым. Пришло время перейти к инструментам микрооптимизации и профилирования: <a href="10-benchmark-testy.html" class="wikilink">10. Benchmark тесты</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

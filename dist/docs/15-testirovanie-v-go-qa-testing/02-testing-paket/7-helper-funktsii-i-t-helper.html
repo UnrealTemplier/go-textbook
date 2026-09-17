@@ -2169,19 +2169,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Helper функции и t.Helper</h1>
           </header>
 
           <div class="article-markdown">
-            <p>По мере роста кодовой базы ваши тесты неизбежно начнут обрастать дублирующимся кодом. Вы будете писать одни и те же проверки JSON, одинаково инициализировать тестовую базу данных или создавать типовые DTO-структуры.</p>
-<p>Следуя принципу DRY (Don't Repeat Yourself), вы вынесете эту логику во вспомогательные функции — <strong>хелперы (Helpers)</strong>. Но как только вы это сделаете, вы столкнетесь с раздражающей проблемой дебага: при падении теста компилятор будет указывать вам не на тот тест, который сломался, а на внутренности самого хелпера.</p>
-<p>Чтобы решить эту проблему, в Go 1.9 был добавлен метод <code>t.Helper()</code>. В этой статье мы разберем не только то, как его использовать, но и как он работает на уровне стека вызовов рантайма, а также изучим паттерны проектирования production-ready хелперов.</p>
+            <p>Повторное использование кода — один из краеугольных камней грамотной разработки. По мере эволюции и разрастания тестовой базы вы неизбежно начнете выносить однотипную инициализацию структур, генерацию тестовых пользователей или громоздкую валидацию сложных JSON-ответов в отдельные вспомогательные функции — <strong>хелперы (Helpers)</strong>.</p>
+<p>Однако благородное стремление следовать принципу DRY (Don't Repeat Yourself) без понимания специфики рантайма Go моментально превращает отладку в мучение. При возникновении первой же ошибки раннер укажет вам не на упавший тестовый сценарий, а на внутреннюю строчку кода самого вспомогательного хелпера. Если этот хелпер вызывается из пятидесяти разных мест, локализация дефекта превращается в детективное расследование.</p>
+<p>Для элегантного решения этой проблемы в Go 1.9 был внедрен метод <code>t.Helper()</code>. В этой главе мы препарируем механику его работы на уровне раскрутки стека вызовов, изучим взаимодействие с горутинами и освоим канонические паттерны проектирования тестовых утилит.</p>
+<hr />
 <h2 id="problema-navigatsii-po-oshibkam">Проблема навигации по ошибкам</h2>
 
-<p>Рассмотрим типичный сценарий: мы написали собственную функцию для сравнения чисел (по сути, мини-assert).</p>
+<p>Рассмотрим классическую ситуацию: мы написали лаконичную функцию для сравнения целых чисел, призванную сократить boilerplate:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2198,18 +2199,18 @@ import &quot;testing&quot;
 // Вспомогательная функция (Helper)
 func assertEqual(t *testing.T, got, want int) {
     if got != want {
-        // Ошибка сгенерируется ЗДЕСЬ (строка 8)
+        // Ошибка формируется ЗДЕСЬ (строка 9)
         t.Errorf(&quot;got %d, want %d&quot;, got, want) 
     }
 }
 
 func TestMath(t *testing.T) {
-    assertEqual(t, 2+2, 5) // Вызов из теста (строка 14)
+    assertEqual(t, 2+2, 5) // Место фактического вызова в тесте (строка 15)
 }
 </code></pre>
 </div>
 
-<p><strong>Что выведет консоль при падении?</strong></p>
+<p>Что отобразит терминал при провале проверки?</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2220,15 +2221,15 @@ func TestMath(t *testing.T) {
     </button>
   </div>
   <pre class="language-text"><code class="language-text">--- FAIL: TestMath (0.00s)
-    math_test.go:8: got 4, want 5
+    math_test.go:9: got 4, want 5
 </code></pre>
 </div>
 
-<p>Тест указывает на <strong>строку 8</strong>. Представьте, что функция <code>assertEqual</code> используется в 500 различных тестах. Если тест падает в CI, кликнув на номер строки в логах, вы перейдете в код хелпера. Вам придется вручную копировать имя упавшего теста (<code>TestMath</code>), искать его по всему проекту и смотреть, с какими аргументами он вызывал этот хелпер. Это убивает весь смысл быстрой обратной связи.</p>
+<p>Тестовый раннер ссылается на <strong>строку 9</strong> — внутренность функции <code>assertEqual</code>. Если эта функция используется сотнями тестов по всему репозиторию, клик по строке ошибки в IDE бесполезен: вы попадете в общий хелпер, а не в падающий тестовый сценарий <code>TestMath</code>. Вам придется вручную копировать имя теста, искать его по кодовой базе и выяснять, с какими входными данными он упал.</p>
+<hr />
 <h2 id="reshenie-t-helper">Решение: t.Helper()</h2>
 
-<p>Вызов <code>t.Helper()</code> сообщает рантайму пакета <code>testing</code>, что текущая функция является вспомогательной, и её следует исключить из трассировки стека (Stack Trace) при выводе ошибки.</p>
-<p>Исправим наш код:</p>
+<p>Вызов метода <code>t.Helper()</code> регистрирует текущую функцию как вспомогательную. Он указывает механизму форматирования отчетов пакета <code>testing</code>, что данную функцию необходимо полностью игнорировать при вычислении координат места ошибки:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2239,7 +2240,7 @@ func TestMath(t *testing.T) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func assertEqual(t *testing.T, got, want int) {
-    t.Helper() // Регистрируем функцию как хелпер
+    t.Helper() // Маркируем функцию как технический хелпер
     if got != want {
         t.Errorf(&quot;got %d, want %d&quot;, got, want) 
     }
@@ -2247,7 +2248,7 @@ func TestMath(t *testing.T) {
 </code></pre>
 </div>
 
-<p><strong>Новый вывод в консоли:</strong></p>
+<p>После добавления этой строки отчет преображается:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2258,21 +2259,22 @@ func TestMath(t *testing.T) {
     </button>
   </div>
   <pre class="language-text"><code class="language-text">--- FAIL: TestMath (0.00s)
-    math_test.go:14: got 4, want 5
+    math_test.go:15: got 4, want 5
 </code></pre>
 </div>
 
-<p>Теперь Go указывает на <strong>строку 14</strong> — то самое место внутри <code>TestMath</code>, где произошел вызов. Навигация в IDE снова работает идеально.</p>
+<p>Теперь тулчейн безупречно указывает на <strong>строку 15</strong> — реальное место вызова в сценарии <code>TestMath</code>. Навигация в IDE и горячие клавиши перехода к ошибке снова работают мгновенно.</p>
+<hr />
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Как именно <code>t.Helper()</code> скрывает строку кода? <br />
-Когда вы вызываете <code>t.Helper()</code>, движок тестов использует функцию <code>runtime.Callers(1, pc)</code>, чтобы получить Program Counter (адрес текущей инструкции) вызывающей функции. Этот адрес сохраняется во внутреннюю <code>map</code> структуры <code>testing.T</code>.</p>
-<p>Когда вызывается <code>t.Errorf</code>, Go начинает <strong>раскручивать стек (Stack Unwinding)</strong>, двигаясь от текущей функции вверх к вызывающим. На каждом фрейме (Stack Frame) он проверяет, не находится ли текущий Program Counter в списке зарегистрированных хелперов.<br />
-Если находит совпадение — пропускает этот фрейм и идет выше, пока не найдет первый "не-хелперный" фрейм стека. Именно его координаты (файл и строка) и выводятся в лог.</p>
+    <p>Какова физическая механика работы <code>t.Helper()</code> в памяти?<br />
+При вызове <code>t.Helper()</code> среда тестирования выполняет системный вызов <code>runtime.Callers(1, pc)</code> (или базовый <code>runtime.Callers</code>), извлекая Program Counter (PC — адрес инструкции в сегменте кода) вызывающей функции. Этот адрес регистрируется во внутренней хэш-таблице <code>map</code> объекта структуры <code>testing.T</code>.  </p>
+<p>Когда вызывается метод фиксации ошибки <code>t.Errorf</code>, рантайм Go запускает процедуру <strong>раскрутки стека (Stack Unwinding)</strong>, последовательно исследуя цепочку стековых кадров (Call Frames). Для каждого кадра проверяется: входит ли его Program Counter в таблицу зарегистрированных хелперов?<br />
+Если адрес найден в списке, рантайм пропускает этот стековый кадр и поднимается на уровень выше, пока не встретит первый кадр пользовательского теста. Именно его имя файла и номер строки отправляются в отчет.</p>
   </div>
 </div>
 
@@ -2290,31 +2292,36 @@ func TestMath(t *testing.T) {
   </div>
   <pre class="mermaid">
 flowchart TD
-Test[&quot;TestFunction&lt;br&gt;Стек фрейм 3&lt;br&gt;НЕ хелпер&quot;] --&gt;|&quot;Вызывает&quot;| Helper[&quot;AssertHelper&lt;br&gt;Стек фрейм 2&lt;br&gt;Зарегистрирован как Helper&quot;]
-Helper --&gt;|&quot;Вызывает&quot;| Fatal[&quot;t.Fatal&lt;br&gt;Стек фрейм 1&quot;]
+Test[&quot;Стековый кадр: TestMath&lt;br/&gt;(Пользовательский тест, НЕ хелпер)&quot;] --&gt;|&quot;Вызов&quot;| Helper[&quot;Стековый кадр: assertEqual&lt;br/&gt;(Зарегистрирован через t.Helper)&quot;]
+Helper --&gt;|&quot;Вызов&quot;| Fail[&quot;Стековый кадр: t.Errorf / t.Fatal&quot;]
 
-Fatal -.-&gt;|&quot;Раскрутка стека для поиска ошибки&quot;| Engine[&quot;testing Runtime&quot;]
-Engine -.-&gt;|&quot;Проверка фрейма 2&quot;| CheckHelper{&quot;Это Helper?&quot;}
-CheckHelper --&gt;|&quot;Да, пропускаем&quot;| Engine2[&quot;Переход к фрейму 3&quot;]
-Engine2 -.-&gt; CheckHelper2{&quot;Это Helper?&quot;}
-CheckHelper2 --&gt;|&quot;Нет&quot;| Print[&quot;Вывод в консоль:&lt;br&gt;Ошибка в TestFunction&quot;]
+Fail -.-&gt;|&quot;Раскрутка стека (Stack Unwinding)&quot;| Engine[&quot;Рантайм пакета testing&quot;]
+Engine -.-&gt; Check1{&quot;Фрейм assertEqual — это Helper?&quot;}
+Check1 --&gt;|&quot;Да: пропустить кадр&quot;| StepUp[&quot;Подъем по стеку выше&quot;]
+StepUp -.-&gt; Check2{&quot;Фрейм TestMath — это Helper?&quot;}
+Check2 --&gt;|&quot;Нет: цель найдена!&quot;| Report[&quot;Вывод координат в лог:&lt;br/&gt;math_test.go:15 (TestMath)&quot;]
 
-style Test fill:#e6f3ff,stroke:#0066cc
-style Print fill:#ccffcc,stroke:#009900
+classDef frame fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+classDef check fill:#0f172a,stroke:#f59e0b,stroke-width:1px,color:#fbbf24;
+classDef success fill:#064e3b,stroke:#10b981,stroke-width:1px,color:#ecfdf5;
+
+class Test,Helper,Fail,Engine,StepUp frame;
+class Check1,Check2 check;
+class Report success;
   </pre>
 </div>
 
 
+<hr />
 <h2 id="patterny-proektirovaniya-khelperov">Паттерны проектирования хелперов</h2>
 
-<p>Написание хороших хелперов требует соблюдения нескольких архитектурных правил.</p>
 <h3 id="1-peredacha-testing-t-pervym-argumentom">1. Передача `*testing.T` первым аргументом</h3>
 
-<p>Это негласный стандарт сообщества Go. Если функция помогает тесту, она должна принимать контекст этого теста первым аргументом. Это позволяет хелперу логировать ошибки (<code>t.Log</code>), прерывать выполнение (<code>t.Fatal</code>) и регистрировать отложенные функции (<code>t.Cleanup</code>).</p>
+<p>Непреложное правило консистенции в Go: любой вспомогательный хелпер, участвующий в тестировании, обязан принимать указатель <code>t *testing.T</code> в качестве своего первого аргумента. Это открывает хелперу доступ к логированию через <code>t.Log</code>, фатальным ошибкам <code>t.Fatal</code>, мягким проверкам <code>t.Error</code> и хукам очистки <code>t.Cleanup</code>.</p>
+<hr />
 <h3 id="2-setup-khelpery-s-t-cleanup">2. Setup-хелперы с t.Cleanup()</h3>
 
-<p>Классический антипаттерн новичков — возвращать функцию очистки (Teardown) из хелпера инициализации.</p>
-<p><strong>Плохой подход (Антипаттерн):</strong></p>
+<p>Типичный антипаттерн, пришедший из других языков — возвращать функцию финализации (Teardown) из фабрики подготовки ресурсов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2324,7 +2331,7 @@ style Print fill:#ccffcc,stroke:#009900
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХО: Возвращаем функцию очистки, заставляя вызывающий код помнить о ней
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Перекладывание очистки на плечи вызывающего кода
 func setupDatabase() (*sql.DB, func()) {
     db := connect()
     cleanup := func() { db.Close() }
@@ -2333,14 +2340,14 @@ func setupDatabase() (*sql.DB, func()) {
 
 func TestBad(t *testing.T) {
     db, cleanup := setupDatabase()
-    defer cleanup() // Разработчик может забыть это написать!
+    defer cleanup() // Программист обязательно забудет это написать!
     // ...
 }
 </code></pre>
 </div>
 
-<p><strong>Idiomatic Go подход:</strong><br />
-Используйте <code>t.Cleanup()</code> внутри самого хелпера. Это гарантирует очистку ресурсов, снижает когнитивную нагрузку и защищает от Data Race при параллельном выполнении подтестов (как мы обсуждали в статье о <code>t.Parallel</code>).</p>
+<p><strong>Канонический подход Go:</strong><br />
+Внедряйте регистрацию очистки <code>t.Cleanup</code> непосредственно внутрь самого хелпера!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2350,41 +2357,45 @@ func TestBad(t *testing.T) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ХОРОШО: Хелпер берет на себя всю ответственность
+  <pre class="language-go"><code class="language-go">// ИДИОМАТИЧНЫЙ ПОДХОД: Хелпер полностью автономен
 func setupDatabase(t *testing.T) *sql.DB {
     t.Helper()
-    db, err := sql.Open(&quot;postgres&quot;, &quot;...&quot;)
+
+    db, err := sql.Open(&quot;postgres&quot;, &quot;conn_string&quot;)
     if err != nil {
-        t.Fatalf(&quot;failed to open db: %v&quot;, err)
+        t.Fatalf(&quot;Не удалось открыть подключение к БД: %v&quot;, err)
     }
 
-    // Регистрация очистки ПРЯМО В ХЕЛПЕРЕ
+    // Регистрация очистки прямо внутри вспомогательной функции:
     t.Cleanup(func() {
-        db.Close()
+        _ = db.Close()
     })
 
     return db
 }
 
 func TestGood(t *testing.T) {
-    // Идеально чисто. Никаких defer. Ресурс будет очищен автоматически.
-    db := setupDatabase(t) 
+    // Предельная чистота: никаких defer, гарантированное освобождение ресурсов
+    db := setupDatabase(t)
     // ...
 }
 </code></pre>
 </div>
 
+<p>Этот паттерн снимает когнитивную нагрузку и надежно защищает ресурсы при использовании конкурентных тестов <code>t.Parallel</code>.</p>
+<hr />
 <h3 id="3-vlozhennye-khelpery">3. Вложенные хелперы</h3>
 
-<p>Часто один высокоуровневый хелпер вызывает другой низкоуровневый. </p>
+<p>Нередко в архитектуре проверок возникает композиция: один высокоуровневый хелпер вызывает несколько низкоуровневых.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Метод <code>t.Helper()</code> не имеет транзитивности. Если Хелпер А вызывает Хелпер Б, вы должны вызвать <code>t.Helper()</code> <strong>в обеих функциях</strong>. <br />
-Если вы забудете написать <code>t.Helper()</code> в Хелпере А, движок тестов раскрутит стек из Хелпера Б, остановится на Хелпере А и выведет ошибку на него, а не на корневой тест.</p>
+    <p>Вызов <code>t.Helper()</code> <strong>не обладает свойством транзитивности</strong>!<br />
+Если функция <code>createAdminUser</code> вызывает внутри себя <code>createBaseUser</code>, инструкция <code>t.Helper()</code> обязана присутствовать <strong>в обеих функциях</strong>.<br />
+Если вы забудете вызвать <code>t.Helper()</code> во внешней функции, алгоритм раскрутки стека остановится именно на ней, и строка ошибки в логах укажет на тело промежуточного хелпера, а не на сам сценарий <code>TestXxx</code>.</p>
   </div>
 </div>
 
@@ -2398,12 +2409,12 @@ func TestGood(t *testing.T) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func createBaseUser(t *testing.T) *User {
-    t.Helper() // Обязательно
+    t.Helper() // Обязательно на каждом уровне иерархии!
     return &amp;User{Role: &quot;user&quot;}
 }
 
 func createAdminUser(t *testing.T) *User {
-    t.Helper() // Тоже обязательно!
+    t.Helper() // Обязательно, иначе стек остановится здесь!
     u := createBaseUser(t)
     u.Role = &quot;admin&quot;
     return u
@@ -2411,10 +2422,10 @@ func createAdminUser(t *testing.T) *User {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="khelpery-i-gorutiny">Хелперы и Горутины</h2>
 
-<p>Самая неочевидная проблема с хелперами возникает при асинхронном программировании.</p>
-<p>Представьте хелпер, который запускает фоновый процесс и мониторит его ошибки:</p>
+<p>Коварная архитектурная ловушка возникает при попытке использовать хелперы в многопоточном асинхронном коде:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2428,42 +2439,43 @@ func createAdminUser(t *testing.T) *User {
     t.Helper()
 
     go func() {
-        // ОШИБКА АРХИТЕКТУРЫ
-        // t.Helper здесь не спасет!
+        // АРХИТЕКТУРНАЯ ОШИБКА: t.Helper здесь бессилен!
         if err := doWork(); err != nil {
-            t.Errorf(&quot;worker failed: %v&quot;, err)
+            t.Errorf(&quot;фоновый воркер завершился ошибкой: %v&quot;, err)
         }
     }()
 }
 </code></pre>
 </div>
 
-<p><strong>Почему <code>t.Helper()</code> здесь бесполезен?</strong><br />
-Вспомните механику рантайма из врезки "Под капотом". <code>t.Helper()</code> манипулирует фреймами стека. Когда вы запускаете новую горутину (<code>go func</code>), она получает <strong>свой собственный, абсолютно новый стек</strong>, размер которого инициализируется с 2 КБ.<br />
-В этом новом стеке нет фрейма корневой функции <code>TestXxx</code>. Когда <code>t.Errorf</code> внутри горутины начнет раскручивать стек, он дойдет до корня горутины (самой анонимной функции) и выведет строку именно внутри этой горутины. Он физически не может "перепрыгнуть" в стек вызвавшего теста.</p>
-<p><strong>Как тестировать асинхронные ошибки?</strong><br />
-Вместо вызова <code>t.Error</code> изнутри горутины, хелпер должен синхронизировать ошибки через каналы, возвращая их в основной поток теста, где они будут обработаны детерминированно.</p>
+<h3 id="pochemu-t-helper-zdes-ne-rabotaet">Почему `t.Helper()` здесь не работает?</h3>
+<p>Вспомним модель памяти Go: каждая горутина (<code>go func</code>) аллоцирует собственный независимый сегмент стека (инициализируемый с 2 КБ).<br />
+В стеке дочерней горутины <strong>физически отсутствует</strong> стековый фрейм функции <code>TestXxx</code>. Когда <code>t.Errorf</code> запускает раскрутку стека, он доходит до корня горутины и останавливается на анонимной функции <code>func()</code>. Он не способен перепрыгнуть в стек другой горутины операционной системы.<br />
+Для обработки асинхронных сбоев хелперы обязаны возвращать ошибки в основной поток теста через каналы, где они будут обработаны детерминированно.</p>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Библиотека <code>testify/assert</code> является стандартом де-факто для проверок в Go. Как вы думаете, как реализована функция <code>assert.Equal(t, a, b)</code> внутри самой библиотеки?<br />
-<strong>Ответ:</strong> Каждая функция в <code>testify/assert</code> первым делом вызывает <code>t.Helper()</code> (через внутренний интерфейс <code>TestingT</code>), чтобы ошибки при сравнении указывали на вашу строку кода, а не на исходники <code>testify</code> в <code>GOPATH/pkg/mod/...</code>. Эта простая функция рантайма сделала возможным существование целой экосистемы assert-библиотек в Go.</p>
+    <p><strong>Вопрос:</strong> Как устроена популярная библиотека <code>testify/assert</code> и почему вызов <code>assert.Equal(t, a, b)</code> выводит в терминал строчку из вашего теста, а не исходный код самого пакета <code>testify</code>?<br />
+<strong>Ответ:</strong> Каждая проверочная функция в пакете <code>testify/assert</code> первым делом вызывает метод <code>t.Helper()</code> у переданного объекта (соответствующего интерфейсу <code>TestingT</code>).<br />
+Благодаря этому при несовпадении значений стек раскручивается мимо исходников библиотеки в каталоге <code>GOPATH/pkg/mod/...</code>, точно указывая на строчку вашего сценария. Этот элегантный механизм рантайма Go сделал возможным расцвет сторонних библиотек ассертов.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><code>t.Helper()</code> необходим для скрытия вспомогательных функций из трассировки стека ошибок, что критически важно для быстрой навигации к сломавшемуся тесту.</li>
-<li>Под капотом механизм использует <code>runtime.Callers</code> для пропуска зарегистрированных Stack Frames при раскрутке стека.</li>
-<li>Идиоматичные Setup-хелперы должны принимать <code>*testing.T</code> и самостоятельно вызывать <code>t.Cleanup()</code>, освобождая вызывающий код от управления ресурсами через <code>defer</code>.</li>
-<li>В цепочке вложенных хелперов <code>t.Helper()</code> должен вызываться на каждом уровне.</li>
-<li>Механизм бесполезен при вызове <code>t.Error</code> из порожденных горутин из-за изоляции стеков.</li>
+<li>Метод <code>t.Helper()</code> маскирует служебные стековые кадры, возвращая разработчику точную навигацию по ошибкам.</li>
+<li>Внутренний механизм опирается на <code>runtime.Callers</code>, сверяя Program Counter функций при генерации отчетов.</li>
+<li>Канонические Setup-хелперы принимают <code>*testing.T</code> и регистрируют завершение через <code>t.Cleanup()</code>, избавляя тест от ненадежных <code>defer</code>.</li>
+<li>Во вложенных цепочках хелперов вызов <code>t.Helper()</code> обязателен на каждом звене.</li>
+<li>Из-за изоляции стеков горутин <code>t.Helper()</code> неприменим внутри асинхронных <code>go func</code>.</li>
 </ol>
-<p>Изоляция тестовых данных часто требует работы с файловой системой. Хардкодить пути к конфигам или писать логи в системный <code>/tmp</code> — плохая практика, чреватая Data Race. О том, как рантайм пакета <code>testing</code> элегантно решает эту проблему без единой строчки ручной очистки, читайте в следующем материале: <a href="8-rabota-s-vremennymi-faylami-i-t-tempdir.html" class="wikilink">8. Работа с временными файлами и t.TempDir</a>.</p>
+<p>Работа со вспомогательными функциями часто требует создания тестовых файлов и конфигураций на диске. Ручное создание файлов в каталоге <code>/tmp</code> ведет к конфликтам между тестами. О том, как рантайм решает проблему временных файлов со скоростью оперативной памяти, читайте в следующей статье: <a href="8-rabota-s-vremennymi-faylami-i-t-tempdir.html" class="wikilink">8. Работа с временными файлами и t.TempDir</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2491,7 +2503,7 @@ func createAdminUser(t *testing.T) *User {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#problema-navigatsii-po-oshibkam">Проблема навигации по ошибкам</a></li><li class="toc-item toc-h2"><a href="#reshenie-t-helper">Решение: t.Helper()</a></li><li class="toc-item toc-h2"><a href="#patterny-proektirovaniya-khelperov">Паттерны проектирования хелперов</a></li><li class="toc-item toc-h3"><a href="#1-peredacha-testing-t-pervym-argumentom">1. Передача testing.T первым аргументом</a></li><li class="toc-item toc-h3"><a href="#2-setup-khelpery-s-t-cleanup">2. Setup-хелперы с t.Cleanup()</a></li><li class="toc-item toc-h3"><a href="#3-vlozhennye-khelpery">3. Вложенные хелперы</a></li><li class="toc-item toc-h2"><a href="#khelpery-i-gorutiny">Хелперы и Горутины</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#problema-navigatsii-po-oshibkam">Проблема навигации по ошибкам</a></li><li class="toc-item toc-h2"><a href="#reshenie-t-helper">Решение: t.Helper()</a></li><li class="toc-item toc-h2"><a href="#patterny-proektirovaniya-khelperov">Паттерны проектирования хелперов</a></li><li class="toc-item toc-h3"><a href="#1-peredacha-testing-t-pervym-argumentom">1. Передача testing.T первым аргументом</a></li><li class="toc-item toc-h3"><a href="#2-setup-khelpery-s-t-cleanup">2. Setup-хелперы с t.Cleanup()</a></li><li class="toc-item toc-h3"><a href="#3-vlozhennye-khelpery">3. Вложенные хелперы</a></li><li class="toc-item toc-h2"><a href="#khelpery-i-gorutiny">Хелперы и Горутины</a></li><li class="toc-item toc-h3"><a href="#pochemu-t-helper-zdes-ne-rabotaet">Почему t.Helper() здесь не работает?</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

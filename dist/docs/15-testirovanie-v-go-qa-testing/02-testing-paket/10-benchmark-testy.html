@@ -2169,20 +2169,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">10. Benchmark тесты</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Вы написали 100% покрытый код. Интеграционные тесты "зеленые", Data Race детектор молчит, бизнес-логика работает безупречно. Но когда ваш сервис выходит в production и на него обрушивается трафик в 10 000 RPS, latency (задержка) улетает в космос, а CPU упирается в 100%. </p>
-<p>Код может быть правильным, но при этом катастрофически медленным. </p>
-<p>В Go производительность — это не фича, которую добавляют в конце. Это фундаментальное свойство языка. И для измерения этой производительности пакет <code>testing</code> предоставляет инструмент, равных которому по удобству нет ни в одной популярной экосистеме — структуру <code>*testing.B</code> и встроенный механизм <strong>Benchmarking</strong>.</p>
-<p>В этой статье мы разберем анатомию бенчмарков, заглянем под капот подсистемы измерения времени и научимся обманывать умный компилятор Go.</p>
+            <p>Корректность программной логики — необходимое, но совершенно недостаточное условие для современного бэкенда. Сервис может обладать 100% тестовым покрытием, успешно проходить все интеграционные сценарии и не содержать гонок данных, но под нагрузкой в 10 000 RPS его 99-й перцентиль задержки (p99 latency) улетает в космос, а процессорные ядра упираются в 100% утилизации.</p>
+<p>В Go производительность — это не побочный эффект, оптимизируемый в последнюю очередь, а фундаментальная характеристика системного дизайна. Для высокоточного измерения скорости работы алгоритмов и профилирования потребления ресурсов стандартный пакет <code>testing</code> предоставляет первоклассный инструмент — структуру <code>*testing.B</code> (тип <code>testing.B</code>) и встроенный механизм <strong>Benchmarking (Микро-бенчмарки)</strong>.</p>
+<p>В этой главе мы препарируем анатомию бенчмарков, заглянем в подсистему адаптивного автомасштабирования измерений, исследуем работу системных таймеров ядра и научимся защищаться от излишне умного оптимизатора компилятора.</p>
+<hr />
 <h2 id="anatomiya-benchmark-testa">Анатомия Benchmark-теста</h2>
 
-<p>Бенчмарки пишутся в тех же файлах <code>_test.go</code>, что и обычные тесты. Разница лишь в сигнатуре функции: она должна начинаться со слова <code>Benchmark</code> и принимать указатель на <code>testing.B</code>.</p>
+<p>Бенчмарки в Go размещаются в тех же самых файлах <code>_test.go</code>, что и обычные тесты <code>TestXxx</code>. Отличие заключается в сигнатуре: функция обязана начинаться с префикса <code>Benchmark</code> и принимать единственный аргумент — указатель на контекст бенчмарка <code>b *testing.B</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2199,7 +2199,7 @@ import (
     &quot;testing&quot;
 )
 
-// Тестируемая DTO
+// Тестируемая структура DTO
 type User struct {
     ID    int    `json:&quot;id&quot;`
     Email string `json:&quot;email&quot;`
@@ -2208,7 +2208,7 @@ type User struct {
 func BenchmarkJSONUnmarshal(b *testing.B) {
     payload := []byte(`{&quot;id&quot;: 42, &quot;email&quot;: &quot;test@example.com&quot;}`)
 
-    // Цикл бенчмарка — это сердце измерений
+    // Цикл измерений — мотор любого бенчмарка
     for i := 0; i &lt; b.N; i++ {
         var u User
         _ = json.Unmarshal(payload, &amp;u)
@@ -2217,7 +2217,7 @@ func BenchmarkJSONUnmarshal(b *testing.B) {
 </code></pre>
 </div>
 
-<p>Чтобы запустить бенчмарк, обычной команды <code>go test</code> недостаточно (она запустит только функциональные тесты <code>TestXxx</code>). Вам нужно передать регулярное выражение в флаг <code>-bench</code>:</p>
+<p>Для запуска бенчмарков стандартного вызова <code>go test</code> недостаточно (он исполняет только функциональные тесты). Необходимо передать регулярное выражение через флаг <code>-bench</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2227,22 +2227,23 @@ func BenchmarkJSONUnmarshal(b *testing.B) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash"># Запустить все бенчмарки в текущем пакете
-go test -bench=. 
+  <pre class="language-bash"><code class="language-bash"># Запуск всех бенчмарков в текущем каталоге пакета:
+go test -bench=.
 </code></pre>
 </div>
 
-<h3 id="chto-takoe-b-n-magiya-avtomasshtabirovaniya">Что такое b.N? (Магия автомасштабирования)</h3>
+<hr />
+<h2 id="chto-takoe-b-n-magiya-avtomasshtabirovaniya">Что такое b.N? (Магия автомасштабирования)</h2>
 
-<p>Самый частый вопрос от разработчиков, приходящих из других языков: "Почему я не задаю количество итераций жестко? Что такое <code>b.N</code>?".</p>
+<p>Первый вопрос, который возникает у разработчиков: «Почему число итераций не задается жестко константой? Что означает счетчик <code>b.N</code>?».</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Рантайм <code>testing</code> не знает заранее, сколько времени займет одна итерация вашего кода. Если он запустит парсинг JSON 10 раз, это займет микросекунды, и погрешность измерения из-за планировщика ОС будет огромной. Если запустит 1 миллиард раз — вы будете ждать результат до завтра.</p>
-<p>Поэтому движок бенчмарков работает адаптивно. Он запускает ваш цикл, динамически увеличивая значение <code>b.N</code> в последовательности: 1, 100, 10000... и так далее, пока общее время выполнения цикла не превысит значение <code>benchtime</code> (по умолчанию 1 секунда).</p>
+    <p>Рантайм пакета <code>testing</code> заранее не знает, сколько тактов CPU займет один вызов вашей функции. Если запустить тяжелый парсинг 10 раз, общее время составит доли микросекунды, и погрешность планировщика ОС сделает замер бессмысленным. Если жестко задать миллиард итераций, медленная функция заморозит сьют на несколько часов.  </p>
+<p>Поэтому движок бенчмаркинга работает <strong>адаптивно</strong>. Он запускает функцию с <code>b.N = 1</code>, затем прогревает код и экспоненциально увеличивает счетчик <code>b.N</code> по шкале (1, 100, 10 000, 1 000 000...), пока суммарное время работы цикла не превысит калибровочный интервал <code>benchtime</code> (по умолчанию равный ровно 1 секунде).</p>
   </div>
 </div>
 
@@ -2260,29 +2261,50 @@ go test -bench=.
   </div>
   <pre class="mermaid">
 flowchart TD
-Start[&quot;go test -bench .&quot;] --&gt; Init[&quot;Установить b.N = 1&quot;]
-Init --&gt; Run[&quot;Выполнение цикла&lt;br&gt;for i := 0; i &lt; b.N; i++&quot;]
-Run --&gt; Check{&quot;Затраченное время&lt;br&gt;больше benchtime -1s-?&quot;}
+Start[&quot;Запуск go test -bench .&quot;] --&gt; Init[&quot;Инициализация: b.N = 1&quot;]
+Init --&gt; Run[&quot;Исполнение цикла for i := 0; i &lt; b.N; i++&quot;]
+Run --&gt; Check{&quot;Суммарное время превысило benchtime (1s)?&quot;}
 
-Check --&gt;|&quot;Нет&quot;| Scale[&quot;Увеличить b.N&lt;br&gt;до следующего порядка&quot;]
+Check --&gt;|&quot;Нет: данных мало&quot;| Scale[&quot;Экспоненциальное увеличение b.N&lt;br/&gt;(1 -&gt; 100 -&gt; 10 000...)&quot;]
 Scale --&gt; Run
 
-Check --&gt;|&quot;Да&quot;| Calc[&quot;Расчет ns/op&lt;br&gt;Вывод результата&quot;]
-Calc --&gt; End[&quot;Завершение&quot;]
+Check --&gt;|&quot;Да: выборка репрезентативна&quot;| Calc[&quot;Расчет средней метрики ns/op&lt;br/&gt;Форматированный вывод&quot;]
+Calc --&gt; End[&quot;Завершение бенчмарка&quot;]
 
-style Run fill:#e6f3ff,stroke:#0066cc
-style Calc fill:#ccffcc,stroke:#009900
+classDef proc fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+classDef check fill:#0f172a,stroke:#f59e0b,stroke-width:1px,color:#fbbf24;
+classDef finish fill:#064e3b,stroke:#10b981,stroke-width:1px,color:#ecfdf5;
+
+class Start,Init,Run,Scale proc;
+class Check check;
+class Calc,End finish;
   </pre>
 </div>
 
 
-<p>Когда бенчмарк завершается, вы видите результат вида:<br />
-<code>BenchmarkJSONUnmarshal-10    3284074     351.4 ns/op</code><br />
-Это означает, что на 10-ядерном процессоре (<code>-10</code>) функция выполнилась <strong>3 284 074 раза</strong>, и на одну итерацию в среднем ушло <strong>351.4 наносекунды</strong>.</p>
+<p>По окончании калибровки раннер выводит эталонную строку:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">BenchmarkJSONUnmarshal-10    3284074     351.4 ns/op
+</code></pre>
+</div>
+
+<p><strong>Анатомия отчета:</strong><br />
+* <code>BenchmarkJSONUnmarshal-10</code>: суффикс <code>-10</code> указывает текущее значение <code>GOMAXPROCS</code> (число ядер процессора).<br />
+* <code>3284074</code>: фактическое число итераций <code>b.N</code>, выполненных за время <code>benchtime</code>.<br />
+* <code>351.4 ns/op</code>: среднее физическое время исполнения одной операции в наносекундах (<code>ns/op</code>).</p>
+<hr />
 <h2 id="izolyatsiya-vremeni-resettimer-i-stoptimer">Изоляция времени: ResetTimer и StopTimer</h2>
 
-<p>Часто перед самим циклом <code>b.N</code> вам нужно провести тяжелую подготовку: сгенерировать мегабайты тестовых данных, поднять мок-сервер или прочитать файл. </p>
-<p>Если вы не изолируете это время, оно "размажется" по всем итерациям и исказит результат (особенно на малых <code>b.N</code>).</p>
+<p>В подавляющем большинстве задач перед стартом замеров требуется тяжелая подготовка окружения: сгенерировать мегабайтный срез данных, загрузить тестовые сертификаты или прочитать эталонный файл с диска.</p>
+<p>Если не исключить эту подготовку из измерений, время генерации данных равномерно размажется по миллиону итераций, безнадежно исказив результаты. Для очистки замеров предназначен метод <code>b.ResetTimer()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2293,11 +2315,11 @@ style Calc fill:#ccffcc,stroke:#009900
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func BenchmarkComplexAlgo(b *testing.B) {
-    // Долгая инициализация (I/O, аллокации)
+    // Долгая предварительная инициализация (дисковый ввод-вывод, парсинг)
     data := generateHugeDataset() 
 
-    // Сбрасываем таймер и счетчик аллокаций. 
-    // Время, потраченное выше, не пойдет в зачет.
+    // Сбрасываем таймер и накопленные счетчики аллокаций.
+    // Всё время и память, потраченные выше, не идут в протокол!
     b.ResetTimer() 
 
     for i := 0; i &lt; b.N; i++ {
@@ -2307,21 +2329,23 @@ style Calc fill:#ccffcc,stroke:#009900
 </code></pre>
 </div>
 
-<p>Если тяжелая работа (не относящаяся к измеряемой функции) нужна <em>внутри</em> каждой итерации цикла, используйте <code>b.StopTimer()</code> и <code>b.StartTimer()</code>. Но будьте осторожны: частые остановки таймера внутри цикла <code>b.N</code> сами по себе потребляют CPU и могут сделать бенчмарк неточным из-за накладных расходов на системные вызовы замера времени (<code>VDSO clock_gettime</code> в Linux).</p>
+<p>Если же сложная подготовка требуется непосредственно <em>внутри</em> тела цикла, используются методы <code>b.StopTimer()</code> и <code>b.StartTimer()</code>.<br />
+Однако помните о накладных расходах: частая остановка и запуск таймера внутри миллионного цикла <code>b.N</code> сами по себе создают нагрузку на процессор из-за обращений к виртуальным системным часам ядра Linux (<code>VDSO clock_gettime</code>), смещая точность наносекундных замеров.</p>
+<hr />
 <h2 id="mechanical-sympathy-okhota-na-allokatsii">Mechanical Sympathy: Охота на аллокации</h2>
 
-<p>Для бэкенда на Go скорость выполнения (CPU time) — это только половина картины. Вторая, гораздо более важная половина — это аллокации памяти в куче (Heap). </p>
+<p>Для серверного бэкенда процессорное время (<code>ns/op</code>) — это лишь вершина айсберга. Подлинный враг высокой пропускной способности — аллокации динамической памяти в куче (Heap).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Чем больше аллокаций делает ваш код на горячем пути (Hot Path), тем больше работы у Garbage Collector-а. В высоконагруженном сервисе фазы очистки GC (Mark and Sweep) будут "красть" кванты времени процессора у ваших рабочих горутин, что приведет к катастрофическому росту p99 latency.</p>
+    <p>Каждая аллокация в куче на критическом пути обработки запросов (Hot Path) — это прямая работа для сборщика мусора (Garbage Collector). Фазы Mark и Sweep отнимают такты у рабочих горутин и провоцируют всплески задержек (Tail Latency).<br />
+Вы обязаны профилировать не только время, но и память. Для этого передавайте флаг <code>-benchmem</code> при запуске, либо вызывайте метод <code>b.ReportAllocs()</code> прямо в начале бенчмарка.</p>
   </div>
 </div>
 
-<p>Вы обязаны писать бенчмарки с учетом аллокаций. Для этого добавьте флаг <code>-benchmem</code> в командной строке или вызовите <code>b.ReportAllocs()</code> прямо в коде бенчмарка.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2332,27 +2356,40 @@ style Calc fill:#ccffcc,stroke:#009900
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func BenchmarkStringConcat(b *testing.B) {
-    b.ReportAllocs() // Эквивалент флага -benchmem
+    b.ReportAllocs() // Принудительный сбор метрик динамической памяти
 
     for i := 0; i &lt; b.N; i++ {
         s := &quot;&quot;
         for j := 0; j &lt; 100; j++ {
-            s += &quot;a&quot; // Ужасный антипаттерн, порождающий аллокации
+            s += &quot;a&quot; // Антипаттерн: постоянное перевыделение памяти в куче
         }
     }
 }
 </code></pre>
 </div>
 
-<p><strong>Вывод:</strong><br />
-<code>BenchmarkStringConcat-10   168231   6870 ns/op   5304 B/op   99 allocs/op</code></p>
-<p>Вывод показывает метрики:<br />
-* <code>5304 B/op</code>: Байт аллоцировано в куче за одну итерацию <code>b.N</code>.<br />
-* <code>99 allocs/op</code>: Количество созданных объектов в куче за итерацию.</p>
-<p>Задача Senior-инженера — сводить эти числа к минимуму (в идеале к нулю) в критических секциях кода, используя <code>sync.Pool</code>, Escape Analysis и предварительную аллокацию слайсов (<code>make([]T, 0, capacity)</code>).</p>
+<p>Вывод бенчмарка с флагом аллокаций:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">BenchmarkStringConcat-10   168231   6870 ns/op   5304 B/op   99 allocs/op
+</code></pre>
+</div>
+
+<p><strong>Ключевые метрики памяти:</strong><br />
+* <code>5304 B/op</code>: суммарный объем байт, выделенный в куче за одну итерацию <code>b.N</code>.<br />
+* <code>99 allocs/op</code> (метрика <code>allocs/op</code>): количество отдельных операций аллокации памяти в куче на один цикл.</p>
+<p>Задача инженера — сводить <code>allocs/op</code> к нулю в критических контурах сервиса, применяя предварительное резервирование емкости срезов <code>make([]T, 0, capacity)</code>, повторное использование буферов через <code>sync.Pool</code> и тонкую настройку Escape Analysis.</p>
+<hr />
 <h2 id="lovushka-optimizatora-dead-code-elimination">Ловушка оптимизатора (Dead Code Elimination)</h2>
 
-<p>Компилятор Go умен. Если он видит, что результат выполнения функции нигде не используется, он может просто вырезать этот кусок кода при компиляции бинарника (Dead Code Elimination).</p>
+<p>Компилятор Go чрезвычайно эффективен в оптимизации машинного кода. Если компилятор видит, что результат выполнения чистой функции нигде не сохраняется и не оказывает побочных эффектов, он активирует оптимизацию <strong>Dead Code Elimination (Удаление мертвого кода)</strong> и попросту вырезает вызов функции из результирующего бинарника!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2362,20 +2399,18 @@ style Calc fill:#ccffcc,stroke:#009900
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХОЙ БЕНЧМАРК
+  <pre class="language-go"><code class="language-go">// ПЛОХОЙ БЕНЧМАРК: Иллюзия скорости
 func BenchmarkCompute(b *testing.B) {
     for i := 0; i &lt; b.N; i++ {
-        // Результат никуда не сохраняется. 
-        // Компилятор может вырезать вызов Compute!
-        Compute(i) 
+        Compute(i) // Результат игнорируется: компилятор удалит эту строку!
     }
 }
 </code></pre>
 </div>
 
-<p>Вы увидите подозрительно идеальный результат вроде <code>0.3 ns/op</code>, решите, что вы гений алгоритмов, задеплоите на прод и получите инцидент. Компилятор просто не выполнял ваш код.</p>
-<p><strong>Идиоматичный способ защиты (Защита от DCE):</strong><br />
-Результат вычислений нужно присвоить глобальной переменной уровня пакета.</p>
+<p>В консоли вы увидите сказочный результат вида <code>0.3 ns/op</code>, решите, что создали самый быстрый алгоритм в мире, а в production получите инцидент. Компилятор просто не выполнял вашу функцию.</p>
+<h3 id="zashchita-ot-dce-cherez-globalnye-peremennye">Защита от DCE через глобальные переменные:</h3>
+<p>Чтобы гарантировать, что компилятор физически выполнит машинные инструкции функции, результат вычислений необходимо экспортировать в глобальную переменную пакета:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2385,25 +2420,25 @@ func BenchmarkCompute(b *testing.B) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Глобальная переменная
+  <pre class="language-go"><code class="language-go">// Глобальная переменная на уровне пакета
 var Result int 
 
 func BenchmarkCompute(b *testing.B) {
-    var r int // Локальная переменная для промежуточного результата
+    var r int // Локальная переменная на стеке
     for i := 0; i &lt; b.N; i++ {
         r = Compute(i) 
     }
-    // Присваиваем локальную переменную глобальной. 
-    // Теперь компилятор не имеет права вырезать код.
+    // Присваивание глобальной переменной запрещает компилятору удалять вычисления:
     Result = r 
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="parallelnye-benchmarki-b-runparallel">Параллельные бенчмарки: b.RunParallel</h2>
 
-<p>До сих пор мы измеряли скорость работы кода в один поток. Но бэкенд на Go работает конкурентно. Тысячи горутин могут вызывать вашу функцию одновременно. Если в вашей функции есть <code>sync.Mutex</code> или конкурентный доступ к <code>map</code>, последовательный бенчмарк покажет идеальное время, а в production вы получите жесточайший Lock Contention (борьбу за блокировку).</p>
-<p>Чтобы протестировать код под конкурентной нагрузкой, используется метод <code>b.RunParallel(pb *testing.PB)</code>.</p>
+<p>Последовательные бенчмарки измеряют чистую скорость алгоритма в одном потоке. Однако реальный бэкенд на Go функционирует в конкурентной среде, где тысячи горутин одновременно обращаются к разделяемым структурам данных. Если алгоритм содержит примитивы синхронизации (<code>sync.Mutex</code>) или общие словари <code>map</code>, последовательный тест покажет идеальные цифры, а в реальной эксплуатации возникнет катастрофический Lock Contention (борьба за блокировку кэш-линий ядер CPU).</p>
+<p>Для стресс-тестирования в условиях конкуренции используется метод <code>b.RunParallel(pb *testing.PB)</code> (или <code>b.RunParallel</code>):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2419,40 +2454,43 @@ func BenchmarkCompute(b *testing.B) {
     b.ReportAllocs()
     b.ResetTimer()
 
-    // RunParallel создает несколько горутин (по умолчанию равно GOMAXPROCS)
-    // и распределяет итерации b.N между ними.
+    // RunParallel создает пул горутин (по умолчанию GOMAXPROCS)
+    // и распределяет итерации b.N между ними
     b.RunParallel(func(pb *testing.PB) {
         // Локальный цикл горутины
         for pb.Next() {
             cache.Set(&quot;key&quot;, &quot;value&quot;)
-            cache.Get(&quot;key&quot;)
+            _ = cache.Get(&quot;key&quot;)
         }
     })
 }
 </code></pre>
 </div>
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Если <code>b.RunParallel</code> по умолчанию запускает количество горутин, равное количеству логических ядер (<code>GOMAXPROCS</code>), как мне протестировать поведение моего кэша, если в production к нему будут одновременно обращаться 10 000 горутин?<br />
-<strong>Ответ:</strong> Во время запуска бенчмарка нужно использовать метод <code>b.SetParallelism(p int)</code>. Он умножает значение <code>GOMAXPROCS</code> на <code>p</code>. Например, если у вас 8 ядер, а вы вызовете <code>b.SetParallelism(100)</code>, рантайм создаст 800 одновременно работающих горутин, заставляя их жестко конкурировать за планировщик ОС и мьютексы внутри вашего кэша. Это идеально симулирует реальную нагрузку высококонкурентной среды.</p>
+    <p><strong>Вопрос:</strong> Если <code>b.RunParallel</code> по умолчанию создает количество горутин, равное числу логических ядер процессора (<code>GOMAXPROCS</code>), как проверить поведение компонента под имитацией огромной нагрузки из сотен параллельных соединений?<br />
+<strong>Ответ:</strong> Для этого используется метод <code>b.SetParallelism(p int)</code>. Он устанавливает коэффициент параллелизма, умножая <code>GOMAXPROCS</code> на аргумент <code>p</code>.<br />
+Например, при вызове <code>b.SetParallelism(100)</code> на 8-ядерной машине (<code>GOMAXPROCS=8</code>) раннер поднимет пул из 800 конкурирующих горутин. Это позволяет реалистично нагрузить внутренние мьютексы, каналы и аллокации строк (<code>string</code>) или пустых интерфейсов (<code>interface{}</code>), выявив узкие места архитектуры до выхода в production.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Структура <code>*testing.B</code> — это инструмент для написания микро-бенчмарков, который сам подбирает нужное количество итераций <code>b.N</code>.</li>
-<li>Используйте <code>b.ResetTimer()</code> для изоляции тяжелой инициализации.</li>
-<li>Метрика <code>allocs/op</code> (включается через <code>b.ReportAllocs()</code>) часто важнее, чем <code>ns/op</code>, так как она напрямую влияет на задержки от Garbage Collector-а.</li>
-<li>Защищайтесь от агрессивного компилятора (DCE) путем записи результата в глобальную переменную.</li>
-<li>Для структур данных, которые будут использоваться из нескольких горутин, всегда пишите конкурентные бенчмарки через <code>b.RunParallel</code>.</li>
+<li><code>*testing.B</code> — стандартный инструмент Go для высокоточного профилирования и написания микро-бенчмарков с автоматическим подбором шага <code>b.N</code>.</li>
+<li>Используйте <code>b.ResetTimer()</code> для отсечения времени тяжелой инициализации тестовых наборов.</li>
+<li>Метрика <code>allocs/op</code> (флаг <code>-benchmem</code> или вызов <code>b.ReportAllocs()</code>) зачастую важнее абсолютного времени <code>ns/op</code>, так как аллокации в куче напрямую определяют паузы сборщика мусора.</li>
+<li>Защищайтесь от оптимизации Dead Code Elimination, сохраняя результат вычислений в глобальную переменную.</li>
+<li>Для оценки потокобезопасных структур данных и выявления Lock Contention используйте конкурентный раннер <code>b.RunParallel</code>.</li>
 </ol>
-<p>Теория и механизмы измерений — это хорошо. Но как это выглядит на практике? Как читать профили, находить узкие места в <code>string</code> или <code>interface{}</code> и оптимизировать реальный код? Мы разберем практический кейс шаг за шагом в следующей статье: <a href="11-primer-benchmarking-i-analiz-rezultatov.html" class="wikilink">11. Пример benchmarking и анализ результатов</a>.</p>
+<p>Теория бенчмаркинга освоена. Теперь пришло время посмотреть на реальный боевой кейс: как профилировать код, интерпретировать выводы утилит сравнения бенчмарков и устранять аллокации на практике. Переходим к заключительной главе подраздела: <a href="11-primer-benchmarking-i-analiz-rezultatov.html" class="wikilink">11. Пример benchmarking и анализ результатов</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2480,7 +2518,7 @@ func BenchmarkCompute(b *testing.B) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-benchmark-testa">Анатомия Benchmark-теста</a></li><li class="toc-item toc-h3"><a href="#chto-takoe-b-n-magiya-avtomasshtabirovaniya">Что такое b.N? (Магия автомасштабирования)</a></li><li class="toc-item toc-h2"><a href="#izolyatsiya-vremeni-resettimer-i-stoptimer">Изоляция времени: ResetTimer и StopTimer</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-okhota-na-allokatsii">Mechanical Sympathy: Охота на аллокации</a></li><li class="toc-item toc-h2"><a href="#lovushka-optimizatora-dead-code-elimination">Ловушка оптимизатора (Dead Code Elimination)</a></li><li class="toc-item toc-h2"><a href="#parallelnye-benchmarki-b-runparallel">Параллельные бенчмарки: b.RunParallel</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#anatomiya-benchmark-testa">Анатомия Benchmark-теста</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-b-n-magiya-avtomasshtabirovaniya">Что такое b.N? (Магия автомасштабирования)</a></li><li class="toc-item toc-h2"><a href="#izolyatsiya-vremeni-resettimer-i-stoptimer">Изоляция времени: ResetTimer и StopTimer</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-okhota-na-allokatsii">Mechanical Sympathy: Охота на аллокации</a></li><li class="toc-item toc-h2"><a href="#lovushka-optimizatora-dead-code-elimination">Ловушка оптимизатора (Dead Code Elimination)</a></li><li class="toc-item toc-h3"><a href="#zashchita-ot-dce-cherez-globalnye-peremennye">Защита от DCE через глобальные переменные:</a></li><li class="toc-item toc-h2"><a href="#parallelnye-benchmarki-b-runparallel">Параллельные бенчмарки: b.RunParallel</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

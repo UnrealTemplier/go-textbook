@@ -2169,19 +2169,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Работа с временными файлами и t.TempDir</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Тестирование кода, который взаимодействует с файловой системой (чтение конфигураций, запись логов, парсинг CSV, генерация отчетов) — это классическая головная боль. </p>
-<p>В идеальном мире юнит-тесты не должны работать с диском (IO). Но в реальности бэкенд-разработчики постоянно пишут интеграционные или модульные тесты для компонентов, где файловая система является неотъемлемой частью контракта.</p>
-<p>До Go 1.15 разработчикам приходилось жонглировать путями, обрабатывать ошибки удаления и молиться, чтобы параллельные тесты не перезаписали файлы друг друга. С появлением встроенного метода <code>t.TempDir()</code> работа с временными файлами стала элегантной и пуленепробиваемой.</p>
+            <p>Программные компоненты бэкенда не существуют в стерильном вакууме: они считывают конфигурационные файлы, парсят CSV-таблицы, выгружают бинарные дампы и генерируют аналитические отчеты. В академических учебниках принято утверждать, что юнит-тесты ни при каких обстоятельствах не должны касаться дискового ввода-вывода (I/O). Однако в реальной инженерной практике файловая система нередко является неотъемлемой частью архитектурного контракта модуля.</p>
+<p>До исторического релиза Go 1.15 работа с файлами в тестах напоминала хождение по минному полю. Разработчикам приходилось вручную генерировать случайные пути, перехватывать системные ошибки удаления и надеяться, что параллельные сценарии не повредят файлы друг друга. С появлением стандартного метода <code>t.TempDir()</code> управление временным дисковым пространством в Go стало эталоном надежности и простоты.</p>
+<p>В этой главе мы препарируем устройство метода <code>t.TempDir()</code>, разберем его механическое взаимодействие с оперативной памятью ядра Linux и изучим тонкости кроссплатформенной файловой изоляции.</p>
+<hr />
 <h2 id="nasledie-proshlogo-kak-my-stradali-ranshe">Наследие прошлого: Как мы страдали раньше</h2>
 
-<p>Чтобы понять всю мощь <code>t.TempDir()</code>, посмотрим на то, как работали с файлами "деды". Если вы видите подобный код в legacy-проекте, знайте — это мина замедленного действия.</p>
+<p>Чтобы по-настоящему оценить изящество <code>t.TempDir()</code>, взглянем на типичный паттерн, применявшийся в легаси-кодовой базе до Go 1.15:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2191,33 +2192,43 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Старый подход (До Go 1.15)
+  <pre class="language-go"><code class="language-go">package storage_test
+
+import (
+    &quot;os&quot;
+    &quot;path/filepath&quot;
+    &quot;testing&quot;
+)
+
+// АНТИПАТТЕРН: Ручное жонглирование временными директориями
 func TestLegacyFileIO(t *testing.T) {
-    // 1. Создаем временную директорию вручную
+    // 1. Создаем временную директорию через вспомогательный вызов
     dir, err := os.MkdirTemp(&quot;&quot;, &quot;mytest_*&quot;)
     if err != nil {
         t.Fatal(err)
     }
 
-    // 2. Вручную регистрируем очистку
+    // 2. Вручную регистрируем отложенную очистку через defer
     defer os.RemoveAll(dir) 
 
-    // 3. Формируем пути
+    // 3. Формируем путь к файлу
     filePath := filepath.Join(dir, &quot;data.txt&quot;)
 
-    // Работа с файлом...
+    // Непосредственная работа с файлом...
 }
 </code></pre>
 </div>
 
-<p><strong>В чем проблема этого подхода?</strong><br />
-1. <strong>Бойлерплейт:</strong> Вы пишете 5 строк инфраструктурного кода ради одного файла.<br />
-2. <strong>Ловушка <code>defer</code> и <code>t.Parallel()</code>:</strong> Как мы уже разбирали в <a href="../01-fundament/7-test-isolation.html" class="wikilink">7. Test isolation</a>, использование <code>defer</code> для очистки ресурсов в параллельных тестах (особенно внутри <code>t.Run</code>) приводит к преждевременному удалению файлов. Тест еще не закончился, а папка уже удалена родительской функцией.<br />
-3. <strong>Утечки мусора:</strong> Если тест вызывает <code>os.Exit</code> (что иногда случается в сложных интеграционных обвязках), <code>defer</code> не срабатывает, и системный <code>/tmp</code> забивается мусорными папками.</p>
+<h3 id="arkhitekturnye-defekty-starogo-podkhoda">Архитектурные дефекты старого подхода:</h3>
+<ol>
+<li><strong>Избыточный шум:</strong> На каждый файловый тест приходится писать 5–7 строк монотонного бойлерплейта с проверками <code>err != nil</code>.</li>
+<li><strong>Ловушка конкуренции с defer:</strong> Как мы выяснили в главе <a href="../01-fundament/7-test-isolation.html" class="wikilink">7. Test isolation</a>, использование <code>defer</code> в тестах с иерархией <code>t.Run</code> и параллелизмом <code>t.Parallel()</code> катастрофично. Родительская функция выходит из стека и выполняет <code>os.RemoveAll(dir)</code> в тот момент, когда асинхронный дочерний подтест еще даже не начал читать файл!</li>
+<li><strong>Утечки мусора в ОС:</strong> Если при сложной интеграционной проверке происходит системный сбой или принудительный вызов <code>os.Exit</code>, отложенные инструкции <code>defer</code> не выполняются, и системный каталог <code>/tmp</code> стремительно забивается миллионами брошенных папок.</li>
+</ol>
 <hr />
 <h2 id="sovremennyy-standart-t-tempdir">Современный стандарт: t.TempDir()</h2>
 
-<p>Метод <code>t.TempDir()</code> решает все эти проблемы одной строчкой. Он создает уникальную временную директорию для текущего теста и <strong>автоматически</strong> регистрирует её удаление через внутренний механизм <code>t.Cleanup()</code>.</p>
+<p>Встроенный метод <code>t.TempDir()</code> (или <code>t.TempDir</code>) превращает всю эту рутину в лаконичный однострочник. Он создает уникальную изолированную папку для текущего теста и <strong>автоматически</strong> связывает ее жизненный цикл с внутренним хуком <code>t.Cleanup()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2228,46 +2239,48 @@ func TestLegacyFileIO(t *testing.T) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestModernFileIO(t *testing.T) {
-    // t.TempDir() возвращает готовую строку с путем. Никаких проверок err != nil!
+    // t.TempDir() возвращает абсолютный путь в виде строки без возврата error
     dir := t.TempDir() 
 
     filePath := filepath.Join(dir, &quot;config.json&quot;)
+    payload := []byte(`{&quot;status&quot;: &quot;ok&quot;}`)
 
-    err := os.WriteFile(filePath, []byte(`{&quot;status&quot;: &quot;ok&quot;}`), 0644)
+    err := os.WriteFile(filePath, payload, 0644)
     if err != nil {
-        t.Fatal(err)
+        t.Fatalf(&quot;Ошибка записи тестового файла: %v&quot;, err)
     }
 
-    // Читаем, проверяем, радуемся.
-    // Больше ничего делать не нужно. Папка будет удалена автоматически.
+    // Читаем, проверяем assertion, завершаем работу.
+    // Никаких defer! Каталог со всем содержимым будет гарантированно удален.
 }
 </code></pre>
 </div>
 
+<hr />
 <h3 id="mechanical-sympathy-tmpfs-i-nulevoy-disk-io">Mechanical Sympathy: tmpfs и нулевой Disk I/O</h3>
 
-<p>Для Senior-разработчика важно понимать, <em>куда именно</em> <code>t.TempDir()</code> пишет данные. </p>
-<p>В Linux и macOS системная временная директория (обычно <code>/tmp</code> или <code>/var/folders/...</code>) почти всегда монтируется как <strong><code>tmpfs</code></strong> (Temporary File System). </p>
+<p>Для Senior-разработчика принципиально понимать физический путь байтов при вызове <code>t.TempDir()</code>. Куда именно операционная система складывает эти файлы?</p>
+<p>В современных дистрибутивах Linux и macOS системный каталог временных файлов (каталог <code>/tmp</code> в Linux или путь вида <code>/var/folders/...</code> в macOS) монтируется как специальная файловая система <strong><code>tmpfs</code></strong>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Файловая система <code>tmpfs</code> физически располагается в оперативной памяти (RAM) и в кэше страниц ядра (Page Cache), а не на постоянном носителе (SSD/HDD).</p>
-<p>Это дает колоссальное преимущество для тестов:<br />
-1. <strong>Нулевая задержка физического диска (Zero Disk Latency):</strong> Ваши вызовы <code>syscall write</code> просто копируют байты из User Space в RAM (Kernel Space).<br />
-2. <strong>Отсутствие износа SSD (Wear Leveling):</strong> Если ваши тесты генерируют гигабайты логов или временных файлов на каждый коммит в CI, использование системного <code>/tmp</code> бережет ресурс дисков на ваших runner-машинах.</p>
-<p>Когда <code>t.TempDir</code> удаляет папку, ОС просто помечает страницы памяти как свободные.</p>
+    <p>Файловая система <code>tmpfs</code> физически не обращается к контроллеру накопителя (NVMe/SSD). Она целиком размещается в виртуальной памяти ядра Linux — в оперативной памяти (RAM) и системном кэше страниц (Page Cache).  </p>
+<p>Это обеспечивает колоссальные преимущества при сборке:<br />
+1. <strong>Нулевая аппаратная задержка (Zero Disk Latency):</strong> Системный вызов записи <code>syscall write</code> сводится к быстрому копированию байтов из User Space в Page Cache ядра операционной системы на скорости шины DDR4/DDR5.<br />
+2. <strong>Экономия ресурса SSD (Wear Leveling):</strong> В крупных CI/CD раннерах ежедневно прогоняются десятки тысяч тестов, генерирующих гигабайты временных логов. Использование оперативной памяти через <code>tmpfs</code> полностью исключает износ твердотельных накопителей.</p>
+<p>При удалении каталога ядро ОС просто мгновенно возвращает страницы памяти в пул доступных страниц без медленных операций перезаписи флеш-блоков.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="arkhitektura-izolyatsiya-parallelnykh-testov">Архитектура: Изоляция параллельных тестов</h2>
 
-<p>Самая большая ценность <code>t.TempDir()</code> раскрывается в конкурентной среде. </p>
-<p>В Go каждый вызов <code>t.TempDir()</code> генерирует уникальное имя директории, которое включает в себя <strong>название текущего теста и подтеста</strong>, очищенное от спецсимволов, и случайный суффикс.</p>
-<p>Например, для <code>t.Run("valid data", ...)</code> путь будет выглядеть примерно так:<br />
+<p>Истинная мощь метода <code>t.TempDir()</code> проявляется в условиях многопоточного параллельного тестирования (<code>t.Parallel()</code>).</p>
+<p>Каждый вызов <code>t.TempDir()</code> генерирует уникальное абсолютное имя каталога на диске. В это имя тулчейн автоматически внедряет <strong>имя тестовой функции и вложенного подтеста</strong>, очищенное от запрещенных спецсимволов, а также инкрементальный суррогатный суффикс.</p>
+<p>Например, для подтеста <code>t.Run("valid data", ...)</code> сгенерированный путь в файловой системе будет иметь вид:<br />
 <code>/tmp/TestParser/valid_data/001/</code></p>
 
 <div class="mermaid-wrapper">
@@ -2284,56 +2297,62 @@ func TestLegacyFileIO(t *testing.T) {
   <pre class="mermaid">
 flowchart TD
 Start[&quot;go test -parallel 4&quot;] --&gt; Main[&quot;TestFileProcessor&quot;]
-Main --&gt; Sub1[&quot;t.Run -case 1-&quot;]
-Main --&gt; Sub2[&quot;t.Run -case 2-&quot;]
+Main --&gt; Sub1[&quot;t.Run(&#x27;case 1&#x27;)&quot;]
+Main --&gt; Sub2[&quot;t.Run(&#x27;case 2&#x27;)&quot;]
 
-Sub1 --&gt;|&quot;t.TempDir&quot;| Dir1[&quot;/tmp/TestFileProcessor/case_1/001&quot;]
-Sub2 --&gt;|&quot;t.TempDir&quot;| Dir2[&quot;/tmp/TestFileProcessor/case_2/002&quot;]
+Sub1 --&gt;|&quot;t.TempDir()&quot;| Dir1[&quot;/tmp/TestFileProcessor/case_1/001/&quot;]
+Sub2 --&gt;|&quot;t.TempDir()&quot;| Dir2[&quot;/tmp/TestFileProcessor/case_2/002/&quot;]
 
-Dir1 --&gt;|&quot;Изолированный IO&quot;| RAM1[&quot;tmpfs (RAM)&quot;]
-Dir2 --&gt;|&quot;Изолированный IO&quot;| RAM2[&quot;tmpfs (RAM)&quot;]
+Dir1 --&gt;|&quot;Изолированный сокет / IO&quot;| RAM1[&quot;tmpfs (Оперативная память)&quot;]
+Dir2 --&gt;|&quot;Изолированный сокет / IO&quot;| RAM2[&quot;tmpfs (Оперативная память)&quot;]
 
-style Dir1 fill:#e6f3ff,stroke:#0066cc
-style Dir2 fill:#e6f3ff,stroke:#0066cc
-style RAM1 fill:#ccffcc,stroke:#009900
-style RAM2 fill:#ccffcc,stroke:#009900
+classDef proc fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+classDef dir fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#38bdf8;
+classDef ram fill:#064e3b,stroke:#10b981,stroke-width:1px,color:#ecfdf5;
+
+class Start,Main,Sub1,Sub2 proc;
+class Dir1,Dir2 dir;
+class RAM1,RAM2 ram;
   </pre>
 </div>
 
 
-<p>Благодаря этому вы можете смело запускать тысячи тестов, пишущих в файлы с одинаковым названием (например, <code>config.yaml</code>), не боясь состояний гонки (Data Race) на уровне файловой системы.</p>
+<p>Благодаря такой гранулярности сотни параллельных горутин могут одновременно создавать файлы со стандартным жестким именем вроде <code>config.yaml</code>, не опасаясь взаимного повреждения данных (Data Race) и коллизий на уровне диска.</p>
 <hr />
 <h2 id="lovushki-i-korner-keysy">Ловушки и корнер-кейсы</h2>
 
-<p>Несмотря на простоту метода, использование <code>t.TempDir()</code> имеет несколько неочевидных нюансов, о которых часто спрашивают на интервью.</p>
+<p>Несмотря на кажущуюся элементарность, вокруг <code>t.TempDir()</code> существует несколько критически важных нюансов, о которых любят спрашивать на технических собеседованиях.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Блокировка файлов в Windows</span>
   </div>
   <div class="callout-body">
-    <p>В Linux/Unix вы можете удалить файл (через <code>unlink</code> или <code>rm -rf</code>), даже если он открыт другим процессом. В Windows файловая система NTFS работает иначе: если файл открыт, ОС блокирует его удаление (File Lock).</p>
-<p>Если в вашем тесте вы создали файл в <code>t.TempDir()</code>, открыли его (<code>os.Open</code>), но забыли сделать <code>file.Close()</code>, тест на Linux пройдет успешно (файл молча удалится после теста). <br />
-Но когда этот же код запустится в CI на Windows-runner, <code>t.TempDir()</code> попытается удалить директорию в фазе <code>Cleanup</code>, получит ошибку <code>Access is denied</code> и <strong>провалит весь тест</strong>, залогировав ошибку очистки.<br />
-<strong>Мораль:</strong> Всегда закрывайте файлы (<code>defer file.Close()</code>), даже если они временные.</p>
+    <p>В POSIX-совместимых операционных системах (Linux и macOS) системный вызов <code>unlink</code> (и утилита <code>rm -rf</code>) без проблем удаляет дескриптор файла из каталога, даже если этот файл прямо сейчас открыт другим процессом на чтение или запись. Ядро удалит данные с диска, как только закроется последний файловый дескриптор.<br />
+В операционной системе Windows и ее файловой системе NTFS модель совершенно иная: открытый дескриптор файла накладывает обязательную эксклюзивную блокировку (Mandatory File Lock).  </p>
+<p>Если ваш тестовый код открыл файл (<code>os.Open</code>), но забыл выполнить закрытие через <code>file.Close()</code> (или <code>defer file.Close()</code>), то на Linux тест завершится успешно. Но когда тот же самый репозиторий запустится в CI на агенте под управлением Windows, раннер в фазе финализации <code>Cleanup</code> попытается удалить временную папку, получит от ядра Windows отказ <code>Access is denied</code> и <strong>аварийно провалит весь тест</strong>, залогировав ошибку в фазе teardown.<br />
+<strong>Инженерный закон:</strong> всегда закрывайте файловые дескрипторы через <code>file.Close()</code>, даже если вы работаете с временными файлами.</p>
   </div>
 </div>
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Мой тест, использующий <code>t.TempDir()</code>, падает. Я хочу зайти в эту папку на диске и посмотреть, какие файлы там сгенерировались. Но папки нет! Почему?<br />
-<strong>Ответ:</strong> Рантайм пакета <code>testing</code> вызывает зарегистрированные <code>t.Cleanup()</code> функции <strong>всегда</strong>, независимо от того, прошел тест успешно или упал (failed). <br />
-Если вам нужно сохранить директорию для дебага, вам придется временно отключить использование <code>t.TempDir()</code> и переписать на ручное создание <code>os.MkdirTemp()</code> без регистрации удаления, либо использовать дебаггер (dlv), чтобы поставить брейкпоинт до завершения функции.</p>
+    <p><strong>Вопрос:</strong> Мой тест, использующий <code>t.TempDir()</code>, упал с ошибкой assertion. Я хочу зайти в терминал и посмотреть, какие файлы там были сгенерированы. Но этой папки физически нет на диске! Куда она исчезла?<br />
+<strong>Ответ:</strong> Хуки <code>t.Cleanup()</code> в рантайме пакета <code>testing</code> вызываются <strong>всегда и безусловно</strong>, независимо от того, прошел тест успешно (PASS) или завершился падением (FAIL). Метод <code>t.TempDir()</code> добросовестно удаляет за собой песочницу в любой ситуации.<br />
+Если вам необходимо сохранить сгенерированные артефакты для последующего расследования, временно замените вызов <code>t.TempDir()</code> на ручной <code>os.MkdirTemp()</code> без регистрации удаления, либо подключите интерактивный отладчик Delve (<code>dlv</code>), установив точку останова перед завершением функции теста.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="pravilnyy-di-s-faylovoy-sistemoy">Правильный DI с файловой системой</h2>
 
-<p>Как сделать так, чтобы ваш production-код мог использовать реальные пути, а тесты — временные? Используйте Dependency Injection на уровне путей или интерфейса файловой системы (<code>io/fs.FS</code>, появившегося в Go 1.16).</p>
+<p>Как спроектировать архитектуру продуктового сервиса так, чтобы в бою он работал с реальными путями сервера, а в тестах — со стерильными временными папками?</p>
+<p>Применяйте Dependency Injection на уровне базовых каталогов или используйте абстракцию <code>io/fs.FS</code>, появившуюся в Go 1.16:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2343,7 +2362,7 @@ style RAM2 fill:#ccffcc,stroke:#009900
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Конструктор принимает базовую директорию
+  <pre class="language-go"><code class="language-go">// Конструктор сервиса принимает базовый путь в качестве явной зависимости
 func NewLogger(baseDir string) *Logger {
     return &amp;Logger{
         filepath: filepath.Join(baseDir, &quot;app.log&quot;),
@@ -2351,25 +2370,29 @@ func NewLogger(baseDir string) *Logger {
 }
 
 func TestLogger(t *testing.T) {
-    // В тесте инжектим временную директорию
+    // В тестовом сценарии инжектируем изолированную временную папку:
     tmp := t.TempDir()
     logger := NewLogger(tmp)
 
-    logger.Write(&quot;test log&quot;)
-    // ... проверки ...
+    err := logger.Write(&quot;test log entry&quot;)
+    if err != nil {
+        t.Fatalf(&quot;Ошибка записи лога: %v&quot;, err)
+    }
+    // ... валидация содержимого ...
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><code>t.TempDir()</code> — это современный, идиоматичный способ работы с временными файлами в тестах.</li>
-<li>Он устраняет необходимость в ручном управлении очисткой и решает проблемы с <code>defer</code> в параллельных подтестах.</li>
-<li>В UNIX-системах <code>t.TempDir()</code> использует оперативную память (<code>tmpfs</code>), обеспечивая наносекундную скорость записи.</li>
-<li>Остерегайтесь незакрытых дескрипторов файлов (FD), особенно если ваш код будет выполняться на Windows-машинах.</li>
+<li><code>t.TempDir()</code> — современный канонический стандарт работы с файловой системой в тестах на Go.</li>
+<li>Он устраняет громоздкий бойлерплейт и решает проблему преждевременного удаления директорий при работе с <code>t.Parallel()</code> и подтестами.</li>
+<li>В среде Linux/macOS временные файлы размещаются в оперативной памяти (<code>tmpfs</code>), обеспечивая наносекундную скорость дискового ввода-вывода.</li>
+<li>Обязательно закрывайте дескрипторы через <code>file.Close()</code>, защищая тесты от ошибок блокировок <code>Access is denied</code> на Windows-платформах.</li>
 </ol>
-<p>Мы разобрались, как изолировать файловое пространство. Но приложения часто зависят не только от файлов, но и от переменных окружения (например, ключей доступа или настроек портов). Как безопасно мутировать их в конкурентной среде, разберем в следующей статье: <a href="9-environment-variables-v-testakh.html" class="wikilink">9. Environment variables в тестах</a>.</p>
+<p>Файловое пространство изолировано. Однако в микросервисах логика столь же часто зависит от переменных окружения операционной системы (токенов, ключей, портов). Как безопасно мутировать переменные окружения, не ломая параллельные тесты? Ответу на этот вопрос посвящена следующая глава: <a href="9-environment-variables-v-testakh.html" class="wikilink">9. Environment variables в тестах</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2397,7 +2420,7 @@ func TestLogger(t *testing.T) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#nasledie-proshlogo-kak-my-stradali-ranshe">Наследие прошлого: Как мы страдали раньше</a></li><li class="toc-item toc-h2"><a href="#sovremennyy-standart-t-tempdir">Современный стандарт: t.TempDir()</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-tmpfs-i-nulevoy-disk-io">Mechanical Sympathy: tmpfs и нулевой Disk I/O</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-izolyatsiya-parallelnykh-testov">Архитектура: Изоляция параллельных тестов</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-korner-keysy">Ловушки и корнер-кейсы</a></li><li class="toc-item toc-h2"><a href="#pravilnyy-di-s-faylovoy-sistemoy">Правильный DI с файловой системой</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#nasledie-proshlogo-kak-my-stradali-ranshe">Наследие прошлого: Как мы страдали раньше</a></li><li class="toc-item toc-h3"><a href="#arkhitekturnye-defekty-starogo-podkhoda">Архитектурные дефекты старого подхода:</a></li><li class="toc-item toc-h2"><a href="#sovremennyy-standart-t-tempdir">Современный стандарт: t.TempDir()</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-tmpfs-i-nulevoy-disk-io">Mechanical Sympathy: tmpfs и нулевой Disk I/O</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-izolyatsiya-parallelnykh-testov">Архитектура: Изоляция параллельных тестов</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-korner-keysy">Ловушки и корнер-кейсы</a></li><li class="toc-item toc-h2"><a href="#pravilnyy-di-s-faylovoy-sistemoy">Правильный DI с файловой системой</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

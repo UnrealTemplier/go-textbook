@@ -2169,19 +2169,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. go test под капотом</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Когда мы пишем <code>go test</code> в консоли, магия происходит настолько быстро, что создается иллюзия работы интерпретатора или JIT-компиляции, как в Java. Кажется, будто Go просто "читает" файлы и выполняет их "на лету". </p>
-<p>Но мы инженеры, и магии для нас не существует. За этой скоростью скрывается сложный, многоступенчатый процесс статической кодогенерации, нативной компиляции и изощренной работы с планировщиком ОС.</p>
-<p>В этой статье мы препарируем команду <code>go test</code>, посмотрим на сгенерированный ею код и разберемся, как тесты исполняются на уровне рантайма (Runtime) и железа.</p>
+            <p>Когда мы вводим в терминале команду <code>go test</code> и спустя доли секунды видим аккуратный отчет о выполнении сотен тестовых сценариев, легко поддаться иллюзии, будто Go работает как скриптовый интерпретатор или легковесная виртуальная машина с JIT-компилятором. Кажется, будто система просто считывает исходные файлы и выполняет их на лету.</p>
+<p>Однако для инженера магии не существует. За этой головокружительной скоростью скрывается отточенный механизм системного программирования: статическая кодогенерация, нативная компиляция в машинный код, оптимизация графа зависимостей и изощренное взаимодействие с планировщиком операционной системы.</p>
+<p>В этой главе мы препарируем тулчейн <code>go test</code>, исследуем синтетический код, генерируемый компилятором, и разберем низкоуровневую механику исполнения тестов на стыке рантайма Go и процессорного железа.</p>
+<hr />
 <h2 id="zhiznennyy-tsikl-go-test">Жизненный цикл `go test`</h2>
 
-<p>Выполнение команды <code>go test</code> можно разделить на три изолированные фазы: <strong>Анализ</strong>, <strong>Сборка</strong> и <strong>Исполнение</strong>. </p>
+<p>Выполнение команды <code>go test</code> состоит из трех строго разграниченных фаз: <strong>Анализ и кодогенерация</strong>, <strong>Компиляция и линковка</strong> и <strong>Исполнение в рантайме</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2196,35 +2197,45 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-CLI[&quot;go test ./...&quot;] --&gt;|&quot;Парсинг файлов&quot;| AST[&quot;AST Анализатор&quot;]
-AST --&gt;|&quot;Поиск сигнатур&quot;| Gen[&quot;Генерация _testmain.go&quot;]
-Gen --&gt;|&quot;go tool compile&quot;| Build[&quot;Компиляция ELF/Mach-O&quot;]
-Build --&gt;|&quot;Linker&quot;| Bin[&quot;Исполняемый файл pkg.test&quot;]
-Bin --&gt;|&quot;os exec&quot;| Run[&quot;Процесс ОС&quot;]
-Run --&gt;|&quot;Сбор метрик&quot;| Cleanup[&quot;Удаление pkg.test&quot;]
+CLI[&quot;go test ./... в терминале&quot;] --&gt;|&quot;Лексический и синтаксический анализ&quot;| AST[&quot;Парсер AST (Abstract Syntax Tree)&quot;]
+AST --&gt;|&quot;Поиск сигнатур Test*, Benchmark*, Fuzz*&quot;| Gen[&quot;Генерация синтетического файла _testmain.go&quot;]
+Gen --&gt;|&quot;go tool compile&quot;| Build[&quot;Компиляция в машинный код&quot;]
+Build --&gt;|&quot;go tool link&quot;| Bin[&quot;Исполняемый бинарник pkg.test (ELF/Mach-O/PE)&quot;]
+Bin --&gt;|&quot;Системный вызов fork/execve&quot;| Run[&quot;Нативный процесс операционной системы&quot;]
+Run --&gt;|&quot;tRunner + сбор метрик и логов&quot;| Output[&quot;Буферизованный вывод в stdout&quot;]
+Output --&gt;|&quot;Удаление временного бинарника&quot;| Cleanup[&quot;Автоматическая очистка кэша сборки&quot;]
 
-style Build fill:#e6f3ff,stroke:#0066cc
-style Bin fill:#fff2e6,stroke:#ff9933
+classDef cli fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+classDef gen fill:#0f172a,stroke:#f59e0b,stroke-width:1px,color:#fbbf24;
+classDef bin fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#38bdf8;
+classDef run fill:#1e293b,stroke:#10b981,stroke-width:1px,color:#f8fafc;
+
+class CLI,AST,Build,Output,Cleanup cli;
+class Gen gen;
+class Bin bin;
+class Run run;
   </pre>
 </div>
 
 
-<h3 id="faza-1-analiz-i-kodogeneratsiya">Фаза 1: Анализ и Кодогенерация</h3>
+<hr />
+<h2 id="faza-1-analiz-i-kodogeneratsiya">Фаза 1: Анализ и Кодогенерация</h2>
 
-<p>Тулчейн Go не использует рефлексию (Reflection) для поиска ваших тестов в рантайме. Рефлексия — это медленно. Вместо этого инструмент статического анализа парсит Abstract Syntax Tree (AST) всех файлов, оканчивающихся на <code>_test.go</code> в текущем пакете.</p>
-<p>Он ищет функции, удовлетворяющие жестким сигнатурам:<br />
-* <code>TestXxx(t *testing.T)</code><br />
-* <code>BenchmarkXxx(b *testing.B)</code><br />
-* <code>FuzzXxx(f *testing.F)</code><br />
-* <code>TestMain(m *testing.M)</code></p>
-<p>Как только функции найдены, <code>go test</code> динамически генерирует во временной директории (обычно в <code>$TMPDIR</code> или кэше сборки) файл <code>_testmain.go</code>. Это настоящая точка входа (<code>func main</code>) для вашего тестового бинарника.</p>
+<p>Тулчейн Go категорически отвергает рантайм-рефлексию для поиска тестов. Рефлексия требует сканирования метаданных во время выполнения программы, что замедляет запуск и увеличивает накладные расходы. Вместо этого инструмент статического анализа строит AST-дерево всех файлов с суффиксом <code>_test.go</code> в целевом каталоге.</p>
+<p>Анализатор отбирает строго декларированные функции, удовлетворяющие каноническим сигнатурам:<br />
+* <code>TestXxx(t *testing.T)</code> — модульные и интеграционные проверки;<br />
+* <code>BenchmarkXxx(b *testing.B)</code> — нагрузочные бенчмарки;<br />
+* <code>FuzzXxx(f *testing.F)</code> — фаззинг-сценарии;<br />
+* <code>TestMain(m *testing.M)</code> — координатор пакетного жизненного цикла.</p>
+<p>После обнаружения функций инструмент кодогенерации создает во временном системном каталоге (определяемом переменной <code>$TMPDIR</code> или директорией кэша сборки <code>GOCACHE</code>) временный файл с именем <code>_testmain.go</code> (компонент <code>_testmain</code>). Этот файл содержит настоящую точку входа операционной системы — функцию <code>func main</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Как выглядит сгенерированный <code>_testmain.go</code>? В упрощенном виде он содержит массив структур <code>testing.InternalTest</code>:</p>
+    <p>Как устроен сгенерированный файл <code>_testmain.go</code>?<br />
+В упрощенном виде генератор создает массив структур <code>testing.InternalTest</code>, связывающий текстовые имена функций с реальными адресами функций в кодовой секции программы:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2237,10 +2248,10 @@ style Bin fill:#fff2e6,stroke:#ff9933
   <pre class="language-go"><code class="language-go">package main
 
 import (
+    &quot;os&quot;
     &quot;testing&quot;
     &quot;testing/internal/testdeps&quot;
-    // Импорт вашего пакета под алиасом
-    _test &quot;myproject/mypackage&quot; 
+    _test &quot;myproject/mypackage&quot; // Импорт вашего пакета
 )
 
 var tests = []testing.InternalTest{
@@ -2255,29 +2266,34 @@ func main() {
 </code></pre>
 </div>
 
-<p>Этот массив передается в движок пакета <code>testing</code>. Никакой магии, только передача указателей на функции.</p>
+<p>Входная точка <code>main()</code> передает сгенерированный реестр тестов в низкоуровневый раннер пакета <code>testing</code>. Никакого динамического поиска — только прямые вызовы по указателям функций.</p>
   </div>
 </div>
 
-<h3 id="faza-2-kompilyatsiya">Фаза 2: Компиляция</h3>
+<hr />
+<h2 id="faza-2-kompilyatsiya">Фаза 2: Компиляция</h2>
 
-<p>Затем вызывается <code>go tool compile</code> (и линковщик <code>go tool link</code>). Ваш код и сгенерированный <code>_testmain.go</code> собираются в единый монолитный исполняемый файл для вашей архитектуры и ОС (например, <code>mypackage.test</code>).</p>
-<p>Этот файл подвергается тем же оптимизациям, что и production-сборка: Escape Analysis пытается аллоцировать переменные на стеке (чтобы не нагружать GC), а короткие функции инлайнятся (Inlining) прямо в тело тестов, чтобы избежать накладных расходов на переключение фреймов стека (Call Frame).</p>
+<p>После формирования исходного кода точки входа тулчейн инициирует вызовы компилятора <code>go tool compile</code> и линковщика <code>go tool link</code>. Ваш продуктовый код, файлы тестов и сгенерированный <code>_testmain.go</code> компилируются в единый независимый монолитный бинарник операционной системы — например, <code>mypackage.test</code> (или <code>pkg.test</code>, а на платформе Windows — <code>pkg.test.exe</code>).</p>
+<p>Этот бинарный файл подвергается тем же агрессивным оптимизациям компилятора, что и промышленный релиз:<br />
+1. <strong>Escape Analysis:</strong> Компилятор стремится разместить структуры на стеке текущего потока, минимизируя аллокации в куче и нагрузку на сборщик мусора.<br />
+2. <strong>Function Inlining:</strong> Тела коротких функций встраиваются непосредственно в место вызова, устраняя накладные расходы на вызов функций (Call Overhead) и переключение стековых кадров.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Могу ли я скомпилировать тесты сейчас, а запустить их позже на другом сервере, где даже не установлен Go?<br />
-<strong>Ответ:</strong> Да. Команда <code>go test -c</code> генерирует тестовый бинарник (по умолчанию <code>pkg.test</code> или <code>pkg.test.exe</code>), но не запускает его. Вы можете передать этот бинарник на голый production-сервер (Linux) и запустить его вручную <code>./pkg.test</code>. Это часто используется в суровых CI/CD пайплайнах для интеграционного тестирования в закрытых контурах.</p>
+    <p><strong>Вопрос:</strong> Можно ли скомпилировать тесты на машине разработчика и запустить их на удаленном сервере без установленного Go?<br />
+<strong>Ответ:</strong> Да, абсолютно. Флаг <code>go test -c</code> компилирует полноценный тестовый исполняемый файл <code>pkg.test</code>, но не запускает его автоматически.<br />
+Вы можете скопировать получившийся бинарник на чистый Linux-сервер и запустить его напрямую: <code>./pkg.test</code>. Этот прием широко используется в изолированных безопасных CI/CD контурах (Air-gapped Environments), где установка сборочного тулчейна Go запрещена политиками безопасности.</p>
   </div>
 </div>
 
-<h3 id="faza-3-ispolnenie-i-trunner">Фаза 3: Исполнение и tRunner</h3>
+<hr />
+<h2 id="faza-3-ispolnenie-i-trunner">Фаза 3: Исполнение и tRunner</h2>
 
-<p>Когда бинарник запущен, движок <code>testing</code> начинает итерацию по массиву тестов. И здесь начинается самое интересное с точки зрения архитектуры рантайма.</p>
-<p>Каждый тест выполняется в отдельной <strong>горутине</strong>, за создание которой отвечает внутренняя функция <code>tRunner</code>.</p>
+<p>Когда операционная система запускает тестовый бинарник, движок пакета <code>testing</code> приступает к последовательному или параллельному прогону зарегистрированных тестов.</p>
+<p>Каждый тест запускается рантаймом в отдельной выделенной горутине под контролем внутренней координирующей функции <code>tRunner</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2287,33 +2303,64 @@ func main() {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Упрощенный исходный код testing/testing.go
+  <pre class="language-go"><code class="language-go">// Упрощенная механика функции tRunner из runtime пакета testing
 func tRunner(t *T, fn func(t *T)) {
-    // ... инициализация
+    t.runnerID = getg() // Регистрация горутины
+
     defer func() {
-        // Перехват panic внутри теста
-        err := recover()
-        if err != nil {
+        // Перехват непредвиденных паник внутри пользовательского теста
+        if err := recover(); err != nil {
             t.Errorf(&quot;panic: %v&quot;, err)
             t.FailNow()
         }
+        t.signal &lt;- true // Сигнализация основному циклу о завершении
     }()
 
-    // Выполнение ВАШЕЙ функции теста
-    fn(t)
+    fn(t) // Непосредственный вызов вашего сценария TestXxx(t)
 }
 </code></pre>
 </div>
 
-<p>Благодаря тому, что каждый тест обернут в <code>tRunner</code> с <code>defer recover()</code>, если один из ваших тестов словит панику (<code>index out of range</code>, <code>nil pointer dereference</code>), это "убьет" только горутину конкретного теста. Основной процесс <code>_testmain</code> перехватит панику, пометит тест как <code>FAIL</code>, выведет Stack Trace и спокойно продолжит выполнять следующие тесты.</p>
+<p>Благодаря защитному блоку <code>defer recover()</code> любая паника внутри теста (например, разыменование нулевого указателя <code>nil pointer dereference</code> или выход за границы среза <code>index out of range</code>) локализуется в горутине конкретного сценария. Функция <code>recover()</code> перехватывает сбой, помечает текущий тест статусом <code>FAIL</code>, сохраняет дамп стека и возвращает управление главному циклу раннера, который спокойно переходит к следующему тесту без падения всего процесса.</p>
+<hr />
 <h2 id="mechanical-sympathy-mekhanika-t-parallel">Mechanical Sympathy: Механика t.Parallel()</h2>
 
-<p>По умолчанию тесты выполняются <strong>строго последовательно</strong> внутри пакета. Планировщик Go выделяет горутине теста квант времени, она отрабатывает до конца, затем запускается следующая.</p>
-<p>Но если вы вызываете метод <code>t.Parallel()</code> в первой строчке теста, происходит магия оркестрации:</p>
+<p>По умолчанию все тесты внутри пакета выполняются <strong>строго последовательно</strong> в одной горутине раннера. Но как только тест содержит вызов <code>t.Parallel()</code>, в рантайме включается двухфазная диспетчеризация:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Main as &quot;Раннер тестов (tRunner)&quot;
+participant Q as &quot;Очередь параллельных тестов&quot;
+participant Sched as &quot;Планировщик Go (GMP)&quot;
+participant Test as &quot;Параллельный тест TestXxx&quot;
+
+Main-&gt;&gt;Test: Запуск функции теста
+Test-&gt;&gt;Test: Вызов t.Parallel()
+Test-&gt;&gt;Main: runtime.Goexit() -&gt; перехват рантаймом
+Main-&gt;&gt;Q: Поместить тест в очередь ожидания
+Note over Main: Выполнение всех последовательных тестов сьюта
+Main-&gt;&gt;Q: Все последовательные тесты завершены!
+Main-&gt;&gt;Sched: Массовое пробуждение параллельных горутин
+Sched-&gt;&gt;Test: Конкурентное исполнение на ядрах CPU
+  </pre>
+</div>
+
+
 <ol>
-<li>Метод <code>t.Parallel()</code> немедленно вызывает <code>runtime.Goexit()</code>. Текущая горутина ставится на паузу и помечается как "ожидающая параллельного запуска".</li>
-<li>Движок тестов переходит к следующему тесту в массиве.</li>
-<li>Только когда <strong>все</strong> последовательные тесты завершатся, движок берет все отложенные параллельные горутины и "будит" их разом, разрешая планировщику (Scheduler) распределить их по тредам ОС (M) и логическим процессорам (P).</li>
+<li><strong>Фаза откладывания:</strong> Вызов <code>t.Parallel()</code> инициирует вызов <code>runtime.Goexit()</code>. Горутина текущего теста паркуется, помещается в очередь отложенных задач, а раннер мгновенно переходит к следующему тесту.</li>
+<li><strong>Фаза параллельного взрыва:</strong> Только после того, как завершится последний последовательный тест пакета, раннер достает все отложенные горутины из очереди и передает их планировщику Go для конкурентного исполнения.</li>
 </ol>
 <div class="callout callout-warning">
   <div class="callout-header">
@@ -2321,32 +2368,64 @@ func tRunner(t *T, fn func(t *T)) {
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Количество тестов, которые физически могут выполняться одновременно при <code>t.Parallel()</code>, ограничено переменной среды <code>GOMAXPROCS</code> (по умолчанию равно количеству ядер процессора). </p>
-<p>Если у вас 1000 параллельных I/O-bound интеграционных тестов (которые ходят в БД), они не "завалят" вашу БД тысячей одновременных подключений. Они выстроятся в очередь планировщика Go, и параллельно в User Space будут крутиться максимум 8-16 тестов (в зависимости от ваших ядер). Вы можете искусственно поднять этот лимит флагом <code>go test -parallel N</code>.</p>
+    <p>Количество тестов, исполняемых параллельно, по умолчанию жестко ограничено значением переменной среды <code>GOMAXPROCS</code> (равной числу физических или виртуальных ядер процессора, доступных процессору).<br />
+Если у вас сотни тяжелых сетевых тестов, они не перегрузят систему неконтролируемым параллелизмом. Однако если ваши тесты упираются в ожидание сетевого I/O, вы можете существенно ускорить прогон, явно увеличив пул параллельных исполнителей через флаг:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -parallel N
+</code></pre>
+</div>
+
+<p>где <code>N</code> — желаемое количество одновременно активных тестовых горутин.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="keshirovanie-pochemu-testy-vypolnyayutsya-za-0-001s">Кеширование: Почему тесты выполняются за 0.001s?</h2>
 
-<p>Тулчейн Go невероятно агрессивен в плане кеширования. Если вы запустите <code>go test</code> дважды без изменений в коде, второй прогон вернет <code>(cached)</code>.</p>
-<p><strong>Как Go определяет, что кеш валиден?</strong><br />
-Он берет хеш (SHA256) от:<br />
-1. Содержимого всех <code>.go</code> файлов пакета и его зависимостей.<br />
-2. Флагов командной строки (<code>-tags</code>, <code>-gcflags</code>).<br />
-3. Переменных окружения, которые влияют на сборку (<code>CGO_ENABLED</code>, <code>GOOS</code>, <code>GOARCH</code>).</p>
-<p>Если хеш совпадает с записью в папке <code>GOCACHE</code>, Go <strong>вообще не компилирует и не запускает бинарник</strong>. Он просто выводит в консоль сохраненный <code>stdout</code> от прошлого успешного запуска.</p>
-<p><strong>Как инвалидировать кеш?</strong><br />
-Иногда тесты зависят от внешнего мира (например, запрос к удаленному API). Код не поменялся, но ответ API мог измениться. Кеш здесь вреден.<br />
-* Идиоматичный способ принудительно запустить тесты: добавить флаг <code>-count=1</code> (<code>go test -count=1 ./...</code>). Этот флаг отключает подсистему кеширования результатов тестов (но оставляет кеш сборки компилятора).</p>
+<p>Тулчейн Go славится агрессивным двухуровневым кэшированием. Если при повторном запуске <code>go test</code> в кодовой базе не произошло изменений, в терминале мгновенно отображается статус <code>(cached)</code>, а время прогона составляет доли миллисекунды.</p>
+<h3 id="algoritm-vychisleniya-klyucha-kesha">Алгоритм вычисления ключа кэша</h3>
+
+<p>Go вычисляет криптографический хэш (SHA-256) от совокупности факторов:<br />
+1. Содержимое всех исходных файлов <code>.go</code> пакета и всех его транзитивных зависимостей.<br />
+2. Флаги компилятора и линковщика (<code>-tags</code>, <code>-gcflags</code>).<br />
+3. Переменные окружения, влияющие на бинарный код: <code>CGO_ENABLED</code>, <code>GOOS</code>, <code>GOARCH</code>.<br />
+4. Точные бинарные версии установленного компилятора Go.</p>
+<p>Если вычисленный хэш совпадает с записью в системном каталоге кэша <code>GOCACHE</code>, тулчейн <strong>вообще не компилирует бинарник и не выполняет системный вызов <code>exec</code></strong>. Он мгновенно выводит в <code>stdout</code> терминала сохраненный текстовый лог предыдущего успешного запуска.</p>
+<h3 id="invalidatsiya-kesha">Инвалидация кэша</h3>
+
+<p>Если ваши тесты взаимодействуют с внешней базой данных, сетью или физическим временем, кеширование результатов может скрыть реальный регресс. Чтобы принудительно отключить кэш результатов тестирования, всегда используйте флаг <code>-count=1</code>:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -count=1 ./...
+</code></pre>
+</div>
+
+<p>Флаг <code>-count=1</code> гарантирует, что каждый тестовый бинарник будет заново скомпилирован и физически запущен операционной системой.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><code>go test</code> — это не интерпретатор. Это обертка, которая генерирует <code>_testmain.go</code>, компилирует нативный исполняемый файл и управляет его запуском.</li>
-<li>Бинарник можно собрать отдельно через <code>go test -c</code>.</li>
-<li>Каждый тест выполняется в своей собственной горутине под присмотром <code>tRunner</code>, который защищает процесс от падений через <code>recover()</code>.</li>
-<li>Инструментарий агрессивно кеширует результаты, опираясь на хеш исходников. Запомните флаг <code>-count=1</code> для обхода этой оптимизации.</li>
+<li><strong>Кодогенерация вместо рефлексии:</strong> Тулчейн <code>go test</code> строит AST, генерирует <code>_testmain.go</code> и собирает нативный бинарник без накладных расходов во время выполнения.</li>
+<li><strong>Автономность артефактов:</strong> Команда <code>go test -c</code> позволяет собрать переносимый бинарник <code>pkg.test</code> для автономного запуска в закрытых контурах.</li>
+<li><strong>Безопасность исполнения:</strong> Внутренняя функция <code>tRunner</code> оборачивает каждый тест в <code>defer recover()</code>, изолируя системные паники.</li>
+<li><strong>Умное кэширование:</strong> Раннер использует хэширование исходников и переменных <code>GOCACHE</code>, пропуская повторные запуски; используйте <code>-count=1</code> для честного сквозного прогона.</li>
 </ol>
-<p>Теперь, понимая механику рантайма, мы готовы переходить к написанию самих тестов. Начнем с самого важного идиоматичного паттерна в Go, который позволяет писать десятки проверок без дублирования кода: <a href="4-table-driven-tests.html" class="wikilink">4. Table driven tests</a>.</p>
+<p>Разобравшись с низкоуровневой анатомией запуска, мы переходим к практическому паттерну, являющемуся золотым стандартом чистого кода в Go: <a href="4-table-driven-tests.html" class="wikilink">4. Table driven tests</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2374,7 +2453,7 @@ func tRunner(t *T, fn func(t *T)) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-go-test">Жизненный цикл go test</a></li><li class="toc-item toc-h3"><a href="#faza-1-analiz-i-kodogeneratsiya">Фаза 1: Анализ и Кодогенерация</a></li><li class="toc-item toc-h3"><a href="#faza-2-kompilyatsiya">Фаза 2: Компиляция</a></li><li class="toc-item toc-h3"><a href="#faza-3-ispolnenie-i-trunner">Фаза 3: Исполнение и tRunner</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-mekhanika-t-parallel">Mechanical Sympathy: Механика t.Parallel()</a></li><li class="toc-item toc-h2"><a href="#keshirovanie-pochemu-testy-vypolnyayutsya-za-0-001s">Кеширование: Почему тесты выполняются за 0.001s?</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-go-test">Жизненный цикл go test</a></li><li class="toc-item toc-h2"><a href="#faza-1-analiz-i-kodogeneratsiya">Фаза 1: Анализ и Кодогенерация</a></li><li class="toc-item toc-h2"><a href="#faza-2-kompilyatsiya">Фаза 2: Компиляция</a></li><li class="toc-item toc-h2"><a href="#faza-3-ispolnenie-i-trunner">Фаза 3: Исполнение и tRunner</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-mekhanika-t-parallel">Mechanical Sympathy: Механика t.Parallel()</a></li><li class="toc-item toc-h2"><a href="#keshirovanie-pochemu-testy-vypolnyayutsya-za-0-001s">Кеширование: Почему тесты выполняются за 0.001s?</a></li><li class="toc-item toc-h3"><a href="#algoritm-vychisleniya-klyucha-kesha">Алгоритм вычисления ключа кэша</a></li><li class="toc-item toc-h3"><a href="#invalidatsiya-kesha">Инвалидация кэша</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
