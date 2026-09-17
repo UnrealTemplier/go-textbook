@@ -166,6 +166,7 @@ def render_article_page(
   <meta name="description" content="Полное руководство: {html.escape(article.title)}. Go, архитектура систем, computer science.">
   <link rel="stylesheet" href="{rel_root}assets/style.css">
   <link rel="stylesheet" href="{rel_root}assets/vendor/prism-tomorrow.min.css">
+  <link rel="stylesheet" href="{rel_root}assets/vendor/katex/katex.min.css">
 </head>
 <body class="theme-dark">
   <div class="reading-progress-bar" id="reading-progress"></div>
@@ -275,6 +276,8 @@ def render_article_page(
   <!-- Скрипты -->
   <script src="{rel_root}assets/vendor/prism-bundle.min.js"></script>
   <script src="{rel_root}assets/vendor/mermaid.min.js"></script>
+  <script src="{rel_root}assets/vendor/katex/katex.min.js"></script>
+  <script src="{rel_root}assets/vendor/katex/contrib/auto-render.min.js"></script>
   <script src="{rel_root}assets/main.js"></script>
 </body>
 </html>

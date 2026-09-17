@@ -716,10 +716,35 @@
   }
 
   // -------------------------------------------------------------------------
+  // 1.1. Инициализация KaTeX (математические формулы LaTeX)
+  // -------------------------------------------------------------------------
+  function initKaTeX() {
+    if (typeof renderMathInElement === 'function') {
+      const content = document.querySelector('.article-markdown') || document.body;
+      try {
+        renderMathInElement(content, {
+          delimiters: [
+            { left: '$$', right: '$$', display: true },
+            { left: '$', right: '$', display: false },
+            { left: '\\(', right: '\\)', display: false },
+            { left: '\\[', right: '\\]', display: true }
+          ],
+          ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option'],
+          ignoredClasses: ['code-block', 'mermaid', 'mermaid-wrapper'],
+          throwOnError: false
+        });
+      } catch (err) {
+        console.warn('KaTeX rendering warning:', err);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Запуск при загрузке DOM
   // -------------------------------------------------------------------------
   document.addEventListener('DOMContentLoaded', function () {
     initMermaid();
+    initKaTeX();
     initSidebarResize();
     initSidebarFilter();
     initSidebarCentering();
