@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Rolling updates</h1>
           </header>
@@ -2178,14 +2178,55 @@
           <div class="article-markdown">
             <h2 id="peresborka-dvigatelya-v-polete-reliz-bez-prava-na-oshibku">Пересборка двигателя в полете: Релиз без права на ошибку</h2>
 
-<p>В эпоху монолитов обновление приложения было событием, к которому готовились неделями. Серверы выводили из балансировки, останавливали демоны, копировали новые бинарники и запускали систему заново. Даунтайм (время простоя) был неизбежен.</p>
-<p>В мире микросервисов и непрерывной доставки (CI/CD) мы выкатываем новые версии десятки раз в день. Делать это с даунтаймом — непозволительная роскошь. Нам нужно менять код "на живую", пока система обрабатывает тысячи запросов в секунду (RPS).</p>
-<p>В Kubernetes этот процесс называется <strong>Rolling Update (Постепенное обновление)</strong>. Это стратегия по умолчанию для контроллера Deployment.</p>
-<p>В этой статье мы разберем математику безопасного обновления, механику отбрасывания трафика на уровне <code>iptables</code> и научимся писать Go-код, который умеет "умирать" красиво (Graceful Shutdown), не обрывая транзакции пользователей.</p>
+<blockquote>
+<p><em>«Если вы не можете обновить систему без остановки обслуживания пользователей, значит, в вашей архитектуре заложена скрытая зависимость от времени простоя».</em><br />
+— Принцип непрерывной доступности</p>
+</blockquote>
+<p>В эпоху монолитных систем релиз новой версии программного обеспечения был драматическим событием, к которому инженерные отделы готовились неделями. Назначались ночные «технические окна» по выходным, серверы вручную выводились из балансировки, демоны останавливались, администраторы копировали новые бинарники по SSH, накатывали скрипты миграций и с замиранием сердца перезапускали сервисы. Даунтайм (Downtime) считался неизбежным злом.</p>
+<p>В мире микросервисов, высокой конкуренции и непрерывной доставки (CI/CD) распределенные системы развертывают новые версии кода десятки раз в сутки прямо посреди рабочего дня. Делать это с прерыванием обслуживания — непозволительная роскошь: даже секундная пауза под нагрузкой в 20 000 RPS обернется десятками тысяч оборванных клиентских корзин, финансовыми потерями и падением репутации сервиса.</p>
+<p>В платформе Kubernetes стандартным механизмом обновления без простоя является <strong>Rolling Update (Постепенное обновление)</strong> — стратегия по умолчанию для контроллера Deployment.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Cluster[&quot;Kubernetes Deployment: Rolling Update в динамике&quot;]
+direction TB
+subgraph Step1[&quot;1. Старт релиза&quot;]
+V1_1[&quot;Pod v1 (Active)&quot;]
+V1_2[&quot;Pod v1 (Active)&quot;]
+V1_3[&quot;Pod v1 (Active)&quot;]
+end
+subgraph Step2[&quot;2. Выкатка v2&quot;]
+V2_1[&quot;Pod v2 (Starting...)&quot;]
+V1_2b[&quot;Pod v1 (Active)&quot;]
+V1_3b[&quot;Pod v1 (Active)&quot;]
+end
+subgraph Step3[&quot;3. Завершение&quot;]
+V2_1c[&quot;Pod v2 (Active)&quot;]
+V2_2c[&quot;Pod v2 (Active)&quot;]
+V2_3c[&quot;Pod v2 (Active)&quot;]
+end
+end
+Step1 ==&gt; Step2 ==&gt; Step3
+  </pre>
+</div>
+
+
+<p>В этой лекции мы разберем математику безопасного релиза, исследуем скрытое состояние гонки между ядром Linux (<code>iptables</code>), сетевым стеком и планировщиком при удалении подов, а также научимся реализовывать образцовый <strong>Graceful Shutdown</strong> на Go, гарантирующий, что ни один пользовательский запрос не будет сброшен по таймауту или <code>Connection refused</code>.</p>
 <hr />
 <h2 id="anatomiya-rolling-update">Анатомия Rolling Update</h2>
 
-<p>Когда вы меняете образ контейнера в манифесте Deployment (например, с <code>myapp:v1</code> на <code>myapp:v2</code>), Kubernetes не убивает все старые поды разом. Он запускает танец двух ReplicaSet.</p>
+<p>Когда вы обновляете тег Docker-образа в манифесте Deployment (например, переходите с <code>myapp:v1</code> на <code>myapp:v2</code>), Kubernetes не уничтожает старые инстансы разом. Контроллер разворачивает изящный алгоритмический танец между двумя объектами <strong>ReplicaSet</strong>:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2200,23 +2241,24 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-D[&quot;Deployment&quot;] --&gt;|&quot;Управляет&quot;| RS1[&quot;ReplicaSet V1&lt;br&gt;Старый код&quot;]
-D --&gt;|&quot;Управляет&quot;| RS2[&quot;ReplicaSet V2&lt;br&gt;Новый код&quot;]
+D[&quot;Deployment Controller\n(kube-controller-manager)&quot;] --&gt;|&quot;Управляет старой версией&quot;| RS1[&quot;ReplicaSet V1\nmyapp:v1&quot;]
+D --&gt;|&quot;Управляет новой версией&quot;| RS2[&quot;ReplicaSet V2\nmyapp:v2&quot;]
 
-RS1 -.-&gt;|&quot;Scale Down&lt;br&gt;Убивает поды&quot;| P1[&quot;Pod V1&quot;]
-RS2 -.-&gt;|&quot;Scale Up&lt;br&gt;Создает поды&quot;| P2[&quot;Pod V2&quot;]
+RS1 -.-&gt;|&quot;Scale Down: -1 Pod&quot;| P1[&quot;Pod V1 (myapp:v1)&quot;]
+RS2 -.-&gt;|&quot;Scale Up: +1 Pod&quot;| P2[&quot;Pod V2 (myapp:v2)&quot;]
 
-P2 --&gt;|&quot;Ждем Health Check&quot;| Ready{&quot;Readiness Probe&lt;br&gt;Успешна?&quot;}
-Ready --&gt;|&quot;Да&quot;| Next[&quot;Убить еще один Pod V1&quot;]
-Ready --&gt;|&quot;Нет&quot;| Wait[&quot;Ждем. Обновление приостановлено&quot;]
+P2 --&gt;|&quot;Проверка готовности&quot;| Ready{&quot;Readiness Probe\nУспешна?&quot;}
+Ready --&gt;|&quot;Да (статус Ready)&quot;| Drain[&quot;Начать вывод из эксплуатации Pod V1&quot;]
+Ready --&gt;|&quot;Нет / Сбой&quot;| Halt[&quot;Приостановить выкатку\nЗащита от сбоя&quot;]
   </pre>
 </div>
 
 
-<p>Процесс строго контролируется контроллером Deployment (в составе <code>kube-controller-manager</code>). Он плавно увеличивает количество реплик в новом <code>ReplicaSet V2</code> и уменьшает их в старом <code>ReplicaSet V1</code>.</p>
+<p>Процесс находится под непрерывным надзором контроллера Deployment в составе <code>kube-controller-manager</code>. Он синхронно увеличивает число желаемых реплик в <code>ReplicaSet V2</code> и уменьшает их в <code>ReplicaSet V1</code>, контролируя, чтобы суммарное число доступных инстансов всегда оставалось в безопасных границах.</p>
+<hr />
 <h3 id="matematika-bezopasnosti-maxsurge-i-maxunavailable">Математика безопасности: maxSurge и maxUnavailable</h3>
 
-<p>Скорость и безопасность этого танца регулируются двумя параметрами в манифесте:</p>
+<p>Скорость, агрессивность и ресурсоемкость процесса обновления регулируются двумя взаимосвязанными параметрами в спецификации Deployment:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2226,40 +2268,174 @@ Ready --&gt;|&quot;Нет&quot;| Wait[&quot;Ждем. Обновление пр�
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">strategy:
-  type: RollingUpdate
-  rollingUpdate:
-    maxSurge: 25%
-    maxUnavailable: 25%
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-deployment
+spec:
+  replicas: 100
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
 </code></pre>
 </div>
 
+<p>Оба параметра могут задаваться как в абсолютных целых числах (подах), так и в процентах от желаемого числа <code>replicas</code>:</p>
 <ul>
-<li><strong><code>maxUnavailable</code> (Максимум недоступных):</strong> Сколько подов от желаемого количества могут быть недоступны во время обновления. Если у вас 100 подов и <code>maxUnavailable: 25%</code>, Kubernetes имеет право мгновенно убить 25 старых подов. У вас останется 75 подов для обработки текущего трафика.</li>
-<li><strong><code>maxSurge</code> (Максимальное превышение):</strong> На сколько подов можно превысить желаемое количество во время обновления. Если лимит 100, а <code>maxSurge: 25%</code>, кластер может создать 25 новых подов, доводя общее количество подов в моменте до 125.</li>
+<li><strong><code>maxUnavailable</code> (Максимальная недоступность):</strong> Какое количество подов от целевого значения может быть недоступно во время обновления.<br />
+  При <code>replicas: 100</code> и <code>maxUnavailable: 25%</code> контроллер имеет право немедленно остановить до 25 старых подов, оставив <strong>75 подов</strong> для обслуживания входящего трафика. Это снижает вычислительную мощность пула на 25%, но экономит ресурсы нод.</li>
+<li><strong><code>maxSurge</code> (Максимальное превышение):</strong> На сколько подов общее количество запущенных контейнеров может временно превысить базовое значение <code>replicas</code>.<br />
+  При <code>replicas: 100</code> и <code>maxSurge: 25%</code> кластер может создать до 25 новых подов сверх нормы, доводя общее число активных инстансов в пике до <strong>125 подов</strong>.</li>
 </ul>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Calc[&quot;Математика Rolling Update (100 реплик, Surge 25%, Unavailable 25%)&quot;]
+R[&quot;Желаемые реплики: 100&quot;]
+Min[&quot;Минимум доступных: 100 - 25 = 75 подов&quot;]
+Max[&quot;Максимум в кластере: 100 + 25 = 125 подов&quot;]
+R --&gt; Min
+R --&gt; Max
+end
+  </pre>
+</div>
+
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдет, если установить <code>maxUnavailable: 0%</code> и <code>maxSurge: 100%</code> для Deployment из 10 подов?<br />
-<strong>Ответ:</strong> Вы получите Blue-Green Deployment в рамках одного контроллера. Kubernetes создаст сразу 10 новых подов (Surge 100%). Старые поды не будут удаляться (Unavailable 0%), пока все 10 новых не станут <code>Ready</code>. В моменте кластер будет потреблять х2 ресурсов (CPU/RAM). Это абсолютно безопасно для трафика, но требует огромного запаса "железа" в кластере.</p>
+    <p><strong>Вопрос:</strong> Что произойдет, если сконфигурировать Deployment со значениями <code>maxUnavailable: 0%</code> и <code>maxSurge: 100%</code> для сервиса из 10 подов?</p>
+<p><strong>Ответ:</strong> Вы получите чистую семантику <strong>Blue-Green Deployment</strong> в рамках одного контроллера Deployment:<br />
+1. Поскольку <code>maxUnavailable: 0%</code>, Kubernetes не имеет права трогать ни один из 10 старых подов <code>myapp:v1</code>.<br />
+2. Контроллер создает сразу 10 новых подов <code>myapp:v2</code> (<code>maxSurge: 100%</code>).<br />
+3. Старые поды продолжают обрабатывать 100% трафика до тех пор, пока все 10 новых подов не перейдут в статус <code>Ready</code>.<br />
+4. В моменте сервис потребляет <strong>200% ресурсов (х2 CPU/RAM)</strong>.<br />
+5. Это обеспечивает абсолютную безопасность для входящего трафика без деградации пропускной способности, но требует двойного запаса свободных мощностей в кластере.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-smert-poda-i-setevoy-lag">Mechanical Sympathy: Смерть пода и сетевой лаг</h2>
 
-<p>Самое слабое место Rolling Update кроется в распределенной природе Kubernetes. Когда <code>kube-controller-manager</code> решает удалить старый под, происходят два независимых асинхронных процесса:</p>
-<ol>
-<li><strong>Endpoint Controller</strong> убирает IP-адрес пода из сущности Endpoints. <code>kube-proxy</code> на каждой ноде замечает это и начинает переписывать правила <code>iptables</code>, чтобы новые сетевые пакеты больше не летели в этот под.</li>
-<li><strong>Kubelet</strong> посылает вашему Go-контейнеру сигнал <code>SIGTERM</code> (просьба мягко завершить работу).</li>
-</ol>
-<p><strong>Ловушка (Gotcha):</strong> Эти процессы параллельны! <code>iptables</code> обновляются не мгновенно (в больших кластерах это может занять секунды). Ваш под уже получил <code>SIGTERM</code> и начал останавливаться, но роутеры K8s всё ещё посылают в него новые HTTP-запросы. Если ваше Go-приложение завершится сразу после получения <code>SIGTERM</code>, все эти новые запросы (и те, что уже находились в обработке) упадут с ошибкой <code>Connection refused</code>.</p>
-<h3 id="idiomatichnyy-graceful-shutdown-na-go">Идиоматичный Graceful Shutdown на Go</h3>
+<p>Самая коварная ловушка Rolling Update кроется в асинхронной распределенной природе Kubernetes. </p>
+<p>Когда <code>kube-controller-manager</code> принимает решение вывести старый Pod из эксплуатации, в системе стартуют <strong>два параллельных и совершенно независимых процесса</strong>:</p>
 
-<p>Чтобы избежать потери трафика, мы обязаны перехватывать сигналы ОС и использовать встроенный в стандартную библиотеку механизм <code>server.Shutdown()</code>.</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor Client as Входящий клиент
+participant API as kube-apiserver
+participant EPC as EndpointSlice Controller
+participant KP as kube-proxy (iptables)
+participant KL as kubelet
+participant App as Go Приложение
+
+Note over API: Начало удаления Pod (DeletionTimestamp)
+
+par Сетевая подсистема (Асинхронно!)
+API-&gt;&gt;EPC: Pod удаляется
+EPC-&gt;&gt;KP: Обновить Endpoints / EndpointSlice
+KP-&gt;&gt;KP: Пересборка правил iptables / IPVS
+Note over KP: Лаг: 1-5 секунд на всех нодах!
+and Жизненный цикл контейнера (Асинхронно!)
+API-&gt;&gt;KL: Остановить контейнер
+KL-&gt;&gt;App: Отправка сигнала SIGTERM!
+end
+
+App-&gt;&gt;App: Если выйти сразу: Socket Closed!
+Client-&gt;&gt;KP: HTTP запрос (правило iptables еще указывает на старый Pod)
+KP-&gt;&gt;App: Пакет TCP SYN -&gt; В закрытый сокет!
+App--&gt;&gt;Client: 💥 TCP RST: Connection refused!
+  </pre>
+</div>
+
+
+<p>Разберем эту анатомию детально:<br />
+1. <strong>Сетевой путь:</strong> Контроллер <code>EndpointSlice</code> исключает IP-адрес пода из списка активных эндпоинтов сервиса. Демон <code>kube-proxy</code> на каждой ноде кластера считывает это изменение и перестраивает цепочки <code>iptables</code> (или таблицы хэшей IPVS). В крупных кластерах с сотнями нод распространение этой информации по сети занимает <strong>от 1 до 5 секунд</strong>.<br />
+2. <strong>Путь исполнения (kubelet):</strong> Локальный агент <code>kubelet</code> получает команду на уничтожение пода и немедленно посылает корневому процессу контейнера сигнал ядра <strong><code>SIGTERM</code></strong>.</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Состояние гонки при удалении</span>
+  </div>
+  <div class="callout-body">
+    <p>Сетевой путь и путь остановки контейнера не синхронизированы!<br />
+Если ваше Go-приложение при получении <code>SIGTERM</code> мгновенно закроет сетевой сокет и завершит выполнение (что часто делают неопытные разработчики вызовом <code>os.Exit(0)</code>), клиенты получат всплеск ошибок <strong><code>Connection refused</code></strong> и <strong><code>503 Service Unavailable</code></strong>. Причина проста: правила <code>iptables</code> на пограничных нодах еще не успели обновиться, и балансировщик продолжает слать новые пакеты на уже мертвого адресата!</p>
+  </div>
+</div>
+
+<hr />
+<h3 id="reshenie-1-prestop-hook-istselyayushchaya-zaderzhka">Решение 1: preStop Hook — исцеляющая задержка</h3>
+
+<p>Для компенсации сетевого лага в спецификацию контейнера добавляют хук жизненного цикла <strong><code>preStop</code></strong>:</p>
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">spec:
+  containers:
+  - name: go-app
+    image: myapp:v2
+    lifecycle:
+      preStop:
+        exec:
+          command: [&quot;/bin/sh&quot;, &quot;-c&quot;, &quot;sleep 5&quot;]
+</code></pre>
+</div>
+
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: preStop Hook</span>
+  </div>
+  <div class="callout-body">
+    <p>Хук <code>preStop</code> вызывается <code>kubelet</code> <strong>синхронно перед</strong> отправкой сигнала <code>SIGTERM</code>.<br />
+Пока контейнер спит эти 5 секунд, он продолжает полноценно работать и отвечать на запросы. За это время <code>kube-proxy</code> на всех серверах кластера успевает гарантированно вычистить старый IP-адрес из правил <code>iptables</code>. Когда 5 секунд истекают, в Pod больше не прилетает ни один новый сетевой пакет, и <code>kubelet</code> наконец отправляет процессу Go сигнал <code>SIGTERM</code>.</p>
+  </div>
+</div>
+
+<p><em>(Для минималистичных Docker-образов на базе <code>scratch</code>, где отсутствует утилита <code>/bin/sh</code>, задержку можно организовать непосредственно в коде Go: перехватить <code>SIGTERM</code>, подождать 5 секунд и лишь затем закрывать сетевой listener).</em></p>
+<hr />
+<h3 id="reshenie-2-idiomatichnyy-graceful-shutdown-na-go">Решение 2: Идиоматичный Graceful Shutdown на Go</h3>
+
+<p>После того как сетевой трафик отведен, приложение должно корректно завершить работу:<br />
+1. Прекратить прием новых TCP-соединений (закрыть сокет <code>net.Listener</code>).<br />
+2. Дождаться завершения всех уже выполняющихся HTTP/gRPC запросов.<br />
+3. Корректно закрыть соединения с брокерами очередей (Kafka, RabbitMQ) и базой данных.<br />
+4. Уложиться в жесткий лимит времени, выделенный Kubernetes (<code>terminationGracePeriodSeconds</code>).</p>
+<p>Для этого в стандартной библиотеке Go используется метод <code>server.Shutdown()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2284,59 +2460,79 @@ import (
 
 func main() {
     mux := http.NewServeMux()
-    mux.HandleFunc(&quot;/&quot;, func(w http.ResponseWriter, r *http.Request) {
-        time.Sleep(2 * time.Second) // Имитация тяжелого запроса
-        w.Write([]byte(&quot;Hello from Go!&quot;))
+    mux.HandleFunc(&quot;/api/v1/checkout&quot;, func(w http.ResponseWriter, r *http.Request) {
+        // Имитация длительной бизнес-транзакции
+        time.Sleep(2 * time.Second)
+        w.WriteHeader(http.StatusOK)
+        _, _ = w.Write([]byte(`{&quot;status&quot;:&quot;order_processed&quot;}`))
     })
 
     srv := &amp;http.Server{
-        Addr:    &quot;:8080&quot;,
-        Handler: mux,
+        Addr:         &quot;:8080&quot;,
+        Handler:      mux,
+        ReadTimeout:  5 * time.Second,
+        WriteTimeout: 10 * time.Second,
+        IdleTimeout:  120 * time.Second,
     }
 
-    // 1. Создаем канал для прослушивания сигналов ОС
+    // 1. Канал для перехвата сигналов операционной системы
     quit := make(chan os.Signal, 1)
-    // Подписываемся на SIGINT (Ctrl+C) и SIGTERM (Kubernetes)
+    // Подписываемся на SIGINT (Ctrl+C локально) и SIGTERM (от Kubelet в кластере)
     signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-    // 2. Запускаем сервер в отдельной горутине
+    // 2. Запуск сервера в отдельной неблокирующей горутине
     go func() {
-        slog.Info(&quot;Server is starting&quot;, &quot;port&quot;, 8080)
+        slog.Info(&quot;Server is listening for requests&quot;, &quot;addr&quot;, srv.Addr)
         if err := srv.ListenAndServe(); err != nil &amp;&amp; !errors.Is(err, http.ErrServerClosed) {
-            slog.Error(&quot;ListenAndServe failed&quot;, &quot;error&quot;, err)
+            slog.Error(&quot;ListenAndServe encountered a fatal error&quot;, &quot;err&quot;, err)
             os.Exit(1)
         }
     }()
 
-    // 3. Блокируемся и ждем сигнала от ОС (или Kubelet)
-    &lt;-quit
-    slog.Info(&quot;SIGTERM received. Starting graceful shutdown...&quot;)
+    // 3. Блокируемся и ждем сигнала завершения от ОС
+    sig := &lt;-quit
+    slog.Info(&quot;Signal received, initiating graceful shutdown&quot;, &quot;signal&quot;, sig.String())
 
-    // 4. Создаем контекст с таймаутом (например, 30 секунд). 
-    // Это хард-лимит на завершение всех текущих запросов.
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    // 4. Опционально (если образ scratch и нет preStop):
+    // time.Sleep(5 * time.Second) // Даем kube-proxy время обновить iptables
+
+    // 5. Создаем контекст с жестким таймаутом на доработку текущих соединений.
+    // Этот таймаут должен быть меньше, чем terminationGracePeriodSeconds в K8s!
+    ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
     defer cancel()
 
-    // 5. srv.Shutdown: 
-    // - Сразу закрывает listener (перестает принимать новые TCP-соединения)
-    // - Ждет завершения всех активных горутин, обрабатывающих HTTP-запросы
+    // 6. Вызов server.Shutdown():
+    // - Немедленно закрывает все открытые net.Listener (отклоняет новые TCP SYN)
+    // - Закрывает все простаивающие (idle) Keep-Alive соединения
+    // - Блокирует поток исполнения, ожидая, пока активные горутины запросов завершатся
     if err := srv.Shutdown(ctx); err != nil {
-        slog.Error(&quot;Server forced to shutdown&quot;, &quot;error&quot;, err)
+        slog.Error(&quot;Server forced to shutdown by timeout&quot;, &quot;err&quot;, err)
         os.Exit(1)
     }
 
-    slog.Info(&quot;Server gracefully stopped&quot;)
+    slog.Info(&quot;All active HTTP requests processed. Server successfully stopped.&quot;)
 }
 </code></pre>
 </div>
 
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом: preStop Hook</span>
-  </div>
-  <div class="callout-body">
-    <p>Даже идеального Go-кода иногда недостаточно из-за задержек <code>iptables</code>. Продвинутый паттерн — добавить в YAML манифест пода искусственную задержку перед отправкой <code>SIGTERM</code>.</p>
+<hr />
+<h2 id="arkhitekturnye-lovushki">Архитектурные ловушки</h2>
+
+<h3 id="1-otsutstvie-readiness-probes">1. Отсутствие Readiness Probes</h3>
+<p>Контроллер Rolling Update полностью опирается на статусы подов. Если в манифесте отсутствует <strong>Readiness Probe</strong> (см. <a href="../05-nadezhnost/6-health-checks.html" class="wikilink">6. Health checks</a>), Kubernetes посчитает Pod готовым (<code>Ready</code>) ровно в ту миллисекунду, когда процесс запустится в контейнере.<br />
+Если вашему Go-приложению требуется 5–10 секунд на прогрев кэша, подключение к базам данных и подгрузку конфигурации, кластер не будет ждать. Он посчитает новый Pod работоспособным, мгновенно убьет старые рабочие поды и направит весь пользовательский поток на неподготовленные инстансы. Результат — массовый обвал в <strong><code>503 Service Unavailable</code></strong>.</p>
+<h3 id="2-slom-kontraktov-bd-backward-incompatibility">2. Слом контрактов БД (Backward Incompatibility)</h3>
+<p>Вы провели идеальный релиз без потери сетевых пакетов. Но ваш сервис работает с общей базой данных.<br />
+Представьте сценарий:<br />
+- Версия 1 (<code>myapp:v1</code>) ожидает, что данные пользователя лежат в одной колонке <code>full_name</code>.<br />
+- Версия 2 (<code>myapp:v2</code>) разбивает имя на две колонки <code>first_name</code> и <code>last_name</code>.</p>
+<p>В процессе Rolling Update (который под нагрузкой может длиться от нескольких минут до часа) <strong><code>myapp:v1</code> и <code>myapp:v2</code> работают бок о бок одновременно</strong>!<br />
+Если <code>myapp:v2</code> выполнит деструктивную миграцию (<code>DROP COLUMN full_name</code>), работающие инстансы <code>myapp:v1</code> моментально упадут с ошибками выполнения SQL-запросов.</p>
+<p><em>Инженерное правило:</em> Всегда строго соблюдайте обратную совместимость (см. <a href="../04-mikroservisy/7-backward-compatibility.html" class="wikilink">7. Backward compatibility</a>). Применяйте паттерн <strong>Expand-Contract (Расширение — Сжатие)</strong>: сначала добавляйте новые колонки (<code>first_name</code>, <code>last_name</code>), поддерживая запись в обе структуры, и лишь через несколько релизов удаляйте устаревшую колонку <code>full_name</code>.</p>
+<h3 id="3-slishkom-korotkiy-terminationgraceperiodseconds">3. Слишком короткий terminationGracePeriodSeconds</h3>
+<p>По умолчанию Kubernetes выделяет контейнеру ровно <strong>30 секунд</strong> на всю процедуру остановки (включая работу хука <code>preStop</code> и вызов <code>http.Server.Shutdown(ctx)</code>).</p>
+<p>Если у вас запущен фоновый воркер, выполняющий тяжелую транзакцию обработки видео или генерации отчета длительностью 2 минуты, то ровно через 30 секунд <code>kubelet</code> потеряет терпение и пошлет процесс-убийцу <strong><code>SIGKILL</code></strong>. Сигнал <code>SIGKILL</code> обрабатывается исключительно ядром Linux: его невозможно перехватить в коде или проигнорировать — процесс будет мгновенно стерт из памяти с риском повреждения данных.</p>
+<p><em>Решение:</em> Если вашим горутинам требуется больше времени на завершение, обязательно увеличьте лимит в манифесте:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2346,40 +2542,42 @@ func main() {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">lifecycle:
-  preStop:
-    exec:
-      command: [&quot;/bin/sh&quot;, &quot;-c&quot;, &quot;sleep 5&quot;]
+  <pre class="language-yaml"><code class="language-yaml">spec:
+  terminationGracePeriodSeconds: 120
 </code></pre>
 </div>
 
-<p>В эти 5 секунд под продолжит штатно принимать трафик, давая <code>kube-proxy</code> время обновить таблицы маршрутизации по всему кластеру. И только потом Kubelet пошлет <code>SIGTERM</code> в ваш бинарник.</p>
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Вопросы сеньорного собеседования по Rolling Updates</span>
+  </div>
+  <div class="callout-body">
+    <ol>
+<li><strong>Что происходит под капотом Linux и Kubernetes при удалении Pod?</strong><br />
+<em>Ответ:</em> Происходят два асинхронных процесса. Контроллер EndpointSlice исключает IP-адрес пода из сетевых списков, и <code>kube-proxy</code> начинает переписывать правила <code>iptables</code>/IPVS на всех нодах. Одновременно с этим <code>kubelet</code> запускает <code>preStop</code> хук и затем отправляет <code>SIGTERM</code> процессу контейнера. Если процесс не завершится за время <code>terminationGracePeriodSeconds</code>, ядро Linux принудительно уничтожит его сигналом <code>SIGKILL</code>.</li>
+<li><strong>Зачем нужен хук <code>preStop: sleep 5</code>, если в Go уже реализован <code>srv.Shutdown()</code>?</strong><br />
+<em>Ответ:</em> Метод <code>srv.Shutdown()</code> закрывает сетевой listener сразу после получения <code>SIGTERM</code>. Однако сетевые правила <code>iptables</code> в кластере распространяются с задержкой (до нескольких секунд). Если listener закроется раньше, чем обновятся таблицы маршрутизации на всех нодах, новые клиентские пакеты попадут в закрытый порт и завершатся ошибкой <code>Connection refused</code>. Пауза в <code>preStop</code> дает сети время синхронизироваться.</li>
+<li><strong>В чем разница между <code>maxUnavailable</code> и <code>maxSurge</code>?</strong><br />
+<em>Ответ:</em> <code>maxUnavailable</code> задает допустимый предел временного снижения производительности сервиса (сколько подов можно погасить от базового количества). <code>maxSurge</code> определяет допустимый перерасход мощностей кластера (сколько подов сверх целевого количества можно временно запустить). Комбинация <code>maxUnavailable: 0%</code> и <code>maxSurge: 100%</code> реализует стратегию Blue-Green без проседания пропускной способности.</li>
+</ol>
   </div>
 </div>
 
 <hr />
-<h2 id="arkhitekturnye-lovushki">Архитектурные ловушки</h2>
-
-<h3 id="1-otsutstvie-readiness-probes">1. Отсутствие Readiness Probes</h3>
-<p>Rolling Update опирается на статусы подов. Если вы не настроили <strong>Readiness Probe</strong> (см. <a href="../05-nadezhnost/6-health-checks.html" class="wikilink">6. Health checks</a>), Kubernetes посчитает ваш новый под "готовым" в ту же секунду, когда запустится процесс в контейнере. <br />
-Если вашему Go-приложению нужно 5 секунд на установку соединений с базой данных и прогрев кэша, K8s этого не поймет. Он убьет старые поды и пустит весь трафик на новые, которые еще не готовы отвечать. Результат — веерные ошибки <code>503 Service Unavailable</code>.</p>
-<h3 id="2-slom-kontraktov-bd-backward-incompatibility">2. Слом контрактов БД (Backward Incompatibility)</h3>
-<p>Вы обновили код без даунтайма. Но ваш код работает с базой данных. <br />
-Представьте: Версия 1 (V1) пишет данные в колонку <code>full_name</code>. Версия 2 (V2) пишет данные в <code>first_name</code> и <code>last_name</code>.<br />
-В процессе Rolling Update (который может длиться минуты) <strong>V1 и V2 будут работать одновременно</strong>, записывая данные в одну и ту же БД!<br />
-<strong>Решение:</strong> Разделяйте деплой кода и миграции БД. Применяйте паттерн расширения-сжатия (Expand-Contract) и гарантируйте <a href="../04-mikroservisy/7-backward-compatibility.html" class="wikilink">7. Backward compatibility</a>. Миграции должны быть неразрушающими.</p>
-<h3 id="3-slishkom-korotkiy-terminationgraceperiodseconds">3. Слишком короткий terminationGracePeriodSeconds</h3>
-<p>По умолчанию Kubernetes дает вашему поду ровно 30 секунд на Graceful Shutdown. Если у вас есть фоновая горутина, которая генерирует тяжелый отчет за 2 минуты, через 30 секунд после <code>SIGTERM</code> Kubelet пошлет <code>SIGKILL</code>, уничтожив процесс на полуслове.<br />
-Если вашему сервису нужно больше времени на "уборку", вы обязаны явно увеличить этот параметр в манифесте Deployment.</p>
-<h2 id="itog">Итог</h2>
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Математика релиза:</strong> <code>maxSurge</code> и <code>maxUnavailable</code> позволяют балансировать между скоростью обновления и запасом отказоустойчивости.</li>
-<li><strong>Асинхронность:</strong> Маршрутизация трафика отключается параллельно с остановкой пода. Используйте <code>preStop</code> hook для компенсации сетевого лага.</li>
-<li><strong>Graceful Shutdown:</strong> Использование <code>http.Server.Shutdown(ctx)</code> с перехватом <code>SIGTERM</code> — абсолютный стандарт для любого Go-бэкенда.</li>
-<li><strong>Зависимость от Health Checks:</strong> Без правильно настроенных Readiness Probes плавное обновление превращается в русскую рулетку.</li>
+<li><strong>Математика релиза:</strong> Параметры <code>maxSurge</code> и <code>maxUnavailable</code> задают баланс между скоростью обновления и запасом отказоустойчивости кластера.</li>
+<li><strong>Параллельная асинхронность:</strong> Маршрутизация трафика отключается независимо от жизненного цикла контейнера. Используйте <code>preStop</code> hook (или таймер в коде) для компенсации сетевого лага <code>iptables</code>.</li>
+<li><strong>Graceful Shutdown на Go:</strong> Использование <code>http.Server.Shutdown(ctx)</code> в связке с перехватом сигналов <code>SIGTERM</code> и <code>SIGINT</code> — закон для production-сервисов.</li>
+<li><strong>Readiness Probes критичны:</strong> Без настроенной проверки готовности плавное обновление превращается в лотерею с гарантированным выпадением <code>503 Service Unavailable</code>.</li>
+<li><strong>Expand-Contract для БД:</strong> Помните, что во время Rolling Update старый и новый код работают одновременно. Миграции базы данных обязаны сохранять обратную совместимость.</li>
 </ol>
-<p>Мы научились разворачивать и бесшовно обновлять наш микросервис. Но теперь наш кластер превратился в черный ящик: десятки сервисов, тысячи подов, динамическое масштабирование и непредсказуемая сеть. Если что-то пойдет не так (например, начнет течь память в одной из 100 реплик), как мы об этом узнаем? В следующей статье мы открываем глаза нашей системе: <a href="7-observability-v-kubernetes.html" class="wikilink">7. Observability в Kubernetes</a>.</p>
+<p>Мы научились разворачивать, масштабировать и бесшовно обновлять наш микросервис. Но теперь кластер превратился в сложнейший распределенный механизм: десятки взаимосвязанных сервисов, тысячи подов, динамические IP-адреса и непредсказуемая виртуальная сеть. Если где-то начнет деградировать база данных, расти задержка ответов или течь память в одном из 100 подов — как мы узнаем об этом до того, как упадет вся система? В следующей лекции мы откроем глаза нашей инфраструктуре: <a href="7-observability-v-kubernetes.html" class="wikilink">7. Observability в Kubernetes</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2407,7 +2605,7 @@ func main() {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#peresborka-dvigatelya-v-polete-reliz-bez-prava-na-oshibku">Пересборка двигателя в полете: Релиз без права на ошибку</a></li><li class="toc-item toc-h2"><a href="#anatomiya-rolling-update">Анатомия Rolling Update</a></li><li class="toc-item toc-h3"><a href="#matematika-bezopasnosti-maxsurge-i-maxunavailable">Математика безопасности: maxSurge и maxUnavailable</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-smert-poda-i-setevoy-lag">Mechanical Sympathy: Смерть пода и сетевой лаг</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-graceful-shutdown-na-go">Идиоматичный Graceful Shutdown на Go</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-lovushki">Архитектурные ловушки</a></li><li class="toc-item toc-h3"><a href="#1-otsutstvie-readiness-probes">1. Отсутствие Readiness Probes</a></li><li class="toc-item toc-h3"><a href="#2-slom-kontraktov-bd-backward-incompatibility">2. Слом контрактов БД (Backward Incompatibility)</a></li><li class="toc-item toc-h3"><a href="#3-slishkom-korotkiy-terminationgraceperiodseconds">3. Слишком короткий terminationGracePeriodSeconds</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#peresborka-dvigatelya-v-polete-reliz-bez-prava-na-oshibku">Пересборка двигателя в полете: Релиз без права на ошибку</a></li><li class="toc-item toc-h2"><a href="#anatomiya-rolling-update">Анатомия Rolling Update</a></li><li class="toc-item toc-h3"><a href="#matematika-bezopasnosti-maxsurge-i-maxunavailable">Математика безопасности: maxSurge и maxUnavailable</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-smert-poda-i-setevoy-lag">Mechanical Sympathy: Смерть пода и сетевой лаг</a></li><li class="toc-item toc-h3"><a href="#reshenie-1-prestop-hook-istselyayushchaya-zaderzhka">Решение 1: preStop Hook — исцеляющая задержка</a></li><li class="toc-item toc-h3"><a href="#reshenie-2-idiomatichnyy-graceful-shutdown-na-go">Решение 2: Идиоматичный Graceful Shutdown на Go</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-lovushki">Архитектурные ловушки</a></li><li class="toc-item toc-h3"><a href="#1-otsutstvie-readiness-probes">1. Отсутствие Readiness Probes</a></li><li class="toc-item toc-h3"><a href="#2-slom-kontraktov-bd-backward-incompatibility">2. Слом контрактов БД (Backward Incompatibility)</a></li><li class="toc-item toc-h3"><a href="#3-slishkom-korotkiy-terminationgraceperiodseconds">3. Слишком короткий terminationGracePeriodSeconds</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

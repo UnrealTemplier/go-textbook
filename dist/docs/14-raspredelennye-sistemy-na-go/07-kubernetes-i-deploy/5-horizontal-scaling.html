@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~12 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Horizontal scaling</h1>
           </header>
@@ -2178,13 +2178,49 @@
           <div class="article-markdown">
             <h2 id="masshtabirovanie-bez-boli-kak-kubernetes-kloniruet-vash-kod">Масштабирование без боли: Как Kubernetes клонирует ваш код</h2>
 
-<p>Когда ваш микросервис на Go становится популярным, один Под (см. <a href="3-pod-deployment-service.html" class="wikilink">3. Pod, Deployment, Service</a>) неизбежно упрется в потолок ресурсов. Можно пойти путем <strong>Vertical Scaling (VPA)</strong> — увеличить лимиты CPU и RAM, но у этого пути есть физический предел (размер самой мощной ноды в кластере) и экономическая неэффективность.</p>
-<p>В распределенных системах стандартом является <strong>Horizontal Scaling (Горизонтальное масштабирование)</strong> — запуск множества идентичных копий приложения. В Kubernetes за автоматизацию этого процесса отвечает <strong>Horizontal Pod Autoscaler (HPA)</strong>.</p>
-<p>Для Go-разработчика горизонтальное масштабирование — это не просто «добавить ещё подов». Это сложная игра с конкурентностью, пулами соединений и холодным стартом рантайма. В этой статье мы разберем математику HPA, механику работы Metrics Server и то, как знание внутреннего устройства Go помогает избежать «болтанки» при масштабировании.</p>
+<blockquote>
+<p><em>«В распределенных системах единственный надежный способ справиться с лавиной работы — разделить ее между множеством независимых тружеников, каждый из которых делает простую вещь».</em><br />
+— Принцип горизонтального масштабирования</p>
+</blockquote>
+<p>Когда микросервис на Go завоевывает признание пользователей, одиночный Pod (см. <a href="3-pod-deployment-service.html" class="wikilink">3. Pod, Deployment, Service</a>) неизбежно упирается в физический потолок ресурсов конкретной машины. В этот момент перед системным архитектором встает развилка:</p>
+<ol>
+<li><strong>Vertical Scaling (VPA — Vertical Pod Autoscaler):</strong> Наращивать мощность существующего пода — выделять ему больше ядер CPU и гигабайт RAM. У этого пути есть непреодолимый физический тупик: размер самого дорогого сервера в стойке дата-центра, деградация производительности из-за переходов через шины NUMA-узлов, а главное — необходимость перезапуска процесса для изменения ресурсов (в классическом Linux cgroups).</li>
+<li><strong>Horizontal Scaling (Горизонтальное масштабирование):</strong> Запускать множество независимых идентичных копий приложения (реплик) и балансировать входящий трафик между ними.</li>
+</ol>
+<p>В экосистеме Kubernetes стандартом де-факто является горизонтальное масштабирование. За автоматизацию этого процесса отвечает встроенный контроллер — <strong>Horizontal Pod Autoscaler (HPA)</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Client[&quot;Клиенты / Трафик&quot;] --&gt; Ingress[&quot;Ingress / Load Balancer&quot;]
+Ingress --&gt; Service[&quot;ClusterIP Service&quot;]
+
+subgraph ScaleGroup[&quot;Динамический пул Pods (управляется HPA)&quot;]
+Service --&gt; Pod1[&quot;Pod 1 (Go App)&quot;]
+Service --&gt; Pod2[&quot;Pod 2 (Go App)&quot;]
+Service --&gt; Pod3[&quot;Pod 3 (Go App)&quot;]
+Service -.-&gt;|Auto Scale| PodN[&quot;Pod N (Go App)&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Для Go-разработчика горизонтальное масштабирование — это не просто абстрактная команда <code>kubectl scale deployment myapp --replicas=10</code>. Это тонкая инженерная работа на стыке рантайма Go (планировщика G-M-P, сборщика мусора GC), пулов соединений к реляционным базам данных и подсистемы Linux CFS (Completely Fair Scheduler).</p>
+<p>В этой лекции мы разберем математику алгоритма HPA, устройство сборщиков метрик, физику троттлинга CPU в cgroups и архитектурные ловушки, подстерегающие Go-сервисы при резких всплесках нагрузки.</p>
 <hr />
 <h2 id="mekhanika-hpa-beskonechnyy-tsikl-primireniya">Механика HPA: Бесконечный цикл примирения</h2>
 
-<p>HPA — это контроллер в составе <code>kube-controller-manager</code> (см. <a href="2-kubernetes-osnovy.html" class="wikilink">2. Kubernetes. Основы</a>), который работает как классический цикл обратной связи.</p>
+<p>HPA реализован как автономный управляющий контур внутри процесса <code>kube-controller-manager</code> (см. <a href="2-kubernetes-osnovy.html" class="wikilink">2. Kubernetes. Основы</a>). Подобно термостату в умном доме, он непрерывно выполняет классический цикл примирения (Reconciliation Loop):</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2199,52 +2235,143 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-HPA[&quot;HPA Controller&lt;br&gt;Цикл: каждые 15 сек&quot;] --&gt;|&quot;1 - Запрос метрик&quot;| MS[&quot;Metrics Server / &lt;br&gt;Prometheus Adapter&quot;]
-MS --&gt;|&quot;2 - Сбор данных&quot;| K[&quot;Kubelet / cAdvisor&quot;]
-K --&gt;|&quot;3 - Статистика контейнера&quot;| Pods[&quot;Ваши Go Поды&quot;]
-HPA --&gt;|&quot;4 - Вычисление реплик&quot;| Formula[&quot;Алгоритм HPA&quot;]
-Formula --&gt;|&quot;5 - Обновление реплик&quot;| Deployment[&quot;Deployment / ReplicaSet&quot;]
+subgraph K8s_ControlPlane[&quot;Kubernetes Control Plane&quot;]
+HPA[&quot;HPA Controller\n(kube-controller-manager)\nИнтервал: каждые 15 сек&quot;]
+Formula[&quot;Алгоритм расчета:\ndesiredReplicas&quot;]
+Deploy[&quot;Deployment / ReplicaSet\n(обновление поля .spec.replicas)&quot;]
+end
+
+subgraph MetricsSubsystem[&quot;Подсистема метрик&quot;]
+MS[&quot;Metrics Server / Custom Metrics API\n(Prometheus Adapter / KEDA)&quot;]
+Kubelet[&quot;kubelet (Node Agent)&quot;]
+cAdvisor[&quot;cAdvisor (чтение Linux cgroups)&quot;]
+end
+
+subgraph Workloads[&quot;Рабочие нагрузки&quot;]
+GoPods[&quot;Go Поды (cgroups: cpu.stat, memory.current)&quot;]
+end
+
+HPA --&gt;|&quot;1. Опрос метрик раз в 15с&quot;| MS
+MS --&gt;|&quot;2. Агрегация метрик подов&quot;| Kubelet
+Kubelet --&gt;|&quot;3. Сбор сырых счетчиков&quot;| cAdvisor
+cAdvisor --&gt;|&quot;4. Чтение из ядра&quot;| GoPods
+HPA --&gt;|&quot;5. Вычисление формулы&quot;| Formula
+Formula --&gt;|&quot;6. Приказ на масштабирование&quot;| Deploy
+Deploy --&gt;|&quot;7. Создание/удаление подов&quot;| GoPods
   </pre>
 </div>
 
 
+<h3 id="periodichnost-oprosa">Периодичность опроса</h3>
+<p>По умолчанию параметр <code>--horizontal-pod-autoscaler-sync-period</code> составляет <strong>15 секунд</strong>. Каждые 15 секунд контроллер опрашивает агрегатор метрик (<code>Metrics Server</code> для базовых CPU/RAM или внешний адаптер Prometheus/KEDA для бизнес-показателей).</p>
+<h3 id="trebovanie-k-resources-requests">Требование к Resources Requests</h3>
+
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Важнейшее требование</span>
+  </div>
+  <div class="callout-body">
+    <p>HPA не сможет рассчитать процентную загрузку контейнера, если в манифесте пода явно не задана секция <code>resources.requests.cpu</code>!<br />
+Если реквест CPU равен <code>500m</code> (половина физического ядра), а процесс утилизирует <code>250m</code>, HPA фиксирует загрузку ровно <strong>50%</strong>. Без заданного <code>requests</code> HPA перейдет в состояние ошибки <code>unknown</code> и не выполнит масштабирование.</p>
+  </div>
+</div>
+
+<hr />
 <h3 id="matematicheskaya-formula-masshtabirovaniya">Математическая формула масштабирования</h3>
 
-<p>HPA использует простую, но эффективную формулу для расчета целевого количества реплик:</p>
+<p>Алгоритм HPA детерминирован и опирается на формулу целочисленного округления вверх (ceiling):</p>
 <p>$$desiredReplicas = \lceil currentReplicas \times \frac{currentMetricValue}{desiredMetricValue} \rceil$$</p>
-<p><strong>Пример:</strong><br />
-* У вас 2 реплики.<br />
-* Средняя загрузка CPU сейчас — 90%.<br />
-* Целевая загрузка (Target) — 50%.<br />
-* Расчет: $\lceil 2 \times (90 / 50) \rceil = \lceil 2 \times 1.8 \rceil = 4$.<br />
-* Результат: Kubernetes создаст еще 2 пода.</p>
+<p>Где:<br />
+- $currentReplicas$ — текущее число реплик в статусе Ready;<br />
+- $currentMetricValue$ — среднее значение метрики по всем работающим репликам;<br />
+- $desiredMetricValue$ — целевое пороговое значение, заданное инженером в манифесте HPA.</p>
+<h4 id="prakticheskiy-primer">Практический пример:</h4>
+<ol>
+<li>Текущее количество реплик: $currentReplicas = 2$.</li>
+<li>Средняя загрузка CPU подов в текущий момент: $currentMetricValue = 90\%$.</li>
+<li>Целевой порог (Target): $desiredMetricValue = 50\%$.</li>
+<li>Вычисление:<br />
+   $$\lceil 2 \times \frac{90}{50} \rceil = \lceil 2 \times 1.8 \rceil = \lceil 3.6 \rceil = 4$$</li>
+<li>Решение контроллера: немедленно увеличить число реплик с 2 до 4.</li>
+</ol>
+<h4 id="zona-dopustimogo-otkloneniya-tolerance-threshold">Зона допустимого отклонения (Tolerance Threshold)</h4>
+<p>Чтобы кластер не реагировал на секундный миллисекундный шум (например, кратковременный скачок CPU с 50% до 52%), в алгоритм заложен порог толерантности по умолчанию <strong>10% (0.1)</strong>.<br />
+Если коэффициент $\frac{currentMetricValue}{desiredMetricValue}$ попадает в интервал $[0.9; 1.1]$, масштабирование не инициируется.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>HPA учитывает только те поды, которые находятся в состоянии <code>Ready</code>. Если под только запускается или завершается, его метрики исключаются из расчета, чтобы не вносить шум в среднее значение.</p>
+    <p>При расчете среднего значения HPA учитывает только те поды, которые находятся в состоянии <code>Ready</code>. Если под только запускается (фаза <code>ContainerCreating</code>, выполняется <code>InitContainer</code> или еще не прошла <code>Readiness Probe</code>), либо под находится в процессе терминации (<code>Terminating</code>), его метрики принудительно исключаются из выборки. Это предотвращает внесение шума в математическую модель.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="mechanical-sympathy-cpu-throttling-vs-scaling">Mechanical Sympathy: CPU Throttling vs Scaling</h2>
 
-<p>Многие разработчики совершают ошибку, настраивая HPA на слишком высокий порог (например, 90% CPU). </p>
-<p>В Go рантайм крайне чувствителен к процессорному времени из-за работы планировщика (G-M-P) и Garbage Collector. Если нагрузка на ядро достигает лимита, ядро Linux начинает <strong>Throttling</strong> (удушение) процесса в рамках cgroups (см. <a href="1-konteynerizatsiya-i-docker.html" class="wikilink">1. Контейнеризация и Docker</a>).</p>
-<p>Когда Go-приложение попадает под троттлинг:<br />
-1. Останавливаются Stop-the-World паузы GC (они длятся дольше).<br />
-2. Планировщик не может вовремя переключать горутины.<br />
-3. Растет Latency, запросы скапливаются в очереди.</p>
-<p><strong>Правило:</strong> Настраивайте HPA на порог <strong>50-70% CPU</strong>. Это создаст необходимый «запас» (headroom), чтобы сервис мог переварить всплеск нагрузки, пока Kubernetes скачивает образы и запускает новые поды. </p>
+<p>Типичная ошибка начинающих инженеров — выставлять целевой порог HPA на уровне <strong>85–90% CPU</strong> с аргументацией: <em>«Мы хотим выжимать из железа максимум, зачем платить за простаивающие ядра?»</em>.</p>
+<p>Для сервисов на Go эта стратегия оборачивается катастрофой. Причина кроется в устройстве подсистемы планирования Linux — <strong>CFS (Completely Fair Scheduler)</strong> и лимитах <code>cgroups</code> (см. <a href="1-konteynerizatsiya-i-docker.html" class="wikilink">1. Контейнеризация и Docker</a>).</p>
+<h3 id="kak-rabotaet-kvotirovanie-cfs">Как работает квотирование CFS</h3>
+<p>Когда вы указываете лимит <code>resources.limits.cpu: "1"</code>, ядро Linux не выделяет вашему контейнеру персональное физическое ядро. Оно выделяет <strong>квоту времени</strong> в рамках фиксированного окна:<br />
+- <code>cpu.cfs_period_us</code> = 100 000 мкс (100 миллисекунд — стандартный период кванта);<br />
+- <code>cpu.cfs_quota_us</code> = 100 000 мкс (100 миллисекунд процессорного времени за один квант).</p>
+<p>А теперь вспомним рантайм Go. Если на ноде доступно 8 физических ядер, Go автоматически выставит <code>GOMAXPROCS=8</code> (без специальных утилит вроде <code>automaxprocs</code>). Восемь системных потоков ОС одновременно исполняют горутины.<br />
+Если все 8 потоков будут загружены вычислениями, они израсходуют суммарную квоту в 100 мс всего за:<br />
+$$\frac{100 \text{ мс}}{8 \text{ ядер}} = 12.5 \text{ миллисекунд}!$$</p>
+<p>Оставшиеся <strong>87.5 миллисекунд</strong> текущего периода ядро Linux принудительно замораживает (throttles) процесс контейнера!</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+gantt
+title Поведение Go-процесса в окне CFS (100ms) при нехватке CPU
+dateFormat  X
+axisFormat %s ms
+section Ядра CPU (GOMAXPROCS=8)
+Активная работа всех потоков (выжигание квоты) :active, 0, 13
+CPU Throttling (Ядро Linux блокирует все потоки) :crit, 13, 100
+  </pre>
+</div>
+
+
+<h3 id="posledstviya-trottlinga-dlya-rantayma-go">Последствия троттлинга для рантайма Go:</h3>
+<ol>
+<li><strong>Катастрофический рост Stop-the-World пауз GC:</strong> Фаза завершения маркировки памяти затягивается на десятки миллисекунд, так как горутины рантайма спят в ожидании квоты.</li>
+<li><strong>Отказ кооперативной многозадачности:</strong> Фоновый системный монитор рантайма (<code>sysmon</code>) не может вытеснить зависшие горутины.</li>
+<li><strong>Обвал хвостовой задержки (Tail Latency):</strong> Запросы, которые в норме выполнялись за 2 мс, внезапно застревают на 100–200 мс. Очередь сокетов переполняется, и балансировщик начинает отдавать клиентам HTTP 504.</li>
+</ol>
+<div class="callout callout-tip">
+  <div class="callout-header">
+    <span class="callout-icon">💡</span>
+    <span class="callout-title">Золотое правило конфигурации HPA для Go</span>
+  </div>
+  <div class="callout-body">
+    <p>Всегда настраивайте целевую загрузку HPA на уровне <strong>50–70% CPU</strong>.<br />
+Этот 30–50% зазор («headroom») жизненно необходим Go-сервису: он позволяет безболезненно абсорбировать внезапный пик трафика в те 30–60 секунд, пока Kubernetes запрашивает у облака новые виртуальные машины, выкачивает слои образов и инициализирует новые поды.</p>
+  </div>
+</div>
+
 <hr />
 <h2 id="problema-boltanki-thrashing-i-stabilizatsiya">Проблема «Болтанки» (Thrashing) и стабилизация</h2>
 
-<p>Если нагрузка импульсна, HPA может начать паниковать: создавать поды каждые 15 секунд и тут же их удалять. Это убивает производительность базы данных из-за постоянных переподключений.</p>
-<p>Для этого в HPA введены параметры стабилизации (<strong>Cool-down periods</strong>):<br />
-* <strong>scaleUp:</strong> Обычно происходит мгновенно (нам нужно спасать систему).<br />
-* <strong>scaleDown:</strong> По умолчанию имеет задержку (например, 5 минут). Kubernetes ждет, пока нагрузка станет стабильно низкой, прежде чем убивать «лишние» поды.</p>
+<p>В реальных распределенных системах нагрузка редко нарастает плавной синусоидой. Чаще она приходит импульсными пачками: мигающий всплеск трафика, пакетный импорт данных или ретраи мобильных клиентов.</p>
+<p>Без тонкой настройки HPA попадает в ловушку <strong>болтанки (Thrashing / Flapping)</strong>:<br />
+1. Всплеск нагрузки: HPA мгновенно раздувает количество подов с 5 до 50.<br />
+2. Всплеск ушел: HPA через 15 секунд видит 5% CPU и уничтожает 45 подов.<br />
+3. Приходит следующий микро-пик: HPA снова судорожно создает 50 подов.</p>
+<p>Постоянное создание и уничтожение десятков подов создает колоссальную нагрузку на <code>kube-apiserver</code>, забивает дисковые контроллеры нод и разрушает пулы соединений внешних СУБД.</p>
+<p>Для предотвращения болтанки в спецификации HPA (<code>v2</code>) предусмотрен блок <code>behavior</code> с окнами стабилизации (<strong>Cool-down periods</strong>):</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2254,36 +2381,173 @@ Formula --&gt;|&quot;5 - Обновление реплик&quot;| Deployment[&qu
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">behavior:
-  scaleDown:
-    stabilizationWindowSeconds: 300 # Ждать 5 минут перед удалением
-    policies:
-    - type: Percent
-      value: 100
-      periodSeconds: 15
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-orders-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-orders-service
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 65
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0 # Мгновенная реакция при перегрузке (спасаем прод!)
+      policies:
+      - type: Percent
+        value: 100 # Не более чем удвоение количества подов за один шаг
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300 # Ждать 5 минут стабильно низкой нагрузки перед удалением
+      policies:
+      - type: Percent
+        value: 10 # Снижать не более чем на 10% подов за раз
+        periodSeconds: 60
 </code></pre>
 </div>
 
+<h3 id="mekhanika-scaledown-okna">Механика scaleDown окна</h3>
+<p>Параметр <code>stabilizationWindowSeconds: 300</code> заставляет контроллер просматривать все рассчитанные значения желаемых реплик за последние 5 минут и выбирать <strong>максимальное из них</strong>. Под не будет удален до тех пор, пока нагрузка гарантированно не останется низкой на протяжении полного пятиминутного окна.</p>
 <hr />
 <h2 id="arkhitekturnye-vyzovy-masshtabirovaniya-v-go">Архитектурные вызовы масштабирования в Go</h2>
 
+<p>Применение HPA влечет за собой серьезные последствия для смежных слоев инфраструктуры, которые каждый Go-инженер обязан просчитывать на этапе проектирования.</p>
 <h3 id="1-vzryv-soedineniy-database-connection-storm">1. Взрыв соединений (Database Connection Storm)</h3>
-<p>Каждый новый под открывает свой пул соединений к БД (см. <span class="wikilink-unresolved" title="Заметка в разработке">12. Базы данных</span>). Если каждый под в <code>sql.DB</code> держит <code>MaxOpenConns = 100</code>, то при масштабировании с 10 до 100 подов ваша база получит 10 000 соединений.<br />
-<strong>Решение:</strong> Используйте PG Bouncer или аналогичные прокси, а также формулу: <code>MaxConnections / MaxExpectedPods</code>.</p>
+<p>Каждый новый Pod — это независимый процесс ОС со своим локальным пулом подключений к базе данных (<code>sql.DB</code>, <code>pgxpool</code>, драйверы Redis).</p>
+<p>Если разработчик сконфигурировал пул так:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">db, err := sql.Open(&quot;postgres&quot;, dsn)
+db.SetMaxOpenConns(100) // MaxOpenConns = 100 соединений на каждый инстанс
+</code></pre>
+</div>
+
+<p>То при спокойной жизни на 10 репликах сервис держит суммарно до $10 \times 100 = 1\,000$ коннектов к PostgreSQL.<br />
+Но когда HPA в пиковый час отмасштабирует Deployment до 100 подов, база данных внезапно получит атаку в виде $100 \times 100 = 10\,000$ одновременных TCP-соединений!</p>
+<p>Поскольку PostgreSQL создает отдельный системный процесс на каждое входящее соединение (<code>fork</code>), 10 000 процессов моментально исчерпают оперативную память сервера БД, вызовут OOM Killer и положат всю информационную систему компании.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph K8s[&quot;Кластер Kubernetes (HPA масштабировал с 10 до 100 подов)&quot;]
+P1[&quot;Pod 1 (sql.DB: 100 conns)&quot;]
+P2[&quot;Pod 2 (sql.DB: 100 conns)&quot;]
+P100[&quot;Pod 100 (sql.DB: 100 conns)&quot;]
+end
+
+subgraph Storm[&quot;Connection Storm&quot;]
+P1 &amp; P2 &amp; P100 ==&gt;|&quot;Суммарно: 10 000 коннектов!&quot;| DB[&quot;PostgreSQL Server\n💥 OOM / Kernel Crash!&quot;]
+end
+
+style DB fill:#3b1d22,stroke:#f43f5e,stroke-width:2px
+  </pre>
+</div>
+
+
+<h4 id="inzhenernye-resheniya">Инженерные решения:</h4>
+<ol>
+<li><strong>Формула расчета пула:</strong> Всегда рассчитывайте размер пула исходя из максимального потолка реплик:<br />
+   $$\text{MaxConnectionsPerPod} = \frac{\text{MaxAllowedDBConnections}}{\text{MaxExpectedPods}}$$</li>
+<li><strong>Проксирование соединений (Connection Pooling):</strong> Выносите пул соединений за пределы приложения на специализированные легковесные прокси — <strong>PgBouncer</strong> или <strong>Odyssey</strong>, способные удерживать десятки тысяч клиентских коннектов, мультиплексируя их в сотню реальных серверных транзакций (см. <span class="wikilink-unresolved" title="Заметка в разработке">12. Базы данных</span>).</li>
+</ol>
+<hr />
 <h3 id="2-kholodnyy-start-i-progrev">2. Холодный старт и прогрев</h3>
-<p>Go-приложения стартуют быстро, но их кэши в памяти пусты. При резком масштабировании новые поды могут «проседать» по производительности первые несколько секунд.<br />
-<strong>Решение:</strong> Используйте <code>Readiness Probes</code> (см. <a href="../05-nadezhnost/6-health-checks.html" class="wikilink">6. Health checks</a>), чтобы под не получал трафик до тех пор, пока не прогреет необходимые ресурсы.</p>
+
+<p>Скомпилированный бинарник Go запускается молниеносно — за 5–20 миллисекунд. Однако сам сервис после старта находится в «холодном» состоянии:<br />
+- Внутренние кэши в оперативной памяти пусты.<br />
+- Пул HTTP-клиентов <code>http.Transport</code> еще не установил постоянные TCP/TLS Keep-Alive соединения с внешними сервисами.<br />
+- Справочники и метаданные еще не подгружены из удаленных хранилищ.</p>
+<p>Если свежесозданный Pod сразу получит рабочий трафик, первые тысячи пользователей столкнутся с драматической деградацией времени ответа (Warm-up Latency).</p>
+<h4 id="inzhenernoe-reshenie">Инженерное решение:</h4>
+<p>Грамотно настроенные <strong><code>Readiness Probes</code></strong> (подробно разобранные в лекции <a href="../05-nadezhnost/6-health-checks.html" class="wikilink">6. Health checks</a>). Проба готовности должна возвращать статус <code>HTTP 200 OK</code> только после того, как сервис завершил фоновый прогрев кэшей и проверил связность с ключевыми зависимостями:</p>
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 2
+  failureThreshold: 3
+</code></pre>
+</div>
+
+<p>До тех пор, пока эндпоинт <code>/readyz</code> не ответит успехом, kube-proxy не включит IP-адрес пода в таблицу маршрутизации Service, и трафик на холодный под поступать не будет.</p>
+<hr />
 <h3 id="3-custom-metrics-masshtabirovanie-po-biznesu">3. Custom Metrics: Масштабирование по бизнесу</h3>
-<p>CPU и RAM — плохие метрики для многих систем. Например, сервис обработки очередей (Kafka/RabbitMQ) может иметь CPU 5%, но при этом в очереди скопилось миллион сообщений.<br />
-<strong>Решение:</strong> Используйте <strong>Prometheus Adapter</strong>, чтобы HPA мог масштабироваться по количеству сообщений в очереди или количеству активных горутин.</p>
+
+<p>CPU и память — это косвенные, запаздывающие метрики.<br />
+Представьте consumer-сервис, вычитывающий события из топика Apache Kafka или очереди RabbitMQ. Если входящий поток сообщений вырастет в 10 раз, Go-воркер может не показать роста CPU выше 30% (он просто последовательно обрабатывает задачи по мере поступления). Однако в очереди образуется критическое отставание (Consumer Lag) в миллионы сообщений.</p>
+<p>Для решения этой задачи используют <strong>Prometheus Adapter</strong> или специализированный фреймворк <strong>KEDA (Kubernetes Event-driven Autoscaling)</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Kafka[&quot;Apache Kafka / RabbitMQ\n(Consumer Lag: 50 000 сообщений)&quot;] --&gt; KEDA[&quot;KEDA Operator\n(External Metrics Provider)&quot;]
+KEDA --&gt; HPA[&quot;HPA Controller&quot;]
+HPA --&gt;|&quot;Масштабирует воркеры с 2 до 25&quot;| Deployment[&quot;Go Consumer Pods&quot;]
+  </pre>
+</div>
+
+
+<p>KEDA позволяет описывать кастомные триггеры (<code>ScaledObject</code>), масштабируя поды по внешним метрикам: длине очереди, числу активных WebSocket-сессий или количеству HTTP-запросов в секунду (RPS) на балансировщике Ingress. Более того, KEDA умеет масштабировать нагрузку в <strong>ноль реплик</strong> (<code>minReplicaCount: 0</code>) при отсутствии задач в очереди, экономя ресурсы облака.</p>
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему не стоит масштабироваться по потреблению оперативной памяти (RAM) в Go?<br />
-<strong>Ответ:</strong> Go — язык с Garbage Collector. Рантайм Go не сразу возвращает память ОС после освобождения объектов (см. <code>GODEBUG=madvdontneed=1</code>). Более того, память в Go растет ступенчато. Если настроить HPA на 70% RAM, он может создать новые поды просто потому, что GC ещё не успел отработать, хотя реальной нагрузки нет. CPU или количество запросов (RPS) — гораздо более надежные метрики.</p>
+    <p><strong>Вопрос 1: Почему крайне не рекомендуется настраивать HPA по потреблению оперативной памяти (RAM) в Go?</strong><br />
+<strong>Ответ:</strong> Go использует собственный аллокатор памяти (TCMalloc-подобный дизайн) и неблокирующий сборщик мусора (GC). Когда Go освобождает объекты из кучи, рантайм не отдает освобожденные страницы виртуальной памяти мгновенно назад ядру Linux через системный вызов <code>madvise</code> — он сохраняет их в пуле для повторного использования (поведение регулируется флагами вроде <code>GODEBUG=madvdontneed=1</code> или мягким лимитом памяти <code>GOMEMLIMIT</code>). <br />
+Память в Go растет ступенчато, и ее резидентный размер (RSS) долгое время не снижается. Если настроить HPA на порог 70% RAM, кластер начнет непрерывно порождать новые поды даже при полном отсутствии реальной нагрузки, просто потому что GC еще не запускался или страницы удерживаются рантаймом. Метрики CPU, RPS или лаг очередей являются несоизмеримо более надежными.</p>
+<p><strong>Вопрос 2: В чем разница между <code>resources.requests</code> и <code>resources.limits</code> с точки зрения CFS и HPA?</strong><br />
+<strong>Ответ:</strong> <code>requests</code> определяет минимально гарантированный квант процессорного времени (<code>cpu.shares</code> в cgroups v1 или <code>cpu.weight</code> в cgroups v2) и используется HPA как знаменатель при расчете процентной загрузки. <code>limits</code> задает жесткий потолок времени (<code>cpu.cfs_quota_us</code>), при превышении которого в рамках 100-миллисекундного окна процесс подвергается троттлингу (заморозке потоков).</p>
   </div>
 </div>
 
@@ -2291,12 +2555,13 @@ Formula --&gt;|&quot;5 - Обновление реплик&quot;| Deployment[&qu
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>HPA — это математика:</strong> Понимайте формулу, чтобы предсказать количество реплик.</li>
-<li><strong>CPU Headroom:</strong> Оставляйте запас ресурсов для Go-рантайма (цель 60%), чтобы избежать троттлинга.</li>
-<li><strong>Стабилизация:</strong> Настраивайте окна <code>scaleDown</code>, чтобы избежать ненужных рестартов.</li>
-<li><strong>Внешние ресурсы:</strong> Помните, что масштабирование бэкенда создает нагрузку на общие ресурсы (DB, Redis, Network bandwidth).</li>
+<li><strong>HPA — это чистая математика:</strong> Контроллер опирается на детерминированную формулу целочисленного деления и цикл примирения (каждые 15 секунд). Без явно заданного <code>resources.requests</code> HPA работать не может.</li>
+<li><strong>CPU Headroom против троттлинга:</strong> Держите целевой порог загрузки в диапазоне 50–70% CPU. Это предотвратит жесткий троттлинг потоков планировщика Go (CFS Throttling) и даст запас времени на раскрутку новых подов.</li>
+<li><strong>Стабилизация <code>scaleDown</code>:</strong> Настраивайте параметры <code>behavior</code> с окном стабилизации от 300 секунд, чтобы исключить деструктивную «болтанку» (thrashing) при волнообразной нагрузке.</li>
+<li><strong>Контроль внешних ресурсов:</strong> Горизонтальное масштабирование бессерверных подов переносит всю нагрузку на единые разделяемые ресурсы. Защищайте базу данных пулерами соединений (<code>PgBouncer</code>, <code>Odyssey</code>) и формулой <code>MaxConnections / MaxExpectedPods</code>.</li>
+<li><strong>Метрики бизнеса важнее железа:</strong> Для очередей и событийно-ориентированных архитектур используйте KEDA и Prometheus Adapter, ориентируясь на Consumer Lag и RPS, а не на память.</li>
 </ol>
-<p>Мы научились масштабировать наши поды. Но как обновить код на всех этих репликах так, чтобы пользователь не заметил ни одной ошибки? Как заменить 100 старых подов на 100 новых, не потеряв ни одного запроса? В следующей статье мы разберем: <a href="6-rolling-updates.html" class="wikilink">6. Rolling updates</a>.</p>
+<p>Мы научились автоматически масштабировать пул реплик сервиса. Но как теперь обновить исполняемый код и конфигурацию на десятках и сотнях этих работающих инстансов без единой миллисекунды даунтайма (Zero Downtime Deployment) и без потери запросов пользователей? В следующей лекции мы детально разберем механизм: <a href="6-rolling-updates.html" class="wikilink">6. Rolling updates</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2324,7 +2589,7 @@ Formula --&gt;|&quot;5 - Обновление реплик&quot;| Deployment[&qu
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#masshtabirovanie-bez-boli-kak-kubernetes-kloniruet-vash-kod">Масштабирование без боли: Как Kubernetes клонирует ваш код</a></li><li class="toc-item toc-h2"><a href="#mekhanika-hpa-beskonechnyy-tsikl-primireniya">Механика HPA: Бесконечный цикл примирения</a></li><li class="toc-item toc-h3"><a href="#matematicheskaya-formula-masshtabirovaniya">Математическая формула масштабирования</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-cpu-throttling-vs-scaling">Mechanical Sympathy: CPU Throttling vs Scaling</a></li><li class="toc-item toc-h2"><a href="#problema-boltanki-thrashing-i-stabilizatsiya">Проблема «Болтанки» (Thrashing) и стабилизация</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-vyzovy-masshtabirovaniya-v-go">Архитектурные вызовы масштабирования в Go</a></li><li class="toc-item toc-h3"><a href="#1-vzryv-soedineniy-database-connection-storm">1. Взрыв соединений (Database Connection Storm)</a></li><li class="toc-item toc-h3"><a href="#2-kholodnyy-start-i-progrev">2. Холодный старт и прогрев</a></li><li class="toc-item toc-h3"><a href="#3-custom-metrics-masshtabirovanie-po-biznesu">3. Custom Metrics: Масштабирование по бизнесу</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#masshtabirovanie-bez-boli-kak-kubernetes-kloniruet-vash-kod">Масштабирование без боли: Как Kubernetes клонирует ваш код</a></li><li class="toc-item toc-h2"><a href="#mekhanika-hpa-beskonechnyy-tsikl-primireniya">Механика HPA: Бесконечный цикл примирения</a></li><li class="toc-item toc-h3"><a href="#periodichnost-oprosa">Периодичность опроса</a></li><li class="toc-item toc-h3"><a href="#trebovanie-k-resources-requests">Требование к Resources Requests</a></li><li class="toc-item toc-h3"><a href="#matematicheskaya-formula-masshtabirovaniya">Математическая формула масштабирования</a></li><li class="toc-item toc-h4"><a href="#prakticheskiy-primer">Практический пример:</a></li><li class="toc-item toc-h4"><a href="#zona-dopustimogo-otkloneniya-tolerance-threshold">Зона допустимого отклонения (Tolerance Threshold)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-cpu-throttling-vs-scaling">Mechanical Sympathy: CPU Throttling vs Scaling</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-kvotirovanie-cfs">Как работает квотирование CFS</a></li><li class="toc-item toc-h3"><a href="#posledstviya-trottlinga-dlya-rantayma-go">Последствия троттлинга для рантайма Go:</a></li><li class="toc-item toc-h2"><a href="#problema-boltanki-thrashing-i-stabilizatsiya">Проблема «Болтанки» (Thrashing) и стабилизация</a></li><li class="toc-item toc-h3"><a href="#mekhanika-scaledown-okna">Механика scaleDown окна</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnye-vyzovy-masshtabirovaniya-v-go">Архитектурные вызовы масштабирования в Go</a></li><li class="toc-item toc-h3"><a href="#1-vzryv-soedineniy-database-connection-storm">1. Взрыв соединений (Database Connection Storm)</a></li><li class="toc-item toc-h4"><a href="#inzhenernye-resheniya">Инженерные решения:</a></li><li class="toc-item toc-h3"><a href="#2-kholodnyy-start-i-progrev">2. Холодный старт и прогрев</a></li><li class="toc-item toc-h4"><a href="#inzhenernoe-reshenie">Инженерное решение:</a></li><li class="toc-item toc-h3"><a href="#3-custom-metrics-masshtabirovanie-po-biznesu">3. Custom Metrics: Масштабирование по бизнесу</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

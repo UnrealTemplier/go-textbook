@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~38 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Kubernetes networking</h1>
           </header>
@@ -2178,26 +2178,78 @@
           <div class="article-markdown">
             <h2 id="anatomiya-seti-ot-gorutiny-do-data-tsentra">Анатомия сети: От горутины до дата-центра</h2>
 
-<p>В предыдущей статье <a href="7-observability-v-kubernetes.html" class="wikilink">7. Observability в Kubernetes</a> мы сделали наш кластер прозрачным для наблюдения. Мы видим логи, метрики и трейсы. Но остается последний "черный ящик" инфраструктуры — сама сеть.</p>
-<p>Для многих разработчиков сеть в Kubernetes кажется магией. Мы создаем манифесты, и внезапно поды на разных физических серверах начинают общаться друг с другом, а клиенты из интернета магическим образом попадают в нужный HTTP-хендлер нашего Go-приложения.</p>
-<p>Однако магии не существует. Есть лишь виртуозная оркестрация фундаментальных примитивов ядра Linux: сетевых пространств имен (Network Namespaces), таблиц маршрутизации, <code>iptables</code> и eBPF. </p>
-<p>В этой финальной статье раздела по Kubernetes мы разберем механику работы Container Network Interface (CNI), вскроем фатальную проблему DNS в Go, убивающую производительность, и научимся тюнинговать сетевой стек Go специально для работы в кластере.</p>
+<blockquote>
+<p><em>«Вся магия распределенных систем исчезает, как только вы понимаете, как ядро операционной системы перекладывает байты из одного сетевого сокета в другой».</em><br />
+— Принцип демистификации инфраструктуры</p>
+</blockquote>
+<p>В предыдущей лекции <a href="7-observability-v-kubernetes.html" class="wikilink">7. Observability в Kubernetes</a> мы сделали наш кластер прозрачным для телеметрии: научились собирать метрики, структурированные логи и сквозные трейсы. Но под всем этим слоем абстракций скрывается фундаментальная основа любой распределенной системы — <strong>компьютерная сеть</strong>.</p>
+<p>Для подавляющего большинства разработчиков сеть в Kubernetes кажется непостижимой магией. Мы применяем декларативные YAML-манифесты, и внезапно поды, физически разнесенные по разным серверам и стойкам дата-центра, начинают прозрачно общаться друг с другом по прямым IP-адресам, а клиентский трафик из глобального интернета безошибочно находит нужную горутину в конкретном поде.</p>
+<p>Однако в компьютерных системах чудес не бывает. Вся «магия» Kubernetes — это строгая и виртуозная оркестрация низкоуровневых механизмов ядра Linux:<br />
+- <strong>Сетевых пространств имен (Network Namespaces);</strong><br />
+- <strong>Виртуальных Ethernet-пар (<code>veth</code>);</strong><br />
+- <strong>Программных мостов (Linux Bridges);</strong><br />
+- <strong>Оверлейных туннелей (VXLAN, Geneve) и протокола маршрутизации BGP;</strong><br />
+- <strong>Подсистем фильтрации пакетов (<code>iptables</code>, IPVS) и eBPF.</strong></p>
+<p>В этой финальной лекции раздела «Kubernetes и деплой» мы разберем внутреннее устройство Container Network Interface (CNI), вскроем печально известную проблему резолвинга DNS в Go (<code>ndots:5</code>), разберем физику переполнения таблицы <code>nf_conntrack</code> ядра Linux и сконфигурируем образцовый сетевой транспорт Go для работы в высоконагруженном кластере.</p>
 <hr />
 <h2 id="1-ploskaya-set-i-cni-container-network-interface">1. Плоская сеть и CNI (Container Network Interface)</h2>
 
-<p>Фундаментальное правило Kubernetes: <strong>Любой под может связываться с любым другим подом без использования NAT (Network Address Translation).</strong> Каждый под получает свой собственный, уникальный в пределах кластера IP-адрес. Это означает, что вашему Go-приложению внутри пода кажется, что оно работает на отдельном физическом хосте.</p>
-<p>За реализацию этого правила отвечает <strong>CNI-плагин</strong> (например, Calico, Flannel или Cilium).</p>
+<p>Архитектура сети Kubernetes построена на концепции <strong>«плоской сети» (Flat Network)</strong>, которая формулируется четырьмя фундаментальными инвариантами:</p>
+<ol>
+<li><strong>Каждый Pod получает собственный уникальный IP-адрес</strong> в рамках всего кластера.</li>
+<li><strong>Любой Pod может обращаться к любому другому Pod без применения NAT (Network Address Translation).</strong></li>
+<li><strong>Системные демоны на ноде (<code>kubelet</code>, рантайм контейнеров) могут связываться со всеми подами на этой же ноде.</strong></li>
+<li><strong>IP-адрес, который Pod видит у себя локально, совпадает с IP-адресом, который видят все остальные участники сети.</strong></li>
+</ol>
+<p>Это фундаментальное упрощение: разработчику Go-сервиса не нужно думать о динамическом сопоставлении портов (Port Mapping) на хосте, как это было в раннем Docker. Для приложения каждый Pod выглядит как независимый физический сервер.</p>
+<p>За реализацию этих правил на уровне ядра Linux отвечает <strong>CNI-плагин</strong> (Container Network Interface) — такие сетевые драйверы, как <strong>Calico</strong>, <strong>Cilium</strong>, <strong>Flannel</strong> или облачные AWS-VPC CNI.</p>
+<hr />
 <h3 id="mechanical-sympathy-kak-pod-poluchaet-set">Mechanical Sympathy: Как под получает сеть?</h3>
 
-<p>Когда <code>kubelet</code> просит Container Runtime запустить ваш Go-контейнер, происходит следующее:</p>
-<ol>
-<li>Создается изолированное сетевое пространство имен (Network Namespace). Ваш код видит только пустой интерфейс <code>lo</code> (localhost).</li>
-<li>Вызывается бинарник CNI-плагина.</li>
-<li>CNI создает виртуальный патч-корд — <strong>veth pair</strong> (Virtual Ethernet Pair). Это "труба" из двух виртуальных сетевых интерфейсов.</li>
-<li>Один конец трубы помещается внутрь неймспейса вашего пода (и переименовывается в <code>eth0</code>). Ему назначается IP-адрес (например, <code>10.244.1.5</code>).</li>
-<li>Другой конец трубы остается в корневом неймспейсе хоста (ноды) и подключается к виртуальному коммутатору — <code>bridge</code> (например, <code>cni0</code>).</li>
-<li>CNI прописывает маршруты: весь трафик из пода отправлять в мост <code>cni0</code>, а оттуда — в физический интерфейс ноды.</li>
-</ol>
+<p>Когда агент <code>kubelet</code> дает команду рантайму контейнеров (<code>containerd</code>) развернуть новый Pod с Go-приложением, разворачивается следующая цепочка системных вызовов:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant KL as kubelet
+participant CRI as containerd
+participant Kernel as Ядро Linux
+participant CNI as CNI Плагин (Calico / Cilium)
+
+KL-&gt;&gt;CRI: Создать Pod Sandbox
+CRI-&gt;&gt;Kernel: unshare(CLONE_NEWNET) -&gt; Создание NetNS
+Note over Kernel: В новом NetNS есть только интерфейс lo
+CRI-&gt;&gt;CNI: Вызов CNI ADD (передача NetNS path)
+CNI-&gt;&gt;Kernel: ip link add veth_pod type veth peer name veth_host
+CNI-&gt;&gt;Kernel: Перенос veth_pod внутрь NetNS -&gt; eth0
+CNI-&gt;&gt;Kernel: Назначение IP 10.244.1.5 на eth0
+CNI-&gt;&gt;Kernel: Подключение veth_host к bridge (cni0) на хосте
+CNI-&gt;&gt;Kernel: Прописка шлюза по умолчанию (default gateway)
+CNI--&gt;&gt;CRI: Сеть настроена!
+CRI-&gt;&gt;KL: Pod готов к запуску Go-контейнера
+  </pre>
+</div>
+
+
+<p>Разберем эту анатомию по шагам:<br />
+1. <strong>Изоляция:</strong> Ядро Linux создает изолированное сетевое пространство имен (<code>Network Namespace</code>). Изначально внутри него поднят лишь пустой псевдоинтерфейс петли обратной связи <strong><code>lo</code></strong> (localhost).<br />
+2. <strong>Создание виртуального патч-корда:</strong> Драйвер CNI создает виртуальную пару интерфейсов — <strong><code>veth pair</code></strong> (Virtual Ethernet Pair). Это прямой программный аналог сетевого кабеля, соединяющего два порта.<br />
+3. <strong>Разделение концов:</strong> <br />
+   - Один конец пары помещается внутрь сетевого пространства имен пода и переименовывается в <strong><code>eth0</code></strong>. Ему присваивается выделенный IP-адрес (например, <code>10.244.1.5</code>).<br />
+   - Второй конец (<code>vethX</code>) остается в корневом пространстве имен хоста (Worker Node).<br />
+4. <strong>Коммутация на ноде:</strong> На хосте второй конец подключается к виртуальному программному коммутатору — Linux Bridge (обычно именуемому <strong><code>cni0</code></strong> или <code>bridge</code>).<br />
+5. <strong>Маршрутизация:</strong> В таблице маршрутизации пода прописывается шлюз по умолчанию (<code>0.0.0.0/0</code>), направляющий все исходящие пакеты через <code>eth0</code> в мост <code>cni0</code>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2212,28 +2264,90 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Pod[&quot;Pod Network Namespace&lt;br&gt;eth0: 10.244.1.5&quot;]--&gt;|&quot;veth-pair&quot;|HostVeth[&quot;Host Network Namespace&lt;br&gt;vethX&quot;]
-HostVeth--&gt;Bridge[&quot;Виртуальный коммутатор&lt;br&gt;cni0 / docker0&quot;]
-Bridge--&gt;HostEth[&quot;eth0 Host&lt;br&gt;192.168.1.10&quot;]
-HostEth--&gt;|&quot;Туннель VXLAN / BGP&quot;|OtherNode[&quot;Другая Нода кластера&quot;]
+subgraph PodNetNS[&quot;Сетевой Namespace Пода (10.244.1.5)&quot;]
+GoProcess[&quot;Go-приложение (net.Listen :8080)&quot;]
+Eth0[&quot;Интерфейс eth0 (10.244.1.5)&quot;]
+GoProcess --&gt; Eth0
+end
+
+subgraph HostNetNS[&quot;Сетевой Namespace Хоста (Worker Node 1: 192.168.1.10)&quot;]
+VethHost[&quot;vethX (Виртуальный патч-корд)&quot;]
+Bridge[&quot;Мост cni0 (10.244.1.1)&quot;]
+HostPhys[&quot;Физическая сетевая карта eth0 (192.168.1.10)&quot;]
+
+Eth0 ===&quot;veth-pair&quot;=== VethHost
+VethHost --&gt; Bridge
+Bridge --&gt; HostPhys
+end
+
+subgraph Fabric[&quot;Сетевая фабрика дата-центра (L2 / L3)&quot;]
+HostPhys --&gt; Wire[&quot;Туннель VXLAN (UDP 4789) / Маршрутизация BGP&quot;]
+end
+
+subgraph RemoteHost[&quot;Удаленный Worker Node 2 (192.168.1.20)&quot;]
+Wire --&gt; RemotePhys[&quot;Физическая сетевая карта eth0&quot;]
+RemotePhys --&gt; RemotePod[&quot;Удаленный Pod (10.244.2.8)&quot;]
+end
   </pre>
 </div>
 
 
-<p>Если поды находятся на разных нодах, CNI-плагин инкапсулирует пакет (например, засовывает IP-пакет пода внутрь UDP-пакета хоста через VXLAN) и отправляет по физической сети.</p>
+<h4 id="mezhkhostovoe-vzaimodeystvie-vxlan-vs-bgp">Межхостовое взаимодействие: VXLAN vs BGP</h4>
+<p>Когда пакет летит между подами на разных физических серверах:<br />
+- <strong>VXLAN (Оверлейная сеть, Flannel / Calico):</strong> Ядро берет оригинальный Ethernet-кадр пода, запаковывает его в стандартный UDP-пакет (порт 4789) хоста и отправляет через обычную сеть дата-центра. На принимающей ноде ядро распаковывает UDP и передает внутренний пакет в целевой под. Это универсально, но создает небольшой оверхед на инкапсуляцию (снижая MTU на 50 байт).<br />
+- <strong>BGP / Прямая маршрутизация (Calico / Cilium):</strong> Ноды кластера сами выступают BGP-маршрутизаторами и объявляют сетевым коммутаторам стойки маршруты к своим подсетям подов. Пакеты летят без дополнительной инкапсуляции с максимальной скоростью сетевой карты.<br />
+- <strong>eBPF (Cilium):</strong> Сетевые пакеты перехватываются на уровне сокетов с помощью программ ядра eBPF, полностью обходя традиционные тяжелые стеки <code>iptables</code> и подсистемы Linux TC (Traffic Control).</p>
 <hr />
 <h2 id="2-vneshniy-trafik-ingress-i-obkhod-kube-proxy">2. Внешний трафик: Ingress и обход kube-proxy</h2>
 
-<p>В статье <a href="3-pod-deployment-service.html" class="wikilink">3. Pod, Deployment, Service</a> мы разбирали, как работает <code>Service</code> (ClusterIP) для внутреннего взаимодействия через <code>kube-proxy</code> и <code>iptables</code>. Но как трафик из интернета попадает в кластер?</p>
-<p>Для этого используется <strong>Ingress Controller</strong> (самый популярный — Ingress Nginx, не путать с обычным Nginx).</p>
-<p>Ingress Controller — это просто под, висящий на публичном IP-адресе или за облачным Load Balancer. Но у него есть суперсила: <strong>он обходит <code>kube-proxy</code></strong>.</p>
-<p>Когда запрос летит снаружи, Nginx читает правило Ingress (маршрут). Вы думаете, что Nginx проксирует трафик на ClusterIP вашего Service? Нет!<br />
-Ingress Controller подписывается на Kubernetes API (Endpoints) и держит в оперативной памяти актуальный список IP-адресов <strong>всех ваших подов</strong>. Когда приходит запрос, Nginx открывает TCP-соединение <em>напрямую</em> с нужным подом. Это избавляет пакет от лишнего NAT-преобразования в ядре Linux, снижая Latency.</p>
+<p>В лекции <a href="3-pod-deployment-service.html" class="wikilink">3. Pod, Deployment, Service</a> мы подробно разобрали, как виртуальный IP-адрес <code>Service</code> (ClusterIP) преобразуется демоном <code>kube-proxy</code> через цепочки <code>iptables</code> или таблицы IPVS. Но как входящий интернет-трафик попадает внутрь кластера?</p>
+<p>Для этого используется <strong>Ingress Controller</strong> (наиболее распространенные решения: Ingress-NGINX, Envoy, Traefik).</p>
+<p>Ingress Controller — это специализированный Pod (или группа подов), развернутый на пограничных нодах кластера и смотрящий наружу через облачный балансировщик (Cloud Load Balancer). Но у Ingress Controller есть колоссальное преимущество перед стандартным Service: <strong>он полностью обходит <code>kube-proxy</code></strong>!</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Client[&quot;Внешний клиент (Интернет)&quot;] --&gt; CloudLB[&quot;Cloud Load Balancer / DNS&quot;]
+CloudLB --&gt; Ingress[&quot;Ingress Controller (NGINX / Envoy)&quot;]
+
+subgraph StandardWay[&quot;Стандартный путь через Service (Медленно)&quot;]
+Ingress -.-&gt;|&quot;1. Обращение к ClusterIP&quot;| Service[&quot;Service Virtual IP&quot;]
+Service -.-&gt;|&quot;2. NAT в ядре (iptables/IPVS)&quot;| KubeProxy[&quot;kube-proxy DNAT&quot;]
+KubeProxy -.-&gt;|&quot;3. Случайный Pod&quot;| PodA[&quot;Pod A&quot;]
+end
+
+subgraph IngressDirect[&quot;Прямой путь Ingress (Быстро! Zero-DNAT)&quot;]
+API[&quot;kube-apiserver (Endpoints API)&quot;] --&gt;|&quot;Watch Endpoints&quot;| Ingress
+Ingress ==&gt;|&quot;Прямой TCP/HTTP сокет к Pod IP&quot;| Pod1[&quot;Pod 1 (10.244.1.5)&quot;]
+Ingress ==&gt;|&quot;Прямой TCP/HTTP сокет к Pod IP&quot;| Pod2[&quot;Pod 2 (10.244.2.8)&quot;]
+end
+  </pre>
+</div>
+
+
+<h3 id="kak-rabotaet-ingress-v-rantayme">Как работает Ingress в рантайме:</h3>
+<ol>
+<li>Ingress Controller непрерывно слушает API-сервер Kubernetes (<code>Endpoints</code> и <code>EndpointSlice</code>).</li>
+<li>Он хранит в своей оперативной памяти актуальный список <strong>реальных IP-адресов всех работающих подов</strong>.</li>
+<li>Когда приходит входящий HTTP-запрос от клиента, NGINX/Envoy разбирает HTTP-заголовки (<code>Host</code>, <code>Path</code>) и открывает TCP-соединение <strong>напрямую с IP-адресом конкретного пода</strong> (<code>10.244.1.5:8080</code>).</li>
+<li>Пакет не проходит через цепочки <code>iptables</code> ClusterIP, избавляя ядро от лишней операции DNAT и сокращая сетевую задержку до абсолютного минимума.</li>
+</ol>
 <hr />
 <h2 id="3-proklyatie-dns-problema-ndots5-v-go">3. Проклятие DNS: Проблема `ndots:5` в Go</h2>
 
-<p>Это самая коварная проблема производительности Go-сервисов в Kubernetes. О ней спрашивают на собеседованиях уровня Principal/Staff.</p>
-<p>В Kubernetes есть свой DNS-сервер — <strong>CoreDNS</strong>. При запуске пода, Kubelet инжектирует в контейнер файл <code>/etc/resolv.conf</code>:</p>
+<p>Среди архитекторов высоконагруженных систем на Go проблема <strong><code>ndots:5</code></strong> стала легендарной. Этот скрытый нюанс работы сетевого стека породил сотни сбоев и падений боевых кластеров под пиковыми нагрузками.</p>
+<h3 id="mekhanika-etcresolv-conf">Механика `/etc/resolv.conf`</h3>
+<p>В кластере за разрешение доменных имен отвечает распределенный DNS-сервер <strong>CoreDNS</strong>. При создании любого контейнера агент <code>kubelet</code> монтирует в него файл конфигурации DNS-клиента <code>/etc/resolv.conf</code>:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2243,34 +2357,106 @@ Ingress Controller подписывается на Kubernetes API (Endpoints) и
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text">search default.svc.cluster.local svc.cluster.local cluster.local
-nameserver 10.96.0.10
+  <pre class="language-text"><code class="language-text">nameserver 10.96.0.10
+search default.svc.cluster.local svc.cluster.local cluster.local
 options ndots:5
 </code></pre>
 </div>
 
-<p>Параметр <code>ndots:5</code> означает: "Если в доменном имени, которое вы ищете, <strong>меньше 5 точек</strong>, сначала примените к нему суффиксы из списка <code>search</code>".</p>
-<p>Представьте, что ваше Go-приложение хочет сделать вызов к стороннему API: <code>http.Get("https://api.stripe.com")</code>.<br />
-В строке <code>api.stripe.com</code> всего 2 точки.</p>
+<p>Директива <strong><code>ndots:5</code></strong> означает следующее:<br />
+<em>«Если в доменном имени, которое пытается разрезолвить приложение, содержится </em><em>меньше 5 точек</em><em>, резолвер обязан сначала последовательно подставить к нему все суффиксы из списка <code>search</code>, и лишь в самом конце запросить имя как есть»</em>.</p>
+<p>А теперь проанализируем, что происходит в коде Go. Предположим, ваш микросервис отправляет платеж через внешний шлюз:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">resp, err := http.Get(&quot;https://api.stripe.com&quot;)
+</code></pre>
+</div>
+
+<p>В доменном имени <code>api.stripe.com</code> всего <strong>две точки</strong> ($2 &lt; 5$).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Рантайм Go</span>
   </div>
   <div class="callout-body">
-    <p>По умолчанию в Go используется чистый внутренний DNS-резолвер (pure-Go resolver), встроенный в пакет <code>net</code>. Он послушно читает <code>/etc/resolv.conf</code>.</p>
-<p>Вместо одного запроса к <code>api.stripe.com</code>, пакет <code>net</code> отправит в CoreDNS шквал UDP-пакетов:<br />
-1. <code>api.stripe.com.default.svc.cluster.local.</code> (NXDOMAIN)<br />
-2. <code>api.stripe.com.svc.cluster.local.</code> (NXDOMAIN)<br />
-3. <code>api.stripe.com.cluster.local.</code> (NXDOMAIN)<br />
-4. <code>api.stripe.com.</code> (Успех!)</p>
+    <p>В отличие от программ на C, которые используют <code>glibc</code> (функцию <code>getaddrinfo</code>), в рантайме Go по умолчанию работает собственный высокопроизводительный, асинхронный DNS-резолвер на чистом Go (Pure-Go Resolver в пакете <code>net</code>). </p>
+<p>Он добросовестно считывает директивы из <code>/etc/resolv.conf</code> и, встретив домен <code>api.stripe.com</code>, начинает методично бомбардировать CoreDNS серией последовательных сетевых UDP-запросов:<br />
+1. <code>api.stripe.com.default.svc.cluster.local.</code> $\to$ Ответ CoreDNS: <code>NXDOMAIN</code> (домен не существует);<br />
+2. <code>api.stripe.com.svc.cluster.local.</code> $\to$ Ответ CoreDNS: <code>NXDOMAIN</code>;<br />
+3. <code>api.stripe.com.cluster.local.</code> $\to$ Ответ CoreDNS: <code>NXDOMAIN</code>;<br />
+4. <code>api.stripe.com.</code> $\to$ И лишь на 4-й раз: <code>NOERROR</code> (Успех!).</p>
   </div>
 </div>
 
-<p>На один исходящий HTTP-запрос вы генерируете 4 DNS-запроса по сети! При 10 000 RPS ваше приложение сгенерирует 40 000 мусорных запросов к CoreDNS. В лучшем случае у вас вырастет Latency (из-за потерь UDP-пакетов). В худшем — вы убьете CoreDNS и "положите" весь кластер.</p>
-<p><strong>Как это лечить?</strong><br />
-1. <strong>Явная точка (FQDN):</strong> В Go-коде всегда добавляйте замыкающую точку для внешних адресов: <code>http.Get("https://api.stripe.com.")</code>. Это говорит резолверу: "Это абсолютное имя, не подставляй суффиксы".<br />
-2. <strong>Тюнинг Pod Spec:</strong> Измените <code>ndots</code> в манифесте Deployment:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant App as Go Приложение (net.Resolver)
+participant DNS as CoreDNS (Кластерный DNS)
+participant Ext as Публичные DNS интернета (8.8.8.8)
+
+Note over App: http.Get(&quot;https://api.stripe.com&quot;) [2 точки &lt; 5]
+App-&gt;&gt;DNS: 1. A? api.stripe.com.default.svc.cluster.local
+DNS--&gt;&gt;App: NXDOMAIN (Мусорный запрос!)
+App-&gt;&gt;DNS: 2. A? api.stripe.com.svc.cluster.local
+DNS--&gt;&gt;App: NXDOMAIN (Мусорный запрос!)
+App-&gt;&gt;DNS: 3. A? api.stripe.com.cluster.local
+DNS--&gt;&gt;App: NXDOMAIN (Мусорный запрос!)
+App-&gt;&gt;DNS: 4. A? api.stripe.com.
+DNS-&gt;&gt;Ext: Рекурсивный запрос к Stripe
+Ext--&gt;&gt;DNS: Ответ IP
+DNS--&gt;&gt;App: 200 OK (Наконец-то!)
+  </pre>
+</div>
+
+
+<h3 id="masshtab-bedstviya">Масштаб бедствия:</h3>
+<p>На <strong>один</strong> безобидный исходящий HTTP-запрос генерируется <strong>четыре</strong> сетевых UDP-пакета!<br />
+Если ваш микросервис держит нагрузку 10 000 RPS, вы обрушиваете на CoreDNS цунами из <strong>40 000 мусорных DNS-запросов каждую секунду</strong>. </p>
+<p>Под такой нагрузкой происходят два катастрофических события:<br />
+1. CoreDNS утилизирует 100% CPU, переполняет очереди сетевых сокетов и начинает терять UDP-пакеты.<br />
+2. Go-резолвер сталкивается с сетевыми таймаутами (дефолтный таймаут UDP-ответа — 5 секунд!). Вся latency бизнес-транзакций взлетает с миллисекунд до десятков секунд, сервис парализуется.</p>
+<hr />
+<h3 id="kak-pobedit-problemu-ndots5">Как победить проблему `ndots:5`:</h3>
+
+<h4 id="1-ispolzovanie-fqdn-s-zamykayushchey-tochkoy-v-go-kode">1. Использование FQDN с замыкающей точкой в Go-коде</h4>
+<p>В коде на Go при обращении к внешним интернет-ресурсам всегда используйте полностью определенные доменные имена (Fully Qualified Domain Name, FQDN) с <strong>замыкающей точкой на конце</strong>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// ✅ ПРАВИЛЬНО: Замыкающая точка указывает резолверу, что имя абсолютное!
+resp, err := http.Get(&quot;https://api.stripe.com.&quot;)
+</code></pre>
+</div>
+
+<p>Встретив точку на конце (<code>api.stripe.com.</code>), резолвер Go мгновенно понимает, что домен уже является абсолютным корнем, и отправляет ровно <strong>один</strong> DNS-запрос сразу во внешний мир, полностью минуя мусорные суффиксы <code>svc.cluster.local</code>.</p>
+<h4 id="2-tyuning-manifesta-pod-spec-dnsconfig">2. Тюнинг манифеста Pod Spec (`dnsConfig`)</h4>
+<p>В спецификации Deployment можно переопределить параметр <code>ndots</code> для конкретного приложения:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2280,36 +2466,78 @@ options ndots:5
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">      dnsConfig:
+  <pre class="language-yaml"><code class="language-yaml">spec:
+  template:
+    spec:
+      dnsConfig:
         options:
           - name: ndots
-            value: &quot;1&quot; # Искать локально только имена без точек (напр. 'database')
+            value: &quot;1&quot; # Искать в локальных доменах только имена БЕЗ точек (например, 'postgres')
 </code></pre>
 </div>
 
+<p>При значении <code>ndots: "1"</code> любое составное имя (<code>api.stripe.com</code>) сразу будет резолвиться без подстановки суффиксов кластера.</p>
+<h4 id="3-vnedrenie-nodelocal-dnscache">3. Внедрение NodeLocal DNSCache</h4>
+<p>В зрелых кластерах Kubernetes на каждом узле разворачивают легковесный кэширующий DNS-демон (<code>NodeLocal DNSCache</code> как <code>DaemonSet</code>). Он перехватывает все UDP-запросы на локальном loopback-интерфейсе ноды, исключая сетевые задержки при обращениях к центральному CoreDNS.</p>
 <hr />
 <h2 id="4-egress-i-perepolnenie-tablitsy-conntrack">4. Egress и переполнение таблицы Conntrack</h2>
 
-<p>Еще один неочевидный архитектурный сбой возникает, когда ваше Go-приложение отправляет слишком много запросов к внешней базе данных (например, к AWS RDS), находящейся за пределами кластера.</p>
-<p>Когда пакет покидает пределы Worker-ноды, ядро Linux обязано сделать <strong>SNAT (Source NAT)</strong>. Оно подменяет внутренний IP-адрес пода (10.244.x.x) на IP-адрес самой ноды, иначе внешний сервер не будет знать, куда отправить ответ.</p>
-<p>Чтобы ядро помнило, какому поду вернуть ответный пакет, оно записывает информацию о каждом соединении в специальную таблицу в оперативной памяти — <strong><code>nf_conntrack</code> (Connection Tracking)</strong>.</p>
+<p>Когда ваше Go-приложение обращается к внешним сервисам за пределами кластера (например, к базе данных AWS RDS, брокеру Kafka или сторонним API), сетевой пакет покидает Worker Node.</p>
+<p>В этот момент ядро Linux выполняет операцию <strong>SNAT (Source NAT)</strong>: оно подменяет частный IP-адрес пода (<code>10.244.x.x</code>) на публичный или маршрутизируемый IP-адрес самого физического сервера ноды. Иначе внешний сервер ответит на адрес пода, о котором глобальная сеть дата-центра ничего не знает.</p>
+<p>Чтобы вернуть ответный пакет из внешней сети ровно в тот сокет пода, который его запросил, подсистема <code>Netfilter</code> ядра Linux ведет специальную хэш-таблицу учета всех активных сетевых соединений — <strong><code>nf_conntrack</code> (Connection Tracking)</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Pod[&quot;Pod (10.244.1.5)\nТысячи коротких TCP&quot;] --&gt;|&quot;Пакет: 10.244.1.5:45231 -&gt; 54.21.0.1:443&quot;| Kernel[&quot;Ядро Linux (Netfilter SNAT)&quot;]
+Kernel --&gt;|&quot;Запись в таблицу nf_conntrack&quot;| Table[&quot;Таблица nf_conntrack\n[max: 262144]&quot;]
+Kernel --&gt;|&quot;Пакет: 192.168.1.10:61002 -&gt; 54.21.0.1:443&quot;| RDS[&quot;Внешний AWS RDS&quot;]
+
+Table -.-&gt;|&quot;Если переполнена!&quot;| Drop[&quot;💥 DROP всех новых пакетов!\ndial tcp: i/o timeout&quot;]
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Переполнение conntrack</span>
   </div>
   <div class="callout-body">
-    <p>Размер таблицы <code>conntrack</code> жестко ограничен (например, 262144 записей на ноду).<br />
-Если ваш Go-сервис при пиковой нагрузке открывает десятки тысяч короткоживущих TCP-соединений (short-lived connections) к внешним ресурсам, таблица <code>conntrack</code> мгновенно переполняется.</p>
-<p>Ядро Linux начинает молча уничтожать (DROP) новые пакеты. В логах Go вы увидите <code>dial tcp: i/o timeout</code> или <code>connection reset by peer</code>, хотя внешняя БД работает идеально.</p>
+    <p>Размер таблицы <code>nf_conntrack</code> жестко ограничен системным лимитом памяти ядра Linux (параметр <code>sysctl net.netfilter.nf_conntrack_max</code>, по умолчанию часто составляющий 131 072 или 262 144 записи на всю ноду).</p>
+<p>Если ваше Go-приложение на каждый HTTP-запрос открывает новое короткоживущее TCP-соединение (short-lived connection), не используя Keep-Alive, то после закрытия сокета соединение переходит в состояние <code>TIME_WAIT</code>. В ядре Linux запись в таблице <code>conntrack</code> удерживается еще до <strong>120 секунд</strong>!</p>
+<p>Под нагрузкой таблица моментально исчерпывается. Ядро Linux начинает молча уничтожать (<code>DROP</code>) все новые сетевые пакеты. В выводе ядра <code>dmesg</code> появляется сообщение:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">nf_conntrack: table full, dropping packet
+</code></pre>
+</div>
+
+<p>А в логах вашего Go-приложения массово возникают непонятные ошибки: <strong><code>dial tcp: i/o timeout</code></strong> или <strong><code>connection reset by peer</code></strong>, при том что внешняя база данных абсолютно свободна и здорова!</p>
   </div>
 </div>
 
-<p><strong>Решение на уровне Go:</strong> Никогда не используйте дефолтный <code>http.Client</code> или <code>sql.DB</code> без настройки пула соединений в Kubernetes. Вы обязаны переиспользовать TCP-соединения (Connection Pooling), чтобы минимизировать нагрузку на NAT и <code>conntrack</code>.</p>
 <hr />
 <h2 id="5-idiomatichnyy-http-transport-dlya-k8s">5. Идиоматичный HTTP Transport для K8s</h2>
 
-<p>С учетом всех знаний о сети, CNI, таймаутах (см. <a href="../05-nadezhnost/3-timeout.html" class="wikilink">3. Timeout</a>) и DNS, вот как должен выглядеть базовый сетевой транспорт для микросервиса на Go, работающего внутри Kubernetes:</p>
+<p>С учетом всех тонкостей сетевого взаимодействия в кластере, таймаутов (см. <a href="../05-nadezhnost/3-timeout.html" class="wikilink">3. Timeout</a>), защиты таблицы <code>conntrack</code> и предотвращения утечек горутин, вот как выглядит эталонная конфигурация сетевого клиента Go для работы в Kubernetes:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2327,46 +2555,85 @@ import (
     &quot;time&quot;
 )
 
-// NewK8sHTTPClient создает клиента, оптимизированного для агрессивной сетевой среды кластера
+// NewK8sHTTPClient конструирует оптимизированный HTTP-клиент для распределенной среды Kubernetes
 func NewK8sHTTPClient() *http.Client {
+    dialer := &amp;net.Dialer{
+        // Быстрый отказ при проблемах на уровне CNI / veth маршрутизации
+        Timeout:   3 * time.Second,
+
+        // TCP Keep-Alive зонды защищают соединения от разрыва файрволами и экономят nf_conntrack
+        KeepAlive: 30 * time.Second,
+    }
+
+    transport := &amp;http.Transport{
+        Proxy:                 http.ProxyFromEnvironment,
+        DialContext:           dialer.DialContext,
+
+        // Мультиплексирование сотен запросов в один TCP-сокет по HTTP/2
+        ForceAttemptHTTP2:     true,
+
+        // Размер пула простаивающих Keep-Alive соединений:
+        // Предотвращает постоянное открытие новых TCP-сокетов (защита conntrack)
+        MaxIdleConns:          1000, 
+        // Ограничение свободных коннектов к конкретному микросервису
+        MaxIdleConnsPerHost:   100,  
+
+        // Время жизни простаивающего соединения в пуле
+        IdleConnTimeout:       90 * time.Second,
+
+        // Таймаут согласования TLS шифрования
+        TLSHandshakeTimeout:   5 * time.Second,
+
+        // Защита от зависания при отправке больших тел запросов (HTTP 100 Continue)
+        ExpectContinueTimeout: 1 * time.Second,
+
+        // Буферы сокетов на уровне ядра Linux (опциональный тюнинг)
+        WriteBufferSize:       32 * 1024, // 32 KB
+        ReadBufferSize:        32 * 1024, // 32 KB
+    }
+
     return &amp;http.Client{
-        Timeout: 10 * time.Second, // Глобальный хард-лимит (защита горутин)
-        Transport: &amp;http.Transport{
-            Proxy: http.ProxyFromEnvironment,
-            DialContext: (&amp;net.Dialer{
-                Timeout:   3 * time.Second,  // Быстрый отказ при проблемах CNI/сети
-                KeepAlive: 30 * time.Second, // Поддержание TCP (обход conntrack)
-            }).DialContext,
-
-            // Форсируем HTTP/2, чтобы использовать мультиплексирование
-            ForceAttemptHTTP2:     true,
-
-            // Максимальное количество соединений на ВЕСЬ транспорт
-            MaxIdleConns:          1000, 
-            // Максимальное количество соединений к ОДНОМУ хосту
-            MaxIdleConnsPerHost:   100,  
-
-            // Очистка мертвых соединений, если под на другой стороне умер
-            IdleConnTimeout:       90 * time.Second,
-            TLSHandshakeTimeout:   5 * time.Second,
-            // Защита от Slowloris на принимающей стороне
-            ExpectContinueTimeout: 1 * time.Second,
-        },
+        // Глобальный жесткий таймаут на всю транзакцию (включая редиректы и чтение body).
+        // Защищает приложение от бесконечного раздувания числа горутин.
+        Timeout:   10 * time.Second,
+        Transport: transport,
     }
 }
 </code></pre>
 </div>
 
+<hr />
+<h2 id="voprosy-dlya-sobesedovaniya">Вопросы для собеседования</h2>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Вопросы сеньорного собеседования по сетям в Kubernetes</span>
+  </div>
+  <div class="callout-body">
+    <ol>
+<li><strong>Что означает параметр <code>ndots:5</code> в <code>/etc/resolv.conf</code> и как он влияет на производительность Go-приложений?</strong><br />
+<em>Ответ:</em> Параметр заставляет DNS-резолвер подставлять внутренние суффиксы кластера (<code>default.svc.cluster.local</code>, <code>svc.cluster.local</code>, <code>cluster.local</code>) к любому доменному имени, содержащему менее 5 точек. В Go это порождает до 3 мусорных DNS-запросов к CoreDNS на каждый внешний вызов. Для решения используют точку на конце имени (<code>api.stripe.com.</code>), снижают <code>ndots</code> в манифесте пода через <code>dnsConfig</code> или ставят NodeLocal DNSCache.</li>
+<li><strong>Как пакет физически проходит от одного Pod к другому на разных нодах при использовании оверлея (VXLAN)?</strong><br />
+<em>Ответ:</em> Пакет выходит из неймспейса пода через <code>eth0</code>, попадает в пару <code>veth</code> на хосте и в мост <code>cni0</code>. Драйвер CNI на хосте перехватывает пакет, инкапсулирует оригинальный Ethernet-кадр в стандартный сетевой UDP-пакет (порт 4789) и отправляет по физической сети на удаленный узел. На удаленном узле драйвер распаковывает UDP-пакет и направляет внутренний IP-пакет через локальный <code>veth</code> в целевой под.</li>
+<li><strong>Почему Ingress Controller эффективнее обычного ClusterIP Service с точки зрения задержки (Latency)?</strong><br />
+<em>Ответ:</em> Ingress Controller минует проксирование через <code>kube-proxy</code>. Он обращается к API-серверу Kubernetes, получает прямой список IP-адресов целевых подов из объекта <code>EndpointSlice</code> и проксирует TCP/HTTP запросы напрямую на Pod IP без промежуточных правил DNAT в таблицах <code>iptables</code> ядра Linux.</li>
+</ol>
+  </div>
+</div>
+
+<hr />
 <h2 id="itog-razdela-kubernetes-i-deploy">Итог раздела "Kubernetes и деплой"</h2>
 
 <ol>
-<li><strong>Изоляция и Namespaces:</strong> Сеть пода — это изолятор. CNI пробрасывает трафик из этого изолятора в виртуальный коммутатор ноды.</li>
-<li><strong>Ingress Controller:</strong> Умный L7 прокси, который сокращает путь пакета, обходя правила <code>iptables</code> и отправляя трафик напрямую в поды.</li>
-<li><strong>Осторожно с DNS:</strong> Дефолтная конфигурация <code>resolv.conf</code> с <code>ndots:5</code> убьет ваш кластер мусорными запросами. Используйте явную точку в URL (<code>.</code>) или тюнингуйте манифест.</li>
-<li><strong>Тюнинг HTTP клиента:</strong> В Kubernetes пул TCP-соединений (Keep-Alive) — это вопрос не только скорости приложения, но и выживания сетевого стека ОС (<code>conntrack</code>).</li>
+<li><strong>Изоляция и Namespaces:</strong> Сеть пода изолирована сетевым пространством имен ядра Linux. CNI-плагин соединяет его с физической сетью хоста через пару виртуальных интерфейсов <code>veth pair</code>.</li>
+<li><strong>Ingress Controller:</strong> Интеллектуальный L7-маршрутизатор, оптимизирующий путь пакета и обходящий накладные расходы <code>kube-proxy</code> и <code>iptables</code> за счет прямого соединения с подами.</li>
+<li><strong>Осторожно с DNS (<code>ndots:5</code>):</strong> По умолчанию резолвер Go генерирует волны паразитных DNS-запросов к CoreDNS. Применяйте абсолютные имена с замыкающей точкой (<code>.</code>) или оптимизируйте параметры <code>dnsConfig</code>.</li>
+<li><strong>Тюнинг HTTP клиента:</strong> Пул соединений (Keep-Alive) в <code>http.Client</code> и <code>sql.DB</code> — это инструмент выживания сетевого стека ОС, защищающий таблицу <code>nf_conntrack</code> от исчерпания и потери пакетов.</li>
 </ol>
-<p>Мы прошли огромный путь: от устройства процессора и ядра ОС, через глубокие механизмы рантайма Go, паттерны распределенных систем, до тонкостей оркестрации в Kubernetes. </p>
-<p>Теперь мы готовы соединить все эти знания воедино. Мы переходим к самому важному практическому разделу. В следующей статье мы перестанем писать разрозненные куски кода и спроектируем архитектуру реального приложения, которое будет легко поддерживать, тестировать и разворачивать: <a href="../08-praktika/1-struktura-mikroservisnogo-proekta-na-go.html" class="wikilink">1. Структура микросервисного проекта на Go</a>.</p>
+<hr />
+<p>Мы завершили фундаментальное исследование оркестрации, контейнеризации и деплоя: от устройства кремниевого процессора и системных вызовов ядра ОС до тонкостей распределенного планирования в Kubernetes.</p>
+<p>Теперь мы обладаем полным арсеналом знаний для перехода к следующему разделу. Мы объединим все изученные принципы и спроектируем архитектуру зрелого, надежного микросервиса на Go, готового к высоким нагрузкам: <a href="../08-praktika/1-struktura-mikroservisnogo-proekta-na-go.html" class="wikilink">1. Структура микросервисного проекта на Go</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2394,7 +2661,7 @@ func NewK8sHTTPClient() *http.Client {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#anatomiya-seti-ot-gorutiny-do-data-tsentra">Анатомия сети: От горутины до дата-центра</a></li><li class="toc-item toc-h2"><a href="#1-ploskaya-set-i-cni-container-network-interface">1. Плоская сеть и CNI (Container Network Interface)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-kak-pod-poluchaet-set">Mechanical Sympathy: Как под получает сеть?</a></li><li class="toc-item toc-h2"><a href="#2-vneshniy-trafik-ingress-i-obkhod-kube-proxy">2. Внешний трафик: Ingress и обход kube-proxy</a></li><li class="toc-item toc-h2"><a href="#3-proklyatie-dns-problema-ndots5-v-go">3. Проклятие DNS: Проблема ndots:5 в Go</a></li><li class="toc-item toc-h2"><a href="#4-egress-i-perepolnenie-tablitsy-conntrack">4. Egress и переполнение таблицы Conntrack</a></li><li class="toc-item toc-h2"><a href="#5-idiomatichnyy-http-transport-dlya-k8s">5. Идиоматичный HTTP Transport для K8s</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-kubernetes-i-deploy">Итог раздела &quot;Kubernetes и деплой&quot;</a></li>
+    <li class="toc-item toc-h2"><a href="#anatomiya-seti-ot-gorutiny-do-data-tsentra">Анатомия сети: От горутины до дата-центра</a></li><li class="toc-item toc-h2"><a href="#1-ploskaya-set-i-cni-container-network-interface">1. Плоская сеть и CNI (Container Network Interface)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-kak-pod-poluchaet-set">Mechanical Sympathy: Как под получает сеть?</a></li><li class="toc-item toc-h4"><a href="#mezhkhostovoe-vzaimodeystvie-vxlan-vs-bgp">Межхостовое взаимодействие: VXLAN vs BGP</a></li><li class="toc-item toc-h2"><a href="#2-vneshniy-trafik-ingress-i-obkhod-kube-proxy">2. Внешний трафик: Ingress и обход kube-proxy</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-ingress-v-rantayme">Как работает Ingress в рантайме:</a></li><li class="toc-item toc-h2"><a href="#3-proklyatie-dns-problema-ndots5-v-go">3. Проклятие DNS: Проблема ndots:5 в Go</a></li><li class="toc-item toc-h3"><a href="#mekhanika-etcresolv-conf">Механика /etc/resolv.conf</a></li><li class="toc-item toc-h3"><a href="#masshtab-bedstviya">Масштаб бедствия:</a></li><li class="toc-item toc-h3"><a href="#kak-pobedit-problemu-ndots5">Как победить проблему ndots:5:</a></li><li class="toc-item toc-h4"><a href="#1-ispolzovanie-fqdn-s-zamykayushchey-tochkoy-v-go-kode">1. Использование FQDN с замыкающей точкой в Go-коде</a></li><li class="toc-item toc-h4"><a href="#2-tyuning-manifesta-pod-spec-dnsconfig">2. Тюнинг манифеста Pod Spec (dnsConfig)</a></li><li class="toc-item toc-h4"><a href="#3-vnedrenie-nodelocal-dnscache">3. Внедрение NodeLocal DNSCache</a></li><li class="toc-item toc-h2"><a href="#4-egress-i-perepolnenie-tablitsy-conntrack">4. Egress и переполнение таблицы Conntrack</a></li><li class="toc-item toc-h2"><a href="#5-idiomatichnyy-http-transport-dlya-k8s">5. Идиоматичный HTTP Transport для K8s</a></li><li class="toc-item toc-h2"><a href="#voprosy-dlya-sobesedovaniya">Вопросы для собеседования</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-kubernetes-i-deploy">Итог раздела &quot;Kubernetes и деплой&quot;</a></li>
   </ul>
 </aside>
 
