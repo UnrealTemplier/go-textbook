@@ -2169,21 +2169,22 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Flaky тесты и их причины</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Ты написал тест. Он прошел. Ты залил код в репозиторий, CI/CD пайплайн запустил прогон всех тестов, и твой тест... упал. Ты перезапускаешь пайплайн без единого изменения в коде — тест проходит зеленой галочкой. </p>
-<p>Добро пожаловать в ад <strong>Flaky tests (Мигающих тестов)</strong>. </p>
-<p>Flaky тесты — это тесты, которые демонстрируют недетерминированное поведение. Они подрывают доверие к CI/CD: разработчики начинают игнорировать упавшие билды, списывая это на "снова мигнуло", и в итоге пропускают реальные баги в продакшен. </p>
-<p>Go, с его мощной конкурентностью и специфическим рантаймом, предоставляет множество способов выстрелить себе в ногу при написании тестов. Давай разберем фундаментальные причины "миганий" и то, как железо и рантайм Go делают тайное явным.</p>
+            <p>Вы написали элегантный тест. Запустили локально — всё безупречно работает. Сделали коммит, отправили Pull Request, и удаленный CI/CD пайплайн запустил прогон всего тестового сьюта. Через пару минут экран окрашивается в тревожный красный цвет: ваш тест упал. Вы в недоумении открываете логи, не находите ни одной очевидной ошибки, нажимаете спасительную кнопку «Re-run failed job» — и тест триумфально завершается с зеленой галочкой, хотя вы не изменили ни единой строчки кода.</p>
+<p>Добро пожаловать в чистилище бэкенд-инженерии — мир <strong>мигающих тестов (Flaky Tests)</strong>.</p>
+<p>Мигающий тест — это тест, который при абсолютно неизменном исходном коде и неизменном тестовом окружении демонстрирует недетерминированный результат: то проходит, то падает. Подобно ржавчине на несущих опорах моста, flaky-тесты незаметно разрушают инженерную культуру команды. Разработчики быстро привыкают к мысли: «А, этот тест опять мигает, просто перезапусти пайплайн». В результате реальные регрессионные баги и критические гонки данных беспрепятственно просачиваются в промышленную эксплуатацию.</p>
+<p>Язык Go с его легковесными горутинами, асинхронным сетевым поллером и специфическим устройством рантайма предоставляет богатейший арсенал для создания скрытых недетерминированных ошибок. Давайте препарируем фундаментальные анатомические причины миганий на стыке рантайма Go, ядра Linux и микроархитектуры современных процессоров.</p>
+<hr />
 <h2 id="1-illyuziya-vremeni-time-sleep-v-testakh">1. Иллюзия времени: `time.Sleep` в тестах</h2>
 
-<p>Самая частая причина flaky тестов — попытка синхронизировать конкурентный код через задержки.</p>
-<p>Представь, что мы тестируем асинхронный воркер, который обрабатывает задачу в горутине:</p>
+<p>Абсолютный лидер среди причин появления нестабильных тестов — попытка скоординировать конкурентный код с помощью искусственных пауз физического времени (<code>time.Sleep</code>).</p>
+<p>Представьте себе классический сценарий: мы тестируем асинхронный компонент, выполняющий фоновую обработку сообщений в отдельной горутине:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2193,14 +2194,23 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Никогда так не делай
+  <pre class="language-go"><code class="language-go">package worker_test
+
+import (
+    &quot;testing&quot;
+    &quot;time&quot;
+
+    &quot;github.com/stretchr/testify/assert&quot;
+)
+
+// АНТИПАТТЕРН: Никогда так не синхронизируйте тесты
 func TestWorker_Bad(t *testing.T) {
     worker := NewWorker()
 
-    // Запускаем асинхронную работу
+    // Запускаем асинхронную обработку
     go worker.DoWork(&quot;task-1&quot;)
 
-    // Ждем, пока горутина закончит работу (НАДЕЕМСЯ, что успеет)
+    // Инженер наивно надеется, что 50 миллисекунд хватит с огромным запасом
     time.Sleep(50 * time.Millisecond)
 
     assert.True(t, worker.IsDone(&quot;task-1&quot;)) // FLAKY!
@@ -2208,15 +2218,17 @@ func TestWorker_Bad(t *testing.T) {
 </code></pre>
 </div>
 
-<p>Почему это сломается? На твоем M1/M2 Mac с пустой ОС 50 миллисекунд — это вечность, тест будет проходить всегда. Но в CI/CD (например, на дешевых shared-раннерах GitLab или GitHub Actions) ресурсы CPU жестко лимитированы (CPU Throttling).</p>
+<p>На локальном ноутбуке с процессором Apple M-серии или 16-ядерным Intel Core i7 этот тест будет стабильно проходить тысячу раз подряд: система не нагружена, горутина воркера мгновенно подхватывается свободным потоком ОС (M), а 50 миллисекунд — это астрономически долгий срок (порядка 150 000 000 тактов CPU).</p>
+<p>Но как только этот код попадает на перегруженный CI-сервер (например, в дешевый контейнер GitHub Actions или раннер GitLab), начинаются чудеса.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Планировщик ОС и Go Runtime</span>
   </div>
   <div class="callout-body">
-    <p>Когда ты вызываешь <code>time.Sleep</code>, твоя тестирующая горутина снимается с выполнения (паркуется). Планировщик ядра Linux -CFS- не дает никаких хард-риалтайм гарантий, что поток проснется ровно через 50 мс. <br />
-Более того, в эти 50 мс рантайм Go может решить запустить цикл сборки мусора -GC-. Произойдет фаза Stop-The-World -STW-, которая заморозит все горутины. В итоге 50 мс превратятся в 150 мс, воркер не успеет обновить статус, и <code>assert.True</code> упадет.</p>
+    <p>Когда горутина вызывает <code>time.Sleep</code>, рантайм Go вызывает <code>goparkunlock()</code>, снимая горутину с логического процессора <code>P</code> и помещая ее в таймерную кучу. </p>
+<p>Однако ядро Linux и его планировщик CFS (Completely Fair Scheduler) не предоставляют жестких гарантий реального времени (Hard Real-Time). Если контейнеру выделен лимит CPU (cgroups quota), при его исчерпании ядро принудительно замораживает все потоки процесса (CPU Throttling). </p>
+<p>Более того, в этот же 50-миллисекундный интервал рантайм Go может инициировать цикл сборки мусора (Garbage Collector). Фаза Mark Termination потребует кратковременной остановки мира (Stop-The-World, STW). В итоге физические 50 миллисекунд истекают, планировщик Go будит тестовую горутину, а фоновый воркер из-за троттлинга ОС даже не успел получить квант процессорного времени! Вызов <code>assert.True</code> терпит крах.</p>
   </div>
 </div>
 
@@ -2234,22 +2246,26 @@ func TestWorker_Bad(t *testing.T) {
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant Test as Test Goroutine
-participant Sched as Go Scheduler -GMP-
-participant Worker as Worker Goroutine
+autonumber
+participant Test as &quot;Test Goroutine&quot;
+participant Sched as &quot;Go Runtime Scheduler (GMP)&quot;
+participant Worker as &quot;Worker Goroutine&quot;
 
-Test-&gt;&gt;Sched: time.Sleep -50ms-
-Sched-&gt;&gt;Worker: Запуск DoWork
-Note over Sched: Внезапный GC STW &lt;br&gt;или CPU Throttling в CI
-Worker--&gt;&gt;Sched: Не успел завершить работу
-Sched-&gt;&gt;Test: Пробуждение через 65ms
-Test-&gt;&gt;Test: assert.True -FAIL-
+Test-&gt;&gt;Sched: time.Sleep(50ms) -&gt; gopark()
+Note over Test: Тестовая горутина спит
+Sched-&gt;&gt;Worker: Выделен квант времени P/M
+Note over Sched: Внезапный GC STW или CPU Throttling в CI
+Worker--&gt;&gt;Sched: Не успел завершить работу (ожидает CPU)
+Sched-&gt;&gt;Test: Таймер истек: пробуждение Test Goroutine
+Test-&gt;&gt;Test: assert.True(worker.IsDone) -&gt; FAIL!
   </pre>
 </div>
 
 
 <h3 id="kak-lechit-mekhanizmy-sinkhronizatsii">Как лечить? Механизмы синхронизации</h3>
-<p>Вместо надежды на время, опирайся на <strong>события</strong>. Используй каналы, <code>sync.WaitGroup</code> или моки с коллбеками.</p>
+
+<p>Запомните железное правило: <strong>в надежных тестах никогда не ждут времени — в них ждут событий</strong>.</p>
+<p>Используйте каналы синхронизации, <code>sync.WaitGroup</code> или явные обратные вызовы (callbacks):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2259,30 +2275,42 @@ Test-&gt;&gt;Test: assert.True -FAIL-
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ИДИОМАТИЧНЫЙ ПОДХОД
+  <pre class="language-go"><code class="language-go">package worker_test
+
+import (
+    &quot;testing&quot;
+    &quot;time&quot;
+
+    &quot;github.com/stretchr/testify/assert&quot;
+)
+
+// ИДИОМАТИЧНЫЙ ПОДХОД: Синхронизация на сигналах
 func TestWorker_Good(t *testing.T) {
     worker := NewWorker()
     done := make(chan struct{})
 
     go func() {
         worker.DoWork(&quot;task-1&quot;)
-        close(done) // Сигнализируем о завершении
+        close(done) // Сигнализируем о физическом окончании работы
     }()
 
     select {
     case &lt;-done:
+        // Дождались ровно в момент готовности, ни микросекундой позже!
         assert.True(t, worker.IsDone(&quot;task-1&quot;))
     case &lt;-time.After(2 * time.Second):
-        // Защита от вечного зависания (deadlock) в тесте
-        t.Fatal(&quot;Таймаут ожидания воркера&quot;)
+        // Таймаут безопасности: защищает сьют от мертвого зависания (deadlock)
+        t.Fatal(&quot;Таймаут ожидания воркера: задача не завершилась вовремя&quot;)
     }
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="2-nedeterminirovannost-map">2. Недетерминированность `map`</h2>
 
-<p>Вторая классическая ловушка для новичков в Go — это уверенность в том, что хеш-таблицы (maps) сохраняют порядок элементов. </p>
+<p>Вторая по распространенности причина мигающих тестов — слепая вера в то, что обход хэш-таблицы (<code>map</code>) сохраняет порядок ключей.</p>
+<p>Взгляните на простую функцию сериализации конфигурации:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2306,22 +2334,28 @@ func TestWorker_Good(t *testing.T) {
 </code></pre>
 </div>
 
+<p>Этот тест будет случайно падать в 50% запусков.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему при итерации по <code>map</code> в Go порядок элементов каждый раз разный? Разве элементы физически перемещаются в памяти?<br />
-<strong>Ответ:</strong> Нет, элементы в памяти (в массиве бакетов <code>hmap</code>) лежат там же. Но авторы Go специально добавили рандомизацию в функцию <code>runtime.mapiterinit</code>. При старте цикла <code>for range</code> Go генерирует случайное число (<code>fastrand()</code>) и начинает итерацию со <strong>случайного бакета</strong> и случайного смещения внутри него. Это сделано намеренно (Security &amp; Compatibility feature), чтобы разработчики не завязывались на внутреннюю структуру памяти мапы, которая может измениться в новых версиях компилятора.</p>
+    <p><strong>Вопрос:</strong> Почему при итерации по <code>map</code> в Go порядок элементов каждый раз меняется? Разве данные физически перемещаются по оперативной памяти?<br />
+<strong>Ответ:</strong> Нет, структура данных в памяти (массив бакетов структуры <code>hmap</code>) остается абсолютно статичной. Но авторы Go сознательно внедрили аппаратную защиту от скрытой связности. В функции <code>runtime.mapiterinit</code>, которая вызывается в начале каждого цикла <code>for range</code> по мапе, рантайм генерирует псевдослучайное число с помощью вызова <code>fastrand()</code>. Итератор стартует со <strong>случайного бакета</strong> и со случайного смещения внутри него. Это проектное решение предотвращает появление кода, завязанного на детали реализации рантайма, и защищает от внешних коллизионных атак (Hash DoS).</p>
   </div>
 </div>
 
 <h3 id="kak-lechit">Как лечить?</h3>
-<p>Если тебе нужно проверять сериализованные структуры на основе мап (например, JSON), парси строку обратно в <code>map</code> и сравнивай мапы через <code>assert.Equal</code> (или <code>cmp.Equal</code>), а не строки. Либо собирай ключи в слайс, сортируй слайс (<code>sort.Strings</code>) и итерируйся по нему.</p>
+
+<ol>
+<li>Если вы тестируете сериализацию (JSON, YAML, строки), десериализуйте результат обратно в объект и сравнивайте структуры через <code>assert.Equal</code> или <code>cmp.Equal</code>.</li>
+<li>Если формат строго текстовый, извлекайте ключи в срез, сортируйте их через <code>sort.Strings</code>, и лишь затем стройте детерминированную строку.</li>
+</ol>
+<hr />
 <h2 id="3-konflikty-portov-porty-shredingera">3. Конфликты портов (Порты Шредингера)</h2>
 
-<p>Когда ты пишешь интеграционные тесты для HTTP-серверов или gRPC-клиентов, тебе нужно поднять реальный сервер.</p>
+<p>При написании интеграционных и компонентных тестов сетевых сервисов разработчики часто поднимают реальные TCP/HTTP слушатели:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2336,9 +2370,38 @@ listener, err := net.Listen(&quot;tcp&quot;, &quot;localhost:8080&quot;)
 </code></pre>
 </div>
 
-<p>Если ты запустишь тесты через <code>go test ./...</code>, Go может запустить разные тестовые пакеты параллельно. Два теста попытаются сделать <code>bind</code> на порт <code>8080</code>. Один упадет с ошибкой <code>bind: address already in use</code>.</p>
+<p>При запуске набора тестов через стандартную команду:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test ./...
+</code></pre>
+</div>
+
+<p>Раннер Go компилирует и запускает разные тестовые пакеты <strong>параллельно</strong> в отдельных процессах операционной системы. Если два независимых пакета одновременно выполнят системный вызов <code>bind</code> на фиксированный порт <code>8080</code>, один из них неизбежно завершится аварийным падением:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">bind: address already in use
+</code></pre>
+</div>
+
 <h3 id="kak-lechit-efemernye-porty">Как лечить? Эфемерные порты</h3>
-<p>Никогда не хардкодь порты в тестах. Отдавай это на откуп ядру операционной системы. Если передать порт <code>0</code>, ОС (Linux/macOS) сама выделит любой свободный эфемерный порт (ephemeral port) из диапазона (обычно 32768–60999).</p>
+
+<p>Никогда не зашивайте фиксированные номера портов в тесты. Делегируйте распределение портов сетевому стеку ядра Linux/macOS.</p>
+<p>Если в качестве номера порта указать <code>0</code>, операционная система автоматически выделит свободный порт из диапазона динамических эфемерных портов (обычно 32768–60999):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2348,28 +2411,49 @@ listener, err := net.Listen(&quot;tcp&quot;, &quot;localhost:8080&quot;)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// БЕЗОПАСНО
-listener, err := net.Listen(&quot;tcp&quot;, &quot;127.0.0.1:0&quot;)
-require.NoError(t, err)
+  <pre class="language-go"><code class="language-go">package server_test
 
-// Получаем реальный порт, который выдала ОС
-addr := listener.Addr().String() 
-client := NewClient(&quot;http://&quot; + addr)
+import (
+    &quot;net&quot;
+    &quot;testing&quot;
+
+    &quot;github.com/stretchr/testify/require&quot;
+)
+
+func TestHTTPServer_Isolated(t *testing.T) {
+    // Порт 0 указывает ядру ОС выделить любой свободный порт
+    listener, err := net.Listen(&quot;tcp&quot;, &quot;127.0.0.1:0&quot;)
+    require.NoError(t, err)
+    defer listener.Close()
+
+    // Извлекаем фактически назначенный порт
+    addr := listener.Addr().String() 
+
+    // Поднимаем сервер и передаем динамический адрес клиенту
+    srv := NewServer()
+    go srv.Serve(listener)
+
+    client := NewClient(&quot;http://&quot; + addr)
+    resp, err := client.Ping()
+    require.NoError(t, err)
+    require.Equal(t, &quot;PONG&quot;, resp)
+}
 </code></pre>
 </div>
 
-<p>В пакете <code>net/http/httptest</code> функция <code>httptest.NewServer()</code> под капотом делает ровно это.</p>
+<p>Именно этот паттерн реализован в стандартном пакете <code>net/http/httptest</code>: вспомогательный конструктор <code>httptest.NewServer()</code> под капотом слушает <code>127.0.0.1:0</code>, гарантируя 100% изоляцию сетевых сокетов даже при тысячах конкурентных тестовых прогонов.</p>
+<hr />
 <h2 id="4-globalnoe-sostoyanie-i-t-parallel">4. Глобальное состояние и `t.Parallel()`</h2>
 
-<p>Функция <code>t.Parallel()</code> говорит планировщику тестов: "Этот тест можно запускать конкурентно с другими параллельными тестами". Это сильно ускоряет прогон, но вскрывает проблемы с глобальным состоянием (Shared State).</p>
-<p>Если твои тесты меняют переменные окружения (<code>os.Setenv</code>), переопределяют глобальные логгеры, мокают глобальные синглтоны (например, <code>http.DefaultClient.Transport</code>) или пишут в одну и ту же тестовую базу данных без разделения по схемам — жди беды.</p>
+<p>Вызов метода <code>t.Parallel()</code> сигнализирует тестовому раннеру: данная тестовая функция может выполняться одновременно с другими параллельными тестами в отдельных горутинах. Это многократно сокращает время выполнения CI-пайплайнов, но мгновенно обнажает дефекты разделяемого глобального состояния.</p>
+<p>Если тесты конкурентно вызывают модификацию переменных окружения через <code>os.Setenv</code>, подменяют глобальный транспорт <code>http.DefaultClient.Transport</code> или обращаются к одной и той же неизолированной схеме базы данных — взаимное повреждение данных неизбежно.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Замыкания в `t.Parallel()`</span>
   </div>
   <div class="callout-body">
-    <p>До версии Go 1.22 существовала легендарная ловушка с <code>t.Parallel()</code> внутри Table-Driven тестов:</p>
+    <p>До релиза Go 1.22 в языке присутствовала одна из самых коварных ловушек в истории программирования, связанная с захватом переменной цикла в замыкание при использовании <code>t.Parallel()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2379,29 +2463,75 @@ client := NewClient(&quot;http://&quot; + addr)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">for _, tc := range testCases {
-    tc := tc // ДО GO 1.22 ЭТО БЫЛО ОБЯЗАТЕЛЬНО! (Shadowing)
-    t.Run(tc.name, func(t *testing.T) {
-        t.Parallel()
-        assert.Equal(t, tc.expected, Process(tc.input))
-    })
+  <pre class="language-go"><code class="language-go">func TestProcessTable(t *testing.T) {
+    testCases := []struct {
+        name     string
+        input    int
+        expected int
+    }{
+        {&quot;case_1&quot;, 1, 10},
+        {&quot;case_2&quot;, 2, 20},
+    }
+
+    for _, tc := range testCases {
+        tc := tc // ДО GO 1.22 ЭТО БЫЛО ЖИЗНЕННО НЕОБХОДИМО! (Shadowing)
+        t.Run(tc.name, func(t *testing.T) {
+            t.Parallel()
+            assert.Equal(t, tc.expected, Process(tc.input))
+        })
+    }
 }
 </code></pre>
 </div>
 
-<p>Без <code>tc := tc</code> горутины, порожденные <code>t.Parallel()</code>, замыкались на одну и ту же область памяти переменной цикла. К моменту их старта цикл уже заканчивался, и ВСЕ тесты выполнялись с данными последнего <code>testCase</code>. В Go 1.22 семантику циклов <code>for</code> изменили, и теперь переменная создается заново на каждой итерации.</p>
+<p>Без строчки <code>tc := tc</code> все горутины, созданные методом <code>t.Run</code> с вызовом <code>t.Parallel()</code>, ссылались на один и тот же адрес в памяти единственной переменной цикла <code>tc</code>. К моменту, когда планировщик Go фактически запускал горутины, цикл <code>for</code> уже завершался, и абсолютно все тестовые случаи выполнялись с аргументами последнего элемента <code>testCase</code>!<br />
+Начиная с <strong>Go 1.22</strong>, семантика циклов <code>for</code> была изменена: переменная цикла создается заново на каждой итерации, навсегда устранив этот источник багов.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="5-nezametnye-data-races-gonki-dannykh">5. Незаметные Data Races (Гонки данных)</h2>
 
-<p>Иногда flake возникает из-за банального Data Race в самом бизнес-коде, который тест случайно "зацепил". </p>
-<p>На уровне железа гонка данных — это рассинхронизация кэшей процессора (L1/L2). <br />
-Допустим, Горутина А выполняется на Ядре 1 и записывает <code>done = true</code>. Это значение попадает в <em>Store Buffer</em> Ядра 1. <br />
-В это же время Горутина Б выполняется на Ядре 2 и читает <code>done</code>. Из-за отсутствия барьеров памяти (Memory Barriers) протокол когерентности кэшей (MESI) не заставляет Ядро 2 сбросить свой кэш и сходить за новым значением в Ядро 1. Горутина Б читает устаревшее <code>false</code>. Тест падает.</p>
+<p>Нередко причиной периодического падения теста становится не дефект тестового кода, а реальная гонка данных (Data Race) в тестируемом сервисе.</p>
+<p>На уровне микроархитектуры современных многоядерных процессоров гонка данных — это рассинхронизация кэш-линий (Cache Lines по 64 байта) в иерархии кэшей L1/L2:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Core1[&quot;Ядро 1 CPU&quot;]
+G1[&quot;Горутина A&lt;br/&gt;done = true&quot;] --&gt; SB1[&quot;Store Buffer&quot;]
+SB1 --&gt; L1_1[&quot;L1 Cache (M-state)&quot;]
+end
+
+subgraph Core2[&quot;Ядро 2 CPU&quot;]
+L1_2[&quot;L1 Cache (S/I-state)&quot;] --&gt; G2[&quot;Горутина B&lt;br/&gt;читает done -&gt; false!&quot;]
+end
+
+L1_1 -.-&gt;|&quot;Нет барьера памяти&lt;br/&gt;MESI задержка&quot;| L1_2
+
+classDef core fill:#1e293b,stroke:#475569,stroke-width:1px,color:#e2e8f0;
+classDef warn fill:#7f1d1d,stroke:#f87171,stroke-width:2px,color:#fff;
+class Core1,Core2 core;
+class G2 warn;
+  </pre>
+</div>
+
+
+<p>Допустим, Горутина A выполняется на Ядре 1 и записывает флаг <code>done = true</code>. Новое значение не попадает в оперативную память мгновенно — оно буферизуется в аппаратно оптимизированном буфере записи (<em>Store Buffer</em>) Ядра 1.</p>
+<p>В этот же физический момент Горутина B на Ядре 2 считывает значение <code>done</code>. При отсутствии барьеров памяти протокол когерентности кэшей (MESI) не форсирует инвалидацию кэш-линии на Ядре 2. Горутина B читает устаревшее значение <code>false</code>. Условие проверки не выполняется, и тест падает.</p>
 <h3 id="glavnoe-oruzhie-race-detector">Главное оружие: Race Detector</h3>
 
-<p>Запускай тесты локально и в CI <strong>только</strong> с флагом <code>-race</code>.</p>
+<p>Запуск тестов локально и в CI-пайплайне обязан производиться <strong>строго с флагом <code>-race</code></strong>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2415,8 +2545,8 @@ client := NewClient(&quot;http://&quot; + addr)
 </code></pre>
 </div>
 
-<p>Race Detector инструментирует компилируемый бинарник, вставляя проверки к каждому обращению к памяти. Он замедляет выполнение тестов в 2-10 раз и потребляет больше памяти, но это единственный способ со 100% гарантией поймать конкурентный доступ к памяти.</p>
-<p>Если у тебя есть подозрения на Flaky тест, используй флаг <code>-count</code>:</p>
+<p>Race Detector компилирует бинарник со специальной инструментацией на базе Google ThreadSanitizer (TSan). Он отслеживает каждое обращение к каждому байту памяти в 8-байтовых теневых ячейках (Shadow Memory). Запуск с флагом <code>-race</code> увеличивает потребление памяти примерно в 4 раза и замедляет выполнение в 2–10 раз, но это единственная математическая гарантия обнаружения несогласованного доступа к памяти.</p>
+<p>Если у вас есть обоснованное подозрение на мигающий тест, отключите тестовый кэш и запустите тест в цикле с помощью флага <code>-count</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2426,21 +2556,22 @@ client := NewClient(&quot;http://&quot; + addr)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash"># Запустить тест 100 раз подряд без использования кэша тестов
+  <pre class="language-bash"><code class="language-bash"># Запустить подозрительный сценарий 100 раз подряд в режиме детекции гонок
 go test -run=TestMySuspectLogic -count=100 -race
 </code></pre>
 </div>
 
+<p>Если в коде затаилась плавающая гонка, флаг <code>-count</code> в сочетании с переключением контекста горутин обязательно проявит ее за 10–50 итераций.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ol start="6">
-<li>Искореняй <code>time.Sleep</code> в тестах. Используй явную синхронизацию (каналы, WaitGroup).</li>
-<li>Не завязывайся на порядок элементов в <code>map</code>.</li>
-<li>Изолируй ресурсы: используй порт <code>0</code> для сети и очищай БД после каждого теста.</li>
-<li>Будь осторожен с глобальным состоянием при использовании <code>t.Parallel()</code>.</li>
-<li>Race Detector (<code>-race</code>) — твой лучший друг в поиске плавающих багов.</li>
-</ol>
-<p>Разобравшись с фундаментом изоляции и недетерминированности, мы подходим к одной из самых сложных тем в тестировании бэкенда. Как тестировать код, который жестко завязан на базу данных (PostgreSQL), брокер сообщений (Kafka) или кэш (Redis), и при этом не ловить конфликты параллельных запусков? Об этом поговорим в следующей статье: <a href="../../09-bekend-na-go-praktika-razrabotki/35-integratsionnye-testy.html" class="wikilink">35. Интеграционные тесты</a>.</p>
+<p>Борьба с flaky-тестами — это вопрос профессиональной зрелости и уважения к времени своих коллег:<br />
+1. <strong>Искореняйте <code>time.Sleep</code>:</strong> синхронизируйте горутины через каналы и примитивы <code>sync.WaitGroup</code>.<br />
+2. <strong>Не полагайтесь на порядок в <code>map</code>:</strong> сортируйте ключи или используйте структурное сравнение.<br />
+3. <strong>Используйте порт <code>0</code>:</strong> доверяйте операционной системе выделение свободных эфемерных портов.<br />
+4. <strong>Изолируйте разделяемое состояние:</strong> помните о влиянии глобальных синглтонов при включении <code>t.Parallel()</code>.<br />
+5. <strong>Всегда проверяйте код через <code>-race</code> и <code>-count=100</code>:</strong> это лучший способ обнаружить скрытые гонки данных до того, как они уронят production.</p>
+<p>Разобравшись с фундаментом воспроизводимости и источниками недетерминизма, мы переходим к вопросу надежной изоляции тестов от внешнего окружения в главе <a href="7-test-isolation.html" class="wikilink">7. Test isolation</a>, а также глубоко погрузимся в практику взаимодействия с реальными СУБД в статье <a href="../../09-bekend-na-go-praktika-razrabotki/35-integratsionnye-testy.html" class="wikilink">35. Интеграционные тесты</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
