@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 14</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~40 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Saga pattern</h1>
           </header>
@@ -2178,44 +2178,49 @@
           <div class="article-markdown">
             <h2 id="tranzaktsii-v-mikroservisakh-problema-raspredelennogo-sostoyaniya">Транзакции в микросервисах: Проблема распределенного состояния</h2>
 
-<p>В классической монолитной архитектуре с реляционной базой данных (PostgreSQL, MySQL) мы привыкли к надежности <strong>ACID-транзакций</strong>. Мы начинаем транзакцию, делаем несколько изменений в разных таблицах, и если что-то идет не так — база данных автоматически откатывает всё обратно. За это отвечают механизмы WAL (Write-Ahead Log) и блокировок на уровне строк.</p>
-<p>В мире микросервисов этот комфорт исчезает. Данные распределены по разным сервисам, каждый из которых имеет собственную базу данных (паттерн <strong>Database per Service</strong>).</p>
-<p>Представь сценарий: <strong>Оформление заказа</strong>.<br />
-1.  Сервис <strong>Orders</strong> создает заказ.<br />
-2.  Сервис <strong>Payments</strong> списывает деньги.<br />
-3.  Сервис <strong>Inventory</strong> резервирует товар.</p>
-<p>Если сервис Inventory падает с ошибкой "Товар закончился", деньги уже списаны, заказ создан. В монолите сработал бы <code>ROLLBACK</code>. В микросервисах у нас нет единой транзакции, охватывающей разные БД. Нам нужен механизм, который гарантирует согласованность данных <strong>в конечном итоге</strong> (Eventual Consistency).</p>
-<p>Этот механизм — <strong>Saga</strong>.</p>
+<blockquote>
+<p><em>"В распределенных системах нет магии. Если вы попытаетесь притвориться, что сеть мгновенна, а чужая база данных — это часть вашей локальной памяти, расплата наступит в виде зависших блокировок и мертвого продакшена."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>В классической монолитной архитектуре с реляционной базой данных (будь то PostgreSQL или MySQL) разработчики привыкли к комфорту и математической строгости <strong>ACID-транзакций</strong>. Мы открываем транзакцию через <code>BEGIN</code>, вносим изменения в три разные таблицы, и если на четвертом шаге что-то пошло не так — база данных мгновенно выполняет спасительный <code>ROLLBACK</code>. За эту атомарность и изоляцию отвечают низкоуровневые механизмы СУБД: журнал упреждающей записи (Write-Ahead Log, WAL), блокировки строк (row-level locks) и многоверсионное управление конкурентным доступом (MVCC).</p>
+<p>Однако в микросервисной архитектуре этот уютный монолитный рай исчезает. Золотой стандарт изоляции гласит: <strong>Database per Service</strong> (у каждого сервиса — собственная независимая база данных). Сервис заказов не имеет прямого доступа к таблицам сервиса платежей или склада.</p>
+<p>Представьте хрестоматийный сценарий оформления покупки в интернет-магазине:<br />
+1. Сервис <strong>Orders</strong> создает запись о заказе в статусе ожидания.<br />
+2. Сервис <strong>Payments</strong> списывает денежные средства с банковской карты покупателя.<br />
+3. Сервис <strong>Inventory</strong> резервирует запрашиваемые товары на складе.</p>
+<p>Что произойдет, если на третьем шаге сервис Inventory падает с фатальной ошибкой: <em>«Товар только что закончился на складе»</em>?<br />
+Деньги у пользователя уже списаны! В монолите один системный вызов СУБД выполнил бы <code>ROLLBACK</code>, откатив списание и создание заказа. Но в распределенной системе у нас нет единого WAL, нет общих блокировок и нет единого координатора транзакций. Вызывающий сервис не может просто послать <code>ROLLBACK</code> в чужую базу данных.</p>
+<p>Если мы ничего не предпримем, система окажется в рассогласованном состоянии: деньги у клиента украдены, а товар не выдан. Нам необходим инженерный паттерн, гарантирующий согласованность данных <strong>в конечном итоге</strong> (Eventual Consistency) без использования тяжелых и блокирующих сетевых протоколов.</p>
+<p>Этот паттерн носит имя <strong>Saga</strong>.</p>
 <hr />
 <h2 id="chto-takoe-saga">Что такое Saga?</h2>
 
-<p><strong>Saga</strong> — это паттерн проектирования, при котором длинная транзакция (Long Lived Transaction, LLT) разбивается на последовательность локальных транзакций.</p>
-<p>Каждая локальная транзакция обновляет данные в рамках одного сервиса и публикует событие или сообщение, чтобы запустить следующий шаг в другом сервисе.</p>
+<p><strong>Saga</strong> — это архитектурный паттерн проектирования распределенных систем, при котором длинная распределенная бизнес-транзакция (Long Lived Transaction, LLT) разбивается на упорядоченную цепочку независимых <strong>локальных транзакций</strong>.</p>
+<p>Каждая локальная транзакция обновляет состояние строго в рамках одной изолированной базы данных своего сервиса и публикует во внешнюю шину (Kafka, RabbitMQ, NATS) сообщение или событие, которое инициирует выполнение следующей локальной транзакции в соседнем сервисе.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Изначально концепция была предложена Гектором Гарсиа-Молиной в 1987 году для долгих транзакций в БД. В современной распределенной архитектуре она трансформировалась в способ координации изменений состояния между сервисами без использования распределенных блокировок (Distributed Locks), которые являются узким местом и точкой отказа.</p>
+    <p>Изначально концепция Saga была сформулирована Гектором Гарсиа-Молиной (Hector Garcia-Molina) и Кеннетом Салемом в 1987 году в Принстонском университете как способ управления долгоживущими транзакциями в мейнфреймах СУБД. В современной распределенной микросервисной среде Saga трансформировалась в фундаментальный стандарт координации состояния без использования распределенных блокировок (Distributed Locks) и протокола двухфазного коммита (2PC), которые в условиях реальной сети становятся главным источником хвостовых задержек (tail latency) и едиными точками отказа.</p>
   </div>
 </div>
 
-<p>Если один шаг транзакции завершается неудачей, выполняются <strong>компенсирующие транзакции</strong> (Compensating Transactions), которые отменяют изменения, сделанные предыдущими шагами.</p>
+<p>Фундаментальный постулат Saga: если какой-либо промежуточный шаг распределенной цепочки завершается бизнес-ошибкой или фатальным сбоем, система обязана запустить строго определенную цепочку <strong>компенсирующих транзакций</strong> (Compensating Transactions), которые семантически нейтрализуют все изменения, внесенные предыдущими успешными шагами.</p>
 <h3 id="printsip-raboty">Принцип работы</h3>
 
-<p>Saga $T$ разбивается на последовательность шагов: $T_1, T_2, \dots, T_n$.<br />
-Для каждого шага $T_i$ определяется компенсирующее действие $C_i$.</p>
-<ol>
-<li>Выполняется $T_1$.</li>
-<li>Если успешно — выполняется $T_2$.</li>
-<li>Если успешно — выполняется $T_3$.<br />
-...</li>
-<li>Если на шаге $k$ происходит ошибка:<ul>
-<li>Запускается цепочка отката: $C_{k-1}, \dots, C_1$.</li>
-</ul>
-</li>
-</ol>
+<p>Формально Saga $T$ представляется в виде последовательности дискретных шагов:<br />
+$$T = {T_1, T_2, T_3, \dots, T_n}$$</p>
+<p>Для каждого прямого шага $T_i$ (за исключением финального, подтверждающего) проектируется парное компенсирующее действие $C_i$:<br />
+- $T_i$ — локальная транзакция, двигающая процесс вперед (например, списание баланса);<br />
+- $C_i$ — компенсирующая транзакция, откатывающая последствия $T_i$ (например, возврат списанных средств).</p>
+<p>Алгоритм выполнения:<br />
+1. Выполняется шаг $T_1$. Если успешно — инициируется шаг $T_2$.<br />
+2. Если $T_2$ завершился успешно — запускается $T_3$.<br />
+3. Если на шаге $k$ ($T_k$) происходит сбой (нехватка товара, отказ валидации):<br />
+   - Прямой ход прерывается;<br />
+   - Координатор запускает обратную волну компенсаций: $C_{k-1}, C_{k-2}, \dots, C_1$.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2232,38 +2237,75 @@
 flowchart TD
 Start[&quot;Начало Saga&quot;] --&gt; Step1[&quot;T1. Создать заказ&quot;]
 Step1 --&gt; Step2[&quot;T2. Списать деньги&quot;]
-Step2 -- Успех --&gt; Step3[&quot;T3. Забронировать товар&quot;]
+Step2 -- &quot;Успех&quot; --&gt; Step3[&quot;T3. Забронировать товар&quot;]
 
-Step3 -- Ошибка! Нет товара --&gt; Comp2[&quot;C2. Вернуть деньги&quot;]
-Step2 -- Ошибка! Нет средств --&gt; Comp1[&quot;C1. Отменить заказ&quot;]
+Step3 -- &quot;Ошибка! Нет товара&quot; --&gt; Comp2[&quot;C2. Вернуть деньги&quot;]
+Step2 -- &quot;Ошибка! Нет средств&quot; --&gt; Comp1[&quot;C1. Отменить заказ&quot;]
 
-Step3 -- Успех --&gt; End[&quot;Saga завершена успешно&quot;]
+Step3 -- &quot;Успех&quot; --&gt; End[&quot;Saga завершена успешно&quot;]
 Comp2 --&gt; Comp1
 Comp1 --&gt; Fail[&quot;Saga завершена с откатом&quot;]
   </pre>
 </div>
 
 
+<p>Важно понимать: компенсация — это <strong>не физический откат</strong> памяти или строк БД к исходному состоянию (как в WAL). Это <strong>новое прямое действие</strong>, компенсирующее бизнес-эффект. Например, если $T_2$ списал 1000 рублей, то $C_2$ зачисляет 1000 рублей обратно, оставляя в истории аудита две явные бухгалтерские проводки.</p>
 <hr />
 <h2 id="dva-sposoba-koordinatsii-khoreografiya-vs-orkestratsiya">Два способа координации: Хореография vs Оркестрация</h2>
 
-<p>Существует два основных подхода к реализации Saga. Выбор между ними — это компромисс между сложностью кода и связностью (coupling) сервисов.</p>
+<p>Выбор способа координации участников саги — это классический инженерный компромисс между автономностью компонентов и когнитивной сложностью системы.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph Choreography[&quot;Хореография (Event-driven)&quot;]
+direction TB
+C1[&quot;Order Service&quot;] -- &quot;OrderCreated&quot; --&gt; C2[&quot;Payment Service&quot;]
+C2 -- &quot;PaymentProcessed&quot; --&gt; C3[&quot;Inventory Service&quot;]
+C3 -. &quot;InventoryFailed&quot; .-&gt; C2
+C2 -. &quot;RefundIssued&quot; .-&gt; C1
+end
+
+subgraph Orchestration[&quot;Оркестрация (Command-driven)&quot;]
+direction TB
+O[&quot;Saga Orchestrator&lt;br&gt;(State Machine)&quot;]
+O -- &quot;1. Command: Pay&quot; --&gt; S1[&quot;Payment Service&quot;]
+S1 -- &quot;Reply: Paid&quot; --&gt; O
+O -- &quot;2. Command: Reserve&quot; --&gt; S2[&quot;Inventory Service&quot;]
+S2 -- &quot;Reply: OutOfStock&quot; --&gt; O
+O -- &quot;3. Command: Refund&quot; --&gt; S1
+end
+  </pre>
+</div>
+
+
 <h3 id="1-khoreografiya-choreography">1. Хореография (Choreography)</h3>
 
-<p>Это децентрализованный подход. Нет единого координатора. Каждый сервис выполняет свою работу и публикует событие (Event). Другие сервисы слушают эти события и реагируют.</p>
+<p>Хореография — это полностью децентрализованный подход. В системе нет начальника или центрального дирижера. Сервисы общаются исключительно языком фактов — бизнес-событий (Events) через общую шину сообщений:</p>
 <ul>
-<li><strong>Сценарий</strong>: Order Service публикует <code>OrderCreated</code>.</li>
-<li><strong>Реакция</strong>: Payment Service слушает событие, списывает деньги, публикует <code>PaymentProcessed</code>.</li>
-<li><strong>Реакция</strong>: Inventory Service слушает <code>PaymentProcessed</code>, бронирует товар. Если товара нет, публикует <code>InventoryFailed</code>.</li>
-<li><strong>Откат</strong>: Payment Service слушает <code>InventoryFailed</code> и возвращает деньги.</li>
+<li><strong>Шаг 1:</strong> Сервис Order Service создает запись в БД и публикует событие <code>OrderCreated</code>.</li>
+<li><strong>Шаг 2:</strong> Сервис Payment Service подписан на события заказов. Услышав <code>OrderCreated</code>, он списывает деньги и публикует событие <code>PaymentProcessed</code>.</li>
+<li><strong>Шаг 3:</strong> Сервис Inventory Service слушает событие <code>PaymentProcessed</code>, пытается зарезервировать складские остатки, обнаруживает пустую полку и публикует событие <code>InventoryFailed</code>.</li>
+<li><strong>Откат:</strong> Payment Service подписан на событие <code>InventoryFailed</code>. Получив его, он немедленно выполняет возврат средств и публикует <code>RefundIssued</code>, по которому Order Service переводит заказ в статус <code>Cancelled</code>.</li>
 </ul>
-<p><strong>Плюсы</strong>:<br />
-*   Простота для простых сценариев (2-3 сервиса).<br />
-*   Слабая связность (сервисы знают только о событиях, но не друг о друге).</p>
-<p><strong>Минусы</strong>:<br />
-*   <strong>Spaghetti Logic</strong>: Сложно отследить весь процесс целиком. Логика размазана по всем сервисам.<br />
-*   <strong>Риск циклических зависимостей</strong>: Сервис A слушает B, B слушает A.<br />
-*   Сложность добавления новых шагов.</p>
+<p><strong>Преимущества хореографии:</strong><br />
+- Предельная простота на ранних этапах (для цепочек из 2–3 сервисов);<br />
+- Слабая связность (сервисы ничего не знают об адресах и интерфейсах друг друга, они знают только контракты событий);<br />
+- Отсутствие дополнительной инфраструктуры в виде сервиса-координатора.</p>
+<p><strong>Недостатки хореографии:</strong><br />
+- <strong>Spaghetti Logic:</strong> Бизнес-логика транзакции размазана по кодовым базам разных команд. Чтобы понять, как работает жизненный цикл заказа, инженеру приходится собирать мозаику из десятка репозиториев;<br />
+- <strong>Риск циклических зависимостей:</strong> Сервис A слушает события от B, а сервис B подписан на побочные события A;<br />
+- <strong>Сложность мониторинга и отладки:</strong> Без сквозного Distributed Tracing невозможно восстановить текущую стадию выполнения саги.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2276,37 +2318,40 @@ Comp1 --&gt; Fail[&quot;Saga завершена с откатом&quot;]
 
 <h3 id="2-orkestratsiya-orchestration">2. Оркестрация (Orchestration)</h3>
 
-<p>Централизованный подход. Существует отдельный сервис-координатор (Orchestrator), который управляет процессом. Он говорит сервисам, что делать, и принимает решения о последствиях.</p>
-<ul>
-<li>Orchestrator командует Payment Service: "Списать деньги".</li>
-<li>Получает ответ: "OK".</li>
-<li>Командует Inventory Service: "Забронировать товар".</li>
-<li>Получает ответ: "Error".</li>
-<li>Командует Payment Service: "Вернуть деньги".</li>
-</ul>
-<p><strong>Плюсы</strong>:<br />
-*   Централизованная логика: Проще понимать состояние текущей транзакции.<br />
-*   Упрощенная обработка ошибок и откаты.<br />
-*   Легче добавлять новые шаги и менять логику.</p>
-<p><strong>Минусы</strong>:<br />
-*   Дополнительная инфраструктура (Orchestrator).<br />
-*   Сильная связность: Orchestrator должен знать API всех участников.</p>
+<p>Оркестрация — это централизованный подход. За координацию процесса отвечает специализированный компонент — <strong>Saga Orchestrator</strong> (дирижер). Оркестратор отправляет участникам асинхронные команды («сделай действие X») и ожидает от них ответов о статусе выполнения:</p>
+<ol>
+<li>Оркестратор отправляет команду сервису платежей: <em>«Списать $100 за заказ #42»</em>.</li>
+<li>Получает статус-ответ: <em>«Успешно списано»</em>.</li>
+<li>Отправляет команду сервису склада: <em>«Забронировать 1 шт. товара #99»</em>.</li>
+<li>Получает статус-ответ: <em>«Ошибка: товара нет на складе»</em>.</li>
+<li>Принимает управленческое решение о запуске компенсации: отправляет сервису платежей команду <em>«Вернуть $100 за заказ #42»</em>.</li>
+</ol>
+<p><strong>Преимущества оркестрации:</strong><br />
+- Единый центр управления: весь сценарий транзакции и логика ветвлений зафиксированы в одном месте (в коде конечного автомата оркестратора);<br />
+- Легкость модификации: добавление нового шага (например, отправка SMS-уведомления) требует изменения только кода оркестратора, а не всех сервисов цепочки;<br />
+- Простота мониторинга: статус любой транзакции можно мгновенно узнать по ID саги из базы оркестратора.</p>
+<p><strong>Недостатки оркестрации:</strong><br />
+- Появление выделенного сервиса-оркестратора, требующего поддержки отказоустойчивости и репликации;<br />
+- Опасность превращения оркестратора в «умного бога» (God Object), отбирающего бизнес-логику у доменных сервисов (сервисы рискуют выродиться в анемичные CRUD-хранилища).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Какой подход выбрать?<br />
-<strong>Ответ:</strong> Если бизнес-процесс простой (2-3 шага) — используй <strong>Хореографию</strong>, чтобы не переусложнять архитектуру. Если процесс сложный, содержит много ветвлений и условий — выбирай <strong>Оркестрацию</strong>. Она добавляет связность, но резко снижает когнитивную сложность понимания потока данных.</p>
+    <p><strong>Вопрос:</strong> Какой подход выбрать на практике — хореографию или оркестрацию?<br />
+<strong>Ответ:</strong><br />
+Если распределенный процесс короткий и линейный (2–3 сервиса, отсутствие сложных ветвлений) — выбирайте <strong>Хореографию</strong>, чтобы не усложнять инфраструктуру.<br />
+Если бизнес-процесс насчитывает 4 и более шагов, имеет сложные правила ветвления, условные переходы или требует строгого SLA и контроля тайм-аутов — выбирайте <strong>Оркестрацию</strong> (самописный конечный автомат на Go или готовые движки вроде Temporal / Cadence). Оркестрация радикально снижает когнитивную нагрузку и стоимость поддержки системы.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="realizatsiya-orkestratora-na-go">Реализация Оркестратора на Go</h2>
 
-<p>В Go оркестратор обычно реализуется как конечный автомат (State Machine). Каждое состояние Saga сохраняется в БД оркестратора (для отказоустойчивости), а общение с сервисами происходит через очереди сообщений (RabbitMQ, Kafka) или gRPC.</p>
-<p>Пример структуры данных для хранения состояния Saga в БД оркестратора:</p>
+<p>В языке Go надежный оркестратор проектируется как персистентный конечный автомат (State Machine). Состояние каждого экземпляра саги обязано сохраняться в транзакционном хранилище оркестратора (PostgreSQL / SQLite) перед отправкой каждой сетевой команды. Это гарантирует, что при внезапном падении pod'а оркестратор после перезапуска прочитает журнал и продолжит сагу с прерванного шага.</p>
+<h3 id="struktury-dannykh-sostoyaniya-sagi">Структуры данных состояния саги</h3>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2316,36 +2361,53 @@ Comp1 --&gt; Fail[&quot;Saga завершена с откатом&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type SagaStatus string
+  <pre class="language-go"><code class="language-go">package saga
 
-const (
-    StatusRunning    SagaStatus = &quot;RUNNING&quot;
-    StatusCompleted  SagaStatus = &quot;COMPLETED&quot;
-    StatusCompensating SagaStatus = &quot;COMPENSATING&quot; // Идет откат
-    StatusFailed     SagaStatus = &quot;FAILED&quot;         // Откат не удался или бизнес-ошибка
+import (
+    &quot;time&quot;
+
+    &quot;github.com/google/uuid&quot;
 )
 
+type SagaStatus string
+
+const (
+    StatusRunning      SagaStatus = &quot;RUNNING&quot;
+    StatusCompleted    SagaStatus = &quot;COMPLETED&quot;
+    StatusCompensating SagaStatus = &quot;COMPENSATING&quot; // Идет откат предыдущих шагов
+    StatusFailed       SagaStatus = &quot;FAILED&quot;       // Сага завершилась с бизнес-ошибкой
+)
+
+// SagaStep описывает состояние конкретного этапа
 type SagaStep struct {
-    Name       string
-    Status     SagaStatus
-    Compensate bool // Флаг: нужно ли выполнять компенсацию для этого шага
+    Name       string     `json:&quot;name&quot;`
+    Status     SagaStatus `json:&quot;status&quot;`
+    Compensate bool       `json:&quot;compensate&quot;` // Требуется ли компенсация при откате
 }
 
+// SagaInstance представляет персистентный слепок транзакции
 type SagaInstance struct {
-    ID          uuid.UUID
-    OrderID     uuid.UUID
-    CurrentStep int
-    Status      SagaStatus
-    Steps       []SagaStep
-    CreatedAt   time.Time
-    UpdatedAt   time.Time
+    ID          uuid.UUID  `json:&quot;id&quot;`
+    OrderID     uuid.UUID  `json:&quot;order_id&quot;`
+    CurrentStep int        `json:&quot;current_step&quot;`
+    Status      SagaStatus `json:&quot;status&quot;`
+    Steps       []SagaStep `json:&quot;steps&quot;`
+    CreatedAt   time.Time  `json:&quot;created_at&quot;`
+    UpdatedAt   time.Time  `json:&quot;updated_at&quot;`
+}
+
+type SagaReply struct {
+    SagaID  uuid.UUID
+    Step    int
+    Success bool
+    Error   string
 }
 </code></pre>
 </div>
 
 <h3 id="obrabotchik-shagov-uproshchenno">Обработчик шагов (упрощенно)</h3>
 
-<p>Оркестратор получает ответ от сервиса и решает, что делать дальше.</p>
+<p>Оркестратор обрабатывает асинхронные ответы от сервисов-исполнителей и переводит автомат в следующее состояние:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2355,45 +2417,82 @@ type SagaInstance struct {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func (o *Orchestrator) HandleReply(reply SagaReply) {
-    // Загружаем состояние Saga из БД (чтобы пережить перезапуск)
+  <pre class="language-go"><code class="language-go">package saga
+
+import (
+    &quot;log/slog&quot;
+    &quot;time&quot;
+)
+
+type Repository interface {
+    GetSaga(id uuid.UUID) (*SagaInstance, error)
+    Save(saga *SagaInstance) error
+}
+
+type Orchestrator struct {
+    repo Repository
+}
+
+func (o *Orchestrator) HandleReply(reply SagaReply) {
+    // Загружаем состояние Saga из БД (чтобы быть устойчивыми к падениям)
     saga, err := o.repo.GetSaga(reply.SagaID)
     if err != nil {
-        log.Printf(&quot;Critical: saga state lost: %v&quot;, err)
+        slog.Error(&quot;Critical: saga state retrieval failed&quot;, &quot;saga_id&quot;, reply.SagaID, &quot;err&quot;, err)
         return
     }
+
+    saga.UpdatedAt = time.Now().UTC()
 
     if reply.Success {
         saga.Steps[saga.CurrentStep].Status = StatusCompleted
         saga.CurrentStep++
 
+        // Проверяем, был ли это финальный шаг
         if saga.CurrentStep == len(saga.Steps) {
             saga.Status = StatusCompleted
-            o.repo.Save(saga)
+            if err := o.repo.Save(saga); err != nil {
+                slog.Error(&quot;Failed to persist completed saga&quot;, &quot;err&quot;, err)
+            }
+            slog.Info(&quot;Saga successfully completed&quot;, &quot;saga_id&quot;, saga.ID)
             return
         }
 
-        // Запускаем следующий шаг
-        o.executeNextStep(saga)
+        // Запускаем исполнение следующей команды
+        o.executeStep(saga, saga.CurrentStep)
     } else {
-        // Ошибка! Начинаем компенсацию
+        // Ошибка шага! Переходим в режим компенсации
+        slog.Warn(&quot;Step failed, initiating compensation&quot;, 
+            &quot;saga_id&quot;, saga.ID, 
+            &quot;failed_step&quot;, saga.CurrentStep, 
+            &quot;error&quot;, reply.Error,
+        )
         saga.Status = StatusCompensating
         o.compensate(saga)
     }
 
-    o.repo.Save(saga)
+    if err := o.repo.Save(saga); err != nil {
+        slog.Error(&quot;Failed to save saga state&quot;, &quot;err&quot;, err)
+    }
 }
 
 func (o *Orchestrator) compensate(saga *SagaInstance) {
-    // Идем в обратном порядке от текущего шага
+    // Двигаемся в строгом обратном порядке от последнего завершенного шага
     for i := saga.CurrentStep - 1; i &gt;= 0; i-- {
-        step := saga.Steps[i]
-        if step.Status == StatusCompleted {
-            // Отправляем команду на компенсацию (например, RefundPayment)
-            o.sendCompensateCommand(saga.ID, step)
+        step := &amp;saga.Steps[i]
+        if step.Status == StatusCompleted &amp;&amp; step.Compensate {
+            slog.Info(&quot;Dispatching compensation command&quot;, &quot;saga_id&quot;, saga.ID, &quot;step&quot;, step.Name)
+            o.sendCompensateCommand(saga.ID, *step)
         }
     }
     saga.Status = StatusFailed
+}
+
+func (o *Orchestrator) executeStep(saga *SagaInstance, stepIdx int) {
+    // Отправка команды в шину сообщений (Kafka/RabbitMQ)
+}
+
+func (o *Orchestrator) sendCompensateCommand(sagaID uuid.UUID, step SagaStep) {
+    // Отправка компенсирующей команды в шину сообщений
 }
 </code></pre>
 </div>
@@ -2401,24 +2500,47 @@ func (o *Orchestrator) compensate(saga *SagaInstance) {
 <hr />
 <h2 id="problemy-i-anomalii-saga">Проблемы и аномалии Saga</h2>
 
-<p>Saga не дает изолированности (Isolation) в классическом понимании ACID. Это порождает специфические проблемы.</p>
+<p>Классические базы данных гарантируют уровень изолированности транзакций (Isolation в ACID). <strong>Saga не обеспечивает изолированности на глобальном уровне.</strong><br />
+Каждая локальная транзакция коммитит свои изменения в базу данных немедленно. Это означает, что промежуточное состояние системы видно другим параллельным процессам. Это порождает классические распределенные аномалии:</p>
 <h3 id="1-lost-updates-poteryannye-obnovleniya">1. Lost Updates (Потерянные обновления)</h3>
-<p>Два экземпляра одной Saga могут одновременно работать с одними данными.<br />
-*   Saga A читает баланс ($100).<br />
-*   Saga B читает баланс ($100).<br />
-*   Saga A списывает $10 ($90).<br />
-*   Saga B списывает $10 ($90).<br />
-*   Итог: баланс $90, хотя должно быть $80.</p>
-<p><strong>Решение</strong>: Пессимистичные блокировки (не рекомендуется в распределенных системах) или <strong>Оптимистичные блокировки</strong> (версионирование данных). В SQL: <code>UPDATE accounts SET balance = balance - 10, version = version + 1 WHERE id = ? AND version = ?</code>.</p>
+
+<p>Возникает, когда две параллельные саги одновременно читают и модифицируют один и тот же агрегат без координации:<br />
+- Сага A читает баланс кошелька клиента: <code>$100</code>.<br />
+- Сага B параллельно читает тот же баланс: <code>$100</code>.<br />
+- Сага A выполняет списание <code>$10</code> и записывает: <code>$90</code>.<br />
+- Сага B выполняет списание <code>$10</code> и записывает: <code>$90</code>.<br />
+- <strong>Итог:</strong> со счета списано $20, но итоговый баланс равен $90 вместо $80. Одно списание бесследно утеряно.</p>
+<p><strong>Решение:</strong> Отказ от неявных перезаписей в пользу оптимистичных блокировок (Optimistic Concurrency Control) с инкрементом версии:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">UPDATE accounts 
+SET balance = balance - 10, version = version + 1 
+WHERE id = $1 AND version = $2;
+</code></pre>
+</div>
+
+<p>Если строка уже изменена другой транзакцией, запрос обновит 0 строк, и приложение повторит операцию с актуальным балансом.</p>
 <h3 id="2-dirty-reads-gryaznoe-chtenie">2. Dirty Reads (Грязное чтение)</h3>
-<p>Внешний наблюдатель может увидеть промежуточное состояние. Например, деньги списаны (Saga T2), но товар еще не забронирован (Saga T3). Пользователь видит "Заказ в обработке" и списанные деньги, а потом заказ отменяется.</p>
-<p><strong>Решение</strong>: Не показывать пользователю состояние "Успешно" до завершения последнего шага Saga. Использовать семантические блокировки (например, флаг <code>status: PENDING</code> в БД сервисов).</p>
+
+<p>Внешний наблюдатель видит промежуточный результат незаконченной саги:<br />
+- Сага заказа списала $100 с карты покупателя (Шаг $T_2$).<br />
+- Пользователь открывает личный кабинет и видит уведомление: <em>«Оплата подтверждена»</em>.<br />
+- На шаге $T_3$ склад сообщает об отсутствии товара. Запускается компенсация $C_2$.<br />
+- Деньги возвращаются, но пользователь в течение нескольких секунд наблюдал ложное состояние успешной покупки.</p>
+<p><strong>Решение:</strong> Использование <strong>семантических блокировок</strong> (Semantic Locks). Сервисы не переводят сущности в терминальные состояния до завершения саги. Заказ создается с промежуточным статусом: <code>status: PENDING</code>. Интерфейсы и внешние системы не показывают клиенту статус «Успешно» до получения финального события подтверждения от оркестратора.</p>
 <hr />
 <h2 id="semantic-lock-i-idempotentnost">Semantic Lock и идемпотентность</h2>
 
-<p>Для надежной работы Saga критически важна <strong>идемпотентность</strong> операций.</p>
-<p>При оркестрации ответ от сервиса может потеряться. Оркестратор не знает, списались деньги или нет. Он должен повторить запрос. Если операция списания не идемпотентна, деньги спишутся дважды.</p>
-<p>В Go для обеспечения идемпотентности при работе через очереди (RabbitMQ/Kafka) часто используют уникальный ключ запроса (Idempotency Key), который генерирует оркестратор.</p>
+<p>В ненадежной распределенной сети сообщения могут теряться, приходить с задержкой или дублироваться. Если оркестратор отправил команду списания, но из-за сетевого сбоя не получил ответ вовремя, он обязан повторить команду. </p>
+<p>Если хэндлер сервиса не обладает <strong>идемпотентностью</strong>, повторный запрос спишет деньги еще раз!</p>
+<p>Для обеспечения надежности в Go используется связка уникального ключа идемпотентности (<code>Idempotency-Key</code>), генерируемого оркестратором, и локальной транзакции базы данных:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2428,21 +2550,73 @@ func (o *Orchestrator) compensate(saga *SagaInstance) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// В сервисе Payments
-func (s *Service) Withdraw(cmd WithdrawCommand) error {
-    // Проверяем, обрабатывали ли мы этот ключ
-    exists, _ := s.idempotencyRepo.Exists(cmd.IdempotencyKey)
-    if exists {
-        return nil // Уже обработали, просто возвращаем успех
+  <pre class="language-go"><code class="language-go">package payment
+
+import (
+    &quot;context&quot;
+    &quot;database/sql&quot;
+    &quot;fmt&quot;
+)
+
+type WithdrawCommand struct {
+    IdempotencyKey string
+    AccountID      string
+    Amount         int64
+}
+
+type PaymentService struct {
+    db *sql.DB
+}
+
+func (s *PaymentService) Withdraw(ctx context.Context, cmd WithdrawCommand) error {
+    // Открываем локальную ACID транзакцию
+    tx, err := s.db.BeginTx(ctx, &amp;sql.TxOptions{Isolation: sql.LevelReadCommitted})
+    if err != nil {
+        return fmt.Errorf(&quot;failed to begin tx: %w&quot;, err)
+    }
+    defer tx.Rollback()
+
+    // 1. Пытаемся зафиксировать IdempotencyKey в служебной таблице
+    // PRIMARY KEY гарантирует, что дубликат команды будет отклонен СУБД
+    const insertKeyQuery = `
+        INSERT INTO processed_commands (idempotency_key, created_at)
+        VALUES ($1, NOW())
+        ON CONFLICT (idempotency_key) DO NOTHING;
+    `
+    res, err := tx.ExecContext(ctx, insertKeyQuery, cmd.IdempotencyKey)
+    if err != nil {
+        return fmt.Errorf(&quot;idempotency check query failed: %w&quot;, err)
     }
 
-    // Выполняем бизнес-логику внутри локальной транзакции
-    err := s.db.Transaction(func(tx *gorm.DB) error {
-        // 1. Списываем деньги
-        // 2. Сохраняем Idempotency Key
+    rowsAffected, err := res.RowsAffected()
+    if err != nil {
+        return err
+    }
+
+    // Если ключ уже существовал в БД — мы уже обрабатывали этот запрос!
+    if rowsAffected == 0 {
+        // Идемпотентно завершаем: возвращаем nil, дубликат безопасно проигнорирован
         return nil
-    })
-    return err
+    }
+
+    // 2. Выполняем бизнес-логику списания
+    const withdrawQuery = `
+        UPDATE accounts 
+        SET balance = balance - $1 
+        WHERE id = $2 AND balance &gt;= $1;
+    `
+    res, err = tx.ExecContext(ctx, withdrawQuery, cmd.Amount, cmd.AccountID)
+    if err != nil {
+        return fmt.Errorf(&quot;failed to withdraw funds: %w&quot;, err)
+    }
+
+    affected, err := res.RowsAffected()
+    if err != nil || affected == 0 {
+        return fmt.Errorf(&quot;insufficient funds or account not found&quot;)
+    }
+
+    // Фиксируем локальную транзакцию
+    return tx.Commit()
 }
 </code></pre>
 </div>
@@ -2450,55 +2624,59 @@ func (s *Service) Withdraw(cmd WithdrawCommand) error {
 <hr />
 <h2 id="sravnenie-s-2pc-two-phase-commit">Сравнение с 2PC (Two-Phase Commit)</h2>
 
-<p>Часто спрашивают: почему не использовать распределенные транзакции (XA, 2PC)?</p>
+<p>Почему индустрия практически отказалась от классического двухфазного коммита (2PC / XA) в микросервисах в пользу Saga?</p>
 <div class="table-container"><table>
 <thead>
 <tr>
-<th style="text-align: left;">Характеристика</th>
-<th style="text-align: left;">2PC (Two-Phase Commit)</th>
-<th style="text-align: left;">Saga</th>
+<th>Характеристика</th>
+<th>2PC (Two-Phase Commit)</th>
+<th>Saga Pattern</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td style="text-align: left;"><strong>Изоляция</strong></td>
-<td style="text-align: left;">Строгая (Serializability)</td>
-<td style="text-align: left;">Отсутствует (на уровне всей транзакции)</td>
+<td><strong>Уровень согласованности</strong></td>
+<td>Строгая согласованность (Linearizability / ACID)</td>
+<td>Согласованность в конечном итоге (Eventual Consistency / BASE)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Блокировки</strong></td>
-<td style="text-align: left;">Долгосрочные блокировки ресурсов</td>
-<td style="text-align: left;">Нет блокировок между сервисами</td>
+<td><strong>Изоляция транзакций</strong></td>
+<td>Строгая изоляция (Serializability)</td>
+<td>Отсутствует на уровне всей саги (требуются семантические блокировки)</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Производительность</strong></td>
-<td style="text-align: left;">Низкая (узкие места в координаторе)</td>
-<td style="text-align: left;">Высокая (асинхронность)</td>
+<td><strong>Блокировки ресурсов</strong></td>
+<td>Удерживает тяжелые блокировки строк в БД на всё время сетевого раунда</td>
+<td>Никаких распределенных блокировок; локальные транзакции коммитятся мгновенно</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Доступность</strong></td>
-<td style="text-align: left;">Низкая (если координатор упал, всё висит)</td>
-<td style="text-align: left;">Высокая (сервисы автономны)</td>
+<td><strong>Производительность</strong></td>
+<td>Катастрофически низкая при росте числа узлов (зависит от самого медленного узла)</td>
+<td>Высокая пропускная способность за счет асинхронного обмена сообщениями</td>
 </tr>
 <tr>
-<td style="text-align: left;"><strong>Сложность</strong></td>
-<td style="text-align: left;">Реализуется на уровне БД/драйверов</td>
-<td style="text-align: left;">Требует написания кода компенсации</td>
+<td><strong>Отказоустойчивость</strong></td>
+<td>Низкая: падение координатора замораживает ресурсы в неопределенном состоянии (In-doubt)</td>
+<td>Высокая: сервисы автономны, состояние саги персистентно сохраняется</td>
+</tr>
+<tr>
+<td><strong>Реализация</strong></td>
+<td>Встроена в протоколы СУБД (тяжело масштабируется)</td>
+<td>Реализуется кодом приложения и компенсирующими транзакциями</td>
 </tr>
 </tbody>
 </table></div>
-<p><strong>Итог:</strong> В микросервисной архитектуре, где доступность (Availability) и отказоустойчивость важнее строгой согласованности, <strong>Saga</strong> является предпочтительным выбором.</p>
+<p><strong>Инженерный вывод:</strong> В мире высоконагруженных распределенных сервисов, где сетевые задержки колеблются от единиц до сотен миллисекунд, 2PC превращает систему в хрупкий карточный домик. <strong>Saga</strong> жертвует мгновенной изолированностью ради высокой доступности и линейной масштабируемости.</p>
 <hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Saga</strong> — это способ обеспечения согласованности данных в распределенных системах без глобальных блокировок.</li>
-<li>Она разбивает транзакцию на локальные шаги и определяет <strong>компенсирующие действия</strong> на случай ошибок.</li>
-<li><strong>Хореография</strong> подходит для простых потоков, <strong>Оркестрация</strong> — для сложных бизнес-процессов.</li>
-<li>Главная сложность — отсутствие изоляции (Dirty Reads, Lost Updates) и необходимость писать код отката (Compensating Logic).</li>
-<li>В Go реализуется через конечные автоматы, очереди сообщений и сохранение состояния в БД.</li>
+<li><strong>Saga</strong> решает фундаментальную проблему распределенного состояния при паттерне Database per Service, заменяя недостижимый глобальный ACID на цепочку локальных транзакций с компенсацией.</li>
+<li>В случае бизнес-ошибки или аппаратного сбоя координатор не может выполнить аппаратный <code>ROLLBACK</code>, поэтому он разворачивает процесс вспять серией <strong>компенсирующих транзакций</strong>.</li>
+<li><strong>Хореография</strong> идеальна для коротких взаимодействий (2–3 сервиса) без сложного ветвления, тогда как <strong>Оркестрация</strong> на базе конечного автомата необходима для прозрачного управления сложными процессами.</li>
+<li>Отсутствие строгой изоляции требует превентивных мер: применения семантических блокировок (<code>status: PENDING</code>), оптимистичной конкурентности (версионирование) и обязательной <strong>идемпотентности</strong> всех обработчиков команд.</li>
 </ol>
-<p>В следующей статье мы перейдем к паттерну, который позволяет разделить нагрузку на чтение и запись, часто используемому в связке с Saga и Event Sourcing — <a href="2-cqrs.html" class="wikilink">2. CQRS</a>.</p>
+<p>В следующей статье мы разберем паттерн, который разделяет архитектуру чтения и изменения данных и часто работает рука об руку с Saga и Event Sourcing — <a href="2-cqrs.html" class="wikilink">2. CQRS</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2526,7 +2704,7 @@ func (s *Service) Withdraw(cmd WithdrawCommand) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#tranzaktsii-v-mikroservisakh-problema-raspredelennogo-sostoyaniya">Транзакции в микросервисах: Проблема распределенного состояния</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-saga">Что такое Saga?</a></li><li class="toc-item toc-h3"><a href="#printsip-raboty">Принцип работы</a></li><li class="toc-item toc-h2"><a href="#dva-sposoba-koordinatsii-khoreografiya-vs-orkestratsiya">Два способа координации: Хореография vs Оркестрация</a></li><li class="toc-item toc-h3"><a href="#1-khoreografiya-choreography">1. Хореография (Choreography)</a></li><li class="toc-item toc-h3"><a href="#2-orkestratsiya-orchestration">2. Оркестрация (Orchestration)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-orkestratora-na-go">Реализация Оркестратора на Go</a></li><li class="toc-item toc-h3"><a href="#obrabotchik-shagov-uproshchenno">Обработчик шагов (упрощенно)</a></li><li class="toc-item toc-h2"><a href="#problemy-i-anomalii-saga">Проблемы и аномалии Saga</a></li><li class="toc-item toc-h3"><a href="#1-lost-updates-poteryannye-obnovleniya">1. Lost Updates (Потерянные обновления)</a></li><li class="toc-item toc-h3"><a href="#2-dirty-reads-gryaznoe-chtenie">2. Dirty Reads (Грязное чтение)</a></li><li class="toc-item toc-h2"><a href="#semantic-lock-i-idempotentnost">Semantic Lock и идемпотентность</a></li><li class="toc-item toc-h2"><a href="#sravnenie-s-2pc-two-phase-commit">Сравнение с 2PC (Two-Phase Commit)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#tranzaktsii-v-mikroservisakh-problema-raspredelennogo-sostoyaniya">Транзакции в микросервисах: Проблема распределенного состояния</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-saga">Что такое Saga?</a></li><li class="toc-item toc-h3"><a href="#printsip-raboty">Принцип работы</a></li><li class="toc-item toc-h2"><a href="#dva-sposoba-koordinatsii-khoreografiya-vs-orkestratsiya">Два способа координации: Хореография vs Оркестрация</a></li><li class="toc-item toc-h3"><a href="#1-khoreografiya-choreography">1. Хореография (Choreography)</a></li><li class="toc-item toc-h3"><a href="#2-orkestratsiya-orchestration">2. Оркестрация (Orchestration)</a></li><li class="toc-item toc-h2"><a href="#realizatsiya-orkestratora-na-go">Реализация Оркестратора на Go</a></li><li class="toc-item toc-h3"><a href="#struktury-dannykh-sostoyaniya-sagi">Структуры данных состояния саги</a></li><li class="toc-item toc-h3"><a href="#obrabotchik-shagov-uproshchenno">Обработчик шагов (упрощенно)</a></li><li class="toc-item toc-h2"><a href="#problemy-i-anomalii-saga">Проблемы и аномалии Saga</a></li><li class="toc-item toc-h3"><a href="#1-lost-updates-poteryannye-obnovleniya">1. Lost Updates (Потерянные обновления)</a></li><li class="toc-item toc-h3"><a href="#2-dirty-reads-gryaznoe-chtenie">2. Dirty Reads (Грязное чтение)</a></li><li class="toc-item toc-h2"><a href="#semantic-lock-i-idempotentnost">Semantic Lock и идемпотентность</a></li><li class="toc-item toc-h2"><a href="#sravnenie-s-2pc-two-phase-commit">Сравнение с 2PC (Two-Phase Commit)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
