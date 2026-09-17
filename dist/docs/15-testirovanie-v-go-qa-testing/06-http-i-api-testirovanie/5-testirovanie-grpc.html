@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Тестирование gRPC</h1>
@@ -2178,24 +2178,29 @@
           <div class="article-markdown">
             <h2 id="binarnyy-mir-drugie-pravila-igry">Бинарный мир: Другие правила игры</h2>
 
-<p>В предыдущей статье <a href="4-testirovanie-rest-api.html" class="wikilink">4. Тестирование REST API</a> мы собирали HTTP-роутер и проверяли обработку текстового JSON. Но в enterprise-системах, когда микросервисы общаются между собой, текстовые протоколы уступают место бинарным. Де-факто стандартом для внутреннего взаимодействия (Server-to-Server) в экосистеме Go является <strong>gRPC</strong> с сериализацией через Protocol Buffers (Protobuf).</p>
-<p>Тестирование gRPC в корне отличается от тестирования REST. Вы не можете просто использовать <code>httptest.NewRecorder</code> и передать туда строку. </p>
+<p>В предыдущей главе <a href="4-testirovanie-rest-api.html" class="wikilink">4. Тестирование REST API</a> мы собирали веб-маршрутизатор и проверяли обработку текстовых JSON-документов. Однако во внутренних распределенных контурах enterprise-бэкенда передача текстового JSON через HTTP/1.1 создает непозволительные накладные расходы на парсинг строк, раздувание сетевого трафика и постоянное открытие TCP-соединений.</p>
+<p>Стандартом де-факто для межсервисного взаимодействия (Server-to-Server) в экосистеме Go является <strong>gRPC</strong> — бинарный фреймворк удаленного вызова процедур от Google, использующий Protocol Buffers (Protobuf) для строгой типизации контрактов.</p>
+<p>Когда инженер пытается применить к gRPC привычные подходы сетевого тестирования, его ожидает сюрприз: здесь невозможно использовать стандартный <code>httptest.NewRecorder</code>, передав ему сырой массив байтов.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Жесткая связка с HTTP/2</span>
   </div>
   <div class="callout-body">
-    <p>gRPC работает <strong>строго</strong> поверх HTTP/2. Протокол опирается на бинарные фреймы (DATA, HEADERS, RST_STREAM), мультиплексирование потоков поверх одного TCP-соединения и сложную систему управления потоком (Flow Control). <br />
-В Go сервер <code>grpc.Server</code> не реализует стандартный интерфейс <code>http.Handler</code> напрямую (хотя его можно завернуть через <code>grpcweb</code>, но это хак). Поэтому мы не можем просто вызвать функцию хэндлера в памяти. Нам <strong>необходимо</strong> поднять реальный gRPC-сервер и подключить к нему реальный gRPC-клиент.</p>
+    <p>Архитектура gRPC неразрывно связана со спецификацией <strong>HTTP/2</strong>. <br />
+Протокол опирается на строгую бинарную фреймовую структуру: служебные кадры <code>HEADERS</code>, полезную нагрузку <code>DATA</code>, управление окнами скольжения <code>WINDOW_UPDATE</code> и сброс вызовов <code>RST_STREAM</code>. Более того, gRPC мультиплексирует сотни независимых логических потоков (Streams) поверх единственного долгоживущего TCP-соединения с компрессией заголовков HPACK.</p>
+<p>В стандартном пакете Go структура <code>grpc.Server</code> принципиально не реализует интерфейс <code>http.Handler</code> напрямую (попытки адаптировать её через <code>grpcweb</code> — это специализированный костыль для браузеров). <br />
+Следовательно, мы не можем вызвать RPC-обработчик как простую изолированную функцию в памяти: нам <strong>необходимо</strong> поднять полноценный <code>grpc.Server</code> и подключить к нему настоящий gRPC-клиент.</p>
   </div>
 </div>
 
-<p>Но значит ли это, что мы обречены на медленные сетевые тесты с открытием TCP-портов? Нет. В экосистеме gRPC есть элегантное решение для тестирования "в памяти".</p>
+<p>Означает ли это, что тесты gRPC неизбежно обречены на медленное выделение TCP-портов операционной системы? Вовсе нет. В арсенале gRPC есть элегантное решение для молниеносных in-memory проверок.</p>
+<hr />
 <h2 id="illyuziya-seti-paket-bufconn">Иллюзия сети: пакет bufconn</h2>
 
-<p>Для тестирования gRPC без накладных расходов сетевого стека ОС (syscalls, маршрутизация, брандмауэры) используется пакет <code>google.golang.org/grpc/test/bufconn</code>.</p>
-<p><code>bufconn</code> предоставляет реализацию <code>net.Listener</code> и <code>net.Conn</code>, которые живут исключительно в оперативной памяти (User Space). Сервер думает, что он слушает сеть, а клиент думает, что он пишет в сокет, но на самом деле байты просто копируются между голами памяти.</p>
+<p>Чтобы избежать сетевого оверхеда ОС (системных вызовов <code>socket</code>, <code>bind</code>, маршрутизации ядра и межсетевых экранов), официальная команда gRPC предоставляет пакет <code>google.golang.org/grpc/test/bufconn</code>.</p>
+<p>Пакет <code>bufconn</code> реализует стандартные сетевые интерфейсы <code>net.Listener</code> и <code>net.Conn</code>, которые функционируют исключительно в пространстве пользователя (User Space) оперативной памяти.</p>
+<p>Сервер абсолютно уверен, что он слушает сетевой сокет, а клиент — что передает байты по кабелю Ethernet. На физическом же уровне байты бинарных Protobuf-кадров мгновенно перекладываются из одного буфера оперативной памяти в другой:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2210,17 +2215,27 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;gRPC Клиент&lt;br&gt;Ваш тест&quot;] --&gt;|&quot;Вызов метода&quot;| B[&quot;ClientConn&lt;br&gt;gRPC драйвер&quot;]
-B --&gt;|&quot;Запись фреймов&quot;| C[&quot;bufconn&lt;br&gt;Буфер в памяти&quot;]
-C --&gt;|&quot;Чтение фреймов&quot;| D[&quot;gRPC Server&lt;br&gt;Слушатель&quot;]
-D --&gt;|&quot;Десериализация&quot;| E[&quot;Бизнес-логика&lt;br&gt;Ваш Сервис&quot;]
+subgraph ClientLayer[&quot;Тестовый gRPC Клиент&quot;]
+Client[&quot;BillingServiceClient (Go)&quot;] --&gt;|&quot;Вызов RPC&quot;| Conn[&quot;ClientConn (HTTP/2 Framer)&quot;]
+end
+
+subgraph MemoryTransport[&quot;In-Memory сетевой эмулятор (bufconn)&quot;]
+Conn --&gt;|&quot;Запись бинарных кадров&quot;| Buf[&quot;Кольцевой буфер RAM (bufconn.Listener)&quot;]
+Buf --&gt;|&quot;Чтение байтов&quot;| ServListener[&quot;net.Listener (User Space)&quot;]
+end
+
+subgraph ServerLayer[&quot;gRPC Сервер приложения&quot;]
+ServListener --&gt; GServer[&quot;grpc.Server (Multiplexer)&quot;]
+GServer --&gt;|&quot;Десериализация Protobuf&quot;| Logic[&quot;BillingAPI (Бизнес-логика)&quot;]
+end
   </pre>
 </div>
 
 
-<h3 id="idiomatichnyy-setap-grpc-testa">Идиоматичный сетап gRPC теста</h3>
+<hr />
+<h2 id="idiomatichnyy-setap-grpc-testa">Идиоматичный сетап gRPC теста</h2>
 
-<p>Давайте напишем тестовую инфраструктуру для вымышленного сервиса <code>BillingService</code>. Мы вынесем создание <code>bufconn</code> слушателя и сервера в отдельный хелпер, чтобы переиспользовать его в табличных тестах.</p>
+<p>Спроектируем архитектуру тестового стенда для биллингового микросервиса <code>BillingService</code>. Мы инкапсулируем запуск in-memory сервера и генерацию клиента во вспомогательную функцию-фикстуру <code>setupGRPCServer</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2237,72 +2252,71 @@ import (
     &quot;net&quot;
     &quot;testing&quot;
 
-    &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
+    &quot;github.com/stretchr/testify/require&quot;
     &quot;go.uber.org/mock/gomock&quot;
     &quot;google.golang.org/grpc&quot;
     &quot;google.golang.org/grpc/credentials/insecure&quot;
     &quot;google.golang.org/grpc/test/bufconn&quot;
 
-    // Сгенерированные protobuf-файлы (pb)
+    // Сгенерированные Protocol Buffers структуры
     pb &quot;yourproject/internal/generated/billing/v1&quot;
     &quot;yourproject/internal/grpcapi&quot;
     &quot;yourproject/internal/mocks&quot;
 )
 
-// Константа размера буфера в памяти (1 Мегабайт обычно достаточно)
+// Емкость кольцевого буфера в оперативной памяти (1 МБ достаточно для тестов)
 const bufSize = 1024 * 1024
 
-// setupGRPCServer поднимает in-memory gRPC сервер и возвращает готовый клиент
+// setupGRPCServer разворачивает in-memory gRPC стенд и возвращает готовый клиент
 func setupGRPCServer(t *testing.T) (pb.BillingServiceClient, *mocks.MockBillingService) {
     t.Helper()
 
-    // 1. Инициализируем мок бизнес-логики
+    // 1. Инициализируем контроллер и мок сервисного слоя
     ctrl := gomock.NewController(t)
     mockSvc := mocks.NewMockBillingService(ctrl)
 
-    // 2. Создаем слушатель в памяти
+    // 2. Создаем in-memory слушатель через bufconn
     listener := bufconn.Listen(bufSize)
 
-    // 3. Создаем и настраиваем gRPC сервер
+    // 3. Создаем боевой gRPC сервер
     server := grpc.NewServer()
 
-    // Инициализируем наш контроллер/обработчик и регистрируем его в сервере
+    // Инициализируем наш контроллер и регистрируем в gRPC сервере
     billingAPI := grpcapi.NewBillingAPI(mockSvc)
     pb.RegisterBillingServiceServer(server, billingAPI)
 
-    // 4. Запускаем сервер в отдельной горутине
+    // 4. Запускаем сервер в фоновой горутине
     go func() {
-        // Serve заблокирует горутину, пока сервер не будет остановлен
         if err := server.Serve(listener); err != nil {
-            // Игнорируем ошибку остановки сервера
+            // Игнорируем штатную ошибку остановки сервера
             if err.Error() != &quot;grpc: the server has been stopped&quot; {
-                panic(&quot;Ошибка запуска gRPC сервера: &quot; + err.Error())
+                t.Errorf(&quot;Ошибка запуска gRPC сервера: %v&quot;, err)
             }
         }
     }()
 
-    // 5. Гарантируем корректную остановку сервера после теста
+    // 5. Регистрируем корректную остановку сервера после завершения теста
     t.Cleanup(func() {
         server.Stop()
     })
 
-    // 6. Настраиваем клиента на подключение к нашему in-memory слушателю
+    // 6. Конфигурируем клиентский диалер на подключение к нашему bufconn слушателю
     ctx := context.Background()
     dialer := func(context.Context, string) (net.Conn, error) {
-        return listener.Dial() // Выдаем соединение из буфера!
+        return listener.Dial() // Выдаем виртуальное соединение прямо из памяти!
     }
 
     conn, err := grpc.DialContext(ctx, &quot;bufnet&quot;,
         grpc.WithContextDialer(dialer),
         grpc.WithTransportCredentials(insecure.NewCredentials()),
     )
-    require.NoError(t, err)
+    require.NoError(t, err, &quot;не удалось установить соединение с in-memory gRPC сервером&quot;)
 
     t.Cleanup(func() {
-        conn.Close()
+        _ = conn.Close()
     })
 
-    // Возвращаем сгенерированного клиента
+    // Возвращаем типизированного сгенерированного клиента
     client := pb.NewBillingServiceClient(conn)
 
     return client, mockSvc
@@ -2310,9 +2324,10 @@ func setupGRPCServer(t *testing.T) (pb.BillingServiceClient, *mocks.MockBillingS
 </code></pre>
 </div>
 
+<hr />
 <h2 id="testirovanie-rpc-vyzovov">Тестирование RPC вызовов</h2>
 
-<p>Теперь, когда у нас есть идеально изолированная среда, мы можем писать тесты, обращаясь к серверу так, как это делал бы реальный клиент из другого микросервиса.</p>
+<p>Имея на руках готовую in-memory инфраструктуру, мы пишем тесты взаимодействия так, будто наш код выполняется на реальном удаленном сервере:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2322,10 +2337,10 @@ func setupGRPCServer(t *testing.T) (pb.BillingServiceClient, *mocks.MockBillingS
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func TestBillingAPI_ProcessPayment(t *testing.T) {
+  <pre class="language-go"><code class="language-go">func TestBillingAPI_ProcessPayment_Success(t *testing.T) {
     t.Parallel()
 
-    // Arrange
+    // Arrange: Поднимаем сервер и получаем клиент
     client, mockSvc := setupGRPCServer(t)
     ctx := context.Background()
 
@@ -2334,15 +2349,16 @@ func setupGRPCServer(t *testing.T) (pb.BillingServiceClient, *mocks.MockBillingS
         Amount: 500.0,
     }
 
-    // Настраиваем ожидания мока: наш API должен вызвать бизнес-логику
+    // Ожидаем, что API корректно распакует protobuf и вызовет доменную логику
     mockSvc.EXPECT().
         Process(gomock.Any(), &quot;user_123&quot;, 500.0).
-        Return(&quot;tx_999&quot;, nil)
+        Return(&quot;tx_999&quot;, nil).
+        Times(1)
 
-    // Act: Вызываем метод через gRPC КЛИЕНТА
+    // Act: Выполняем сетевой RPC-вызов через gRPC-клиент
     resp, err := client.ProcessPayment(ctx, req)
 
-    // Assert
+    // Assert: Верифицируем ответ
     require.NoError(t, err)
     require.NotNil(t, resp)
     require.Equal(t, &quot;tx_999&quot;, resp.TransactionId)
@@ -2350,21 +2366,37 @@ func setupGRPCServer(t *testing.T) (pb.BillingServiceClient, *mocks.MockBillingS
 </code></pre>
 </div>
 
+<hr />
 <h2 id="translyatsiya-oshibok-error-translation">Трансляция ошибок (Error Translation)</h2>
 
-<p>Одна из главных задач gRPC-слоя (как и HTTP-контроллеров) — правильная конвертация ошибок бизнес-логики в понятные клиенту коды. В gRPC нет статусов <code>404</code> или <code>500</code>. Там используется пакет <code>google.golang.org/grpc/codes</code> и <code>google.golang.org/grpc/status</code>.</p>
+<p>Одна из ключевых задач транспортного слоя gRPC — трансформация внутренних доменных ошибок сервиса в канонические статус-коды RPC. В мире gRPC не существует привычных HTTP-статусов <code>404</code> или <code>500</code>. Вместо них используется жестко стандартизированный набор кодов из пакета <code>google.golang.org/grpc/codes</code> и обертки <code>google.golang.org/grpc/status</code>.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Сравнение ошибок в тестах</span>
   </div>
   <div class="callout-body">
-    <p>Если ваш хэндлер возвращает ошибку <code>status.Error(codes.NotFound, "user not found")</code>, вы не можете просто сравнить её в клиенте через <code>errors.Is</code>. gRPC сериализует ошибку и десериализует её на клиенте, поэтому указатели на ошибки будут разными.<br />
-Для проверки ошибок в тестах <strong>обязательно</strong> нужно использовать пакет <code>status</code>.</p>
+    <p>Если ваш серверный обработчик возвращает ошибку вида:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">return nil, status.Error(codes.NotFound, &quot;пользователь не найден&quot;)
+</code></pre>
+</div>
+
+<p>вы <strong>не можете</strong> проверить её в клиентском коде через банальный <code>errors.Is</code>! </p>
+<p>Драйвер gRPC сериализует метаданные ошибки в специальные Protobuf-структуры и восстанавливает их на стороне клиента с новым адресом в памяти. Прямое сравнение указателей ошибок завершится провалом.</p>
+<p>Для корректной верификации ошибок в тестах необходимо обращаться к методу <code>status.FromError(err)</code>.</p>
   </div>
 </div>
 
-<p>Пример теста негативного сценария:</p>
+<p>Пример надежного тестирования негативного сценария:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2380,44 +2412,53 @@ func setupGRPCServer(t *testing.T) (pb.BillingServiceClient, *mocks.MockBillingS
     client, mockSvc := setupGRPCServer(t)
     ctx := context.Background()
 
-    // Имитируем доменную ошибку от сервиса
+    // Имитируем ошибку предметной области (недостаточно средств)
     mockSvc.EXPECT().
         Process(gomock.Any(), &quot;user_123&quot;, 50000.0).
-        Return(&quot;&quot;, grpcapi.ErrInsufficientFunds)
+        Return(&quot;&quot;, grpcapi.ErrInsufficientFunds).
+        Times(1)
 
-    req := &amp;pb.ProcessPaymentRequest{UserId: &quot;user_123&quot;, Amount: 50000.0}
+    req := &amp;pb.ProcessPaymentRequest{
+        UserId: &quot;user_123&quot;,
+        Amount: 50000.0,
+    }
 
-    // Act
+    // Act: Вызываем метод клиента
     _, err := client.ProcessPayment(ctx, req)
 
-    // Assert
+    // Assert: Проверяем gRPC статус ошибки
     require.Error(t, err)
 
-    // Идиоматичная проверка gRPC статуса
+    // Извлекаем gRPC-статус из полученной ошибки
     st, ok := status.FromError(err)
-    require.True(t, ok, &quot;Ожидалась gRPC ошибка&quot;)
+    require.True(t, ok, &quot;Возвращенная ошибка обязана быть валидным gRPC статусом&quot;)
 
-    // Проверяем, что слой API правильно отмаппил доменную ошибку на gRPC код FailedPrecondition
+    // Проверяем корректность трансляции ошибки в код FailedPrecondition
     require.Equal(t, codes.FailedPrecondition, st.Code())
     require.Equal(t, &quot;insufficient funds&quot;, st.Message())
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="testirovanie-interceptors-perekhvatchikov">Тестирование Interceptors (Перехватчиков)</h2>
 
-<p>В gRPC нет мидлварей, но есть <strong>Interceptors</strong> (Перехватчики). Они бывают двух видов: <code>Unary</code> (для одиночных запросов) и <code>Stream</code> (для потоковых).</p>
-<p>Так же, как и в статье про <a href="3-middleware-testirovanie.html" class="wikilink">3. Middleware тестирование</a>, interceptors отвечают за авторизацию, логирование и трейсинг. Тестировать их можно двумя путями:<br />
-1. <strong>Легковесный путь:</strong> Вызывать функцию перехватчика напрямую, передав ей мок-функцию <code>grpc.UnaryHandler</code>, которая имитирует вызов следующего шага.<br />
-2. <strong>Интеграционный путь:</strong> Добавить ваш interceptor при создании сервера в <code>setupGRPCServer</code> через <code>grpc.UnaryInterceptor(myInterceptor)</code>, и проверять поведение через клиента (например, передавая токен в метаданных).</p>
+<p>Аналогом Middleware в gRPC выступают <strong>Interceptors (Перехватчики)</strong>. Они подразделяются на два типа:<br />
+1. <code>Unary</code> — для одиночных классических RPC-запросов (Request-Response).<br />
+2. <code>Stream</code> — для потоковых методов (Streaming RPC).</p>
+<p>Интерцепторы берут на себя сквозные задачи: проверку авторизационных токенов, логирование, трассировку и метрики Prometheus. </p>
+<p>Тестировать интерцепторы можно двумя путями:<br />
+1. <strong>Модульный путь:</strong> Вызывать функцию перехватчика напрямую в юнит-тесте, передав ей мок-обработчик с сигнатурой <code>grpc.UnaryHandler</code>, фиксирующий вызов следующего шага.<br />
+2. <strong>Интеграционный путь:</strong> Зарегистрировать интерцептор в сервере при конструировании <code>grpc.NewServer(grpc.UnaryInterceptor(myInterceptor))</code> внутри функции <code>setupGRPCServer</code>. В этом случае тестовый клиент передает метаданные в контексте, проверяя реальное поведение сквозного конвейера.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как клиент может передать токен авторизации в gRPC тесте, ведь заголовка <code>Authorization</code> там нет?<br />
-<strong>Ответ:</strong> В gRPC HTTP-заголовки абстрагированы концепцией <strong>Metadata</strong>. Чтобы передать данные, клиент в тесте должен прикрепить метаданные к контексту:</p>
+    <p><strong>Вопрос:</strong> Каким образом клиент может передать токен авторизации в gRPC-тесте, если классический заголовок <code>Authorization</code> в протоколе HTTP/1.1 отсутствует?</p>
+<p><strong>Ответ:</strong> В архитектуре gRPC любые транспортные заголовки инкапсулируются понятием <strong>Metadata</strong> (пакет <code>google.golang.org/grpc/metadata</code>). </p>
+<p>Для передачи токена клиент в тестовом коде создает исходящий контекст:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2427,28 +2468,79 @@ func setupGRPCServer(t *testing.T) (pb.BillingServiceClient, *mocks.MockBillingS
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">md := metadata.Pairs(&quot;authorization&quot;, &quot;Bearer my-secret-token&quot;)
+  <pre class="language-go"><code class="language-go">md := metadata.Pairs(&quot;authorization&quot;, &quot;Bearer test-secret-token&quot;)
 ctx = metadata.NewOutgoingContext(ctx, md)
 resp, err := client.ProcessPayment(ctx, req)
 </code></pre>
 </div>
 
-<p>Серверный interceptor извлечет этот токен через <code>metadata.FromIncomingContext(ctx)</code>.</p>
+<p>Серверный перехватчик извлекает эти данные с помощью вызова:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">md, ok := metadata.FromIncomingContext(ctx)
+</code></pre>
+</div>
+
   </div>
 </div>
 
+<hr />
 <h2 id="testirovanie-streaming-rpc">Тестирование Streaming RPC</h2>
 
-<p>Если ваш метод использует потоки (Streams), например <code>rpc DownloadLogs(Request) returns (stream Chunk)</code>, тестирование через <code>bufconn</code> работает безупречно. <br />
-Ваш тест просто вызывает метод клиента, получает интерфейс <code>StreamClient</code> и в цикле <code>for</code> вызывает <code>stream.Recv()</code>, пока не получит ошибку <code>io.EOF</code> (конец потока). Никаких дополнительных моков для TCP не нужно — HTTP/2 мультиплексирование прозрачно отработает в оперативной памяти.</p>
+<p>В архитектурах, требующих непрерывной передачи данных (например, потоковая передача логов, событий телеметрии или котировок), gRPC задействует потоковые вызовы (<code>stream</code>).</p>
+<p>Стенд на базе <code>bufconn</code> безупречно поддерживает тестирование потоков:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func TestLogService_StreamLogs(t *testing.T) {
+    t.Parallel()
+    client, _ := setupLogServer(t)
+
+    // Получаем интерфейс StreamClient для чтения потока
+    stream, err := client.DownloadLogs(context.Background(), &amp;pb.LogRequest{})
+    require.NoError(t, err)
+
+    var receivedChunks int
+    for {
+        // Читаем очередной бинарный чанк из потока
+        chunk, err := stream.Recv()
+        if err == io.EOF {
+            break // Поток корректно завершен сервером!
+        }
+        require.NoError(t, err)
+        require.NotEmpty(t, chunk.Data)
+        receivedChunks++
+    }
+
+    require.Greater(t, receivedChunks, 0)
+}
+</code></pre>
+</div>
+
+<p>HTTP/2 мультиплексирование и передача управляющих кадров прозрачно исполняются внутри оперативной памяти процесса.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Забудьте про <code>httptest</code> для gRPC.</strong> Протоколы принципиально отличаются на уровне транспорта и сериализации.</li>
-<li>Используйте <strong><code>bufconn</code></strong> для поднятия молниеносно быстрых in-memory gRPC серверов, которые пропускают сетевой I/O, но полностью тестируют протокол.</li>
-<li>Проверяйте ошибки исключительно через пакет <strong><code>status</code></strong>, так как gRPC маскирует оригинальные ошибки при передаче по сети.</li>
+<li><strong>Не используйте <code>httptest</code> для gRPC:</strong> различия в транспорте HTTP/2 и бинарном протоколе Protocol Buffers делают его неприменимым.</li>
+<li>Пакет <strong><code>google.golang.org/grpc/test/bufconn</code></strong> — эталонный инструмент тестирования gRPC в памяти. Он имитирует полноценный сетевой стек, избавляя тесты от задержек I/O и конфликтов TCP-портов.</li>
+<li>Проверяйте ошибки исключительно через пакет <strong><code>status</code></strong>, так как gRPC сериализует исключения в Protobuf-сообщения.</li>
+<li>Метаданные (аутентификация, трассировка) передаются через <code>metadata.NewOutgoingContext</code> и валидируются интерцепторами <code>Unary</code> и <code>Stream</code>.</li>
 </ol>
-<p>Мы научились тестировать строгие контракты (Protobuf). Но в мире публичных API балом до сих пор правит гибкий и коварный JSON. Как гарантировать, что ваш сервис не сломается от отсутствующего поля или неправильного типа в динамическом JSON-объекте? Об этом мы поговорим в следующей статье: <a href="6-proverka-json-struktur.html" class="wikilink">6. Проверка JSON структур</a>.</p>
+<p>Освоив жесткие бинарные контракты Protobuf, мы возвращаемся к миру динамических веб-интеграций, где по-прежнему доминирует гибкий и коварный формат JSON. Как гарантировать устойчивость системы к отсутствующим полям, неявным типам и структурным изменениям полезной нагрузки? Об этом пойдет речь в следующей главе: <a href="6-proverka-json-struktur.html" class="wikilink">6. Проверка JSON структур</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2476,7 +2568,7 @@ resp, err := client.ProcessPayment(ctx, req)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#binarnyy-mir-drugie-pravila-igry">Бинарный мир: Другие правила игры</a></li><li class="toc-item toc-h2"><a href="#illyuziya-seti-paket-bufconn">Иллюзия сети: пакет bufconn</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-setap-grpc-testa">Идиоматичный сетап gRPC теста</a></li><li class="toc-item toc-h2"><a href="#testirovanie-rpc-vyzovov">Тестирование RPC вызовов</a></li><li class="toc-item toc-h2"><a href="#translyatsiya-oshibok-error-translation">Трансляция ошибок (Error Translation)</a></li><li class="toc-item toc-h2"><a href="#testirovanie-interceptors-perekhvatchikov">Тестирование Interceptors (Перехватчиков)</a></li><li class="toc-item toc-h2"><a href="#testirovanie-streaming-rpc">Тестирование Streaming RPC</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#binarnyy-mir-drugie-pravila-igry">Бинарный мир: Другие правила игры</a></li><li class="toc-item toc-h2"><a href="#illyuziya-seti-paket-bufconn">Иллюзия сети: пакет bufconn</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-setap-grpc-testa">Идиоматичный сетап gRPC теста</a></li><li class="toc-item toc-h2"><a href="#testirovanie-rpc-vyzovov">Тестирование RPC вызовов</a></li><li class="toc-item toc-h2"><a href="#translyatsiya-oshibok-error-translation">Трансляция ошибок (Error Translation)</a></li><li class="toc-item toc-h2"><a href="#testirovanie-interceptors-perekhvatchikov">Тестирование Interceptors (Перехватчиков)</a></li><li class="toc-item toc-h2"><a href="#testirovanie-streaming-rpc">Тестирование Streaming RPC</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

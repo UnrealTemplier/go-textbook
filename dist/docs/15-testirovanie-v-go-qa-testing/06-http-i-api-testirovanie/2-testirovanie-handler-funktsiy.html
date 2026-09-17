@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Тестирование handler функций</h1>
@@ -2178,17 +2178,19 @@
           <div class="article-markdown">
             <h2 id="granitsa-mezhdu-http-i-biznes-logikoy">Граница между HTTP и Бизнес-логикой</h2>
 
-<p>В прошлой статье <a href="1-net-http-httptest-paket.html" class="wikilink">1. net/http/httptest пакет</a> мы разобрали низкоуровневые механизмы создания искусственных HTTP-запросов и ответов в памяти. Теперь мы поднимемся на уровень выше и применим эти инструменты для тестирования самих <strong>HTTP-хэндлеров</strong> (или контроллеров, если использовать терминологию MVC).</p>
-<p>Основная задача unit-теста хэндлера — проверить <strong>только транспортный слой</strong>. Мы не тестируем здесь работу с базой данных или сложную бизнес-логику (это прерогатива сервисного слоя). </p>
-<p>Мы должны убедиться, что хэндлер:<br />
-1. Корректно парсит входящие данные (JSON body, Query-параметры, URL path).<br />
-2. Правильно передает эти данные на слой бизнес-логики (Service Layer).<br />
-3. Адекватно обрабатывает ошибки от сервиса и транслирует их в правильные HTTP статус-коды (например, <code>ErrNotFound</code> $\rightarrow$ <code>404 Not Found</code>).<br />
-4. Формирует валидный JSON-ответ.</p>
+<p>В предыдущей главе <a href="1-net-http-httptest-paket.html" class="wikilink">1. net/http/httptest пакет</a> мы исследовали низкоуровневые строительные блоки пакета <code>net/http/httptest</code>, научившись порождать входящие сетевые запросы и собирать ответы в буферах оперативной памяти. Теперь настало время подняться на следующий архитектурный ярус — к уровню <strong>HTTP-обработчиков (Handlers)</strong>, которые в классической терминологии MVC и Clean Architecture часто называют контроллерами или первичными адаптерами.</p>
+<p>Главная ошибка начинающих разработчиков при тестировании хэндлеров — попытка возложить на них проверку всей бизнес-логики сервиса. </p>
+<p>Опытный инженер четко осознает границы ответственности: <strong>HTTP-хэндлер — это всего лишь транспортный переводчик</strong>. Его задача сводится к четырем базовым операциям:<br />
+1. Десериализовать и валидировать входящие транспортные данные (разобрать параметры URL-пути, query-параметры, заголовки, тело JSON).<br />
+2. Перевести транспортные структуры (DTO) в доменные типы и передать их в сервисный слой (Use Case / Service Layer).<br />
+3. Принять результат или доменную ошибку и транслировать её в семантически корректный HTTP-статус (например, доменная ошибка <code>ErrNotFound</code> трансформируется в статус <code>404 Not Found</code>, а <code>ErrConflict</code> — в <code>409 Conflict</code>).<br />
+4. Сериализовать ответ в байты нужного формата (JSON, XML или Protocol Buffers) и выставить необходимые HTTP-заголовки (<code>Content-Type: application/json</code>).</p>
+<p>Юнит-тест хэндлера обязан тестировать <strong>только этот транспортный шлюз</strong>. Бизнес-логика, транзакции базы данных и обращение к дискам должны оставаться за пределами его внимания.</p>
+<hr />
 <h2 id="arkhitektura-inektsiya-zavisimostey-di">Архитектура: Инъекция зависимостей (DI)</h2>
 
-<p>Для того чтобы хэндлер можно было протестировать изолированно, он должен быть спроектирован с учетом <a href="../01-fundament/8-dependency-injection-dlya-testiruemosti.html" class="wikilink">8. Dependency injection для тестируемости</a>. Если ваш хэндлер внутри себя вызывает глобальные функции или сам создает подключение к БД, вы не сможете его протестировать без поднятия всей инфраструктуры.</p>
-<p>Идиоматичный подход в Go — это внедрение сервиса через интерфейс в структуру хэндлера.</p>
+<p>Чтобы обработчик можно было тестировать в строгой изоляции за микросекунды, код обязан следовать принципам <a href="../01-fundament/8-dependency-injection-dlya-testiruemosti.html" class="wikilink">8. Dependency injection для тестируемости</a>. Если обработчик обращается к глобальным переменным базы данных или напрямую создает экземпляры клиентов внешних служб внутри тела функции, изолированное тестирование становится невозможным.</p>
+<p>Идиоматичный подход в Go заключается в определении минимального интерфейса потребителя и передаче зависимости в конструктор структуры хэндлера:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2207,12 +2209,18 @@ import (
     &quot;net/http&quot;
 )
 
-// UserService — интерфейс бизнес-логики, который мы будем мокировать
+// Ошибки предметной области
+var (
+    ErrNotFound      = errors.New(&quot;пользователь не найден&quot;)
+    ErrAlreadyExists = errors.New(&quot;пользователь с таким email уже зарегистрирован&quot;)
+)
+
+// UserService — узкий интерфейс бизнес-логики, необходимый хэндлеру
 type UserService interface {
     Create(ctx context.Context, email string) (int, error)
 }
 
-// UserHandler хранит зависимости
+// UserHandler инкапсулирует зависимость от бизнес-сервиса
 type UserHandler struct {
     service UserService
 }
@@ -2221,36 +2229,47 @@ func NewUserHandler(s UserService) *UserHandler {
     return &amp;UserHandler{service: s}
 }
 
-// CreateUser — сам хэндлер
+// CreateUser обрабатывает запрос на создание пользователя
 func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
     var req struct {
         Email string `json:&quot;email&quot;`
     }
 
+    // 1. Потоковое чтение и парсинг входящего JSON
     if err := json.NewDecoder(r.Body).Decode(&amp;req); err != nil {
-        http.Error(w, `{&quot;error&quot;: &quot;bad request&quot;}`, http.StatusBadRequest)
+        w.Header().Set(&quot;Content-Type&quot;, &quot;application/json&quot;)
+        w.WriteHeader(http.StatusBadRequest)
+        _, _ = w.Write([]byte(`{&quot;error&quot;: &quot;bad request&quot;}`))
         return
     }
 
+    // 2. Вызов бизнес-логики с пробросом контекста запроса
     id, err := h.service.Create(r.Context(), req.Email)
     if err != nil {
-        if errors.Is(err, ErrAlreadyExists) { // Допустим, мы определили такую ошибку
-            http.Error(w, `{&quot;error&quot;: &quot;conflict&quot;}`, http.StatusConflict)
-            return
+        w.Header().Set(&quot;Content-Type&quot;, &quot;application/json&quot;)
+        switch {
+        case errors.Is(err, ErrAlreadyExists):
+            w.WriteHeader(http.StatusConflict)
+            _, _ = w.Write([]byte(`{&quot;error&quot;: &quot;conflict&quot;}`))
+        default:
+            w.WriteHeader(http.StatusInternalServerError)
+            _, _ = w.Write([]byte(`{&quot;error&quot;: &quot;internal&quot;}`))
         }
-        http.Error(w, `{&quot;error&quot;: &quot;internal&quot;}`, http.StatusInternalServerError)
         return
     }
 
+    // 3. Формирование успешного ответа
+    w.Header().Set(&quot;Content-Type&quot;, &quot;application/json&quot;)
     w.WriteHeader(http.StatusCreated)
-    json.NewEncoder(w).Encode(map[string]int{&quot;id&quot;: id})
+    _ = json.NewEncoder(w).Encode(map[string]int{&quot;id&quot;: id})
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="anatomiya-table-driven-testa">Анатомия Table-Driven Теста</h2>
 
-<p>Хэндлеры — идеальные кандидаты для <a href="../02-testing-paket/4-table-driven-tests.html" class="wikilink">4. Table driven tests</a>. Одному эндпоинту обычно соответствует множество сценариев: успешный сценарий (Happy Path), невалидный JSON, ошибка валидации почты, конфликт (пользователь уже существует) и падение базы данных (500).</p>
+<p>Один HTTP-эндпоинт всегда обладает разветвленной сетью граничных сценариев: успешное создание (Happy Path), битый JSON-пакет, дубликат email, падение нижележащего хранилища. Это делает хэндлеры идеальными кандидатами для паттерна табличных тестов — <a href="../02-testing-paket/4-table-driven-tests.html" class="wikilink">4. Table driven tests</a>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2265,17 +2284,19 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Table-Driven Test&quot;] --&gt; B[&quot;Создание gomock.Controller&quot;]
-B --&gt; C[&quot;t.Run -Итерация по кейсам-&quot;]
-C --&gt; D[&quot;Настройка мока -setupMock-&quot;]
-D --&gt; E[&quot;httptest.NewRequest&quot;]
-E --&gt; F[&quot;Вызов UserHandler.CreateUser&quot;]
-F --&gt; G[&quot;Сравнение Code и Body&quot;]
+Start[&quot;Запуск Table-Driven Test&quot;] --&gt; InitCtrl[&quot;Инициализация gomock.Controller&quot;]
+InitCtrl --&gt; Loop[&quot;Итерация по тест-кейсам: t.Run(tc.name)&quot;]
+Loop --&gt; MockConf[&quot;Настройка ожиданий мока (setupMock)&quot;]
+MockConf --&gt; CreateReq[&quot;httptest.NewRequest + httptest.NewRecorder&quot;]
+CreateReq --&gt; Execute[&quot;Вызов handler.CreateUser(rec, req)&quot;]
+Execute --&gt; AssertStatus[&quot;Проверка res.StatusCode&quot;]
+AssertStatus --&gt; AssertBody[&quot;Семантическая проверка тела: require.JSONEq&quot;]
+AssertBody --&gt; Finish[&quot;t.Cleanup -&gt; ctrl.Finish()&quot;]
   </pre>
 </div>
 
 
-<p>Для генерации мока интерфейса <code>UserService</code> мы будем использовать <code>gomock</code> (сегодня это <code>go.uber.org/mock/gomock</code>).</p>
+<p>Для генерации мок-реализации интерфейса <code>UserService</code> воспользуемся <code>gomock</code> (актуальная библиотека: <code>go.uber.org/mock/gomock</code>):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2289,89 +2310,108 @@ F --&gt; G[&quot;Сравнение Code и Body&quot;]
 
 import (
     &quot;bytes&quot;
-    &quot;errors&quot;
+    &quot;context&quot;
     &quot;net/http&quot;
     &quot;net/http/httptest&quot;
     &quot;testing&quot;
 
-    &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
+    &quot;github.com/stretchr/testify/require&quot;
     &quot;go.uber.org/mock/gomock&quot;
 
     &quot;yourproject/internal/api&quot;
-    &quot;yourproject/internal/mocks&quot; // Сгенерированные моки
+    &quot;yourproject/internal/mocks&quot; // Пакет со сгенерированным MockUserService
 )
 
 func TestUserHandler_CreateUser(t *testing.T) {
     t.Parallel()
 
-    // 1. Описываем структуру тест-кейса
+    // 1. Декларативное описание схемы сценария
     type testCase struct {
         name           string
         requestBody    string
-        setupMock      func(mockService *mocks.MockUserService)
+        setupMock      func(m *mocks.MockUserService)
         expectedStatus int
         expectedJSON   string
     }
 
-    // 2. Заполняем таблицу сценариев
+    // 2. Набор тест-кейсов
     testCases := []testCase{
         {
             name:        &quot;Happy Path: Успешное создание&quot;,
             requestBody: `{&quot;email&quot;: &quot;test@example.com&quot;}`,
             setupMock: func(m *mocks.MockUserService) {
-                // Проверяем, что хэндлер передал правильный email и вызвал метод 1 раз
-                m.EXPECT().Create(gomock.Any(), &quot;test@example.com&quot;).Return(42, nil).Times(1)
+                // Проверяем факт вызова метода с ожидаемым аргументом ровно 1 раз
+                m.EXPECT().
+                    Create(gomock.Any(), &quot;test@example.com&quot;).
+                    Return(42, nil).
+                    Times(1)
             },
             expectedStatus: http.StatusCreated,
             expectedJSON:   `{&quot;id&quot;: 42}`,
         },
         {
-            name:           &quot;Bad Request: Невалидный JSON&quot;,
-            requestBody:    `{&quot;email&quot;: &quot;test...`, // Сломанный JSON
-            setupMock:      func(m *mocks.MockUserService) {}, // Мок не должен быть вызван
+            name:        &quot;Bad Request: Невалидный JSON&quot;,
+            requestBody: `{&quot;email&quot;: &quot;test...`, // Синтаксически сломанный JSON
+            setupMock: func(m *mocks.MockUserService) {
+                // При ошибке парсинга сервис НЕ должен вызываться вовсе
+            },
             expectedStatus: http.StatusBadRequest,
             expectedJSON:   `{&quot;error&quot;: &quot;bad request&quot;}`,
         },
         {
-            name:        &quot;Conflict: Пользователь существует&quot;,
+            name:        &quot;Conflict: Пользователь уже зарегистрирован&quot;,
             requestBody: `{&quot;email&quot;: &quot;exist@example.com&quot;}`,
             setupMock: func(m *mocks.MockUserService) {
-                m.EXPECT().Create(gomock.Any(), &quot;exist@example.com&quot;).Return(0, api.ErrAlreadyExists)
+                m.EXPECT().
+                    Create(gomock.Any(), &quot;exist@example.com&quot;).
+                    Return(0, api.ErrAlreadyExists).
+                    Times(1)
             },
             expectedStatus: http.StatusConflict,
             expectedJSON:   `{&quot;error&quot;: &quot;conflict&quot;}`,
         },
+        {
+            name:        &quot;Internal Error: Сбой сервисного слоя&quot;,
+            requestBody: `{&quot;email&quot;: &quot;crash@example.com&quot;}`,
+            setupMock: func(m *mocks.MockUserService) {
+                m.EXPECT().
+                    Create(gomock.Any(), &quot;crash@example.com&quot;).
+                    Return(0, api.ErrNotFound).
+                    Times(1)
+            },
+            expectedStatus: http.StatusInternalServerError,
+            expectedJSON:   `{&quot;error&quot;: &quot;internal&quot;}`,
+        },
     }
 
-    // 3. Выполняем тесты
+    // 3. Параллельное исполнение сценариев
     for _, tc := range testCases {
-        tc := tc // Захват переменной для параллельного запуска (важно для Go &lt; 1.22)
+        tc := tc // Защитный захват переменной замыкания (актуально для Go &lt; 1.22)
         t.Run(tc.name, func(t *testing.T) {
             t.Parallel()
 
-            // Инициализация мок-контроллера
+            // Инициализируем контроллер моков
             ctrl := gomock.NewController(t)
-            // t.Cleanup гарантирует вызов ctrl.Finish() в конце теста
 
             mockSvc := mocks.NewMockUserService(ctrl)
             tc.setupMock(mockSvc)
 
             handler := api.NewUserHandler(mockSvc)
 
-            // Создаем искусственный запрос
+            // Создаем искусственный входящий запрос и перехватчик ответа
             req := httptest.NewRequest(http.MethodPost, &quot;/users&quot;, bytes.NewBufferString(tc.requestBody))
             rec := httptest.NewRecorder()
 
-            // Act: Вызываем хэндлер напрямую
+            // Act: Прямой вызов обработчика в памяти
             handler.CreateUser(rec, req)
 
-            // Assert: Проверяем результат
+            // Assert: Проверяем транспортный контракт
             res := rec.Result()
             defer res.Body.Close()
 
             require.Equal(t, tc.expectedStatus, res.StatusCode)
 
-            // Специфичная проверка для JSON
+            // Семантическая валидация JSON-ответа
             require.JSONEq(t, tc.expectedJSON, rec.Body.String())
         })
     }
@@ -2379,9 +2419,10 @@ func TestUserHandler_CreateUser(t *testing.T) {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="lovushki-i-luchshie-praktiki">Ловушки и лучшие практики</h2>
 
-<h3 id="1-require-jsoneq-vmesto-require-equal">1. `require.JSONEq` вместо `require.Equal`</h3>
+<h3 id="1-require-jsoneq-vmesto-require-equal">1. require.JSONEq вместо require.Equal</h3>
 
 <div class="callout callout-interview">
   <div class="callout-header">
@@ -2389,16 +2430,21 @@ func TestUserHandler_CreateUser(t *testing.T) {
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему при сравнении HTTP-ответов нельзя просто использовать <code>require.Equal(t, expectedStr, actualStr)</code>?<br />
-<strong>Ответ:</strong> Функция <code>json.NewEncoder(w).Encode(...)</code> по умолчанию добавляет символ переноса строки <code>\n</code> в конец вывода. Кроме того, порядок ключей в JSON-объекте не гарантирован (хотя в структурах он детерминирован, в <code>map</code> — нет), и могут отличаться пробелы. Сравнение строк через <code>Equal</code> упадет на банальном переносе строки. <code>require.JSONEq</code> парсит обе строки как JSON и сравнивает их семантически, игнорируя форматирование.</p>
+    <p><strong>Вопрос:</strong> Почему при сравнении тел HTTP-ответов в Go категорически не рекомендуется использовать посимвольное сравнение строк через <code>require.Equal(t, expectedStr, actualStr)</code>?</p>
+<p><strong>Ответ:</strong> По трем фундаментальным причинам:<br />
+1. Метод <code>json.NewEncoder(w).Encode(...)</code> по спецификации всегда дописывает символ перевода строки <code>\n</code> в конец потока байтов. Сравнение строк через <code>Equal</code> гарантированно сломается из-за невидимого <code>\n</code>.<br />
+2. Порядок сериализации ключей в типах <code>map</code> в языке Go намеренно рандомизирован рантаймом. Один и тот же словарь <code>{"a": 1, "b": 2}</code> может превратиться в <code>{"b": 2, "a": 1}</code>.<br />
+3. Различия в пробелах и отступах (pretty print vs compact) не должны приводить к падению тестов.</p>
+<p>Метод <code>require.JSONEq</code> десериализует обе строки во внутреннее AST-дерево и производит семантическое сравнение структуры данных независимо от форматирования.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="2-peredacha-konteksta-mechanical-sympathy">2. Передача Контекста (Mechanical Sympathy)</h3>
 
-<p>Обратите внимание на вызов <code>m.EXPECT().Create(gomock.Any(), "test@example.com")</code> в моке. Мы используем <code>gomock.Any()</code> для первого аргумента (контекста). <br />
-В жестких enterprise-требованиях этого может быть недостаточно. Вы должны проверять, что хэндлер передал <strong>именно контекст запроса</strong> (<code>r.Context()</code>), а не <code>context.Background()</code>. Если хэндлер потеряет <code>r.Context()</code>, то при отмене HTTP-запроса клиентом, тяжелый запрос в базу данных на слое репозитория не будет прерван, что приведет к утечкам горутин.</p>
-<p>Строгая проверка выглядит так:</p>
+<p>В строке <code>m.EXPECT().Create(gomock.Any(), "test@example.com")</code> мы использовали обобщенный матчер <code>gomock.Any()</code> для проверки контекста. В простых тестах это допустимо, но в критических компонентах это скрывает опасную ошибку: потерю контекста.</p>
+<p>Если невнимательный разработчик внутри хэндлера передаст в сервис <code>context.Background()</code> вместо <code>r.Context()</code>, то при обрыве HTTP-соединения клиентом дорогостоящий SQL-запрос в базе данных продолжит выполняться, растрачивая процессорные ресурсы сервера впустую.</p>
+<p>Для строгой верификации проброса контекста запроса используется проверка типов или инспекция значений:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2411,32 +2457,67 @@ func TestUserHandler_CreateUser(t *testing.T) {
   <pre class="language-go"><code class="language-go">m.EXPECT().
     Create(gomock.AssignableToTypeOf(context.Background()), &quot;test@example.com&quot;).
     DoAndReturn(func(ctx context.Context, email string) (int, error) {
-        // Проверяем, что контекст содержит данные из HTTP-запроса
+        // Убеждаемся, что контекст не был подменен на пустой Background
+        require.NotNil(t, ctx.Done(), &quot;Контекст обязан быть отменяемым контекстом HTTP-запроса&quot;)
         return 42, nil
     })
 </code></pre>
 </div>
 
+<hr />
 <h3 id="3-proizvoditelnost-decoder-vs-unmarshal">3. Производительность: Decoder vs Unmarshal</h3>
 
-<p>В хэндлере выше мы использовали <code>json.NewDecoder(r.Body).Decode(&amp;req)</code>. </p>
+<p>В теле обработчика мы применили конструкцию:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">json.NewDecoder(r.Body).Decode(&amp;req)
+</code></pre>
+</div>
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p><code>r.Body</code> реализует интерфейс <code>io.ReadCloser</code>. <br />
-Использование <code>json.NewDecoder</code> читает данные прямо из TCP-сокета (или из буфера памяти в случае <code>httptest</code>) потоково (streaming), по мере парсинга JSON, что минимизирует аллокации в куче (Heap).</p>
-<p>Альтернативный подход: <code>bodyBytes, _ := io.ReadAll(r.Body)</code> с последующим <code>json.Unmarshal(bodyBytes, &amp;req)</code>. Это загружает всё тело запроса в слайс байт (одна большая аллокация).</p>
-<p>Для мелких запросов разницы нет, но если клиент пришлет JSON размером 50 МБ, <code>io.ReadAll</code> вызовет серьезный всплеск использования RAM и нагрузит Garbage Collector. В тестах мы имитируем <code>r.Body</code> с помощью <code>bytes.NewBufferString</code>, который тоже ведет себя как поток, позволяя тестировать потоковый парсинг.</p>
+    <p>Тело запроса <code>r.Body</code> реализует потоковый интерфейс <code>io.ReadCloser</code>.</p>
+<p>Вызов <code>json.NewDecoder</code> считывает байты порциями напрямую из сетевого буфера сокета (или внутреннего буфера памяти в <code>httptest</code>) по мере синтаксического разбора токенов JSON. Это исключает необходимость предварительного выделения единого непрерывного блока памяти в куче (Heap).</p>
+<p>Альтернативный подход, часто встречающийся в любительском коде:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">bodyBytes, _ := io.ReadAll(r.Body)
+json.Unmarshal(bodyBytes, &amp;req)
+</code></pre>
+</div>
+
+<p>Функция <code>io.ReadAll</code> принудительно вычитывает весь входящий поток целиком в непрерывный слайс байтов. Если злоумышленник или невнимательный клиент пришлет полезную нагрузку размером в 50 мегабайт, <code>io.ReadAll</code> мгновенно выделит 50 МБ в оперативной памяти, вызвав аллокационный всплеск и внеочередную паузу сборщика мусора (Garbage Collector Stop-the-World).</p>
+<p>В тестах мы эмулируем входящий поток <code>r.Body</code> через структуру <code>bytes.NewBufferString</code>, проверяя корректность именно потокового разбора данных.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Тестирование хэндлеров — это самый быстрый и эффективный способ покрыть контракты вашего API. Мы убедились, что Table-Driven тесты вкупе с мокированием слоя сервиса позволяют описать десятки корнер-кейсов в одном файле, сохраняя при этом выполнение на уровне микросекунд.</p>
-<p>Однако наш хэндлер выполняет только "чистую" бизнес-работу. В реальном приложении до того, как запрос попадет в хэндлер, он проходит через цепочку перехватчиков: авторизацию, логирование, лимитирование запросов (Rate Limiting). О том, как тестировать этот критически важный защитный слой, мы поговорим в следующей статье: <a href="3-middleware-testirovanie.html" class="wikilink">3. Middleware тестирование</a>.</p>
+<p>Тестирование хэндлеров — это самый быстрый, дешевый и точный способ верификации контрактов API на уровне модульных тестов:<br />
+1. Хэндлеры не должны тестировать бизнес-логику; их задача — адаптация транспортного протокола HTTP.<br />
+2. Внедрение зависимостей через интерфейсы позволяет изолировать транспортный слой с помощью моков <code>gomock</code>.<br />
+3. Подход <strong>Table-Driven Tests</strong> дает возможность компактно выразить десятки граничных сценариев в единой декларативной таблице.<br />
+4. Сравнение JSON-ответов обязано производиться через семантический <code>require.JSONEq</code>, а не через посимвольный <code>require.Equal</code>.</p>
+<p>Однако в реальных приложениях входящий запрос редко попадает в хэндлер напрямую: путь ему преграждает цепочка промежуточных перехватчиков (Middleware), отвечающих за авторизацию, аудит, сжатие и защиту от перегрузок. В следующей главе мы разберем, как элегантно тестировать этот критически важный слой: <a href="3-middleware-testirovanie.html" class="wikilink">3. Middleware тестирование</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
