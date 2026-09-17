@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Тестирование Redis</h1>
@@ -2178,26 +2178,45 @@
           <div class="article-markdown">
             <h2 id="spetsifika-in-memory-khranilishch">Специфика in-memory хранилищ</h2>
 
-<p>В прошлых статьях мы победили тяжеловесный PostgreSQL, научившись запускать его через <a href="4-testcontainers-go.html" class="wikilink">4. testcontainers go</a> и изолировать состояние параллельных тестов с помощью <code>ROLLBACK</code> транзакций. </p>
-<p>Но современные бэкенды редко ограничиваются только реляционной БД. Кэширование, rate-limiting, управление сессиями, распределенные блокировки — для этих задач стандартом де-факто является <strong>Redis</strong>. И когда дело доходит до тестирования, Redis бросает нам совершенно новые вызовы.</p>
-<p>Главная проблема: <strong>В Redis нет транзакций с поддержкой MVCC (Multi-Version Concurrency Control) и откатов (Rollback).</strong><br />
-Команды <code>MULTI</code> и <code>EXEC</code> в Redis — это не ACID-транзакции. Это просто способ поставить пачку команд в очередь и выполнить их последовательно без прерывания другими клиентами. Вы не можете сделать <code>BEGIN</code>, записать данные, проверить их в тесте, а затем сделать <code>ROLLBACK</code>. Если данные попали в Redis, они там остались.</p>
-<p>Как же тогда тестировать код с Redis, не жертвуя скоростью и <code>t.Parallel()</code>?</p>
+<p>В предыдущих главах мы научились подчинять тяжеловесный PostgreSQL, разворачивая его в эфемерных окружениях через <a href="4-testcontainers-go.html" class="wikilink">4. testcontainers go</a> и изолируя параллельные запуски тестов с помощью транзакционного <code>ROLLBACK</code>. Реляционная СУБД с её журналом упреждающей записи (WAL) и многоверсионным управлением конкурентным доступом (MVCC) предоставляет нам идеальную иллюзию: каждый тест может делать вид, что он один на свете, а в конце — просто отменить свои следы.</p>
+<p>Однако современный серверный стек редко исчерпывается одной лишь реляционной базой данных. Быстрый кэш ответов, скользящие окна для rate limiting, распределенные мьютексы и сессии пользователей ложатся на плечи сетевого in-memory хранилища — <strong>Redis</strong>. И как только инженер пытается применить к Redis привычные шаблоны интеграционного тестирования, он немедленно наталкивается на фундаментальные архитектурные различия.</p>
+<p>Главная загвоздка заключается в том, что <strong>в Redis нет транзакций с поддержкой MVCC и привычных откатов (<code>ROLLBACK</code>)</strong>. </p>
+<p>Команды <code>MULTI</code> и <code>EXEC</code> в протоколе Redis — это вовсе не ACID-транзакции в реляционном понимании. Это лишь механизм буферизации: клиент собирает пачку инструкций в очередь, после чего сервер последовательно и непрерывно исполняет их в едином контексте, не допуская вклинивания команд от других клиентов. Вы не можете выполнить условный <code>BEGIN</code>, записать тестовые ключи, проверить состояние сервиса и затем нажать волшебную кнопку <code>ROLLBACK</code>. Если ключ записан в память Redis, он останется там до явного удаления или истечения срока жизни (TTL).</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">Реляционная БД (PostgreSQL):
+[BEGIN] -&gt; [INSERT/UPDATE (в рамках снимка MVCC)] -&gt; [ROLLBACK] =&gt; состояние не тронуто
+
+Ключ-значение (Redis):
+[MULTI] -&gt; [SET/INCR (буферизация команд)] -&gt; [EXEC] =&gt; данные уже в RAM!
+</code></pre>
+</div>
+
+<p>Как же организовать интеграционное тестирование сервисов, опирающихся на Redis, не скатываясь в последовательное медленное исполнение и сохраняя возможность вызова <code>t.Parallel()</code>? Для этого инженеру необходимо заглянуть под капот протокола взаимодействия и разделить тестовые сценарии на две принципиальные категории.</p>
+<hr />
 <h2 id="pod-kapotom-redis-i-go-redis">Под капотом: Redis и go-redis</h2>
 
-<p>Прежде чем писать тесты, нужно понимать, как Go-приложение взаимодействует с Redis на уровне сети и рантайма. Самый популярный драйвер в Go — <code>github.com/redis/go-redis/v9</code>.</p>
+<p>Прежде чем проектировать тест-сьюты, разберем механику взаимодействия приложения на Go с сервером Redis. В подавляющем большинстве проектов де-факто стандартом выступает клиентская библиотека <code>github.com/redis/go-redis/v9</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Клиент <code>go-redis</code> под капотом использует собственный пул соединений (<code>Connection Pool</code>), защищенный мьютексами и атомиками. <br />
-Когда десятки параллельных тестов (горутин) одновременно делают <code>client.Get(ctx, key)</code>, <code>go-redis</code> берет свободные TCP-сокеты из пула и отправляет запросы. </p>
-<p>Сам же Redis (до версии 6.0) был строго однопоточным. В версиях 6.0+ сетевой I/O стал многопоточным (I/O threads читают байты из сокетов), но <strong>исполнение команд</strong> (доступ к памяти) всё равно происходит строго в одном главном потоке (Main Thread). Это значит, что Redis сериализует все запросы от ваших параллельных тестов.</p>
+    <p>Драйвер <code>go-redis</code> управляет внутренним пулом соединений (<code>Connection Pool</code>), построенным на базе потокобезопасных структур данных и атомиков. </p>
+<p>Когда десятки параллельных тестов или горутин вызывают <code>client.Get(ctx, key)</code>, клиент не создает новое TCP-соединение на каждый чих. Он извлекает свободный сокет из пула, сериализует запрос в текстовый протокол RESP (REdis Serialization Protocol), передает системному вызову <code>write()</code> и блокируется на чтении ответа через сетевой поллер Go (<code>netpoller</code>).</p>
+<p>На стороне сервера Redis архитектура исторически однопоточна. Начиная с версии 6.0, в Redis появился многопоточный ввод-вывод (I/O threads парсят байты из сокетов), однако <strong>непосредственное исполнение команд</strong> над структурами данных в оперативной памяти по-прежнему происходит строго в главном цикле событий (Main Thread). Это гарантирует строгую сериализацию всех поступающих команд: даже если параллельные тесты шлют запросы одновременно, ядро Redis выполняет их строго по очереди.</p>
   </div>
 </div>
 
+<p>Следующая диаграмма наглядно иллюстрирует этот путь:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2212,31 +2231,42 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Тест 1&lt;br&gt;Горутина&quot;] --&gt;|Get| D[&quot;go-redis Pool&quot;]
-B[&quot;Тест 2&lt;br&gt;Горутина&quot;] --&gt;|Set| D
-C[&quot;Тест 3&lt;br&gt;Горутина&quot;] --&gt;|Del| D
+subgraph App[&quot;Go Application (Тестовый процесс)&quot;]
+T1[&quot;Тест 1 (Горутина)&quot;] --&gt;|&quot;client.Get(ctx, key)&quot;| Pool[&quot;go-redis Connection Pool&quot;]
+T2[&quot;Тест 2 (Горутина)&quot;] --&gt;|&quot;client.Set(ctx, key, val)&quot;| Pool
+T3[&quot;Тест 3 (Горутина)&quot;] --&gt;|&quot;client.Del(ctx, key)&quot;| Pool
+end
 
-D --&gt;|&quot;TCP сокет 1&quot;| E[&quot;Redis Network Thread 1&quot;]
-D --&gt;|&quot;TCP сокет 2&quot;| F[&quot;Redis Network Thread 2&quot;]
+Pool --&gt;|&quot;TCP сокет 1 (RESP)&quot;| IO1[&quot;Redis I/O Thread 1&quot;]
+Pool --&gt;|&quot;TCP сокет 2 (RESP)&quot;| IO2[&quot;Redis I/O Thread 2&quot;]
 
-E --&gt; G[&quot;Redis Main Thread&lt;br&gt;Очередь команд&lt;br&gt;Строго последовательно&quot;]
-F --&gt; G
-
-G -.-&gt;|&quot;RAM&quot;| H[&quot;Keyspace&quot;]
+subgraph RedisServer[&quot;Redis Instance&quot;]
+IO1 --&gt; Queue[&quot;Очередь разобранных команд&quot;]
+IO2 --&gt; Queue
+Queue --&gt; MainThread[&quot;Redis Main Thread (Single-threaded Execution)&quot;]
+MainThread &lt;--&gt; Memory[&quot;RAM: Hash Tables, Skiplists, Strings&quot;]
+end
   </pre>
 </div>
 
 
+<p>Понимание этой модели определяет две фундаментальные стратегии тестирования:<br />
+1. <strong>Чистая in-memory эмуляция в адресном пространстве Go-процесса (<code>miniredis</code>):</strong> когда нам важна предельная скорость и независимость от внешнего окружения.<br />
+2. <strong>Реальный контейнер через Testcontainers с пространством имен (Key Namespacing):</strong> когда логика завязана на специфику рантайма Redis (Lua-скрипты, модули, транзакции <code>WATCH</code>/<code>MULTI</code>/<code>EXEC</code>, Redis Streams).</p>
+<hr />
 <h2 id="strategiya-1-miniredis-ultimativnaya-skorost">Стратегия 1: miniredis (Ультимативная скорость)</h2>
 
-<p>Для 90% интеграционных тестов с Redis вам вообще <strong>не нужен Docker</strong>. <br />
-В экосистеме Go существует шедевральная библиотека: <code>github.com/alicebob/miniredis</code>. </p>
-<p>Это чистая реализация Redis-сервера, написанная на Go. Она поднимается за микросекунды прямо внутри памяти вашего тестового процесса. </p>
-<p><strong>Плюсы:</strong><br />
-1. Не требует Docker daemon.<br />
-2. Скорость запуска — доли миллисекунд (в 1000 раз быстрее Testcontainers).<br />
-3. Идеальная изоляция: каждый <code>t.Run</code> может поднимать свой собственный, абсолютно чистый инстанс <code>miniredis</code> на случайном порту. Это дает 100% поддержку <code>t.Parallel()</code>.</p>
-<p><strong>Пример идиоматичного теста:</strong></p>
+<p>Для подавляющего большинства интеграционных тестов (до 90% типовых сценариев кэширования, хранения сессий и счетчиков) поднимать настоящий образ Docker через Testcontainers — неоправданная роскошь. </p>
+<p>В экосистеме Go существует превосходный инструмент: библиотека <code>github.com/alicebob/miniredis</code>. </p>
+<p>Это чистая реализация сервера Redis, написанная на языке Go. Она компилируется прямо в бинарник ваших тестов и запускается за доли миллисекунды в оперативной памяти тестового процесса, открывая настоящий сетевой слушатель (TCP listener) на случайном локальном порту.</p>
+<h3 id="arkhitekturnye-dostoinstva-miniredis">Архитектурные достоинства miniredis:</h3>
+<ol>
+<li><strong>Полная независимость от Docker:</strong> тесты выполняются на любой машине разработчика и в легковесных CI-контейнерах без проброса docker-сокета.</li>
+<li><strong>Мгновенный старт:</strong> инициализация занимает меньше одной миллисекунды (против 2–4 секунд у Docker-контейнера).</li>
+<li><strong>Бескомпромиссная изоляция:</strong> каждый отдельный тест <code>t.Run</code> может поднять свой собственный изолированный сервер <code>miniredis</code> с нулевым состоянием, гарантируя абсолютную чистоту экспериментов в режиме <code>t.Parallel()</code>.</li>
+<li><strong>Управление временем:</strong> <code>miniredis</code> позволяет программно перематывать серверное время с помощью метода <code>FastForward()</code>, что делает тестирование устаревания ключей (TTL) мгновенным и детерминированным — без вызовов <code>time.Sleep()</code>.</li>
+</ol>
+<p>Рассмотрим идиоматичный пример организации теста с инкапсуляцией жизненного цикла через <code>t.Cleanup</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2253,51 +2283,80 @@ import (
     &quot;testing&quot;
     &quot;time&quot;
 
-    &quot;[github.com/alicebob/miniredis/v2](https://github.com/alicebob/miniredis/v2)&quot;
-    &quot;[github.com/redis/go-redis/v9](https://github.com/redis/go-redis/v9)&quot;
-    &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
-    &quot;yourproject/internal/cache&quot;
+    &quot;github.com/alicebob/miniredis/v2&quot;
+    &quot;github.com/redis/go-redis/v9&quot;
+    &quot;github.com/stretchr/testify/require&quot;
 )
 
-func setupMiniredis(t *testing.T) *redis.Client {
+// SessionCache — прикладной компонент, управляющий сессиями
+type SessionCache struct {
+    client *redis.Client
+}
+
+func NewSessionCache(client *redis.Client) *SessionCache {
+    return &amp;SessionCache{client: client}
+}
+
+func (s *SessionCache) Set(ctx context.Context, key, val string, ttl time.Duration) error {
+    return s.client.Set(ctx, key, val, ttl).Err()
+}
+
+func (s *SessionCache) Get(ctx context.Context, key string) (string, error) {
+    return s.client.Get(ctx, key).Result()
+}
+
+// setupMiniredis поднимает персональный in-memory сервер под конкретный тест
+func setupMiniredis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
     t.Helper()
 
-    // Поднимаем in-memory Redis сервер
+    // Запускаем in-memory эмулятор Redis
     mr, err := miniredis.Run()
-    require.NoError(t, err)
+    require.NoError(t, err, &quot;не удалось инициализировать miniredis&quot;)
 
-    // Гарантируем остановку сервера после теста
-    t.Cleanup(func() { mr.Close() })
+    // Останавливаем сервер после завершения теста
+    t.Cleanup(func() {
+        mr.Close()
+    })
 
-    // Создаем реальный go-redis клиент, подключая его к miniredis
+    // Подключаем стандартный боевой клиент go-redis к локальному адресу miniredis
     client := redis.NewClient(&amp;redis.Options{
         Addr: mr.Addr(),
     })
 
-    // Закрываем соединения в пуле
-    t.Cleanup(func() { client.Close() })
+    // Закрываем пул TCP-соединений клиента
+    t.Cleanup(func() {
+        _ = client.Close()
+    })
 
-    return client
+    return mr, client
 }
 
-func TestSessionCache_SetGet(t *testing.T) {
+func TestSessionCache_SetGetAndTTL(t *testing.T) {
     t.Parallel()
 
-    // У каждого параллельного теста — свой личный сервер Redis!
-    rdb := setupMiniredis(t)
-    sessionCache := cache.NewSessionCache(rdb)
-
+    mr, rdb := setupMiniredis(t)
+    cache := NewSessionCache(rdb)
     ctx := context.Background()
 
-    // Act
-    err := sessionCache.Set(ctx, &quot;user:123&quot;, &quot;token_abc&quot;, time.Minute)
-    require.NoError(t, err)
+    t.Run(&quot;успешное сохранение и извлечение данных&quot;, func(t *testing.T) {
+        err := cache.Set(ctx, &quot;session:user_101&quot;, &quot;jwt_token_payload&quot;, 10*time.Minute)
+        require.NoError(t, err)
 
-    val, err := sessionCache.Get(ctx, &quot;user:123&quot;)
+        val, err := cache.Get(ctx, &quot;session:user_101&quot;)
+        require.NoError(t, err)
+        require.Equal(t, &quot;jwt_token_payload&quot;, val)
+    })
 
-    // Assert
-    require.NoError(t, err)
-    require.Equal(t, &quot;token_abc&quot;, val)
+    t.Run(&quot;истечение времени жизни ключа без ожидания time.Sleep&quot;, func(t *testing.T) {
+        err := cache.Set(ctx, &quot;temp_key&quot;, &quot;temporary_data&quot;, 5*time.Second)
+        require.NoError(t, err)
+
+        // Магия miniredis: мгновенно перематываем виртуальное время вперед
+        mr.FastForward(6 * time.Second)
+
+        _, err = cache.Get(ctx, &quot;temp_key&quot;)
+        require.ErrorIs(t, err, redis.Nil, &quot;ключ должен был испариться по истечении TTL&quot;)
+    })
 }
 </code></pre>
 </div>
@@ -2308,17 +2367,20 @@ func TestSessionCache_SetGet(t *testing.T) {
     <span class="callout-title">Ловушка / Gotcha: Ограничения miniredis</span>
   </div>
   <div class="callout-body">
-    <p><code>miniredis</code> идеален, но это не 100% копия настоящего Redis. Если ваш код использует сложные Lua-скрипты, модули (RedisJSON, RediSearch) или специфичные фичи кластеризации, <code>miniredis</code> может повести себя не так, как реальный сервер, или вовсе вернуть ошибку <code>ERR unknown command</code>. В таких случаях (оставшиеся 10%) придется использовать Testcontainers.</p>
+    <p><code>miniredis</code> великолепен своей скоростью, однако это не побитовая копия официального C-исходника Redis. </p>
+<p>Если ваша бизнес-логика опирается на сложные скрипты Lua, модули (такие как RedisJSON, RediSearch, RedisBloom), команды кластеризации или специфичное поведение потоков (Redis Streams), <code>miniredis</code> может повести себя некорректно либо выдать фатальную ошибку <code>ERR unknown command</code>. В таких ситуациях попытка сэкономить на Docker приводит к ложноположительным тестам. Здесь вступает в игру полноценный контейнер.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="strategiya-2-testcontainers-izolyatsiya-klyuchey">Стратегия 2: Testcontainers + Изоляция ключей</h2>
 
-<p>Если вам нужен настоящий Redis (например, для тестирования сложного Lua-скрипта для Rate Limiter), мы используем <code>testcontainers-go</code>. <br />
-Поднимать тяжелый контейнер на каждый тест — непозволительно долго. Мы поднимаем <strong>один контейнер на пакет</strong> (через <code>TestMain</code>), как делали это с PostgreSQL.</p>
-<p>Но как изолировать тесты? Очищать базу через <code>FLUSHALL</code> в <code>t.Cleanup</code> нельзя — это убьет данные соседних параллельных тестов, и вы получите <a href="../01-fundament/6-flaky-testy-i-ikh-prichiny.html" class="wikilink">6. Flaky тесты и их причины</a>.</p>
-<p><strong>Решение: Пространство имен (Key Prefixes).</strong><br />
-Каждый тест генерирует уникальный префикс (например, UUID) и передает его в тестируемый компонент.</p>
+<p>Когда тестируемая подсистема использует возможности, специфичные для нативного сервера Redis (например, атомарный скрипт скользящего окна rate limiter на языке Lua), компромиссы недопустимы. Мы поднимаем честный контейнер с помощью библиотеки <code>testcontainers-go</code>.</p>
+<p>Однако создание отдельного Docker-контейнера на каждый запуск функции <code>t.Run</code> приведет к колоссальным временным задержкам: сьют из ста тестов будет выполняться несколько минут. Поэтому применяется паттерн <strong>общего долгоживущего контейнера на пакет</strong> с инициализацией внутри <code>TestMain</code>.</p>
+<p>Здесь мы возвращаемся к начальной проблеме: если контейнер один, а тесты работают конкурентно с <code>t.Parallel()</code>, как предотвратить взаимное повреждение данных?</p>
+<p>Очищать базу командой <code>FLUSHALL</code> или <code>FLUSHDB</code> в <code>t.Cleanup</code> категорически запрещено. Вызов <code>FLUSHALL</code> в одном тесте мгновенно сметет ключи, с которыми прямо в эту наносекунду работает соседняя горутина, порождая трудноуловимые <a href="../01-fundament/6-flaky-testy-i-ikh-prichiny.html" class="wikilink">6. Flaky тесты и их причины</a>.</p>
+<p><strong>Единственно надежное решение: Пространство имен (Key Prefixes).</strong></p>
+<p>Каждый тестовый сценарий генерирует уникальный случайный префикс (например, с помощью UUID или имени теста) и использует только свои собственные изолированные ключи.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2328,19 +2390,102 @@ func TestSessionCache_SetGet(t *testing.T) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func TestRateLimiter_RealRedis(t *testing.T) {
-    t.Parallel()
+  <pre class="language-go"><code class="language-go">package limiter_test
 
-    // testDB_Redis — глобальный пул, инициализированный в TestMain
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;os&quot;
+    &quot;testing&quot;
+    &quot;time&quot;
+
+    &quot;github.com/google/uuid&quot;
+    &quot;github.com/redis/go-redis/v9&quot;
+    &quot;github.com/stretchr/testify/require&quot;
+    &quot;github.com/testcontainers/testcontainers-go&quot;
+    rediscontainer &quot;github.com/testcontainers/testcontainers-go/modules/redis&quot;
+)
+
+var sharedClient *redis.Client
+
+func TestMain(m *testing.M) {
     ctx := context.Background()
 
-    // Генерируем уникальный префикс для изоляции ключей этого теста
-    testPrefix := &quot;test_limit:&quot; + uuid.NewString() + &quot;:&quot;
+    // Запускаем один официальный контейнер Redis на весь тестовый пакет
+    container, err := rediscontainer.Run(ctx, &quot;redis:7-alpine&quot;)
+    if err != nil {
+        fmt.Printf(&quot;Не удалось поднять Redis контейнер: %v\n&quot;, err)
+        os.Exit(1)
+    }
 
-    // Передаем префикс в конструктор (потребует DI в вашем коде)
-    limiter := limiter.NewRateLimiter(testDB_Redis, testPrefix)
+    connStr, err := container.ConnectionString(ctx)
+    if err != nil {
+        fmt.Printf(&quot;Ошибка получения ConnectionString: %v\n&quot;, err)
+        os.Exit(1)
+    }
 
-    // Тест работает только со своими ключами (например, test_limit:uuid123:user_1)
+    opt, err := redis.ParseURL(connStr)
+    if err != nil {
+        fmt.Printf(&quot;Ошибка парсинга URL: %v\n&quot;, err)
+        os.Exit(1)
+    }
+
+    sharedClient = redis.NewClient(opt)
+
+    // Запускаем тесты
+    code := m.Run()
+
+    // Корректно сворачиваем окружение
+    _ = sharedClient.Close()
+    _ = container.Terminate(ctx)
+
+    os.Exit(code)
+}
+
+// RateLimiter реализует алгоритм ограничения запросов поверх Redis
+type RateLimiter struct {
+    client *redis.Client
+    prefix string
+}
+
+func NewRateLimiter(client *redis.Client, prefix string) *RateLimiter {
+    return &amp;RateLimiter{client: client, prefix: prefix}
+}
+
+func (r *RateLimiter) Allow(ctx context.Context, userID string) (bool, error) {
+    key := fmt.Sprintf(&quot;%s:%s&quot;, r.prefix, userID)
+    // Атомарно увеличиваем счетчик обращений
+    count, err := r.client.Incr(ctx, key).Result()
+    if err != nil {
+        return false, err
+    }
+    if count == 1 {
+        _ = r.client.Expire(ctx, key, time.Minute).Err()
+    }
+    return count &lt;= 5, nil
+}
+
+func TestRateLimiter_RealRedis(t *testing.T) {
+    t.Parallel()
+
+    ctx := context.Background()
+
+    // Генерируем уникальный префикс для полной изоляции ключей данного теста
+    testPrefix := &quot;test_limit:&quot; + uuid.NewString()
+
+    // Внедряем изолированный префикс в создаваемый экземпляр сервиса
+    limiter := NewRateLimiter(sharedClient, testPrefix)
+
+    // Гарантируем подчистку за собой после завершения теста
+    t.Cleanup(func() {
+        // Очищаем исключительно собственные ключи, не трогая соседей
+        keys, err := sharedClient.Keys(ctx, testPrefix+&quot;*&quot;).Result()
+        if err == nil &amp;&amp; len(keys) &gt; 0 {
+            _ = sharedClient.Del(ctx, keys...).Err()
+        }
+    })
+
+    // Тест работает строго в изолированном пространстве ключей
     allowed, err := limiter.Allow(ctx, &quot;user_1&quot;)
     require.NoError(t, err)
     require.True(t, allowed)
@@ -2348,18 +2493,22 @@ func TestSessionCache_SetGet(t *testing.T) {
 </code></pre>
 </div>
 
-<p><em>Примечание: Чтобы не засорять память реального Redis-сервера в CI, можно обойти все ключи по шаблону префикса и удалить их в <code>t.Cleanup</code>, либо просто положиться на удаление самого контейнера после завершения <code>TestMain</code>.</em></p>
+<hr />
 <h2 id="lovushki-pri-rabote-s-redis-v-go">Ловушки при работе с Redis в Go</h2>
 
-<p>На собеседованиях и в production-коде часто всплывают специфичные паттерны работы с Redis, которые обязательно нужно покрывать тестами.</p>
+<h3 id="oshibka-otsutstviya-klyucha-redis-nil">Ошибка отсутствия ключа: redis.Nil</h3>
+
+<p>На технических собеседованиях и во время код-ревью регулярно всплывает классическая ошибка обработки краевых условий при чтении из кэша.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как в <code>go-redis</code> отличить ошибку сети от ситуации, когда ключ просто не найден?<br />
-<strong>Ответ:</strong> Когда ключ отсутствует, Redis возвращает <code>(nil)</code>. Библиотека <code>go-redis</code> конвертирует это в специальную ошибку <code>redis.Nil</code>. Это классическая ловушка для джунов: если вы напишете <code>if err != nil { return err }</code>, ваш код упадет при отсутствии ключа. Правильная обработка:</p>
+    <p><strong>Вопрос:</strong> Как в драйвере <code>go-redis</code> отличить сетевой сбой (или падение сервера) от штатной ситуации, когда запрашиваемый ключ просто отсутствует в базе?</p>
+<p><strong>Ответ:</strong> По протоколу RESP при отсутствии ключа сервер Redis возвращает специальное пустое значение <code>(nil)</code>. Библиотека <code>go-redis</code> транслирует этот ответ в константную ошибку <code>redis.Nil</code>. </p>
+<p>Это классическая ловушка для начинающих: если программист пишет наивное <code>if err != nil { return err }</code>, приложение расценивает штатный промах кэша (Cache Miss) как тяжелую ошибку и завершает обработку запроса с кодом 500. </p>
+<p>Идиоматичная обработка строится через сопоставление ошибок:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2369,26 +2518,31 @@ func TestSessionCache_SetGet(t *testing.T) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">val, err := rdb.Get(ctx, key).Result()
+  <pre class="language-go"><code class="language-go">val, err := client.Get(ctx, key).Result()
 switch {
 case err == redis.Nil:
-    fmt.Println(&quot;Кэш пуст, идем в БД&quot;)
+    // Штатная ситуация: кэш пуст, обращаемся к источнику истины (БД)
+    return fetchFromDatabase(ctx, key)
 case err != nil:
-    fmt.Println(&quot;Реальная ошибка сети/БД:&quot;, err)
+    // Сетевой таймаут, сбой десериализации или отказ сокета
+    return &quot;&quot;, fmt.Errorf(&quot;redis connection failure: %w&quot;, err)
 default:
-    fmt.Println(&quot;Значение из кэша:&quot;, val)
+    // Ключ найден в оперативной памяти
+    return val, nil
 }
 </code></pre>
 </div>
 
-<p>В тестах (особенно с моками) нужно обязательно проверять поведение при возврате <code>redis.Nil</code>.</p>
+<p>В ваших юнит- и интеграционных тестах поведение системы при возврате <code>redis.Nil</code> обязательно должно проверяться отдельным тест-кейсом!</p>
   </div>
 </div>
 
+<hr />
 <h3 id="testirovanie-atomarnosti-pipelines-i-lua">Тестирование атомарности (Pipelines и Lua)</h3>
 
-<p>Если ваш код обновляет несколько ключей в Redis, это должно быть атомарно. Иначе при конкурентной нагрузке возникнет состояние гонки (Race Condition). </p>
-<p>В Go это решается через Pipelining или Lua-скрипты. Ваши интеграционные тесты должны симулировать конкурентность, чтобы проверить правильность работы с Redis.</p>
+<p>Если сервису требуется обновить несколько связанных ключей или выполнить операцию «проверить и изменить» (Check-and-Set), наивная реализация на стороне приложения приводит к фатальным состояниям гонки (Race Conditions).</p>
+<p>Представим счетчик просмотров, в котором инженер сначала выполняет <code>GET</code>, затем инкрементирует число в Go-коде (<code>+1</code>), а затем отправляет результат через <code>SET</code>. При высокой нагрузке параллельные горутины будут читать одно и то же значение и перетирать данные друг друга (Lost Updates).</p>
+<p>Интеграционный тест обязан выявлять такие архитектурные просчеты за счет создания искусственной конкуренции:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2398,35 +2552,76 @@ default:
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func TestCounter_ConcurrentIncrement(t *testing.T) {
-    // Инициализация miniredis...
-    counter := stats.NewCounter(rdb)
+  <pre class="language-go"><code class="language-go">package stats_test
 
-    // Запускаем 100 горутин одновременно
+import (
+    &quot;context&quot;
+    &quot;sync&quot;
+    &quot;testing&quot;
+
+    &quot;github.com/alicebob/miniredis/v2&quot;
+    &quot;github.com/redis/go-redis/v9&quot;
+    &quot;github.com/stretchr/testify/require&quot;
+)
+
+type CounterService struct {
+    client *redis.Client
+}
+
+func NewCounterService(client *redis.Client) *CounterService {
+    return &amp;CounterService{client: client}
+}
+
+// Increment обязан использовать атомарную команду INCR на стороне Redis
+func (c *CounterService) Increment(ctx context.Context, key string) error {
+    // Правильная реализация: c.client.Incr(ctx, key).Err()
+    // Ошибочная реализация: GET -&gt; +1 в памяти Go -&gt; SET
+    return c.client.Incr(ctx, key).Err()
+}
+
+func TestCounter_ConcurrentIncrement(t *testing.T) {
+    t.Parallel()
+
+    mr, err := miniredis.Run()
+    require.NoError(t, err)
+    t.Cleanup(func() { mr.Close() })
+
+    rdb := redis.NewClient(&amp;redis.Options{Addr: mr.Addr()})
+    t.Cleanup(func() { _ = rdb.Close() })
+
+    counter := NewCounterService(rdb)
+
+    const totalGoroutines = 100
     var wg sync.WaitGroup
-    for i := 0; i &lt; 100; i++ {
-        wg.Add(1)
+    wg.Add(totalGoroutines)
+
+    // Запускаем 100 горутин, одновременно увеличивающих общий счетчик
+    for i := 0; i &lt; totalGoroutines; i++ {
         go func() {
             defer wg.Done()
-            // Внутри инкремент должен использовать INCR, а не GET+SET
+            // Внутри инкремент должен использовать INCR, а не связку GET+SET
             _ = counter.Increment(context.Background(), &quot;page_views&quot;)
         }()
     }
     wg.Wait()
 
-    val, _ := rdb.Get(context.Background(), &quot;page_views&quot;).Int()
-    require.Equal(t, 100, val, &quot;Должно быть ровно 100, без потерянных обновлений&quot;)
+    val, err := rdb.Get(context.Background(), &quot;page_views&quot;).Int()
+    require.NoError(t, err)
+    require.Equal(t, 100, val, &quot;Счетчик должен быть равен ровно 100; потерянные обновления недопустимы&quot;)
 }
 </code></pre>
 </div>
 
-<p>Если <code>counter.Increment</code> внутри себя делает неатомарный <code>GET</code>, затем <code>+1</code> в Go, и затем <code>SET</code>, этот тест гарантированно упадет, выявив серьезный архитектурный баг, который не поймал бы обычный Unit-тест.</p>
+<p>Если внутри <code>counter.Increment</code> разработчик допустит ошибку, реализовав неатомарный <code>GET</code> с последующим сложением <code>+1</code> и вызовом <code>SET</code>, тест с высокой вероятностью завершится падением, продемонстрировав итоговое значение 20 или 30 вместо ожидаемых 100.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Тестирование Redis в Go — это выбор между удобством и достоверностью:<br />
-1. <strong>Для 90% задач</strong> (CRUD кэша, простые счетчики) используйте <code>miniredis</code>. Это сверхбыстро, идиоматично и позволяет запускать тесты строго в <code>t.Parallel()</code>.<br />
-2. <strong>Для 10% хардкора</strong> (сложные Lua-скрипты, Redis Streams, Redlock) используйте <code>testcontainers-go</code> с глобальным запуском в <code>TestMain</code> и изоляцией через уникальные префиксы ключей.</p>
-<p>Закончив с базами данных и кэшами, мы переходим к самому сложному аспекту асинхронных микросервисов — потокам данных. В следующей статье мы разберем, как укротить брокеры сообщений и писать надежные тесты для Event-Driven архитектуры: <a href="7-testirovanie-kafka-i-ocheredey.html" class="wikilink">7. Тестирование Kafka и очередей</a>.</p>
+<p>Тестирование интеграций с Redis в экосистеме Go требует трезвого инженерного баланса между скоростью обратной связи и абсолютной реалистичностью окружения:</p>
+<ol>
+<li><strong>Для 90% задач повседневной разработки</strong> (кэширование DTO, валидация сессий, скользящие окна с TTL) безальтернативным лидером является <code>miniredis</code>. Он разворачивается за доли миллисекунды, не требует Docker, позволяет мгновенно манипулировать временем (<code>FastForward</code>) и обеспечивает честный <code>t.Parallel()</code> для всех тестов.</li>
+<li><strong>Для 10% специализированных сценариев</strong> (сложные транзакции с <code>WATCH</code>, скрипты Lua, структуры Redis Streams, модули RedisJSON) используйте связку <code>testcontainers-go</code> с глобальным жизненным циклом в <code>TestMain</code> и изоляцией на основе префиксов ключей. Команда <code>FLUSHALL</code> в многопоточном сьюте — абсолютное табу.</li>
+</ol>
+<p>Разобравшись с хранилищами состояния и кэшами, мы вплотную подходим к наиболее сложному и коварному элементу распределенных систем — шинам сообщений и асинхронным очередям. В следующей лекции мы детально разберем организацию тестирования брокеров событий: <a href="7-testirovanie-kafka-i-ocheredey.html" class="wikilink">7. Тестирование Kafka и очередей</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2454,7 +2649,7 @@ default:
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#spetsifika-in-memory-khranilishch">Специфика in-memory хранилищ</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-redis-i-go-redis">Под капотом: Redis и go-redis</a></li><li class="toc-item toc-h2"><a href="#strategiya-1-miniredis-ultimativnaya-skorost">Стратегия 1: miniredis (Ультимативная скорость)</a></li><li class="toc-item toc-h2"><a href="#strategiya-2-testcontainers-izolyatsiya-klyuchey">Стратегия 2: Testcontainers + Изоляция ключей</a></li><li class="toc-item toc-h2"><a href="#lovushki-pri-rabote-s-redis-v-go">Ловушки при работе с Redis в Go</a></li><li class="toc-item toc-h3"><a href="#testirovanie-atomarnosti-pipelines-i-lua">Тестирование атомарности (Pipelines и Lua)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#spetsifika-in-memory-khranilishch">Специфика in-memory хранилищ</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-redis-i-go-redis">Под капотом: Redis и go-redis</a></li><li class="toc-item toc-h2"><a href="#strategiya-1-miniredis-ultimativnaya-skorost">Стратегия 1: miniredis (Ультимативная скорость)</a></li><li class="toc-item toc-h3"><a href="#arkhitekturnye-dostoinstva-miniredis">Архитектурные достоинства miniredis:</a></li><li class="toc-item toc-h2"><a href="#strategiya-2-testcontainers-izolyatsiya-klyuchey">Стратегия 2: Testcontainers + Изоляция ключей</a></li><li class="toc-item toc-h2"><a href="#lovushki-pri-rabote-s-redis-v-go">Ловушки при работе с Redis в Go</a></li><li class="toc-item toc-h3"><a href="#oshibka-otsutstviya-klyucha-redis-nil">Ошибка отсутствия ключа: redis.Nil</a></li><li class="toc-item toc-h3"><a href="#testirovanie-atomarnosti-pipelines-i-lua">Тестирование атомарности (Pipelines и Lua)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

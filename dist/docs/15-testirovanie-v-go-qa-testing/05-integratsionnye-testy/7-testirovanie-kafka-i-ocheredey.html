@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Тестирование Kafka и очередей</h1>
@@ -2178,22 +2178,25 @@
           <div class="article-markdown">
             <h2 id="smena-paradigmy-ot-sinkhronnosti-k-sobytiyam">Смена парадигмы: от Синхронности к Событиям</h2>
 
-<p>В предыдущих статьях мы рассматривали классический синхронный мир: мы делаем запрос в БД или кэш, и поток выполнения (горутина) блокируется до получения ответа. Успех или ошибка известны немедленно. </p>
-<p>Тестирование Event-Driven архитектуры (EDA) с брокерами сообщений вроде Apache Kafka, RabbitMQ или NATS ломает этот подход. Когда ваш сервис публикует событие <code>UserCreated</code>, функция отправки возвращает <code>nil</code> (ошибок нет) буквально через пару миллисекунд. Но бизнес-транзакция на этом не завершена. Другой микросервис (или горутина) должен вычитать это событие, обработать его и, например, обновить статус в базе данных.</p>
-<p>Главный враг интеграционного тестирования очередей — <strong>Eventual Consistency (Согласованность в конечном счете)</strong> и время, необходимое на пересылку байтов через сеть, запись на диск и поллинг (polling) со стороны консьюмера.</p>
+<p>В предыдущих главах мы исследовали понятный синхронный мир: клиентская горутина отправляет сетевой запрос в PostgreSQL или Redis, приостанавливает свое выполнение в планировщике Go, а после получения ответа немедленно узнает вердикт — успешно записаны данные или произошла ошибка. Жизненный цикл операции строго детерминирован и привязан к конкретному контексту вызова.</p>
+<p>Однако переход к событийно-ориентированной архитектуре (Event-Driven Architecture, EDA) с брокерами сообщений вроде Apache Kafka, RabbitMQ или NATS разрушает привычные ментальные паттерны. </p>
+<p>Представьте типичный обработчик: сервис регистрирует пользователя и генерирует доменное событие <code>UserCreated</code>. Функция отправки продюсера завершает свою работу за пару миллисекунд и возвращает <code>nil</code>. Но значит ли это, что бизнес-процесс завершен? Отнюдь нет. Событие лишь упаковано в байтовый пакет и отправлено по сети. Чтобы бизнес-сценарий увенчался успехом, другой микросервис (или изолированный фоновый воркер) должен вычитать эти байты из брокера, распарсить полезную нагрузку, применить логику биллинга и сохранить результат в базе данных.</p>
+<p>Главный вызов интеграционного тестирования очередей и брокеров — <strong>согласованность в конечном счете (Eventual Consistency)</strong>. Между моментом отправки и моментом реальной материализации эффекта лежит непреодолимая дистанция: сетевые задержки, системные буферы ядра, дисковый ввод-вывод и конкурентный поллинг (polling) со стороны консьюмеров.</p>
+<hr />
 <h2 id="mechanical-sympathy-kafka-eto-ne-ochered">Mechanical Sympathy: Kafka — это не очередь</h2>
 
-<p>Чтобы писать надежные тесты, нужно понимать, как брокер работает с ОС и железом. </p>
-<p>Многие ошибочно переносят ментальную модель RabbitMQ (где сообщение удаляется из памяти после прочтения) на Kafka. Kafka — это <strong>распределенный Append-Only лог</strong>.</p>
+<p>Чтобы проектировать детерминированные тесты, инженер обязан понимать физическую модель хранилища, с которым работает.</p>
+<p>Распространенная ошибка разработчиков, пришедших из классического enterprise-стека — перенос ментальной модели брокеров очередей (вроде RabbitMQ) на Apache Kafka. В RabbitMQ сообщения хранятся в оперативной памяти как элементы связного списка или кольцевого буфера: как только консьюмер прочитал и подтвердил (ACK) сообщение, оно физически удаляется из очереди.</p>
+<p>Kafka устроена принципиально иначе. <strong>Kafka — это распределенный распределяемый лог с последовательной записью (Append-Only Commit Log).</strong> Брокер не удаляет прочитанные записи; он лишь последовательно дописывает новые байты в конец сегментных файлов на диске, а консьюмеры независимо передвигают собственные курсоры смещений (Offsets).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Zero-Copy и Page Cache</span>
   </div>
   <div class="callout-body">
-    <p>Когда ваш Go-продюсер отправляет батч сообщений в Kafka, брокер не хранит их в JVM heap. Он сбрасывает их прямо в системный кэш страниц Linux (Page Cache) и асинхронно пишет на диск. <br />
-Когда консьюмер запрашивает данные, Kafka использует системный вызов <code>sendfile</code>, который передает байты напрямую из Page Cache в сетевой сокет, минуя user-space приложения. <br />
-Для тестов это означает следующее: I/O операции в Kafka невероятно быстрые, но <strong>метаданные</strong> (создание топиков, выборы лидера партиции, ребалансировка консьюмер-групп) требуют синхронизации (через KRaft или Zookeeper) и занимают сотни миллисекунд, а иногда и секунды.</p>
+    <p>Когда ваш Go-продюсер публикует пачку записей, брокер Kafka не складирует их в динамической памяти Java (JVM Heap). Он записывает входящие байты напрямую в системный кэш страниц операционной системы Linux (<strong>Page Cache</strong>), после чего ядро ОС асинхронно сбрасывает грязные страницы на постоянный накопитель (SSD/NVMe).</p>
+<p>Когда консьюмер запрашивает очередную порцию данных (Fetch Request), брокер обращается к системному вызову <code>sendfile(2)</code>. Ядро Linux передает байты напрямую из Page Cache в сетевой сокет, минуя промежуточное копирование в адресное пространство процесса пользователя (Zero-Copy). Контроллер сетевой карты (NIC) забирает данные через прямой доступ к памяти (DMA).</p>
+<p>Что это означает для тестового стенда? Скорость передачи полезных данных в Kafka невероятно высока, однако <strong>операции с метаданными</strong> (создание топиков, выборы лидеров партиций, координация консьюмер-групп через KRaft) требуют согласования по протоколам распределенного консенсуса. На эти операции уходят сотни миллисекунд и даже секунды.</p>
   </div>
 </div>
 
@@ -2211,20 +2214,36 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Go Producer&lt;br&gt;Тест&quot;] --&gt;|&quot;TCP Send&lt;br&gt;Батч байтов&quot;| B[&quot;Kafka Broker&lt;br&gt;Network Thread&quot;]
-B --&gt;|&quot;Page Cache&quot;| C[&quot;RAM ОС&quot;]
-C -.-&gt;|&quot;Асинхронный&lt;br&gt;сброс&quot;| D[&quot;Диск сегмент .log&quot;]
+subgraph TestApp[&quot;Тестовый процесс Go&quot;]
+P[&quot;Go Producer (тест)&quot;]
+C[&quot;Go Consumer (тест)&quot;]
+end
 
-E[&quot;Go Consumer&lt;br&gt;Тест&quot;] --&gt;|&quot;Fetch Request&quot;| B
-C --&gt;|&quot;syscall sendfile&lt;br&gt;Прямое копирование&quot;| E
+subgraph LinuxKernel[&quot;Ядро Linux и Broker&quot;]
+SockIn[&quot;TCP сокет продюсера&quot;]
+SockOut[&quot;TCP сокет консьюмера&quot;]
+PC[&quot;Page Cache (RAM ядра)&quot;]
+Disk[(&quot;Диск: .log сегменты&quot;)]
+end
+
+P --&gt;|&quot;Батч байтов (write)&quot;| SockIn
+SockIn --&gt;|&quot;Запись в кэш&quot;| PC
+PC -.-&gt;|&quot;Асинхронный сброс&quot;| Disk
+
+C --&gt;|&quot;Fetch запрос&quot;| SockOut
+PC --&gt;|&quot;syscall sendfile (Zero-Copy)&quot;| SockOut
+SockOut --&gt;|&quot;Поток данных&quot;| C
   </pre>
 </div>
 
 
+<hr />
 <h2 id="infrastruktura-kafka-vs-redpanda-v-testcontainers">Инфраструктура: Kafka vs Redpanda в Testcontainers</h2>
 
-<p>Официальный образ Apache Kafka написан на Java/Scala. Поднятие JVM и оркестрация метаданных занимает от 5 до 15 секунд. Если вы запускаете тесты локально, это убивает весь Developer Experience.</p>
-<p>В мире Go стандартом де-факто для тестов стала <strong>Redpanda</strong> — брокер, написанный на C++ (Seastar framework), который на 100% совместим с API Kafka, но стартует за 1-2 секунды, так как не имеет JVM-оверхеда и Zookeeper. В пакете <code>testcontainers-go</code> есть готовые модули для обоих решений.</p>
+<p>Оригинальный брокер Apache Kafka исторически работает поверх виртуальной машины Java (JVM). Инициализация JVM, разогрев JIT-компилятора и стабилизация метаданных занимают от 8 до 20 секунд. Если в вашем CI-пайплайне или локальном сьюте тестов на каждый прогон тратится столько времени, инженер перестает запускать тесты локально.</p>
+<p>В современной экосистеме Go стандартом де-факто для интеграционного тестирования стала <strong>Redpanda</strong>. </p>
+<p>Redpanda — это брокер следующего поколения, полностью написанный на C++ поверх реактивного фреймворка Seastar с архитектурой thread-per-core. Он на 100% совместим с бинарным протоколом Kafka API, но полностью лишен JVM-оверхеда и внешних координаторов. Контейнер с Redpanda стартует за 1–2 секунды, потребляет считанные мегабайты памяти и идеально вписывается в инфраструктуру <code>testcontainers-go</code>.</p>
+<p>Пример создания вспомогательного метода (fixture) для поднятия брокера:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2239,42 +2258,45 @@ C --&gt;|&quot;syscall sendfile&lt;br&gt;Прямое копирование&quo
 import (
     &quot;context&quot;
     &quot;testing&quot;
-    &quot;time&quot;
 
-    &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
-    &quot;[github.com/testcontainers/testcontainers-go](https://github.com/testcontainers/testcontainers-go)&quot;
-    &quot;[github.com/testcontainers/testcontainers-go/modules/redpanda](https://github.com/testcontainers/testcontainers-go/modules/redpanda)&quot;
+    &quot;github.com/stretchr/testify/require&quot;
+    &quot;github.com/testcontainers/testcontainers-go&quot;
+    &quot;github.com/testcontainers/testcontainers-go/modules/redpanda&quot;
 )
 
-func setupKafka(t *testing.T) string {
+// setupRedpandaBroker поднимает легковесный контейнер Redpanda для тестов
+func setupRedpandaBroker(t *testing.T) string {
     t.Helper()
     ctx := context.Background()
 
-    // Используем Redpanda для молниеносного старта вместо тяжелой JVM Kafka
+    // Используем Redpanda вместо тяжеловесной JVM Kafka для мгновенного старта
     container, err := redpanda.RunContainer(ctx,
-        testcontainers.WithImage(&quot;[docker.redpanda.com/redpandadata/redpanda:v23.2.2](https://docker.redpanda.com/redpandadata/redpanda:v23.2.2)&quot;),
+        testcontainers.WithImage(&quot;docker.redpanda.com/redpandadata/redpanda:v23.2.2&quot;),
     )
-    require.NoError(t, err, &quot;не удалось поднять Redpanda/Kafka&quot;)
+    require.NoError(t, err, &quot;не удалось развернуть контейнер Redpanda/Kafka&quot;)
 
+    // Регистрируем обязательное завершение контейнера
     t.Cleanup(func() {
         if err := container.Terminate(ctx); err != nil {
-            t.Logf(&quot;Ошибка остановки брокера: %s&quot;, err)
+            t.Logf(&quot;Ошибка при остановке брокера: %v&quot;, err)
         }
     })
 
+    // Извлекаем адрес bootstrap-серверов для подключения Go-клиентов
     seedBrokers, err := container.KafkaSeedBroker(ctx)
-    require.NoError(t, err)
+    require.NoError(t, err, &quot;не удалось получить адреса брокеров Kafka&quot;)
 
     return seedBrokers
 }
 </code></pre>
 </div>
 
+<hr />
 <h2 id="tri-lovushki-asinkhronnogo-testirovaniya">Три ловушки асинхронного тестирования</h2>
 
 <h3 id="1-time-sleep-antipattern-nomer-odin">1. time.Sleep() — Антипаттерн номер один</h3>
 
-<p>Самый частый грех, который можно встретить в тестах Middle-разработчиков:</p>
+<p>Самая распространенная ошибка при переходе к асинхронным системам — использование фиксированных пауз:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2284,16 +2306,17 @@ func setupKafka(t *testing.T) string {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// НЕВЕРНО!
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: Хрупкий, ненадежный код
 producer.SendMessage(msg)
-time.Sleep(2 * time.Second) // &quot;Подождем, пока консьюмер обработает&quot;
+time.Sleep(2 * time.Second) // &quot;Надеемся, что за 2 секунды консьюмер всё сделает&quot;
 require.Equal(t, expected, db.GetResult())
 </code></pre>
 </div>
 
-<p>Это прямая дорога к <a href="../01-fundament/6-flaky-testy-i-ikh-prichiny.html" class="wikilink">6. Flaky тесты и их причины</a>. В CI-пайплайне (например, на перегруженных GitHub Actions) CPU может быть занят, I/O затормозит, и ваш консьюмер обработает сообщение за 2.1 секунды. Тест упадет. Если вы увеличите таймаут до 5 секунд — ваши тесты станут невыносимо медленными.</p>
-<p><strong>Правильный подход: Polling (Polling) или Синхронизация.</strong></p>
-<p>В Go идиоматично использовать паттерн <code>Eventually</code> (из библиотек вроде <code>testify/require</code> с плагинами или писать свой цикл):</p>
+<p>Это прямой путь к созданию мигающих проверок (<a href="../01-fundament/6-flaky-testy-i-ikh-prichiny.html" class="wikilink">6. Flaky тесты и их причины</a>). </p>
+<p>На локальном мощном ноутбуке двух секунд всегда хватает с избытком. Но как только тесты запускаются в нагруженном CI-раннере (где параллельно компилируются другие проекты и виртуализованные vCPU делят физические ядра), процессорная задержка или дисковый троттлинг приводят к тому, что консьюмер среагирует за 2.05 секунды. Тест аварийно завершится. Если же разработчик в попытке починить флапание увеличит задержку до 10 секунд, сьют превратится в мучительно медленное болото.</p>
+<p><strong>Идиоматичное решение: Асинхронный опрос (Polling) с предельным тайм-аутом (<code>Eventually</code>).</strong></p>
+<p>В библиотеке <code>testify/require</code> и смежных инструментах тестирование асинхронных условий строится через паттерн <code>Eventually</code>. Мы проверяем состояние с коротким интервалом (например, каждые 50–100 мс) вплоть до достижения дедлайна:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2303,48 +2326,75 @@ require.Equal(t, expected, db.GetResult())
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func Eventually(t *testing.T, timeout time.Duration, tick time.Duration, condition func() bool) {
+  <pre class="language-go"><code class="language-go">package testutils
+
+import (
+    &quot;testing&quot;
+    &quot;time&quot;
+)
+
+// Eventually опрашивает условие condition с интервалом tick вплоть до timeout
+func Eventually(t *testing.T, timeout time.Duration, tick time.Duration, condition func() bool) {
     t.Helper()
     deadline := time.Now().Add(timeout)
+
     for time.Now().Before(deadline) {
         if condition() {
-            return // Успех!
+            return // Условие выполнено, мгновенно продолжаем!
         }
         time.Sleep(tick)
     }
-    t.Fatalf(&quot;Условие не выполнилось за %v&quot;, timeout)
-}
 
-// Использование:
+    t.Fatalf(&quot;Условие не было удовлетворено за отведенный таймаут: %v&quot;, timeout)
+}
+</code></pre>
+</div>
+
+<p>В сценарии теста вызов выглядит лаконично и надежно:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Отправляем событие в брокер
 producer.SendMessage(msg)
+
+// Ожидаем материализации эффекта в базе данных
 Eventually(t, 5*time.Second, 100*time.Millisecond, func() bool {
-    return db.GetResult() == expected // Проверяем базу каждые 100мс
+    result, err := db.FindOrder(ctx, orderID)
+    return err == nil &amp;&amp; result.Status == &quot;PROCESSED&quot;
 })
 </code></pre>
 </div>
 
-<p>Этот код выполнится за 100мс при хорошем сценарии, но не упадет из-за скачков задержек сети, давая запас в 5 секунд.</p>
+<p>Если система работает быстро, тест пройдет всего за 80 миллисекунд. Если CI перегружен — тест терпеливо дождется завершения в пределах щедрых 5 секунд, сохранив стабильность пайплайна.</p>
+<hr />
 <h3 id="2-gonka-rebalansirovki-consumer-group-rebalance">2. Гонка ребалансировки (Consumer Group Rebalance)</h3>
 
-<p>Это самый сложный и неочевидный баг в интеграционных тестах Kafka.</p>
+<p>Вторая фундаментальная проблема кроется в протоколе координации групп консьюмеров Kafka.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha: Проклятие auto.offset.reset</span>
   </div>
   <div class="callout-body">
-    <p>По умолчанию консьюмеры стартуют с настройкой <code>auto.offset.reset = latest</code>.<br />
-1. Вы запускаете тест. Консьюмер стартует в фоне (горутина).<br />
-2. Тест мгновенно публикует сообщение в Kafka.<br />
-3. Консьюмер подключается к брокеру, но ему нужно пройти процесс <strong>JoinGroup</strong> и <strong>SyncGroup</strong> (получить партицию от Group Coordinator). Это занимает время (от 100мс до нескольких секунд).<br />
-4. Сообщение уже в логе. Консьюмер наконец-то получает партицию, смотрит на политику <code>latest</code> и начинает читать лог <em>с конца</em>.<br />
-5. <strong>Сообщение проигнорировано.</strong> Тест висит по таймауту.</p>
+    <p>Большинство клиентских конфигураций по умолчанию выставляют параметр <code>auto.offset.reset = latest</code>.</p>
+<p>Разберем хронику катастрофы:<br />
+1. Тест поднимает консьюмер в отдельной горутине.<br />
+2. Сразу на следующей строке тест публикует проверочное событие в топик.<br />
+3. В это же время клиентский драйвер консьюмера только начинает сетевой диалог с Group Coordinator: фазы <code>FindCoordinator</code>, <code>JoinGroup</code>, <code>SyncGroup</code> и согласование распределения партиций (Partition Assignment). Этот процесс занимает от 200 миллисекунд до нескольких секунд.<br />
+4. Тестовое сообщение уже лежит в партиции брокера!<br />
+5. Консьюмер наконец-то завершает ребалансировку, видит политику <code>latest</code> и выставляет свой указатель смещения на <em>текущий конец лога</em> — <strong>пропуская только что опубликованное сообщение</strong>.<br />
+6. В итоге консьюмер зависает в ожидании новых событий, а тест падает по таймауту.</p>
   </div>
 </div>
 
-<p><strong>Решение (Idiomatic Go):</strong><br />
-При использовании популярных драйверов (например, <code>IBM/sarama</code>) мы должны передать сигнал в тест, что консьюмер физически получил партиции и готов к чтению, и <strong>только после этого</strong> отправлять тестовое сообщение.</p>
-<p>В <code>sarama.ConsumerGroupHandler</code> есть метод <code>Setup</code>:</p>
+<p><strong>Идиоматичное решение в Go: Явная синхронизация готовности через каналы.</strong></p>
+<p>Работая с драйвером <code>IBM/sarama</code> (или аналогичными клиентами), необходимо перехватывать жизненный цикл назначения партиций. Интерфейс <code>sarama.ConsumerGroupHandler</code> содержит callback-метод <code>Setup</code>, который гарантированно вызывается брокером в тот момент, когда ребалансировка завершена и воркеру физически назначены конкретные разделы топика:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2354,21 +2404,52 @@ Eventually(t, 5*time.Second, 100*time.Millisecond, func() bool {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type TestConsumerHandler struct {
-    Ready chan struct{} // Канал для синхронизации
+  <pre class="language-go"><code class="language-go">package kafka_test
+
+import (
+    &quot;sync&quot;
+
+    &quot;github.com/IBM/sarama&quot;
+)
+
+// ConsumerReadyHandler информирует тест о завершении ребалансировки
+type ConsumerReadyHandler struct {
+    ready     chan struct{}
+    once      sync.Once
+    processed chan *sarama.ConsumerMessage
 }
 
-// Setup вызывается, когда партиции назначены
-func (h *TestConsumerHandler) Setup(sarama.ConsumerGroupSession) error {
-    close(h.Ready) // Сигнализируем тесту, что мы готовы!
+func NewConsumerReadyHandler() *ConsumerReadyHandler {
+    return &amp;ConsumerReadyHandler{
+        ready:     make(chan struct{}),
+        processed: make(chan *sarama.ConsumerMessage, 100),
+    }
+}
+
+// Setup вызывается ядром Sarama, когда консьюмеру выделены партиции
+func (h *ConsumerReadyHandler) Setup(sarama.ConsumerGroupSession) error {
+    h.once.Do(func() {
+        // Безопасно закрываем канал, сигнализируя: мы готовы читать сообщения!
+        close(h.ready)
+    })
     return nil
 }
 
-// ... ConsumeClaim и Cleanup
+func (h *ConsumerReadyHandler) Cleanup(sarama.ConsumerGroupSession) error {
+    return nil
+}
+
+func (h *ConsumerReadyHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+    for msg := range claim.Messages() {
+        h.processed &lt;- msg
+        session.MarkMessage(msg, &quot;&quot;)
+    }
+    return nil
+}
 </code></pre>
 </div>
 
-<p>А в самом тесте:</p>
+<p>В самом тесте отправка сообщений откладывается до подтверждения готовности консьюмера:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2378,42 +2459,61 @@ func (h *TestConsumerHandler) Setup(sarama.ConsumerGroupSession) error {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">handler := &amp;TestConsumerHandler{Ready: make(chan struct{})}
-go consumerGroup.Consume(ctx, []string{&quot;events&quot;}, handler)
+  <pre class="language-go"><code class="language-go">handler := NewConsumerReadyHandler()
 
-// Блокируемся, пока консьюмер не скажет, что он готов читать
-&lt;-handler.Ready 
+// Запускаем вычитку топика в фоновой горутине
+go func() {
+    _ = consumerGroup.Consume(ctx, []string{&quot;orders&quot;}, handler)
+}()
 
-// ТЕПЕРЬ безопасно отправлять сообщение!
-producer.SendMessage(msg)
+// БЛОКИРУЕМСЯ до тех пор, пока консьюмер не пройдет ребалансировку!
+&lt;-handler.ready
+
+// ТЕПЕРЬ и только теперь безопасно публиковать тестовые данные
+err := producer.SendMessage(&quot;orders&quot;, testPayload)
+require.NoError(t, err)
 </code></pre>
 </div>
 
+<hr />
 <h3 id="3-izolyatsiya-dannykh-v-parallelnykh-testakh">3. Изоляция данных в параллельных тестах</h3>
 
-<p>Как и с базами данных (разобранными в <a href="3-tranzaktsii-i-rollback-podkhod.html" class="wikilink">3. Транзакции и rollback подход</a>), мы хотим запускать тесты очередей параллельно через <code>t.Parallel()</code>. </p>
-<p>Но в Kafka нет транзакций с <code>ROLLBACK</code> для изоляции тестов. Если 10 тестов шлют сообщения в один топик <code>orders</code>, консьюмер первого теста может вычитать сообщение второго теста.</p>
-<p><strong>Стратегии изоляции:</strong><br />
-1. <strong>Уникальные топики:</strong> Каждый <code>t.Run</code> генерирует уникальное имя топика (например, <code>orders_test_uuid</code>). Консьюмер настраивается только на него. Это идеальная изоляция, но требует поддержки со стороны бизнес-логики (возможности динамически прокидывать имена топиков).<br />
-2. <strong>Уникальные ключи (Partition Keys) и фильтрация:</strong> Все тесты пишут в один топик, но каждый тест генерирует уникальный ID сущности (например, <code>OrderID</code>). В коде теста мы вычитываем сообщения и игнорируем те, у которых <code>OrderID</code> не совпадает с ожидаемым.</p>
+<p>Как и при работе с реляционными базами данных (рассмотренными в <a href="3-tranzaktsii-i-rollback-podkhod.html" class="wikilink">3. Транзакции и rollback подход</a>), мы стремимся запускать наши интеграционные сьюты с включенным флагом <code>t.Parallel()</code>.</p>
+<p>Однако в архитектуре лога Kafka транзакционный откат <code>ROLLBACK</code> отсутствует как класс. Если десять параллельных тестов будут отправлять сообщения в один общий топик <code>orders</code>, то консьюмер первого теста перехватит сообщение второго, нарушая предсказуемость вычислений.</p>
+<p>Для обеспечения надежной изоляции применяются две стратегии:</p>
+<ol>
+<li><strong>Динамические топики на каждый сценарий:</strong><br />
+   Каждый запуск функции <code>t.Run</code> генерирует собственное уникальное имя топика (например, <code>orders_test_uuid</code>). Консьюмер и продюсер настраиваются строго на этот изолированный канал. Это гарантирует 100% изоляцию, но требует, чтобы ваши сервисы поддерживали конфигурирование имен топиков через аргументы или переменные окружения.</li>
+<li><strong>Маршрутизация по ключам и корреляция по сущностям:</strong><br />
+   Все тесты пишут в единый топик <code>orders</code>, но каждое сообщение снабжается уникальным идентификатором бизнес-сущности — например, сгенерированным UUID для <code>OrderID</code>. В теле теста консьюмер фильтрует поток событий, игнорируя чужие заказы и реагируя исключительно на свой собственный <code>OrderID</code>.</li>
+</ol>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Стоит ли писать моки для Kafka (интерфейсы <code>Producer</code> / <code>Consumer</code>) вместо использования Testcontainers?<br />
-<strong>Ответ:</strong> Для Unit-тестов бизнес-логики (которая просто формирует структуру и отдает в интерфейс) — да. Для интеграционных тестов — категорически <strong>нет</strong>. Моки никогда не воспроизведут реальное поведение брокера: обрывы сети, Poison Pills (невалидные байты, ломающие десериализацию и останавливающие партицию), ребалансировку групп и коммиты оффсетов. Интеграционный тест должен проверять именно то, как ваш код интегрируется с драйвером и сетью.</p>
+    <p><strong>Вопрос:</strong> Имеет ли смысл мокать интерфейсы брокера (<code>Producer</code> / <code>Consumer</code>) в интеграционных тестах, чтобы не поднимать Redpanda/Kafka?</p>
+<p><strong>Ответ:</strong> Для быстрых юнит-тестов бизнес-логики (например, чтобы проверить, что сервис сериализует структуру в корректный JSON и передает в абстрактный интерфейс <code>Producer</code>) использование моков абсолютно оправдано. </p>
+<p>Однако называть такие тесты <strong>интеграционными — грубая ошибка</strong>. Никакой мок в памяти не воспроизведет поведение реального брокера:<br />
+- Специфику десериализации «отравленных сообщений» (Poison Pills), способных намертво заблокировать партицию.<br />
+- Поведение при ребалансировке консьюмер-группы и потере heartbeat-пакетов.<br />
+- Семантику доставки: At-Least-Once дублирование сообщений при сетевых сбоях и необходимость идемпотентной обработки.</p>
+<p>Настоящий интеграционный тест обязан взаимодействовать с реальным бинарным протоколом через контейнер.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Тестирование Event-Driven систем требует смещения фокуса с "вызвал-получил" на "отправил-дождался состояния". <br />
-1. Используйте <code>Redpanda</code> в <code>testcontainers-go</code> для быстрого старта.<br />
-2. Никогда не используйте жесткие <code>time.Sleep</code>, применяйте асинхронный поллинг (<code>Eventually</code>).<br />
-3. Явно синхронизируйте старт консьюмеров (через <code>Setup</code> хуки и каналы), чтобы избежать гонки ребалансировки.</p>
-<p>Разобравшись с базами данных, кэшами и асинхронными очередями, мы покрыли весь спектр внутренних коммуникаций бэкенда. Пришло время выйти наружу — туда, где с нашим сервисом взаимодействуют реальные клиенты и другие микросервисы. В следующем разделе мы погрузимся в то, как правильно тестировать контракты и ручки API: <a href="8-http-integration-testy.html" class="wikilink">8. HTTP integration тесты</a>.</p>
+<p>Тестирование событийно-ориентированных систем кардинально меняет подход к проверкам: синхронная парадигма «вызвал функцию — проверил результат» уступает место асинхронному принципу «отправил команду — дождался стабилизации распределенного состояния».</p>
+<ol>
+<li>Для локальной разработки и быстрых CI-пайплайнов используйте образы <code>Redpanda</code> в <code>testcontainers-go</code>. Это сократит время ожидания брокера с десятков секунд до полутора секунд.</li>
+<li>Категорически откажитесь от фиксированных пауз <code>time.Sleep()</code>. Асинхронные проверки должны строиться через гибкий поллинг с предельным таймаутом (<code>Eventually</code>).</li>
+<li>Всегда учитывайте лаг ребалансировки консьюмер-групп. Синхронизируйте старт публикации событий через хук <code>Setup</code> интерфейса <code>sarama.ConsumerGroupHandler</code>.</li>
+<li>Изолируйте конкурентные запуски в <code>t.Parallel()</code>, используя динамические имена топиков (<code>orders_test_uuid</code>) или фильтрацию по уникальным ключам сущностей (<code>OrderID</code>).</li>
+</ol>
+<p>Освоив базы данных, кэширующие прослойки и асинхронные шины сообщений, мы завершили рассмотрение внутренней кухни бэкенда. Теперь настало время перейти к точке входа в наше приложение — сетевым фасадам и транспортным протоколам. В следующей главе мы разберем проектирование надежных и быстрых сетевых интеграционных проверок: <a href="8-http-integration-testy.html" class="wikilink">8. HTTP integration тесты</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

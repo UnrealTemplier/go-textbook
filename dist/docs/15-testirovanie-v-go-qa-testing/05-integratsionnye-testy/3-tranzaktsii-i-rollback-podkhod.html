@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Транзакции и rollback подход</h1>
@@ -2178,27 +2178,33 @@
           <div class="article-markdown">
             <h2 id="illyuziya-sterilnosti-pochemu-ochistka-bazy-rabotaet-plokho">Иллюзия стерильности: почему очистка базы работает плохо</h2>
 
-<p>В прошлой статье мы столкнулись с фундаментальной проблемой: очистка таблиц через <code>TRUNCATE</code> или <code>DELETE</code> не позволяет использовать <code>t.Parallel()</code>, превращая прогон тестов в медленное, последовательное "бутылочное горлышко". Создание уникальных схем под каждый тест решает проблему параллелизма, но невероятно нагружает диск и CPU на этапе выполнения миграций.</p>
-<p>В enterprise-разработке на Go золотым стандартом для тестирования уровня доступа к данным (Repository Layer) стал <strong>транзакционный подход (Rollback подход)</strong>.</p>
-<p>Суть метода элегантна и проста: перед началом теста мы открываем транзакцию (<code>BEGIN</code>), передаем объект транзакции в тестируемый код вместо пула соединений, выполняем бизнес-логику, проверяем результаты в базе, а в конце теста — отменяем изменения через <code>ROLLBACK</code>.</p>
+<p>В предыдущей главе <a href="2-rabota-s-bazoy-dannykh-v-testakh.html" class="wikilink">2. Работа с базой данных в тестах</a> мы столкнулись с суровой реальностью: прямолинейная очистка таблиц через <code>TRUNCATE</code> или <code>DELETE</code> накладывает фатальные ограничения на производительность. Команда <code>TRUNCATE</code> блокирует всю таблицу целиком, делая невозможным запуск тестов через <code>t.Parallel()</code>. Создание же уникальных баз данных под каждый сценарий великолепно изолирует данные, но сжигает драгоценные процессорные циклы и ресурсы диска на этапе многократного прогона DDL-миграций.</p>
+<p>В высоконагруженной enterprise-разработке на Go золотым стандартом для тестирования уровня доступа к данным (Repository Layer) стал <strong>транзакционный подход (Rollback подход)</strong>.</p>
+<p>Его архитектурная идея подкупает изяществом:<br />
+1. Перед началом каждого теста мы стартуем изолированную транзакцию (<code>BEGIN</code>).<br />
+2. Вместо глобального пула соединений мы передаем объект активной транзакции внутрь тестируемого репозитория.<br />
+3. Код исполняет запросы и проверяет состояние строк в рамках этой же транзакции.<br />
+4. В блоке завершения теста мы принудительно вызываем <code>ROLLBACK</code>.</p>
+<p>База данных возвращается в исходное состояние мгновенно, не оставив на диске ни единого следа.</p>
+<hr />
 <h2 id="mechanical-sympathy-kak-baza-proshchaet-nam-oshibki">Mechanical Sympathy: Как база прощает нам ошибки</h2>
 
-<p>Чтобы понять, почему <code>ROLLBACK</code> работает на порядки быстрее <code>TRUNCATE</code>, нужно спуститься на уровень движка базы данных (на примере PostgreSQL).</p>
+<p>Чтобы в полной мере оценить, почему откат транзакции <code>ROLLBACK</code> работает на два порядка быстрее операции <code>TRUNCATE</code>, необходимо заглянуть под капот ядра реляционной СУБД (на примере PostgreSQL).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: MVCC и WAL</span>
   </div>
   <div class="callout-body">
-    <p>Когда вы выполняете <code>INSERT</code> или <code>UPDATE</code> внутри транзакции, PostgreSQL не записывает данные сразу в основные файлы таблиц на диске (Heap). <br />
-1. Сначала изменения пишутся в <strong>WAL (Write-Ahead Log)</strong> — журнал предзаписи. Это строго последовательная запись на диск (Sequential I/O), которая работает очень быстро.<br />
-2. Сами строки (tuples) помещаются в оперативную память (Shared Buffers). <br />
-3. Благодаря механизму <strong>MVCC (Multi-Version Concurrency Control)</strong>, эти новые строки помечаются системным полем <code>xmin</code> (ID текущей транзакции). Для всех остальных конкурентных транзакций (других параллельных тестов) этих строк просто не существует, так как они не зафиксированы (<code>COMMIT</code>).</p>
-<p>Когда тест завершается и вы делаете <code>ROLLBACK</code>, база просто помечает эту транзакцию как отмененную. Страницы памяти помечаются как "грязные" (dirty), а сборщик мусора (Autovacuum) позже незаметно вычистит эти "мертвые" строки. Никаких дорогостоящих эксклюзивных блокировок уровня таблиц (<code>ACCESS EXCLUSIVE</code>), как при <code>TRUNCATE</code>, не происходит.</p>
+    <p>Когда вы выполняете модификацию данных через <code>INSERT</code> или <code>UPDATE</code> внутри активной транзакции, PostgreSQL не производит немедленной записи в основные файлы таблиц на диске (Heap):<br />
+1. <strong>Последовательный лог WAL:</strong> Сначала дельта изменений фиксируется в <strong>WAL (Write-Ahead Log)</strong> — журнале предзаписи. Это строго последовательная запись на диск (Sequential I/O), отличающаяся предельной скоростью.<br />
+2. <strong>Буферный пул в памяти:</strong> Модифицированные страницы данных (tuples) оседают в оперативной памяти сервера (Shared Buffers).<br />
+3. <strong>Многоверсионность (MVCC):</strong> Механизм <strong>Multi-Version Concurrency Control</strong> помечает созданные версии строк системным полем <code>xmin</code> (идентификатор текущей транзакции). Для любых других параллельно выполняющихся транзакций (то есть других тестов в соседних горутинах) эти строки физически невидимы, поскольку транзакция еще не зафиксирована через <code>COMMIT</code>.</p>
+<p>Когда тестовый сценарий завершается и вызывается <code>ROLLBACK</code>, сервер СУБД не тратит ресурсы на поштучное стирание строк. Он лишь выставляет битовый флаг отмены транзакции в журнале статусов (<code>pg_xact</code>). Память объявляется свободной, а фоновый процесс Autovacuum позже утилизирует «мертвые» строки. Никаких тяжелых табличных блокировок уровня <code>ACCESS EXCLUSIVE</code> не возникает.</p>
   </div>
 </div>
 
-<p>Это означает, что сотни тестов могут одновременно писать в одну и ту же таблицу <code>users</code>, не мешая друг другу. MVCC обеспечивает полную изоляцию, а отсутствие фиксации на диске сохраняет высочайшую производительность.</p>
+<p>Благодаря механике MVCC сотни параллельных тестов могут одновременно вставлять, изменять и читать записи в одной и той же таблице <code>users</code>, оставаясь в полной взаимной изоляции!</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2213,30 +2219,31 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant TestA as Тест A
-participant TestB as Тест B
-participant DB as PostgreSQL
+participant TestA as Тест A (горутина 1)
+participant TestB as Тест B (горутина 2)
+participant DB as PostgreSQL (Shared Buffers)
 
-TestA-&gt;&gt;DB: BEGIN
-TestB-&gt;&gt;DB: BEGIN
-Note over DB: Созданы изолированные&lt;br&gt;снимки данных
-TestA-&gt;&gt;DB: INSERT INTO users
-TestB-&gt;&gt;DB: SELECT count FROM users
-Note over DB: Тест B не видит&lt;br&gt;данные Теста A
-TestA-&gt;&gt;DB: ROLLBACK
-TestB-&gt;&gt;DB: ROLLBACK
-Note over DB: Изменения отброшены&lt;br&gt;БД осталась чистой
+TestA-&gt;&gt;DB: BEGIN (xmin = 101)
+TestB-&gt;&gt;DB: BEGIN (xmin = 102)
+Note over DB: Созданы изолированные снимки MVCC
+TestA-&gt;&gt;DB: INSERT INTO users (Name: &quot;Gopher&quot;)
+TestB-&gt;&gt;DB: SELECT count(*) FROM users
+Note over DB: Тест B не видит данные Теста A (xmin 101 не зафиксирован)
+TestA-&gt;&gt;DB: ROLLBACK (отмена xmin 101)
+TestB-&gt;&gt;DB: ROLLBACK (отмена xmin 102)
+Note over DB: Память чиста, 0 блокировок ACCESS EXCLUSIVE
   </pre>
 </div>
 
 
+<hr />
 <h2 id="arkhitektura-koda-dlya-tranzaktsionnykh-testov">Архитектура кода для транзакционных тестов</h2>
 
-<p>Чтобы этот подход сработал, наш код должен быть спроектирован с учетом <a href="../01-fundament/8-dependency-injection-dlya-testiruemosti.html" class="wikilink">8. Dependency injection для тестируемости</a>. Главная сложность: стандартный <code>*sql.DB</code> (пул соединений) и <code>*sql.Tx</code> (конкретная транзакция) — это разные типы.</p>
-<p>Если ваш репозиторий жестко завязан на <code>*sql.DB</code>, вы не сможете передать ему транзакцию в тесте.</p>
+<p>Чтобы реализовать этот подход на практике, архитектура сервиса обязана соответствовать принципам внедрения зависимостей, о которых мы говорили в главе <a href="../01-fundament/8-dependency-injection-dlya-testiruemosti.html" class="wikilink">8. Dependency injection для тестируемости</a>.</p>
+<p>Однако здесь разработчиков подстерегает классическая проблема строгой типизации Go: типы <code>*sql.DB</code> (пул соединений) и <code>*sql.Tx</code> (одиночная транзакция) в пакете <code>database/sql</code> — это абсолютно разные, несовместимые структуры данных. Если конструктор вашего репозитория жестко требует указатель <code>*sql.DB</code>, передать в него транзакцию <code>*sql.Tx</code> в тесте не удастся без дублирования методов.</p>
 <h3 id="reshenie-interfeys-dbtx">Решение: Интерфейс DBTX</h3>
 
-<p>В идиоматичном Go эту проблему решают через абстракцию (именно так работает популярный генератор <code>sqlc</code>). Мы объявляем интерфейс <code>DBTX</code>, который описывает методы, общие как для пула соединений, так и для транзакции.</p>
+<p>В идиоматичном Go эта проблема элегантно разрешается через выделение минимального интерфейса абстракции выполнения запросов (этот паттерн положен в основу архитектуры популярного генератора кода <code>sqlc</code>):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2253,7 +2260,7 @@ import (
     &quot;database/sql&quot;
 )
 
-// DBTX описывает методы, доступные и в *sql.DB, и в *sql.Tx
+// DBTX декларирует базовый контракт, общий как для *sql.DB, так и для *sql.Tx
 type DBTX interface {
     ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
     QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -2264,11 +2271,12 @@ type UserRepo struct {
     db DBTX
 }
 
+// Конструктор принимает универсальный интерфейс DBTX
 func NewUserRepo(db DBTX) *UserRepo {
     return &amp;UserRepo{db: db}
 }
 
-// Пример метода бизнес-логики
+// Рабочий метод репозитория
 func (r *UserRepo) Create(ctx context.Context, name string) error {
     _, err := r.db.ExecContext(ctx, &quot;INSERT INTO users (name) VALUES ($1)&quot;, name)
     return err
@@ -2276,9 +2284,10 @@ func (r *UserRepo) Create(ctx context.Context, name string) error {
 </code></pre>
 </div>
 
+<p>В рабочей среде приложение передает в репозиторий глобальный пул соединений <code>*sql.DB</code>. А в интеграционном тесте мы без единой правки передаем свежесозданную транзакцию <code>*sql.Tx</code>!</p>
 <h3 id="idiomatichnyy-test-s-rollback">Идиоматичный тест с rollback</h3>
 
-<p>Теперь в тестах мы можем легко стартовать транзакцию и передать её в репозиторий. Используем <code>t.Cleanup</code> для гарантированного отката.</p>
+<p>Соберем эталонный сценарий тестирования с автоматической регистрацией отката через <code>t.Cleanup</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2294,35 +2303,36 @@ import (
     &quot;context&quot;
     &quot;testing&quot;
 
-    &quot;[github.com/stretchr/testify/require](https://github.com/stretchr/testify/require)&quot;
+    &quot;github.com/stretchr/testify/require&quot;
     &quot;yourproject/internal/repository&quot;
 )
 
 func TestUserRepository_Create(t *testing.T) {
-    t.Parallel() // Теперь мы можем безопасно запускать тесты параллельно!
+    // Теперь мы можем смело и безопасно запускать тесты в параллель!
+    t.Parallel()
 
     ctx := context.Background()
-    db := getTestDB(t) // Функция инициализации из предыдущей статьи
+    db := getTestDB(t) // Инициализация пула соединений
 
-    // 1. Начинаем транзакцию специально для этого теста
+    // 1. Открываем изолированную транзакцию под текущий тест
     tx, err := db.BeginTx(ctx, nil)
     require.NoError(t, err, &quot;не удалось стартовать транзакцию&quot;)
 
-    // 2. Гарантируем откат в конце теста
+    // 2. Гарантируем обязательный откат после завершения сценария
     t.Cleanup(func() {
-        // Rollback вернет ошибку sql.ErrTxDone, если транзакция 
-        // уже была закрыта, это нормальное поведение.
-        _ = tx.Rollback() 
+        // Ошибка sql.ErrTxDone игнорируется, если транзакция
+        // была закрыта внутри теста, что является корректным поведением
+        _ = tx.Rollback()
     })
 
-    // 3. Подменяем пул соединений на нашу транзакцию
+    // 3. Внедряем транзакцию вместо глобального пула
     repo := repository.NewUserRepo(tx)
 
-    // Act
+    // Act: выполняем доменную операцию
     err = repo.Create(ctx, &quot;Gopher&quot;)
     require.NoError(t, err)
 
-    // Assert
+    // Assert: проверяем появление строки внутри нашей же транзакции
     var count int
     err = tx.QueryRowContext(ctx, &quot;SELECT count(*) FROM users WHERE name = $1&quot;, &quot;Gopher&quot;).Scan(&amp;count)
     require.NoError(t, err)
@@ -2337,15 +2347,17 @@ func TestUserRepository_Create(t *testing.T) {
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдет "под капотом" рантайма Go, когда мы вызовем <code>db.BeginTx()</code>?<br />
-<strong>Ответ:</strong> Пакет <code>database/sql</code> захватит <code>sync.Mutex</code> пула, извлечет одно свободное сетевое соединение (<code>*driverConn</code>) и <strong>жестко привяжет</strong> его к объекту <code>*sql.Tx</code>. Пока не будет вызван <code>Rollback()</code> или <code>Commit()</code>, это соединение недоступно для других горутин. Если вы забудете вызвать завершение транзакции в тесте, соединение "утечет" (leak), и пул рано или поздно исчерпает лимит (<code>MaxOpenConns</code>), что приведет к зависанию (Deadlock) следующих тестов. Именно поэтому <code>t.Cleanup()</code> критически важен.</p>
+    <p><strong>Вопрос:</strong> Что физически происходит в пуле соединений <code>database/sql</code> при вызове <code>db.BeginTx()</code>?<br />
+<strong>Ответ:</strong> Рантайм пакета <code>database/sql</code> захватывает внутренний мьютекс <code>sync.Mutex</code>, извлекает из пула одно свободное сетевое TCP-соединение (<code>*driverConn</code>) и <strong>монопольно закрепляет</strong> его за объектом транзакции <code>*sql.Tx</code>.<br />
+До тех пор пока на этой транзакции не будут явно вызваны методы <code>Rollback()</code> или <code>Commit()</code>, это физическое соединение остается заблокированным и недоступным для других горутин. Если инженер забудет завершить транзакцию, соединение безвозвратно «утечет» (Connection Leak). При параллельном прогоне тестов лимит соединений <code>MaxOpenConns</code> быстро исчерпается, что вызовет взаимную блокировку (Deadlock) и зависание всего тестового сьюта. Именно поэтому регистрация <code>Rollback</code> внутри <code>t.Cleanup()</code> является критически важной гарантией стабильности.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="lovushka-vlozhennye-tranzaktsii-nested-transactions">Ловушка: Вложенные транзакции (Nested Transactions)</h2>
 
-<p>Подход с Rollback идеален для тестирования атомарных запросов репозитория. Но он ломается, если мы поднимаемся на слой выше (Usecase / Service) и хотим протестировать бизнес-логику, которая <strong>сама управляет транзакциями</strong>.</p>
-<p>Представьте сервис, который переводит деньги и делает это внутри своей транзакции:</p>
+<p>Паттерн Rollback безупречен для атомарных операций уровня репозитория. Однако архитектурная сложность резко возрастает, когда мы поднимаемся на уровень бизнес-логики (Usecase / Application Service) и пытаемся протестировать метод, который <strong>сам управляет собственными транзакциями</strong>.</p>
+<p>Рассмотрим классический сервис денежных переводов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2357,7 +2369,13 @@ func TestUserRepository_Create(t *testing.T) {
   </div>
   <pre class="language-go"><code class="language-go">func (s *TransferService) Transfer(ctx context.Context, from, to int, amount float64) error {
     tx, err := s.db.BeginTx(ctx, nil)
-    // ... логика снятия и зачисления
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+
+    // ... бизнес-логика списания и начисления ...
+
     return tx.Commit()
 }
 </code></pre>
@@ -2369,21 +2387,28 @@ func TestUserRepository_Create(t *testing.T) {
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Если вы обернете вызов этого сервиса в "тестовую транзакцию", вы столкнетесь с тем, что стандартный PostgreSQL <strong>не поддерживает вложенные транзакции</strong> (<code>BEGIN</code> внутри <code>BEGIN</code> вызовет ошибку <code>WARNING: there is already a transaction in progress</code>).</p>
-<p>Более того, если код сервиса вызовет <code>tx.Commit()</code>, он зафиксирует изменения в реальной БД, нарушив изоляцию, а ваш тестовый <code>ROLLBACK</code> в <code>t.Cleanup</code> упадет с <code>sql.ErrTxDone</code>.</p>
+    <p>Если вы попытаетесь обернуть вызов сервиса <code>Transfer</code> в тестовую транзакцию, вы столкнетесь с фундаментальным ограничением: СУБД PostgreSQL <strong>не поддерживает вложенные транзакции на уровне протокола SQL</strong>. Попытка выполнить инструкцию <code>BEGIN</code> внутри уже открытого блока вызовет предупреждение <code>WARNING: there is already a transaction in progress</code>.  </p>
+<p>Хуже того: когда внутренний код сервиса выполнит вызов <code>tx.Commit()</code>, он физически зафиксирует изменения в общей базе данных на диске, нарушив изоляцию соседних тестов, а последующий тестовый <code>ROLLBACK</code> в блоке <code>t.Cleanup</code> завершится ошибкой <code>sql.ErrTxDone</code>.</p>
   </div>
 </div>
 
-<p><strong>Как решать эту архитектурную проблему в Go?</strong></p>
-<p>Есть два пути для Senior-разработчиков:</p>
+<p><strong>Инженерные стратегии решения проблемы:</strong></p>
 <ol>
-<li><strong>Использование SAVEPOINT:</strong> Вы можете написать кастомный драйвер или обертку над <code>database/sql</code>, которая перехватывает вызов <code>BeginTx</code> внутри активной "тестовой" транзакции и вместо реального <code>BEGIN</code> выполняет SQL-команду <code>SAVEPOINT sub_tx</code>. Вызов <code>Rollback</code> внутри кода транслируется в <code>ROLLBACK TO SAVEPOINT sub_tx</code>. Это сложно, требует глубокого знания SQL и может конфликтовать со сторонними библиотеками.</li>
-<li><strong>Отказ от Rollback для сложных сценариев E2E:</strong> Интеграционные тесты слоя репозитория тестируются через Rollback (быстро, сотни в секунду). А тесты комплексных сервисных слоев, где явно стартуют транзакции, выделяются в отдельный пакет (например, <code>test/integration</code>). Для таких тестов используется изоляция на уровне схемы базы данных или применяется <code>TRUNCATE</code> (с отключением <code>t.Parallel()</code>), о чем мы говорили в прошлой статье.</li>
+<li><strong>Точки сохранения (SAVEPOINT):</strong> Вы можете сконструировать специализированную обертку над интерфейсом <code>DBTX</code>, которая перехватывает внутренние вызовы <code>BeginTx</code> и транслирует их в SQL-команду точки сохранения: <code>SAVEPOINT sub_tx</code>. Вложенный откат при этом транслируется в инструкцию <code>ROLLBACK TO SAVEPOINT sub_tx</code>. Это мощный прием, однако он требует нетривиальной реализации и аккуратной синхронизации.</li>
+<li><strong>Разделение тестов по пирамиде:</strong> Тесты атомарных репозиториев выполняются через быстрый Rollback (сотни тестов в секунду под <code>t.Parallel()</code>). А для комплексных транзакционных сценариев бизнес-сервисов формируется отдельный тестовый пакет <code>test/integration</code>. В нем тесты работают либо в изолированных схемах базы данных, либо применяют стратегию <code>TRUNCATE</code> с последовательным выполнением.</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Транзакции и <code>ROLLBACK</code> — это фундаментальный паттерн для написания быстрых, не подверженных состоянию гонки (race-condition free) и детерминированных интеграционных тестов БД в Go. Он заставляет нас писать более чистый код (используя интерфейсы вроде <code>DBTX</code>) и позволяет в полной мере использовать <code>t.Parallel()</code>.</p>
-<p>Однако для работы этого подхода нам по-прежнему нужна живая база данных. Разворачивать её вручную или через глобальный <code>docker-compose</code> — прошлый век. В следующей статье мы перейдем к стандарту де-факто современной инфраструктуры тестирования и разберем: <a href="4-testcontainers-go.html" class="wikilink">4. testcontainers go</a>.</p>
+<ol>
+<li>Использование транзакций и <code>ROLLBACK</code> — основополагающий архитектурный паттерн для построения быстрых, детерминированных и конкурентных интеграционных тестов базы данных в Go.</li>
+<li>Механизмы MVCC и журнала WAL гарантируют, что незафиксированные мутации остаются невидимыми для параллельных горутин и не требуют блокировок уровня <code>ACCESS EXCLUSIVE</code>.</li>
+<li>Применение интерфейса <code>DBTX</code> устраняет несовместимость между пулом <code>*sql.DB</code> и транзакцией <code>*sql.Tx</code>, делая репозитории гибкими и открытыми для тестирования.</li>
+<li>Всегда освобождайте транзакционные соединения через <code>t.Cleanup()</code>, чтобы избежать утечки дескрипторов <code>*driverConn</code> и исчерпания пула <code>MaxOpenConns</code>.</li>
+<li>Для сервисов с внутренней транзакционной логикой используйте эмуляцию точек сохранения (<code>SAVEPOINT sub_tx</code>) либо выносите их в выделенный интеграционный сьют.</li>
+</ol>
+<p>Откат транзакций дает колоссальную скорость, однако нам по-прежнему необходима надежная среда запуска самой СУБД. Ручное управление контейнерами через <code>docker-compose</code> давно уступило место программному оркестрированию зависимостей.</p>
+<p>О том, как поднимать полноценные изолированные базы данных прямо из кода на Go, мы поговорим в следующей главе: <a href="4-testcontainers-go.html" class="wikilink">4. testcontainers go</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
