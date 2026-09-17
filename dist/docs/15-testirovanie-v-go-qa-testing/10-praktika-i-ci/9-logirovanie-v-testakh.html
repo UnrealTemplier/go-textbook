@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 15</span>
-              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">9. Логирование в тестах</h1>
           </header>
@@ -2178,32 +2178,67 @@
           <div class="article-markdown">
             <h2 id="signal-skvoz-shum-zachem-otdelnoe-logirovanie-v-testakh">Сигнал сквозь шум: Зачем отдельное логирование в тестах?</h2>
 
-<p>В прошлой статье <a href="8-debugging-testov.html" class="wikilink">8. Debugging тестов</a> мы вскользь упомянули, что <code>fmt.Println</code> — это зло для параллельных тестов, и посоветовали использовать <code>t.Log</code>. Однако логирование в тестировании — это не просто инструмент для отладки сломанного кода. Это полноценная система наблюдаемости (Observability) для ваших тестов.</p>
-<p>Когда ваш CI-пайплайн падает, у вас нет возможности подключить отладчик Delve. Логи, которые оставил после себя упавший тест — это единственный способ понять, что произошло. Но если тесты "спамят" в консоль, найти полезную информацию становится невозможно.</p>
-<p>В этой статье мы разберем, как правильно управлять выводом в тестах, как "подружить" production-логгеры (Zap, slog) с тестовым фреймворком Go, и какие артефакты стоит логировать при падениях.</p>
+<p>В предыдущей главе <a href="8-debugging-testov.html" class="wikilink">8. Debugging тестов</a> мы убедились, что прямолинейный вызов <code>fmt.Println</code> в конкурентных тестах порождает трудночитаемую кашу в консоли, и сформулировали базовое правило перехода на методы <code>t.Log</code> и <code>t.Logf</code>. Однако логирование в процессе тестирования — это не просто временная подпорка при отладке. Это полноценная система наблюдаемости (Observability) вашего тестового контура.</p>
+<blockquote>
+<p><em>«Самым эффективным инструментом отладки по-прежнему остаётся ясное мышление в сочетании с разумно расставленными вызовами печати.»</em><br />
+— Брайан В. Керниган</p>
+</blockquote>
+<p>Когда пайплайн CI падает в полночь на удалённом изолированном раннере, у инженера нет возможности подключить интерактивный отладчик Delve. Единственный след, который оставляет после себя упавший процесс — это текстовый журнал (Log Stream). Если тесты непрерывно «спамят» в консоль десятками тысяч служебных сообщений, извлечь полезный сигнал из океана белого шума становится невозможно.</p>
+<p>В этой статье мы спроектируем культуру чистого логирования в Go: разберём механику буферизации <code>testing.T</code>, научимся бесшовно интегрировать production-логгеры (Uber Zap и <code>log/slog</code>) в тестовый рантайм и освоим паттерны аварийного сброса контекста (Dump on Failure).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant G as Тестовая горутина
+participant T as testing.T (Буфер)
+participant Out as os.Stdout (Терминал)
+
+Note over G,T: Параллельный запуск тестов (t.Parallel)
+G-&gt;&gt;T: t.Logf(&quot;State at step 2...&quot;)
+Note over T: Запись в изолированный буфер памяти
+alt Тест завершился успешно (PASS) без флага -v
+T-&gt;&gt;T: Очистка буфера из памяти (Zero Noise)
+else Тест упал (FAIL) или передан флаг -v
+T-&gt;&gt;Out: Сброс буфера в консоль с именем теста
+end
+  </pre>
+</div>
+
+
 <hr />
 <h2 id="1-fundament-mekhanika-t-log-i-t-logf">1. Фундамент: Механика t.Log и t.Logf</h2>
 
-<p>Главное свойство <code>t.Log</code> — это <strong>буферизация</strong>.</p>
-<p>Когда вы вызываете <code>fmt.Println</code>, текст мгновенно пишется в стандартный поток вывода (<code>os.Stdout</code>). Если у вас параллельно работают 10 тестов, их строки перемешаются в нечитаемую кашу.</p>
-<p>Когда вы вызываете <code>t.Log</code>, фреймворк <code>testing</code> сохраняет эту строку в специальный внутренний буфер, привязанный к конкретному экземпляру <code>*testing.T</code> (к конкретному тесту или сабтесту <code>t.Run</code>).</p>
+<p>Ключевое архитектурное свойство методов семейства <code>t.Log</code> — <strong>потокобезопасная буферизация на уровне экземпляра теста</strong>.</p>
+<p>При прямом вызове <code>fmt.Println</code> или <code>os.Stdout.WriteString()</code> байты немедленно отправляются в файловый дескриптор 1 (<code>os.Stdout</code>). Если в рантайме одновременно работают 16 параллельных тестов, фрагменты их строк перемешаются на уровне ядра операционной системы. Разобрать, какой ответ сервера к какому запросу относится, становится физически невозможно.</p>
+<p>Когда вы вызываете <code>t.Log</code> или <code>t.Logf</code>, рантайм <code>testing</code> перехватывает сообщение и аппендит его во внутренний байтовый срез, защищённый мьютексом и строго привязанный к конкретному экземпляру <code>*testing.T</code> (или вложенному сабтесту <code>t.Run</code>).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом: Правила вывода буфера</span>
   </div>
   <div class="callout-body">
-    <p>Раннер <code>go test</code> покажет содержимое буфера <code>t.Log</code> в консоли <strong>только в двух случаях</strong>:<br />
-1. Тест завершился с ошибкой (через <code>t.Fail</code>, <code>t.Error</code>, <code>require.NoError</code> и т.д.).<br />
-2. Тесты были запущены с флагом "verbose": <code>go test -v</code>.</p>
-<p>Если тест прошел успешно и флаг <code>-v</code> не передан, все логи <code>t.Log</code> просто молча удаляются из памяти. Это гениальное решение, которое сохраняет консоль кристально чистой (Zero Noise), пока не произойдет проблема.</p>
+    <p>Раннер <code>go test</code> выводит накопленное содержимое буфера <code>t.Log</code> в терминал <strong>строго в двух ситуациях</strong>:<br />
+1. Тест завершился аварийно или с ошибкой (вызовы <code>t.Fail</code>, <code>t.Error</code>, <code>t.Fatal</code>, паника, либо провал ассерта <code>require.NoError</code>).<br />
+2. Фреймворк запущен с флагом подробного протоколирования: <code>go test -v</code>.</p>
+<p>Если тест завершился успехом (<code>PASS</code>), а флаг <code>-v</code> не передан, накопленный буфер просто освобождается сборщиком мусора. Это инженерное решение гарантирует идеальную чистоту консоли (<strong>Zero Noise</strong>): пока система работает стабильно, разработчик видит лишь лаконичный зелёный прогресс.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="2-integratsiya-production-loggerov">2. Интеграция Production-логгеров</h2>
 
-<p>Здесь возникает главная архитектурная проблема. Ваша бизнес-логика ничего не знает о <code>*testing.T</code>. Она ожидает интерфейс логгера (например, <code>*zap.Logger</code> или <code>*slog.Logger</code>).</p>
+<p>Здесь возникает классическая архитектурная дилемма: чистая бизнес-логика не должна зависеть от тестовых пакетов и ничего не знает о структуре <code>*testing.T</code>. Сервисы принимают абстракции или конкретные типы структурированных логгеров — например, <code>*zap.Logger</code> или стандартный <code>*slog.Logger</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2213,10 +2248,10 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Бизнес-логика
+  <pre class="language-go"><code class="language-go">// Бизнес-логика сервиса платежей:
 func ProcessPayment(amount int, logger *zap.Logger) error {
     logger.Info(&quot;starting payment processing&quot;, zap.Int(&quot;amount&quot;, amount))
-    // ...
+    // ... проведение транзакции ...
     if err != nil {
         logger.Error(&quot;payment failed&quot;, zap.Error(err))
         return err
@@ -2226,10 +2261,39 @@ func ProcessPayment(amount int, logger *zap.Logger) error {
 </code></pre>
 </div>
 
-<p>Если в тесте вы передадите обычный production-логгер (<code>zap.NewProduction()</code>), он будет писать логи прямо в <code>os.Stdout</code> или <code>os.Stderr</code>. Вы потеряете буферизацию <code>go test</code>, и ваша консоль снова превратится в свалку.</p>
+<p>Если передать в этот метод обычный экземпляр, созданный через <code>zap.NewProduction()</code> или <code>slog.Default()</code>, логгер начнёт писать JSON-строки напрямую в <code>os.Stdout</code> или <code>os.Stderr</code>. Вся магия буферизации <code>go test</code> испарится: при параллельном прогоне консоль вновь утонет в мусоре.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph App[&quot;Бизнес-логика&quot;]
+S[&quot;Service.ProcessPayment&quot;]
+end
+subgraph Adapter[&quot;Слой адаптации к тестам&quot;]
+SL[&quot;*slog.Logger / *zap.Logger&quot;]
+TW[&quot;testingWriter (io.Writer) / zaptest&quot;]
+end
+subgraph Runner[&quot;Рантайм тестирования&quot;]
+TB[&quot;testing.T (буфер сообщений)&quot;]
+end
+S --&gt; SL --&gt; TW --&gt; TB
+  </pre>
+</div>
+
+
 <h3 id="reshenie-dlya-uber-zap-zaptest">Решение для Uber Zap: zaptest</h3>
 
-<p>Авторы библиотеки <code>go.uber.org/zap</code> предусмотрели эту проблему и создали пакет <code>zaptest</code>. Он создает специальный логгер, который перехватывает все вызовы <code>Info/Error</code> и перенаправляет их под капот в <code>t.Log</code>.</p>
+<p>Авторы высокопроизводительной библиотеки <code>go.uber.org/zap</code> предусмотрели эту потребность и создали пакет <code>zaptest</code>. Он создаёт специальный логгер, который перехватывает все вызовы <code>Info/Error</code> и перенаправляет их под капот прямо в <code>t.Log</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2243,27 +2307,30 @@ func ProcessPayment(amount int, logger *zap.Logger) error {
 
 import (
     &quot;testing&quot;
+
     &quot;go.uber.org/zap/zaptest&quot;
     &quot;yourproject/internal/payment&quot;
 )
 
 func TestProcessPayment(t *testing.T) {
-    // Создаем логгер, привязанный к текущему тесту
+    // Создаем логгер, неразрывно привязанный к жизненному циклу данного теста:
     logger := zaptest.NewLogger(t)
 
-    // Передаем его в бизнес-логику
+    // Передаем его в доменную логику:
     err := payment.ProcessPayment(100, logger)
 
-    // Если ProcessPayment упадет, мы увидим все внутренние Info/Error логи,
-    // аккуратно отформатированные и привязанные именно к этому тесту!
+    // Если ProcessPayment упадет, мы увидим структурированные Zap-логи,
+    // отформатированные и привязанные строго к данному упавшему сценарию!
+    _ = err
 }
 </code></pre>
 </div>
 
+<hr />
 <h3 id="reshenie-dlya-slog-go-1-21">Решение для slog (Go 1.21+)</h3>
 
-<p>Если вы используете встроенный пакет <code>log/slog</code>, вам нужно перенаправить его вывод (который ожидает <code>io.Writer</code>) в <code>t.Log</code>.</p>
-<p>Проблема в том, что <code>*testing.T</code> не реализует интерфейс <code>io.Writer</code>. Нам нужно написать простую обертку (Adapter):</p>
+<p>Начиная с Go 1.21, стандартным инструментом структурированного логирования стал пакет <code>log/slog</code>. Его обработчики (Handlers) принимают интерфейс <code>io.Writer</code>.</p>
+<p>Поскольку структура <code>*testing.T</code> напрямую не реализует метод <code>Write([]byte) (int, error)</code>, нам достаточно реализовать компактный адаптер (Adapter Pattern):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2276,45 +2343,50 @@ func TestProcessPayment(t *testing.T) {
   <pre class="language-go"><code class="language-go">package testutil
 
 import (
+    &quot;bytes&quot;
     &quot;log/slog&quot;
     &quot;testing&quot;
 )
 
-// testingWriter адаптирует *testing.T под интерфейс io.Writer
+// testingWriter адаптирует *testing.T под стандартный контракт io.Writer
 type testingWriter struct {
     t *testing.T
 }
 
 func (w testingWriter) Write(p []byte) (n int, err error) {
-    // TrimSpace нужен, чтобы t.Log не добавлял лишние переносы строк
-    w.t.Logf(&quot;%s&quot;, p)
+    // bytes.TrimRight исключает дублирование символов перевода строки,
+    // так как метод t.Logf автоматически форматирует завершение строки.
+    w.t.Logf(&quot;%s&quot;, bytes.TrimRight(p, &quot;\n&quot;))
     return len(p), nil
 }
 
 // NewSlogLogger создает slog логгер для тестов
 func NewSlogLogger(t *testing.T) *slog.Logger {
     t.Helper()
+
     writer := testingWriter{t: t}
-    // Используем TextHandler или JSONHandler по вкусу
+
+    // Настраиваем TextHandler или JSONHandler с детализацией Debug:
     handler := slog.NewTextHandler(writer, &amp;slog.HandlerOptions{
-        Level: slog.LevelDebug, // В тестах нам нужны все детали
+        Level: slog.LevelDebug, // В тестах мы хотим видеть максимальный контекст
     })
+
     return slog.New(handler)
 }
 </code></pre>
 </div>
 
-<p>Теперь в тесте вы просто вызываете <code>logger := testutil.NewSlogLogger(t)</code> и передаете его в свои сервисы.</p>
+<p>Теперь в любом тесте достаточно написать <code>logger := testutil.NewSlogLogger(t)</code> и пробросить его в тестируемые структуры.</p>
 <hr />
 <h2 id="3-chto-logirovat-pri-padenii-test-observability">3. Что логировать при падении (Test Observability)</h2>
 
-<p>Обычная ошибка выглядит так:<br />
+<p>Типичное сообщение об ошибке начинающего разработчика выглядит так:<br />
 <code>Error: expected 200, got 500</code>.</p>
-<p>Это абсолютно бесполезно. Почему 500? Какой был запрос? Какое тело ответа? <br />
-Senior-инженеры добавляют в тесты механизм <strong>Dump on Failure</strong> (Сброс контекста при падении).</p>
+<p>Такая диагностика бессильна. Почему сервер вернул код 500? Какой URL был запрошен? Какие заголовки переданы? Что содержало тело ответа? </p>
+<p>Инженеры высокой квалификации внедряют в интеграционные тесты паттерн <strong>Dump on Failure</strong> (аварийный сброс контекста).</p>
 <h3 id="pattern-http-dump">Паттерн: HTTP Dump</h3>
 
-<p>Если вы пишете E2E или интеграционные API тесты (с использованием <code>httptest</code>), всегда логируйте полные HTTP-запросы и ответы при возникновении ошибки. Для этого в Go есть пакет <code>net/http/httputil</code>.</p>
+<p>При тестировании HTTP-хэндлеров и сквозных API-маршрутов с использованием <code>httptest.Server</code> сохраняйте полный дамп протокола через пакет <code>net/http/httputil</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2325,19 +2397,19 @@ Senior-инженеры добавляют в тесты механизм <stron
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func TestAPI_CreateUser(t *testing.T) {
-    // ... Подготовка httptest.Server ...
+    // ... Инициализация тестового сервера ts := httptest.NewServer(handler) ...
 
     req, _ := http.NewRequest(http.MethodPost, ts.URL+&quot;/users&quot;, body)
     resp, err := http.DefaultClient.Do(req)
     require.NoError(t, err)
 
-    // Читаем тело ответа для ассертов
+    // Читаем тело ответа для последующих проверок:
     respBody, _ := io.ReadAll(resp.Body)
     resp.Body.Close()
 
     if resp.StatusCode != http.StatusCreated {
         // ТЕСТ УПАЛ!
-        // Сбрасываем весь контекст запроса и ответа для дебага в CI
+        // Сбрасываем весь контекст сетевого взаимодействия в буфер t.Log:
         reqDump, _ := httputil.DumpRequestOut(req, true)
         t.Logf(&quot;--- DUMP REQUEST ---\n%s\n--------------------&quot;, string(reqDump))
 
@@ -2351,7 +2423,7 @@ Senior-инженеры добавляют в тесты механизм <stron
 
 <h3 id="pattern-state-dump-sbros-sostoyaniya-bd">Паттерн: State Dump (Сброс состояния БД)</h3>
 
-<p>Если интеграционный тест БД падает, часто полезно знать, что вообще было в таблице в этот момент.</p>
+<p>Если интеграционный тест репозитория падает из-за конфликта ключей или неожиданного количества строк, сбросьте текущий снимок таблицы:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2362,9 +2434,9 @@ Senior-инженеры добавляют в тесты механизм <stron
     </button>
   </div>
   <pre class="language-go"><code class="language-go">    if err != nil {
-        // Дополнительный SQL-запрос только для вывода в лог при падении
+        // Выполняем диагностический SELECT строго для вывода в журнал падения:
         rows, _ := db.Query(&quot;SELECT id, status FROM users&quot;)
-        // ... форматируем в строку ...
+        // ... форматируем выборку в строку dbStateString ...
         t.Logf(&quot;DB State at failure:\n%s&quot;, dbStateString)
         t.Fatal(err)
     }
@@ -2377,14 +2449,14 @@ Senior-инженеры добавляют в тесты механизм <stron
     <span class="callout-title">Ловушка / Gotcha: Логирование секретов</span>
   </div>
   <div class="callout-body">
-    <p>Помните, что логи тестов (если они падают в CI) сохраняются в артефактах GitHub Actions или GitLab. Если ваш интеграционный тест использует реальные токены, пароли или Stripe ключи (даже тестового окружения), прогоняйте дампы через маскировщик (Sanitizer) перед вызовом <code>t.Log</code>, иначе вы сольете секреты в логи CI.</p>
+    <p>Журналы упавших тестов сохраняются в виде артефактов и логов сборки GitHub Actions, GitLab CI или TeamCity. Если интеграционный тест взаимодействует со сторонними сервисами (Stripe, банковские шлюзы, токены JWT), сырой дамп запроса рискует опубликовать секретные ключи авторизации. Перед вызовом <code>t.Log</code> всегда пропускайте дампы через маскировщик (Sanitizer), заменяющий заголовки <code>Authorization: Bearer ...</code> на <code>***REDACTED***</code>.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="4-etapy-zhiznennogo-tsikla-testa">4. Этапы жизненного цикла теста</h2>
 
-<p>Длинные интеграционные тесты (которые выполняются по 10-20 секунд) бывает сложно читать в логах. Рекомендуется явно логировать этапы <strong>Arrange-Act-Assert</strong>.</p>
+<p>Сложные интеграционные тесты, длящиеся более 10–15 секунд, сложно читать в консоли, если они падают по таймауту. В таких сценариях рекомендуется структурировать лог по фазам классического шаблона <strong>Arrange-Act-Assert</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2405,21 +2477,22 @@ Senior-инженеры добавляют в тесты механизм <stron
     runWorker()
 
     t.Log(&quot;[ASSERT] Verifying user statuses...&quot;)
-    // ... проверки ...
+    // ... проверки инвариантов ...
 }
 </code></pre>
 </div>
 
-<p>Если тест упадет по таймауту или панике, последний <code>t.Log</code> в буфере точно скажет вам, на каком именно этапе тест завис.</p>
+<p>Если сценарий неожиданно зависнет на 30-й секунде, последний префикс <code>[ACT]</code> в журнале сразу подскажет дежурному инженеру, какая именно фоновая операция заблокировала процесс.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Никакого <code>fmt.Println</code> в тестах.</strong> Только <code>t.Log</code> и <code>t.Logf</code> для поддержания порядка в консоли и работы с параллельностью.</li>
-<li><strong>Адаптеры логгеров:</strong> Никогда не оставляйте production-логгер писать напрямую в <code>Stdout</code> во время тестов. Оборачивайте <code>zap</code> через <code>zaptest</code>, а <code>slog</code> через кастомный <code>io.Writer</code>.</li>
-<li><strong>Богатый контекст падений:</strong> Логируйте дампы HTTP-запросов (<code>httputil.DumpRequest</code>), тела ответов и состояния структур при падении ассертов.</li>
-<li><strong>Разметка этапов:</strong> В длинных (E2E) тестах логируйте переходы между фазами Setup, Act и Assert.</li>
+<li><strong>Никакого <code>fmt.Println</code> в тестах.</strong> Используйте исключительно <code>t.Log</code> и <code>t.Logf</code> для потокобезопасного, буферизованного вывода без засорения терминала.</li>
+<li><strong>Адаптеры логгеров:</strong> Никогда не оставляйте production-логгеры писать напрямую в <code>os.Stdout</code> или <code>os.Stderr</code> во время тестов. Оборачивайте <code>go.uber.org/zap</code> через <code>zaptest.NewLogger(t)</code>, а <code>log/slog</code> — через кастомный адаптер <code>io.Writer</code>.</li>
+<li><strong>Богатый контекст падений:</strong> Логируйте дампы HTTP-запросов (<code>httputil.DumpRequest</code> / <code>httputil.DumpRequestOut</code>), тела ответов и срезы состояния БД при срабатывании ассертов.</li>
+<li><strong>Разметка этапов:</strong> В длинных сквозных сценариях явно маркируйте переходы между фазами Arrange, Act и Assert.</li>
 </ol>
-<p>Этим материалом мы закрываем практическую часть организации тестовых стендов и CI-пайплайнов. Качественное логирование — это тот самый механизм, который превращает "красный крестик" в CI из повода для паники в четкую инструкцию по исправлению бага.</p>
+<p>Грамотно выстроенная культура логирования тестов превращает красный статус пайплайна в CI из повода для растерянности в точную, исчерпывающую инструкцию по локализации и исправлению дефекта.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
