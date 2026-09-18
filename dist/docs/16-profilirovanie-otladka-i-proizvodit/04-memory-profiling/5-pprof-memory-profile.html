@@ -2169,28 +2169,28 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. pprof memory profile</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="profil-pamyati-kak-karta-raspredeleniya-obektov">Профиль памяти как карта распределения объектов</h2>
+            <h1>pprof memory profile</h1>
+<blockquote>
+<p><em>«Демографическая перепись населения (inuse_space) учитывает только тех, кто жив на момент опроса. Но если родильное отделение и похоронная служба работают день и ночь, оформляя миллионы свидетельств (alloc_space), городская казна разорится на ритуальных расходах, даже если население не прибавило ни одного жителя. Профилировщик памяти pprof — это одновременно и перепись живых структур, и полный реестр всех родившихся и умерших объектов».</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<hr />
+<h2 id="profil-pamyati-kak-karta-raspredeleniya-obektov">Профиль памяти как карта распределения объектов</h2>
 
-<p>В <a href="4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a> мы освоили практику сбора и анализа профиля аллокаций с флагом <code>-alloc_space</code>. Но инструмент <code>pprof</code> для памяти — это не просто «посмотреть, сколько выделено». Он содержит как минимум два разных среза (inuse и alloc), поддерживает разные режимы сэмплирования, позволяет сравнивать версии и глубоко интегрирован с рантаймом Go. Понимание всех этих возможностей превращает pprof из «чёрного ящика» в прецизионный инструмент диагностики.</p>
-<p>Эта статья систематизирует знания о <strong>pprof memory profile</strong>: как он устроен внутри, какие метрики предоставляет, как правильно его снимать и интерпретировать, как связывать с escape analysis (<a href="3-escape-analysis.html" class="wikilink">3. Escape analysis</a>) и тюнингом GC (<a href="../05-garbage-collector/7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>). После неё мы будем готовы к поиску утечек (<a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>) и анализу фрагментации (<a href="7-fragmentation.html" class="wikilink">7. Fragmentation</a>).</p>
+<p>В предыдущей лекции (<a href="4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>) мы освоили концептуальные основы профилирования аллокаций. Однако утилита <code>pprof</code> для работы с памятью — это не просто счетчик мегабайт, а сложнейший прецизионный микроскоп, тесно интегрированный в ядро рантайма Go.</p>
+<p>Профиль памяти Go принципиально отличается от традиционных снимков кучи (Heap Dumps) в Java или Python. Вместо того чтобы замораживать весь процесс на минуты и записывать многогигабайтный слепок каждого объекта со всеми связями, рантайм Go ведет <strong>непрерывное статистическое наблюдение за потоком аллокаций</strong>. Это позволяет профилировать высоконагруженные production-сервисы под полной боевой нагрузкой с накладными расходами менее 1–2% CPU!</p>
+<p>В этой главе мы разберем внутреннее устройство memory profile, систематизируем режимы отображения, научимся проводить дифференциальный сравнительный анализ (<code>-diff_base</code>), связывать метрики с анализом побега (<a href="3-escape-analysis.html" class="wikilink">3. Escape analysis</a>) и поведением сборщика мусора (<a href="../05-garbage-collector/7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>), заложив надежный фундамент для поиска утечек (<a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>) и борьбы с фрагментацией (<a href="7-fragmentation.html" class="wikilink">7. Fragmentation</a>).</p>
+<hr />
 <h2 id="dva-vzglyada-na-pamyat-allocspace-i-inusespace">Два взгляда на память: alloc_space и inuse_space</h2>
 
-<p>Профиль памяти в Go хранит два независимых набора данных, переключаемых в <code>go tool pprof</code> флагами <code>-alloc_space</code> и <code>-inuse_space</code> (или через вкладки веб-интерфейса). Важно различать их семантику:</p>
-<ul>
-<li><strong>alloc_space</strong> (по умолчанию в <code>go tool pprof</code> при открытии профиля без флагов?) — на самом деле по умолчанию <code>pprof</code> показывает <code>inuse_space</code>, если профиль снят без <code>seconds</code>. Но при использовании <code>seconds</code> профиль содержит оба представления, и <code>go tool pprof</code> по умолчанию показывает <code>inuse_space</code> (живые объекты). Чтобы увидеть аллокации, надо явно указать <code>-alloc_space</code>. Рекомендация: всегда явно задавать флаг при анализе.</li>
-<li><strong>alloc_space</strong> — суммарный объём байт, которые были выделены в куче за время наблюдения (или с начала процесса, если профиль мгновенный). Включает уже освобождённые объекты.</li>
-<li><strong>inuse_space</strong> — объём байт, занятых <em>живыми</em> объектами в момент снятия профиля. Те, что не освобождены и удерживаются указателями.</li>
-</ul>
-<p>Разница принципиальна:<br />
-- Если функция создаёт много временных объектов, которые быстро освобождаются, она будет «горячей» в <code>alloc_space</code>, но почти невидимой в <code>inuse_space</code>.<br />
-- Если функция накапливает объекты (утечка), она будет большой в <code>inuse_space</code>, но может быть умеренной в <code>alloc_space</code>.</p>
+<p>Профиль памяти в Go хранит два независимых пространственных среза данных, между которыми можно переключаться флагами командной строки или вкладками в веб-интерфейсе:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2205,58 +2205,85 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Alloc[alloc_space] --&gt;|&quot;Включает&quot;| Freed[Освобождённые объекты]
-Alloc --&gt; Live[Живые объекты]
-Inuse[inuse_space] --&gt; Live
+Alloc[&quot;alloc_space (Совокупные аллокации)&quot;] --&gt;|&quot;Включает&quot;| Freed[&quot;Освобожденные объекты (мусор)&quot;]
+Alloc --&gt; Live[&quot;Живые объекты&quot;]
+Inuse[&quot;inuse_space (Текущая живая память)&quot;] --&gt; Live
 Inuse -.-&gt;|&quot;Не включает&quot;| Freed
-style Alloc fill:#bbdefb
-style Inuse fill:#c8e6c9
+style Alloc fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#fff
+style Inuse fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#fff
+style Freed fill:#334155,stroke:#f43f5e,stroke-width:1px,color:#cbd5e1
+style Live fill:#334155,stroke:#38bdf8,stroke-width:1px,color:#cbd5e1
   </pre>
 </div>
 
 
-<div class="callout callout-interview">
+<ol>
+<li><strong><code>alloc_space</code> (и <code>alloc_objects</code>):</strong><br />
+   Суммарный объем байт (и количество объектов), выделенных в куче за время наблюдения. Этот срез включает в себя как живые объекты, так и те, что уже давно были уничтожены и переработаны сборщиком мусора. Это метрика <strong>кумулятивной нагрузки на подсистему памяти</strong>.</li>
+<li><strong><code>inuse_space</code> (и <code>inuse_objects</code>):</strong><br />
+   Объем байт (и количество объектов), удерживаемых активными указателями непосредственно в момент фиксации профиля. Это срез <strong>фактического потребления оперативной памяти</strong>.</li>
+</ol>
+<div class="callout callout-important">
   <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Важно</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> При анализе потребления памяти сервис показывает высокий <code>alloc_space</code>, но <code>inuse_space</code> в норме. Это проблема?<br />
-<strong>Ответ:</strong> Это указывает на высокий уровень аллокационной активности (мусор), который нагружает GC, даже если утечки нет. Может потребоваться оптимизация для сокращения CPU, затрачиваемого на сборку мусора, и снижения хвостовых задержек.</p>
+    <p>Обратите внимание на поведение <code>go tool pprof</code> по умолчанию: если вы открываете файл профиля без явных флагов, инструмент отобразит <strong><code>inuse_space</code></strong> (текущие живые объекты). Чтобы исследовать поток аллокаций, нагружающий процессор и GC, <strong>всегда явно передавайте флаг <code>-alloc_space</code></strong>!</p>
   </div>
 </div>
 
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование: Высокий alloc_space при стабильном inuse_space</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> При мониторинге сервиса в Grafana объем используемой памяти стабилен (inuse_space в норме), но профиль alloc_space демонстрирует гигабайты выделений в секунду. Является ли это проблемой и почему?<br />
+<strong>Ответ:</strong> Да, это серьезная проблема производительности. Высокий <code>alloc_space</code> при стабильном <code>inuse_space</code> свидетельствует о том, что сервис непрерывно порождает огромный поток короткоживущего мусора. Хотя утечки памяти нет, трехцветный сборщик мусора вынужден непрерывно запускать циклы маркировки (<code>gcBgMarkWorker</code>), сжигая до 25% ресурсов CPU, загрязняя кэши L1/L2/L3 и раздувая хвостовые задержки (p99 latency) сервиса.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="vnutrennee-ustroystvo-profilya-pamyati">Внутреннее устройство профиля памяти</h2>
 
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Сэмплирование аллокаций в рантайме</span>
   </div>
   <div class="callout-body">
-    <p>Профилировщик памяти в Go работает на основе сэмплирования. При каждой аллокации <code>runtime.mallocgc</code> увеличивает счётчик выделенных байт. Если разница между текущим счётчиком и последним записанным сэмплом превышает <code>MemProfileRate</code> (по умолчанию 512 КБ), создаётся новый сэмпл: записывается текущий стек вызовов и добавляется накопленный объём. Таким образом, записывается не каждая аллокация, а агрегированные порции. В момент снятия профиля (через <code>runtime/pprof</code> или HTTP) рантайм собирает все накопленные сэмплы в хеш-таблицу, сериализует в protobuf и отправляет.</p>
-<p>При использовании <code>?seconds=N</code> рантайм предварительно вызывает <code>runtime.GC()</code> (чтобы очистить мусор), запоминает начальные значения счётчиков, затем через N секунд снова вызывает GC и вычисляет дельту счётчиков. Таким образом, профиль с <code>seconds</code> показывает только аллокации, сделанные за этот интервал.</p>
+    <p>Профилировщик памяти в Go работает на основе вероятностного сэмплирования. При каждой аллокации в куче внутренняя функция <code>runtime.mallocgc</code> прибавляет размер выделяемого объекта к накопительному счетчику текущей горутины. </p>
+<p>Если разница между текущим счетчиком и последним записанным сэмплом превышает порог <code>MemProfileRate</code> (по умолчанию <strong>512 КБ</strong>), планировщик инициирует фиксацию сэмпла:<br />
+1. Снимается текущий стек вызовов горутины (Call Stack);<br />
+2. Стек и объем выделенных байт заносятся в хэш-таблицу профилировщика;<br />
+3. Рантайм вычисляет псевдослучайный интервал до следующего сэмплирования на основе экспоненциального распределения Пуассона.</p>
+<p>При снятии профиля через HTTP с параметром <code>?seconds=N</code> рантайм:<br />
+- Предварительно вызывает <code>runtime.GC()</code> (чтобы очистить накопленный мусор);<br />
+- Фиксирует стартовые значения счетчиков;<br />
+- Ждет $N$ секунд под нагрузкой;<br />
+- Снова вызывает <code>runtime.GC()</code> и вычисляет чистую дельту аллокаций за интервал;<br />
+- Сериализует полученные сэмплы в бинарный формат Google Protocol Buffers (<code>profile.proto</code>) и отправляет клиенту.</p>
   </div>
 </div>
 
-<p>Из этого следует несколько важных свойств:</p>
-<ul>
-<li><strong>Статистическая природа.</strong> Мелкие функции с суммарным объёмом аллокаций менее <code>MemProfileRate</code> могут отсутствовать в профиле.</li>
-<li><strong>Влияние GC.</strong> Принудительный GC при <code>seconds</code> может исказить картину, особенно в latency-sensitive сервисах (но для профилирования это обычно допустимо).</li>
-<li><strong>Стек вызовов.</strong> Каждый сэмпл привязан к стеку, что позволяет строить деревья вызовов и flamegraph, аналогично CPU-профилю (<a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>).</li>
-</ul>
+<p>Ключевые свойства архитектуры профилировщика:<br />
+- <strong>Статистическая репрезентативность:</strong> Профиль идеально отображает функции, суммарно аллоцирующие мегабайты памяти, но может пропустить редкие точечные аллокации размером меньше 512 КБ.<br />
+- <strong>Влияние GC:</strong> Принудительный запуск <code>runtime.GC()</code> при сборе профиля с параметром <code>seconds</code> временно замораживает мир (STW) на доли миллисекунды, что допустимо для профилирования, но должно учитываться при анализе таймингов.<br />
+- <strong>Полная трассировка стека:</strong> Каждый сэмпл содержит глубокий стек вызовов, что позволяет строить интерактивные флеймграфы памяти (<a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>).</p>
+<hr />
 <h2 id="sposoby-polucheniya-profilya-pamyati">Способы получения профиля памяти</h2>
 
-<h3 id="1-http-endpoint-nethttppprof">1. HTTP-эндпоинт `net/http/pprof`</h3>
+<h3 id="1-http-endpoint-nethttppprof">1. HTTP-эндпоинт net/http/pprof</h3>
 
-<p>Самый гибкий способ. Базовый URL: <code>/debug/pprof/heap</code>. Параметры запроса:</p>
+<p>Стандартный и наиболее удобный способ для долгоживущих микросервисов. Эндпоинт <code>/debug/pprof/heap</code> поддерживает следующие параметры:</p>
 <ul>
-<li><code>?seconds=30</code> — сбор профиля в течение 30 секунд с вычислением дельты (alloc_space). Без <code>seconds</code> — мгновенный inuse-профиль.</li>
-<li><code>?debug=1</code> — текстовое представление в виде плоского списка (удобно для быстрой проверки в консоли).</li>
-<li><code>?gc=1</code> — принудительный GC перед снятием (по умолчанию включен при <code>seconds</code>).</li>
-<li><code>?h=1</code> — добавить заголовки.</li>
+<li><code>?seconds=30</code> — сбор дельты аллокаций за 30 секунд под нагрузкой (<code>alloc_space</code>). Без этого параметра возвращается мгновенный моментальный снимок живой памяти.</li>
+<li><code>?debug=1</code> — текстовый дамп спанов кучи и статистики рантайма в человекочитаемом виде.</li>
+<li><code>?gc=1</code> — принудительный запуск сборщика мусора перед снятием профиля (автоматически включен при передаче <code>seconds</code>).</li>
+<li><code>?h=1</code> — вывод краткой справки по доступным заголовкам.</li>
 </ul>
-<p>Примеры:</p>
+<p>Практические команды для терминала:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2272,13 +2299,14 @@ curl -o mem.prof &quot;http://localhost:6060/debug/pprof/heap&quot;
 # Сбор в течение 30 секунд под нагрузкой (alloc_space)
 curl -o alloc.prof &quot;http://localhost:6060/debug/pprof/heap?seconds=30&quot;
 
-# Текстовый дамп для быстрого просмотра
+# Текстовый дамп для быстрого просмотра в консоли
 curl &quot;http://localhost:6060/debug/pprof/heap?debug=1&quot;
 </code></pre>
 </div>
 
-<h3 id="2-pryamoy-vyzov-runtimepprof-dlya-skriptov-i-cli">2. Прямой вызов `runtime/pprof` (для скриптов и CLI)</h3>
+<h3 id="2-pryamoy-vyzov-runtimepprof-dlya-skriptov-i-cli">2. Прямой вызов runtime/pprof (для скриптов и CLI)</h3>
 
+<p>В утилитах командной строки, пакетных обработчиках данных и микротестах профилирование активируется через системные флаги:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2293,20 +2321,26 @@ var memprofile = flag.String(&quot;memprofile&quot;, &quot;&quot;, &quot;write m
 
 func main() {
     flag.Parse()
+    // ... основная логика программы ...
     if *memprofile != &quot;&quot; {
-        f, _ := os.Create(*memprofile)
+        f, err := os.Create(*memprofile)
+        if err != nil {
+            log.Fatal(err)
+        }
         defer f.Close()
-        runtime.GC() // получить живые объекты
-        pprof.Lookup(&quot;heap&quot;).WriteTo(f, 0)
+        runtime.GC() // принудительно очищаем мусор, чтобы зафиксировать живые объекты
+        if err := pprof.Lookup(&quot;heap&quot;).WriteTo(f, 0); err != nil {
+            log.Fatal(err)
+        }
     }
 }
 </code></pre>
 </div>
 
-<p>Это даёт мгновенный inuse-профиль. Чтобы симулировать <code>seconds</code>, нужно вручную запустить таймер и использовать <code>runtime.ReadMemStats</code> до и после, что сложнее.</p>
-<h3 id="3-cherez-go-test-bench">3. Через `go test -bench`</h3>
+<p>Такой подход формирует мгновенный снимок <code>inuse_space</code>. Чтобы симулировать <code>seconds</code>, нужно вручную запустить таймер и использовать <code>runtime.ReadMemStats</code> до и после замера, вычисляя разницу счетчиков вручную, что сложнее. Проще и надежнее использовать HTTP-эндпоинт с параметром <code>seconds</code>.</p>
+<h3 id="3-cherez-go-test-bench">3. Через go test -bench</h3>
 
-<p>Бенчмарки автоматически поддерживают <code>-memprofile</code>:</p>
+<p>При запуске микробенчмарков памяти используйте связку флагов <code>-benchmem</code> и <code>-memprofile</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2320,11 +2354,13 @@ func main() {
 </code></pre>
 </div>
 
-<p>Профиль будет содержать как <code>alloc_space</code>, так и <code>inuse_space</code> для последнего стабильного прогона бенчмарка. Это идеально для оценки аллокаций изолированного кода.</p>
-<h2 id="analiz-profilya-v-go-tool-pprof">Анализ профиля в `go tool pprof`</h2>
+<p>Сформированный файл <code>mem.prof</code> содержит полноценный профиль, объединяющий оба среза (<code>alloc_space</code> и <code>inuse_space</code>) для самого стабильного прогона бенчмарка.</p>
+<hr />
+<h2 id="analiz-profilya-v-go-tool-pprof">Анализ профиля в go tool pprof</h2>
 
 <h3 id="osnovnye-komandy">Основные команды</h3>
 
+<p>Запустите консольный интерфейс <code>pprof</code>, явно указав требуемый аналитический срез:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2334,24 +2370,25 @@ func main() {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go tool pprof -alloc_space alloc.prof
-# или
+  <pre class="language-bash"><code class="language-bash"># Анализ совокупных аллокаций (поиск источников мусора для GC)
+go tool pprof -alloc_space alloc.prof
+
+# Анализ живой памяти (поиск утечек и тяжелых структур)
 go tool pprof -inuse_space mem.prof
 </code></pre>
 </div>
 
-<p>Внутри интерактивного режима:</p>
-<ul>
-<li><strong><code>top</code></strong> — список функций по объёму памяти (flat). <code>top -cum</code> — с учётом потомков.</li>
-<li><strong><code>list FuncName</code></strong> — построчный разбор с объёмами.</li>
-<li><strong><code>tree</code></strong> — иерархическое представление call graph.</li>
-<li><strong><code>web</code></strong> — граф вызовов (Graphviz).</li>
-<li><strong><code>weblist FuncName</code></strong> — аннотированный исходный код в браузере.</li>
-<li><strong><code>flamegraph</code></strong> (через веб-интерфейс <code>-http=:8080</code>) — flamegraph для памяти, аналогично CPU (<a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>), но по байтам.</li>
-<li><strong><code>disasm FuncName</code></strong> — ассемблерный листинг с аннотациями (продвинутый уровень).</li>
-</ul>
+<p>Внутри интерактивной консоли доступны ключевые команды:<br />
+- <strong><code>top</code></strong> — таблица функций с наибольшим собственным объемом памяти (<code>flat</code>).<br />
+- <strong><code>top -cum</code></strong> — таблица функций по кумулятивному объему памяти (с учетом потомков).<br />
+- <strong><code>list FuncName</code></strong> — построчный аннотированный листинг исходного кода целевой функции с объемами аллокаций на каждой строке.<br />
+- <strong><code>weblist FuncName</code></strong> — генерация интерактивного HTML-листинга исходного кода в окне браузера.<br />
+- <strong><code>tree</code></strong> — иерархическое дерево графа вызовов с процентным распределением памяти.<br />
+- <strong><code>web</code></strong> — генерация векторного SVG-графа вызовов.<br />
+- <strong><code>disasm FuncName</code></strong> — ассемблерный листинг с пометками машинных инструкций аллокатора.</p>
 <h3 id="veb-interfeys">Веб-интерфейс</h3>
 
+<p>Наиболее наглядный способ исследования памяти — запуск встроенного веб-сервера <code>pprof</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2365,23 +2402,24 @@ go tool pprof -inuse_space mem.prof
 </code></pre>
 </div>
 
-<p>Предоставляет вкладки:<br />
-- <strong>Top</strong> — таблица.<br />
-- <strong>Graph</strong> — граф вызовов с толщиной рёбер, пропорциональной памяти.<br />
-- <strong>Flamegraph</strong> — интерактивное пламя.<br />
-- <strong>Source</strong> — аннотированный код.<br />
-- <strong>Alloc space vs Inuse space</strong> — переключатель между представлениями, если профиль содержит оба.</p>
+<p>Вкладки веб-интерфейса:<br />
+- <strong>Top:</strong> Сортируемая таблица функций;<br />
+- <strong>Graph:</strong> Граф потока данных, где толщина стрелок пропорциональна объему аллокаций;<br />
+- <strong>Flamegraph:</strong> Интерактивное пламя вызовов, где ширина каждого плато прямо пропорциональна объему памяти;<br />
+- <strong>Source:</strong> Построчный просмотр исходного кода с подсветкой горячих строк;<br />
+- <strong>VIEW -&gt; Sample type:</strong> Мгновенный переключатель между проекциями: <code>alloc_space</code>, <code>alloc_objects</code>, <code>inuse_space</code>, <code>inuse_objects</code>.</p>
 <h3 id="interpretatsiya-chisel">Интерпретация чисел</h3>
 
 <ul>
-<li><strong>flat</strong> — байты, выделенные непосредственно в теле функции (не включая вызовы).</li>
-<li><strong>cum</strong> — байты, выделенные функцией и всеми её потомками.</li>
-<li>Проценты — от общего объёма в профиле.</li>
+<li><strong>flat:</strong> Объем памяти, аллоцированный непосредственно инструкциями внутри тела текущей функции.</li>
+<li><strong>cum (cumulative):</strong> Суммарный объем памяти, выделенный самой функцией и всеми дочерними подпрограммами, вызванными из неё.</li>
+<li>Проценты (<code>flat%</code>, <code>cum%</code>) рассчитываются от общего объема памяти в анализируемом профиле.</li>
 </ul>
-<p>Паттерн анализа такой же, как в <a href="../03-cpu-profiling/4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a>: сначала смотрим <code>top -cum</code> для поиска диспетчеров, затем спускаемся к листьям с большим <code>flat</code>.</p>
+<p>Методология расследования совпадает с алгоритмом из <a href="../03-cpu-profiling/4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a>: сначала изучаем <code>top -cum</code> для локализации высокоуровневого диспетчера, затем спускаемся к конкретным листовым вызовам с максимальным <code>flat</code>.</p>
+<hr />
 <h2 id="sravnenie-profiley-pamyati-mezhdu-versiyami">Сравнение профилей памяти между версиями</h2>
 
-<p><code>go tool pprof</code> поддерживает сравнение двух профилей через <code>-diff_base</code>:</p>
+<p>Один из самых мощных аналитических приемов <code>pprof</code> — дифференциальный анализ двух снимков памяти с помощью ключа <code>-diff_base</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2395,58 +2433,81 @@ go tool pprof -inuse_space mem.prof
 </code></pre>
 </div>
 
-<p>На flamegraph и в таблице будут показаны разницы: красный — увеличение аллокаций, зелёный — уменьшение. Это мощный инструмент для проверки, действительно ли оптимизация снизила нагрузку на память, и не появилось ли новых источников мусора.</p>
+<p>В веб-интерфейсе и на флеймграфе отобразится цветовая дельта:<br />
+- <strong>Красные плато:</strong> Рост аллокаций (потенциальная регрессия или новая утечка);<br />
+- <strong>Зеленые плато:</strong> Снижение аллокаций (успешная оптимизация).</p>
+<p>Этот инструмент незаменим в CI/CD пайплайнах для предотвращения регрессий производительности перед релизом.</p>
+<hr />
 <h2 id="nastroyka-tochnosti-memprofilerate">Настройка точности: MemProfileRate</h2>
 
-<p>Переменная окружения <code>GODEBUG=memprofilerate=N</code> или вызов <code>runtime.MemProfileRate = N</code> управляют частотой сэмплирования. По умолчанию 512 КБ. Снижение до 1 (каждый байт записывается) даёт максимальную точность, но огромный overhead. Для отладки в тестах можно установить 1–1024. В production-среде менять не рекомендуется без крайней необходимости.</p>
+<p>Частота статистического сэмплирования регулируется переменной окружения <code>GODEBUG=memprofilerate=N</code> или программной модификацией глобальной переменной рантайма:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">runtime.MemProfileRate = N
+</code></pre>
+</div>
+
+<p>По умолчанию шаг составляет <strong>512 КБ</strong>.<br />
+- Установка <code>GODEBUG=memprofilerate=1</code> переводит профилировщик в режим перехвата каждого байта, гарантируя 100% точность для бенчмарков, но создавая огромные накладные расходы на CPU.<br />
+- В боевом окружении менять <code>MemProfileRate</code> без острой необходимости категорически не рекомендуется.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Ложная уверенность в отсутствии аллокаций</span>
   </div>
   <div class="callout-body">
-    <p>При низком <code>MemProfileRate</code> профиль может не содержать важных мелких аллокаций, и вы сделаете ложный вывод, что функция «не аллоцирует». При подозрении на это временно уменьшайте <code>MemProfileRate</code> и повторяйте профилирование в тестовой среде.</p>
+    <p>При работе со стандартным <code>MemProfileRate=512KB</code> функция, которая редко аллоцирует мелкие объекты размером 32 байта, может ни разу не пересечь порог сэмплирования. Инженер смотрит в профиль, видит ноль и делает ошибочный вывод, что «функция не аллоцирует в куче». Всегда перепроверяйте гипотезы через микробенчмарки с ключом <code>-benchmem</code>!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="svyaz-s-drugimi-profilyami-i-metrikami-pamyati">Связь с другими профилями и метриками памяти</h2>
 
-<ul>
-<li><strong>CPU-профиль</strong> (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>) показывает, <em>какие</em> функции жгут процессор. Если у вас много <code>runtime.mallocgc</code> и <code>runtime.gcBgMarkWorker</code> в CPU, memory profile покажет, <em>кто</em> генерирует эту нагрузку.</li>
-<li><strong>Блокировочный профиль</strong> (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>) может показать ожидания на аллокаторе (хотя в Go аллокатор редко становится точкой contention).</li>
-<li><strong>Метрики GC</strong> (<code>/debug/pprof/gc</code>, <code>GODEBUG=gctrace=1</code>) — для корреляции пиков аллокаций и пауз GC.</li>
-<li><strong>Утечки памяти</strong> диагностируются сравнением нескольких <code>inuse_space</code> профилей во времени (<a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>).</li>
-</ul>
+<p>Профиль памяти работает в синергии с другими инструментами экосистемы Go:<br />
+- <strong>CPU-профиль (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>):</strong> Если в отчете CPU доминируют функции рантайма <code>runtime.mallocgc</code> и фоновые потоки <code>runtime.gcBgMarkWorker</code>, значит, процессор перегружен чисткой мусора. Профиль памяти с флагом <code>-alloc_space</code> покажет, кто именно генерирует эту нагрузку.<br />
+- <strong>Блокировочный профиль (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>):</strong> Позволяет выявить задержки горутин на системных блокировках аллокатора при экстремальной конкуренции.<br />
+- <strong>Диагностика GC (<code>GODEBUG=gctrace=1</code> и эндпоинт <code>/debug/pprof/gc</code>):</strong> Позволяет сопоставить пиковые выбросы аллокаций с длительностью фаз разметки сборщика мусора.<br />
+- <strong>Диагностика утечек памяти (<a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>):</strong> Базируется на сравнении нескольких снимков <code>inuse_space</code>, сделанных с интервалом в несколько часов.</p>
+<hr />
 <h2 id="mechanical-sympathy-chto-profil-pamyati-govorit-o-zheleze">Mechanical Sympathy: что профиль памяти говорит о «железе»</h2>
 
-<p>Профиль памяти не содержит прямых метрик кэша или TLB, но Senior может экстраполировать:<br />
-- Большое количество мелких объектов (много allocs/op) ведёт к фрагментации и разбросу адресов, увеличивая TLB misses (<a href="1-memory-model-go.html" class="wikilink">1. Memory model Go</a>).<br />
-- Большие аллокации (десятки МБ) могут не помещаться в кэш и вызывать потоковые копирования RAM↔CPU, что видно по высокому <code>runtime.memmove</code> в CPU-профиле.<br />
-- Предвыделение (<code>make</code> с cap) и <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) улучшают пространственную локальность и снижают долю холодных данных.</p>
-<p>Таким образом, pprof memory profile — это не просто учёт байтов, а карта взаимодействия вашей программы с иерархией памяти.</p>
+<p>Хотя <code>pprof</code> оперирует абстрактными байтами и структурами Go, опытный Senior видит за ними физические события кремния:<br />
+1. <strong>Шквал мелких объектов (высокий alloc_objects):</strong> Порождает катастрофическую фрагментацию спанов, заставляя контроллер памяти обращаться к тысячам разрозненных страниц и вызывая постоянные промахи TLB (<a href="1-memory-model-go.html" class="wikilink">1. Memory model Go</a>).<br />
+2. <strong>Гигантские аллокации (десятки мегабайт):</strong> Не умещаются в кэш процессора L3, вызывая прямые обращения к шине DRAM и провоцируя всплески функции копирования <code>runtime.memmove</code> в CPU-профиле.<br />
+3. <strong>Оптимизация локальности:</strong> Предварительное выделение емкости (<code>make</code> с <code>cap</code>) и повторное использование буферов через <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) удерживают активные данные в горячем кэше L1/L2, защищая ядра от простоев.</p>
+<hr />
 <h2 id="tipichnyy-workflow-pri-problemakh-s-pamyatyu">Типичный workflow при проблемах с памятью</h2>
 
+<p>При расследовании проблем с памятью следуйте системному регламенту:</p>
 <ol>
-<li>Обнаружили аномалию: высокое потребление RAM или частые GC-паузы через метрики (<a href="../05-garbage-collector/6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>).</li>
-<li>Снимаем <code>inuse_space</code> профиль для поиска того, что занимает память сейчас.</li>
-<li>Снимаем <code>alloc_space</code> за 30 секунд под нагрузкой для поиска источников мусора.</li>
-<li>Анализируем <code>top</code>, <code>list</code>, возможно, <code>flamegraph</code>.</li>
-<li>Для конкретной функции проверяем escape analysis (<code>go build -gcflags="-m"</code>).</li>
-<li>Оптимизируем: предвыделение, пул, замена библиотеки.</li>
-<li>Сравниваем профили до и после через <code>-diff_base</code>.</li>
-<li>Подтверждаем улучшение бенчмарками с <code>-benchmem</code>.</li>
+<li><strong>Зафиксировать симптом:</strong> Обнаружить монотонный рост RSS процесса или аномальные всплески задержек GC в метриках Prometheus (<a href="../05-garbage-collector/6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>).</li>
+<li><strong>Снять снимок живой памяти:</strong> Зафиксировать <code>inuse_space</code> для оценки текущей занятости кучи.</li>
+<li><strong>Снять дельту аллокаций:</strong> Зафиксировать <code>alloc_space</code> за 30 секунд под нагрузкой через HTTP (<code>/debug/pprof/heap?seconds=30</code>).</li>
+<li><strong>Локализовать виновника:</strong> Открыть профиль в браузере (<code>-http=:8080</code>), изучить плато флеймграфа, команды <code>top</code> и <code>list</code>.</li>
+<li><strong>Проверить причину побега:</strong> Запустить <code>go build -gcflags="-m"</code> для целевой функции (<a href="3-escape-analysis.html" class="wikilink">3. Escape analysis</a>).</li>
+<li><strong>Оптимизировать код:</strong> Применить предвыделение, пул объектов <code>sync.Pool</code> или заменить тяжелую библиотеку.</li>
+<li><strong>Верифицировать дельту:</strong> Сравнить снимки до и после оптимизации с помощью ключа <code>-diff_base</code>.</li>
+<li><strong>Зафиксировать успех:</strong> Убедиться в снижении <code>B/op</code> в бенчмарках с ключом <code>-benchmem</code>.</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>pprof memory profile</strong> — мощный инструмент с двумя режимами: <code>inuse_space</code> (живая память) и <code>alloc_space</code> (аллокации).</li>
-<li>Сбор через HTTP, <code>runtime/pprof</code> или <code>go test</code>; параметр <code>seconds</code> позволяет получить дельту.</li>
-<li>Анализ через <code>go tool pprof</code> с командами <code>top</code>, <code>list</code>, <code>tree</code>, <code>flamegraph</code> и сравнение версий.</li>
-<li>Настройка <code>MemProfileRate</code> балансирует точность и overhead.</li>
-<li>Профиль памяти связывает высокоуровневые проблемы (GC-паузы, утечки) с конкретными строками кода.</li>
-<li>В сочетании с CPU-профилем и escape analysis даёт полную картину для оптимизации.</li>
+<li><strong>pprof memory profile</strong> — высокоточный инструмент инспекции кучи, оперирующий двумя взаимодополняющими проекциями: <code>inuse_space</code> (текущая живая память) и <code>alloc_space</code> (накопленный поток аллокаций).</li>
+<li>Сбор данных выполняется через эндпоинт <code>/debug/pprof/heap</code>, флаг <code>-memprofile</code> бенчмарков или прямой программный вызов <code>pprof.Lookup("heap").WriteTo</code>.</li>
+<li>Режим <code>?seconds=30</code> позволяет получить изолированную дельту аллокаций, исключая фоновый шум старых объектов.</li>
+<li>Аналитические команды <code>top</code>, <code>list</code>, <code>tree</code> и веб-флеймграф позволяют пройти путь от миллионных аллокаций к конкретной строке кода.</li>
+<li>Дифференциальный анализ через флаг <code>-diff_base</code> наглядно подсвечивает успехи и регрессии оптимизации памяти.</li>
+<li>Понимание метрик профилировщика памяти связывает код программы с паузами сборщика мусора и аппаратным благополучием кремниевых кэшей.</li>
 </ul>
-<p>Теперь, освоив инструментарий памяти, мы готовы перейти к диагностике одной из самых неприятных проблем — <a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>: как находить, какие бывают, и как не допускать.</p>
+<p>Освоив полный инструментарий снятия профилей, мы переходим к расследованию одной из самых коварных болезней production-систем: <a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a> — разберем классификацию утечек в Go, способы их локализации и методы предотвращения.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

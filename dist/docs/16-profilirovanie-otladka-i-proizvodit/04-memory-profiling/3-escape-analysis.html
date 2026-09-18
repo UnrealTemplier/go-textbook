@@ -2169,28 +2169,63 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Escape analysis</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="pochemu-kompilyator-reshaet-gde-zhit-peremennoy">Почему компилятор решает, где жить переменной</h2>
+            <h1>Escape analysis</h1>
+<blockquote>
+<p><em>«Компилятор Go при анализе побега переменных напоминает предельно бдительного пограничника: он обязан гарантировать, что ни один указатель не пересечет границу стекового фрейма функции нелегально. Если есть хоть малейшее сомнение, что объект переживет вызов или будет кем-то разделен, выносится вердикт: эвакуация в кучу. Наша задача как инженеров — не спорить с пограничником, а предъявлять код с безупречным алиби для стека».</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<hr />
+<h2 id="pochemu-kompilyator-reshaet-gde-zhit-peremennoy">Почему компилятор решает, где жить переменной</h2>
 
-<p>В <a href="2-heap-vs-stack.html" class="wikilink">2. Heap vs stack</a> мы установили фундаментальное различие: стек быстр и автоматически очищается, куча — медленна и нагружает GC. Но разработчик в Go не размещает переменные явно. Решение принимает <strong>escape analysis</strong> (анализ убегания) — статический анализ кода на этапе компиляции, который определяет, может ли переменная быть использована за пределами своего фрейма, и если да — отправляет её в кучу.</p>
-<p>Понимание escape analysis критически важно для Senior Go-инженера: оно объясняет, почему совершенно безобидный на вид код генерирует гигабайты мусора, и даёт рычаг управления без отказа от идиоматичности. В этой статье мы разберём, как именно компилятор принимает решение, как читать его отчёты, как влиять на «убегание» и как проверять результаты с помощью профилировщика памяти (<a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>, <a href="4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>).</p>
+<p>В предыдущей статье (<a href="2-heap-vs-stack.html" class="wikilink">2. Heap vs stack</a>) мы выяснили фундаментальную истину микроархитектуры: стековая память — это экстремальная скорость (1 такт CPU) и нулевая нагрузка на сборщик мусора, а куча — это комплексная плата за гибкость с накладными расходами аллокатора, барьеров записи и промахов кэша.</p>
+<p>Но в Go у разработчика нет ключевых слов <code>stack</code> или <code>heap</code>, как нет и явного вызова освобождения памяти. Решение о том, где физически материализуется каждый байт вашей структуры, принимает <strong>анализ побега (Escape Analysis)</strong> — специализированная фаза оптимизации компилятора (<code>cmd/compile</code>), анализирующая граф потока указателей на этапе статической сборки.</p>
+<p>Понимание механизмов escape analysis — один из самых мощных рычагов в руках Senior Go-разработчика. Оно объясняет, почему визуально безобидный лог в цикле может порождать гигабайты мусора в секунду, и позволяет целенаправленно оптимизировать горячие пути сервисов, не жертвуя идиоматичностью и выразительностью языка Go. </p>
+<p>В этой главе мы заглянем под капот алгоритма анализа, научимся расшифровывать отчеты компилятора, разберем главные триггеры побега и проверим их влияние инструментами профилирования (<a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>, <a href="4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>).</p>
+<hr />
 <h2 id="chto-takoe-escape-analysis">Что такое Escape Analysis</h2>
 
-<p>Escape analysis — это статический анализ потока указателей, выполняемый компилятором Go. Его задача: для каждой переменной с типом, содержащим указатели, или для составных типов (слайсы, мапы, интерфейсы) определить, может ли указатель на неё (или она сама) «убежать» из текущей области видимости. Если да — переменная размещается в куче. Если нет — она остаётся на стеке.</p>
-<p>Анализ консервативен: если компилятор не может строго доказать, что переменная не убегает, она отправляется в кучу. Поэтому часть переменных, которые фактически никогда не используются вне функции, всё равно могут быть размещены в куче из-за ограничений анализа.</p>
-<p>Escape analysis работает на уровне SSA-представления внутри компилятора (после преобразования AST в SSA). Он проходит по всем функциям пакета и строит граф потока указателей. Подробнее «под капотом» будет ниже.</p>
+<p><strong>Escape Analysis</strong> — это алгоритм статического анализа потока данных (Data-Flow Analysis), выполняемый компилятором Go над промежуточным SSA-представлением программы.</p>
+<p>Его фундаментальная цель: для каждого выражения создания объекта (литералы структур, вызовы <code>new()</code>, <code>make()</code>, создание замыканий) строго доказать, что <strong>время жизни этого объекта ограничено временем жизни текущего стекового фрейма</strong>.<br />
+- Если доказательство получено: объект аллоцируется на стеке функции;<br />
+- Если компилятор видит, что ссылка на объект может пережить фрейм, либо не может это опровергнуть: объект эвакуируется в кучу (<strong>escapes to heap</strong>).</p>
+<h3 id="printsip-arkhitekturnogo-konservatizma">Принцип архитектурного консерватизма</h3>
+<p>Главное правило escape analysis: <strong>компилятор предельно консервативен</strong>.<br />
+Если из-за динамического полиморфизма интерфейсов, сложного ветвления или межпакетных вызовов компилятор не имеет 100% математического доказательства безопасности стека, он <strong>всегда выбирает кучу</strong>. Безопасность памяти (Memory Safety — отсутствие Dangling Pointers) для создателей Go безусловно важнее наносекунд производительности.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Init[&quot;Создание объекта (new, make, struct literal)&quot;] --&gt; Analyze[&quot;Анализ графа потока указателей (SSA)&quot;]
+Analyze --&gt; Check{&quot;Указатель выходит&lt;br&gt;за пределы функции?&quot;}
+Check -- &quot;Нет (гарантировано)&quot; --&gt; Stack[&quot;Размещение на стеке&lt;br&gt;0 аллокаций, 1 такт CPU&quot;]
+Check -- &quot;Да или сомнительно&quot; --&gt; Heap[&quot;Эвакуация в кучу (escapes to heap)&lt;br&gt;Аллокатор mcache + учет в GC&quot;]
+  </pre>
+</div>
+
+
+<hr />
 <h2 id="kak-kompilyator-reshaet-osnovnye-kriterii-ubeganiya">Как компилятор решает: основные критерии убегания</h2>
 
-<p>Любая операция, которая делает указатель на переменную доступным «внешнему миру», вызывает её эвакуацию в кучу. Перечислим главные триггеры.</p>
+<p>Рассмотрим канонические ситуации, при которых переменная неизбежно покидает безопасный стек и отправляется в кучу.</p>
 <h3 id="1-vozvrat-ukazatelya-iz-funktsii">1. Возврат указателя из функции</h3>
-
-<p>Классика:</p>
+<p>Классический паттерн фабричных методов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2207,9 +2242,9 @@
 </code></pre>
 </div>
 
+<p>В языках C/C++ возвращение указателя на локальную переменную привело бы к UB и разрушению стека. В Go компилятор анализирует сигнатуру: адрес <code>&amp;x</code> покидает стек вызываемой функции и будет доступен вызывающему коду. Переменная <code>x</code> принудительно эвакуируется в кучу.</p>
 <h3 id="2-otpravka-v-kanal">2. Отправка в канал</h3>
-
-<p>Значение, посланное в канал, может быть прочитано другой горутиной, которая живёт дольше текущей функции:</p>
+<p>Значение, отправленное в канал, предназначено для другой, конкурентной горутины, чье время жизни абсолютно независимо от текущего фрейма:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2221,13 +2256,13 @@
   </div>
   <pre class="language-go"><code class="language-go">ch := make(chan *int)
 x := 42
-ch &lt;- &amp;x // убегает
+ch &lt;- &amp;x // x убегает в кучу
 </code></pre>
 </div>
 
-<p>Даже если канал небуферизированный и приём происходит немедленно, компилятор не анализирует динамику, только факт передачи в канал.</p>
+<p>Даже если канал небуферизированный и чтение произойдет мгновенно, компилятор оперирует статическим анализом потока данных, в котором отправка в канал является безусловной точкой побега.</p>
 <h3 id="3-sokhranenie-v-globalnuyu-peremennuyu-ili-pole-struktury-kotoraya-perezhivyot-f">3. Сохранение в глобальную переменную или поле структуры, которая переживёт функцию</h3>
-
+<p>Если указатель на локальную переменную записывается в глобальное состояние или поле структуры, живущей дольше текущего вызова, компилятор немедленно перемещает ее в кучу:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2246,10 +2281,9 @@ func f() {
 </code></pre>
 </div>
 
-<p>Аналогично присваивание указателя в поле слайса, мапы или интерфейса, который возвращается или хранится глобально.</p>
+<p>Аналогичное правило действует для сохранения указателей в глобальные слайсы или мапы.</p>
 <h3 id="4-vyzov-metodov-cherez-interfeys">4. Вызов методов через интерфейс</h3>
-
-<p>Если переменная конкретного типа передаётся в функцию, принимающую интерфейс, происходит <strong>боксинг</strong> — значение копируется в кучу, чтобы быть представленным как интерфейс. Даже если функция не сохраняет значение, факт приведения к интерфейсу вызывает аллокацию (в ранних версиях Go, сейчас есть оптимизации, но общий принцип: <code>interface{}</code> может вызвать убегание).</p>
+<p>Приведение конкретного типа данных к интерфейсному типу <code>interface{}</code> (или <code>any</code>) влечет за собой процедуру <strong>боксинга (boxing)</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2260,15 +2294,15 @@ func f() {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func print(v interface{}) { fmt.Println(v) }
+
 x := 42
 print(x) // x уходит в кучу? зависит от escape-анализа fmt.Println
 </code></pre>
 </div>
 
-<p><code>fmt.Println</code> принимает <code>...interface{}</code>, это заставляет аргументы «упаковываться» в интерфейсы. Компилятор может определить, что внутри <code>Println</code> значение не сохраняется, и всё же оставить его на стеке (поздние версии Go умеют такое), но часто всё равно происходит эвакуация.</p>
+<p>Рантайму Go для представления интерфейса необходима пара указателей: таблица методов <code>itab</code> и указатель на сами данные. Если вызываемая функция не заинлайнена, компилятор не может гарантировать, что метод интерфейса не сохранит ссылку у себя. Кроме того, стандартная функция <code>fmt.Println(v ...interface{})</code> принимает срез пустых интерфейсов, что практически гарантированно вызывает побег переданных аргументов в кучу.</p>
 <h3 id="5-zakhvat-peremennoy-zamykaniem">5. Захват переменной замыканием</h3>
-
-<p>Горутина или анонимная функция, переживающая текущий фрейм, заставляет все захваченные переменные уйти в кучу:</p>
+<p>Если анонимная функция (замыкание) захватывает локальную переменную по ссылке и сохраняется, передается наружу или запускается в отдельной горутине:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2285,13 +2319,11 @@ print(x) // x уходит в кучу? зависит от escape-анализ�
 </code></pre>
 </div>
 
-<p>Даже если горутина завершится до выхода из <code>start</code>, компилятор не знает порядок выполнения — он видит захват и эвакуирует.</p>
+<p>Поскольку новая горутина выполняется асинхронно и гарантированно переживет фрейм функции <code>start</code>, переменная <code>x</code> разделяется между горутинами и обязана жить в куче.</p>
 <h3 id="6-khranenie-v-slayse-ili-mape-kotorye-mogut-perezhit-freym">6. Хранение в слайсе или мапе, которые могут пережить фрейм</h3>
-
-<p>Если слайс или мапа создаются локально, но затем возвращаются или присваиваются внешней структуре, все их элементы могут убежать (хотя компилятор может отслеживать, какие конкретно). Но в общем случае, если слайс «убегает», его backing array выделяется в куче.</p>
+<p>Если вы создаете локальный слайс или ассоциативный массив и возвращаете его из функции, все элементы, на которые ссылается структура, эвакуируются в кучу: базовый массив (Backing Array) слайса аллоцируется через <code>runtime.makeslice</code> в куче.</p>
 <h3 id="7-peremennye-v-tsiklakh-na-kotorye-berutsya-ukazateli">7. Переменные в циклах, на которые берутся указатели</h3>
-
-<p>Компилятор анализирует, берётся ли указатель на переменную внутри цикла, и если да, то переменная может оказаться недоступной после итерации (раньше типичная ошибка с <code>for range</code>). Но сейчас итерационные переменные в <code>for range</code> с Go 1.22 имеют per-iteration, что изменило поведение. Однако для классического <code>for</code> с указателем может убегать:</p>
+<p>Если внутри цикла создается переменная и ее адрес сохраняется в накопительную коллекцию:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2309,9 +2341,12 @@ for i := 0; i &lt; 10; i++ {
 </code></pre>
 </div>
 
+<p>Поскольку срез <code>ptrs</code> переживает тело цикла, каждый экземпляр <code>x</code> эвакуируется в кучу, создавая 10 раздельных аллокаций.<br />
+<em>(Начиная с Go 1.22 итерационная переменная <code>for range</code> имеет область видимости per-iteration, что защищает от логических ошибок замыканий, но взятие указателя и сохранение в слайс по-прежнему эвакуирует объект в кучу).</em></p>
+<hr />
 <h2 id="kak-uvidet-resheniya-escape-analysis">Как увидеть решения escape analysis</h2>
 
-<p>Компилятор Go сообщает о принятых решениях при флаге <code>-m</code> (и более детально с <code>-m -m</code>):</p>
+<p>Компилятор Go открыт к диалогу: разработчик может в любой момент увидеть подробнейший протокол решений анализа побега с помощью флага компилятора <code>-gcflags="-m"</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2325,11 +2360,11 @@ for i := 0; i &lt; 10; i++ {
 </code></pre>
 </div>
 
-<p>Вывод:</p>
+<p>Пример вывода:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
@@ -2341,12 +2376,15 @@ for i := 0; i &lt; 10; i++ {
 </code></pre>
 </div>
 
-<p>Первая строка говорит, что функция может быть инлайнена. Вторая — что указатель <code>&amp;x</code> убегает. Третья — что сама переменная <code>x</code> перемещена в кучу.</p>
-<p>Если переменная не убегает, мы увидим:</p>
+<p>Разбор строк протокола:<br />
+- <code>can inline newInt</code> — компилятор отмечает, что функция может быть заинлайнена (инлайнинг может кардинально изменить картину побега, позволив переменной остаться на стеке вызывающего фрейма!);<br />
+- <code>&amp;x escapes to heap</code> — указатель на переменную покидает локальную область видимости;<br />
+- <code>moved to heap: x</code> — окончательный вердикт: переменная <code>x</code> аллоцируется в куче.</p>
+<p>Если же переменная успешно удержана на стеке:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
@@ -2356,25 +2394,46 @@ for i := 0; i &lt; 10; i++ {
 </code></pre>
 </div>
 
-<p>Полезно применять к бенчмаркам или конкретным функциям, чтобы понять, почему аллокации высоки.</p>
+<p>Для глубокого расследования сложных связей побега используйте флаг двойного уровня детализации:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go build -gcflags=&quot;-m -m&quot; .
+</code></pre>
+</div>
+
+<p>Он выведет цепочки зависимостей потока данных (flow graph), объясняющие, какое именно выражение заставило компилятор эвакуировать переменную.</p>
+<hr />
 <h2 id="escape-analysis-pod-kapotom">Escape analysis под капотом</h2>
 
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Пакет cmd/compile/internal/escape</span>
   </div>
   <div class="callout-body">
-    <p>Escape analysis в Go реализован в пакете <code>cmd/compile/internal/escape</code>. Он работает на SSA-графе, но имеет собственный проход, который строит граф потока данных для указателей. Каждому выражению присваивается уровень "location" (stack или heap). Алгоритм использует абстрактную интерпретацию: он помечает узлы графа, если на них есть ссылки из "escape points" (точки убегания). Основные escape points: возвращаемое значение, аргументы функций с пометкой <code>//go:noescape</code> или без, глобальные переменные, каналы. Анализ консервативен и не отслеживает динамическое поведение (поток управления через горутины, динамические типы). С каждой новой версией Go анализ становится умнее: например, раньше <code>for range</code> циклы вызывали убегание переменной-итератора, сейчас (с 1.22) переменная на каждой итерации новая и не убегает. Также улучшилась обработка интерфейсов: если компилятор видит, что значение не покидает вызов, он может разместить его на стеке.</p>
+    <p>Реализация анализа побега сосредоточена в пакете <code>cmd/compile/internal/escape</code>. Анализ выполняется над промежуточным SSA-представлением кода (Static Single Assignment) и строит ориентированный граф потока данных (Directed Data Flow Graph). </p>
+<p>Каждому узлу графа (переменная, выражение, аргумент) присваивается уровень расположения (<code>location</code>): стек или куча. Анализ запускает процесс абстрактной интерпретации (Abstract Interpretation), проходя по узлам от так называемых <strong>escape points</strong> (точек побега):<br />
+- операторы возврата <code>return</code>;<br />
+- присваивание в глобальные переменные;<br />
+- передача аргументов в сторонние невстроенные функции без директивы <code>//go:noescape</code>;<br />
+- операции с каналами.</p>
+<p>Если от точки побега существует путь к переменной, она помечается как <code>EscHeap</code>. Важно: с каждой версией Go компилятор становится умнее. Начиная с Go 1.22 переменные цикла <code>for range</code> создаются заново на каждой итерации, а механизм devirtualization в связке с PGO позволяет компилятору раскрывать типы за интерфейсами и устранять побег на стеке.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="prakticheskie-priyomy-upravleniya-escape-analysis">Практические приёмы управления escape analysis</h2>
 
-<p>Senior может влиять на решения компилятора, проектируя API и структуры данных так, чтобы горячие переменные оставались на стеке.</p>
+<p>Понимая правила игры, инженер может проектировать код так, чтобы критические переменные оставались на стеке:</p>
 <h3 id="1-izbegayte-vozvrata-ukazateley-na-lokalnye-peremennye-esli-eto-ne-neobkhodimo">1. Избегайте возврата указателей на локальные переменные, если это не необходимо</h3>
-
-<p>Если структура небольшая, возвращайте её по значению. Компилятор может разместить её в стеке вызывающей функции (frame pointer) и избежать кучи. Сравните:</p>
+<p>Если создаваемая структура компактна (до одной-двух кэш-линий), возвращайте ее <strong>по значению</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2384,17 +2443,16 @@ for i := 0; i &lt; 10; i++ {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// убегает
+  <pre class="language-go"><code class="language-go">// Убегает в кучу: аллокатор mcache + GC
 func makeConfig() *Config { return &amp;Config{Timeout: 10} }
 
-// не убегает, если Config &lt;= 64-128 байт
+// Не убегает: создается на стеке вызывающего кода (если Config &lt;= 64-128 байт)
 func makeConfig() Config { return Config{Timeout: 10} }
 </code></pre>
 </div>
 
 <h3 id="2-peredavayte-po-znacheniyu-a-ne-po-ukazatelyu-kogda-eto-umestno">2. Передавайте по значению, а не по указателю, когда это уместно</h3>
-
-<p>Если функция не модифицирует структуру и структура невелика, передача по значению исключает необходимость в указателе и, возможно, позволит компилятору оставить её на стеке.</p>
+<p>Если вызываемая функция лишь читает поля компактной структуры, передача по значению избавляет от создания указателя и гарантирует нулевой побег:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2409,11 +2467,9 @@ func makeConfig() Config { return Config{Timeout: 10} }
 </div>
 
 <h3 id="3-izbegayte-interfeysov-v-goryachikh-vyzovakh">3. Избегайте интерфейсов в горячих вызовах</h3>
-
-<p>Там, где нужна полиморфная обработка, и производительность критична, используйте generics (с Go 1.18+). Generics мономорфизируются на этапе компиляции, что позволяет избежать боксинга и кучи.</p>
+<p>Интерфейсы прячут конкретный тип за таблицей <code>itab</code>. В горячих циклах используйте дженерики (Generics, Go 1.18+): компилятор мономорфизирует параметризованный код под конкретный тип, устраняя боксинг и сохраняя переменные на стеке.</p>
 <h3 id="4-ne-zakhvatyvayte-peremennye-gorutinami-bez-neobkhodimosti">4. Не захватывайте переменные горутинами без необходимости</h3>
-
-<p>Передавайте значения через аргументы горутины — это может позволить переменной остаться на стеке:</p>
+<p>Передавайте аргументы в горутину явно через параметры функции:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2424,19 +2480,19 @@ func makeConfig() Config { return Config{Timeout: 10} }
     </button>
   </div>
   <pre class="language-go"><code class="language-go">x := 42
-go func(v int) { fmt.Println(v) }(x) // x не обязательно убежит
+go func(v int) { fmt.Println(v) }(x) // x передается по значению, избегая общего побега
 </code></pre>
 </div>
 
-<h3 id="5-ispolzuyte-gonoinline-tolko-dlya-otladki">5. Используйте `//go:noinline` только для отладки</h3>
-
-<p>Иногда разработчики запрещают инлайнинг, чтобы заставить escape analysis держать переменную на стеке (инлайн мог бы раскрыть убегание). Но это хрупко и не рекомендуется для production.</p>
+<h3 id="5-ispolzuyte-gonoinline-tolko-dlya-otladki">5. Используйте //go:noinline только для отладки</h3>
+<p>Иногда инженеры отключают инлайнинг директивой <code>//go:noinline</code>, чтобы изолировать стек функции. В боевом коде этого делать нельзя: инлайнинг — главный союзник escape analysis, так как он стирает границы между функциями и позволяет переменным остаться на стеке родителя!</p>
 <h3 id="6-sledite-za-razmerom-struktur">6. Следите за размером структур</h3>
-
-<p>Компилятор может решить, что большую структуру дешевле скопировать в кучу, чем держать на стеке (из-за роста стека). Это эвристика, но общее правило: для структур &gt; 1 КБ есть риск убегания; проверяйте.</p>
+<p>Компилятор Go имеет внутренний лимит размера локальных переменных на стеке (эвристика порядка десятков килобайт). Если объявить структуру размером 10 МБ, компилятор принудительно отправит ее в кучу, чтобы не вызвать панического переполнения стека горутины.</p>
+<hr />
 <h2 id="proverka-rezultata-profili-pamyati-i-benchmarki">Проверка результата: профили памяти и бенчмарки</h2>
 
-<p>После изменения кода обязательно проверьте фактические аллокации через memory profile (<a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>) или <code>go test -benchmem</code>. Например:</p>
+<p>После изменения кода обязательно проверьте фактические аллокации через memory profile (<a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>) или команду <code>go test -benchmem</code>.</p>
+<p>Напишите микробенчмарк для горячей функции:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2468,67 +2524,72 @@ go func(v int) { fmt.Println(v) }(x) // x не обязательно убежи
 </code></pre>
 </div>
 
-<p>Если <code>allocs/op</code> и <code>B/op</code> снизились, вы на верном пути. Если нет — вернитесь к <code>-gcflags="-m"</code> и ищите неожиданные убегания.</p>
+<p>Следите за показателями:<br />
+- <strong><code>allocs/op</code></strong> — количество аллокаций в куче на одну операцию;<br />
+- <strong><code>B/op</code></strong> — количество выделенных байт кучи на операцию.</p>
+<p>Если вам удалось свести метрику к <strong><code>0 B/op</code> и <code>0 allocs/op</code></strong>, вы добились идеального размещения на стеке, и сборщик мусора больше никогда не побеспокоит этот цикл.</p>
+<hr />
 <h2 id="tipichnye-lovushki-i-neochevidnye-sluchai">Типичные ловушки и неочевидные случаи</h2>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Сборка слайса с возвратом</span>
   </div>
   <div class="callout-body">
-    <p><strong>Сборка слайса с возвратом.</strong> Если функция собирает слайс и возвращает его, слайс (заголовок) может быть на стеке, но его backing array всегда в куче. Это нормально. Но если вы внутри цикла добавляете элементы в слайс, который потом возвращается, все элементы в куче. Убегания элементов по отдельности не избежать, но можно снизить общее число аллокаций, предвыделяя ёмкость (<a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>).</p>
+    <p>Если функция создает срез через <code>make([]T, 0, n)</code> и возвращает его вызывающему коду, заголовок среза передается по значению, но его базовый массив (Backing Array) неизбежно эвакуируется в кучу. Это штатное поведение. Однако добавление элементов в срез через <code>append</code> без предвыделения емкости породит многократные промежуточные аллокации в куче. Обязательно используйте предвыделение емкости (<a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>).</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Передача ...interface{} в логировании и форматировании</span>
   </div>
   <div class="callout-body">
-    <p><strong>Передача <code>...interface{}</code>.</strong> Функции вроде <code>fmt.Printf</code> принимают <code>interface{}</code>. Каждый аргумент, даже простой <code>int</code>, может быть упакован в интерфейс и аллоцирован. Если вы логируете в горячем пути, используйте structured logging без боксинга (например, <code>slog</code> с типизированными методами) или отложенную оценку.</p>
+    <p>Функции стандартной библиотеки <code>fmt.Printf</code>, <code>fmt.Sprintf</code> и устаревшие логгеры принимают аргументы <code>...interface{}</code>. Каждый переданный примитив (даже <code>int</code> или <code>bool</code>) боксится в интерфейс и убегает в кучу. В высокочастотных контурах используйте современный структурированный логгер <code>slog</code> с типизированными методами (<code>slog.Int</code>, <code>slog.String</code>), которые спроектированы под Zero-Allocation.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Скрытые указатели в строках и слайсах</span>
   </div>
   <div class="callout-body">
-    <p><strong>Скрытые указатели.</strong> Строки и слайсы содержат указатели (на начало данных). Если вы возвращаете структуру с полем <code>string</code>, а строка формируется из локального слайса, это может привести к аллокации строки в куче. Компилятор часто выделяет строку на стеке, но зависит от контекста.</p>
+    <p>Тип <code>string</code> в Go под капотом содержит указатель на неизменяемый байтовый массив (<code>StringHeader</code>). Если функция конструирует строку из локального байтового среза через <code>string(bytes)</code> и возвращает ее, массив символов гарантированно копируется в кучу.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Межпакетный Escape Analysis</span>
   </div>
   <div class="callout-body">
-    <p><strong>Escape analysis не меж-пакетный.</strong> Если функция пакета A возвращает указатель на локальную переменную, то в пакете B переменная уже в куче (при вызове A). Компилятор не может отменить это решение. Поэтому проектируйте API так, чтобы избегать возврата указателей на внутренние данные без нужды.</p>
+    <p>Анализ побега работает в рамках компилируемого пакета (Package-level scope). Если функция пакета $A$ возвращает указатель наружу, компилятор не может знать, как этот указатель будет использоваться в импортирующем пакете $B$, и безоговорочно выталкивает данные в кучу. Проектируйте публичные API библиотек с возвратом структур по значению.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-pochemu-ubeganie-vredit">Mechanical Sympathy: почему убегание вредит</h2>
 
-<p>Каждая переменная, ушедшая в кучу, не только требует аллокации (которая может быть быстрой), но и становится частью графа GC, что приводит к:<br />
-- Дополнительным затратам CPU на сканирование и маркировку (<a href="../05-garbage-collector/2-tri-color-marking.html" class="wikilink">2. Tri color marking</a>);<br />
-- Записям write barrier при каждом обновлении указателя на неё (<a href="../05-garbage-collector/5-write-barriers.html" class="wikilink">5. Write barriers</a>);<br />
-- Разбросу адресов, ведущему к кэш-промахам и TLB-промахам (<a href="1-memory-model-go.html" class="wikilink">1. Memory model Go</a>, <a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
-<p>Стековые же данные линейны, плотно упакованы и автоматически освобождаются. Поэтому разумное управление escape analysis — это прямой путь к снижению latency и повышению throughput.</p>
+<p>Каждая переменная, выдавленная анализом побега в кучу, запускает цепную реакцию микроархитектурных потерь:<br />
+1. <strong>Затраты CPU на маркировку:</strong> Сборщик мусора обязан обойти каждый кучевой объект в фазе Mark (<a href="../05-garbage-collector/2-tri-color-marking.html" class="wikilink">2. Tri color marking</a>), расходуя вычислительные циклы ядер.<br />
+2. <strong>Активация барьеров записи:</strong> Мутация кучевых указателей сопровождается выполнением системных инструкций write barrier (<a href="../05-garbage-collector/5-write-barriers.html" class="wikilink">5. Write barriers</a>).<br />
+3. <strong>Разрушение кэша и TLB:</strong> Кучевые объекты фрагментируют память, вызывая шквал промахов кэш-линий и записей в TLB (<a href="1-memory-model-go.html" class="wikilink">1. Memory model Go</a>, <a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<p>Стековые переменные живут компактно, линейно и умирают мгновенно. Побег в кучу — это всегда микроархитектурный долг.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Escape analysis</strong> — статический анализ компилятора, решающий, может ли переменная быть использована вне текущего фрейма.</li>
-<li>Переменные убегают при возврате указателя, отправке в канал, сохранении в глобальные объекты, захвате замыканием, боксинге в интерфейс.</li>
-<li>Узнать о решениях можно с помощью <code>go build -gcflags="-m"</code>.</li>
-<li>Избегая ненужных указателей, интерфейсов в горячих путях и возврата указателей из функций, мы помогаем компилятору оставлять переменные на стеке.</li>
-<li>Убегание напрямую влияет на производительность через аллокации, GC-нагрузку и кэш-промахи.</li>
-<li>Проверять эффективность изменений следует через <code>-benchmem</code> и memory profile.</li>
+<li><strong>Escape Analysis</strong> — невидимый арбитр компилятора Go, решающий судьбу каждого байта вашей программы.</li>
+<li>Главные триггеры побега: возврат указателя из функции, отправка в каналы, сохранение в глобальные структуры, замыкания горутин и боксинг в интерфейсы <code>interface{}</code>.</li>
+<li>Инспекция: используйте флаг <code>go build -gcflags="-m"</code> для изучения вердиктов компилятора.</li>
+<li>Инженерная тактика: отдавайте предпочтение передаче структур по значению, используйте дженерики вместо пустых интерфейсов, предвыделяйте срезы и применяйте <code>slog</code>.</li>
+<li>Валидация: контролируйте показатели <code>0 allocs/op</code> в бенчмарках с ключом <code>-benchmem</code>.</li>
 </ul>
-<p>Теперь, понимая, как переменные распределяются между стеком и кучей, мы переходим к инструментальному анализу аллокаций: <a href="4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a> — где детально рассмотрим, как снимать профили памяти и интерпретировать распределение объектов.</p>
+<p>В следующей лекции мы перейдем от статического анализа к динамической практике: <a href="4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a> — научимся снимать профили аллокаций, анализировать частоту выделения памяти и находить прожорливые участки под реальной нагрузкой.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2556,7 +2617,7 @@ go func(v int) { fmt.Println(v) }(x) // x не обязательно убежи
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pochemu-kompilyator-reshaet-gde-zhit-peremennoy">Почему компилятор решает, где жить переменной</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-escape-analysis">Что такое Escape Analysis</a></li><li class="toc-item toc-h2"><a href="#kak-kompilyator-reshaet-osnovnye-kriterii-ubeganiya">Как компилятор решает: основные критерии убегания</a></li><li class="toc-item toc-h3"><a href="#1-vozvrat-ukazatelya-iz-funktsii">1. Возврат указателя из функции</a></li><li class="toc-item toc-h3"><a href="#2-otpravka-v-kanal">2. Отправка в канал</a></li><li class="toc-item toc-h3"><a href="#3-sokhranenie-v-globalnuyu-peremennuyu-ili-pole-struktury-kotoraya-perezhivyot-f">3. Сохранение в глобальную переменную или поле структуры, которая переживёт функцию</a></li><li class="toc-item toc-h3"><a href="#4-vyzov-metodov-cherez-interfeys">4. Вызов методов через интерфейс</a></li><li class="toc-item toc-h3"><a href="#5-zakhvat-peremennoy-zamykaniem">5. Захват переменной замыканием</a></li><li class="toc-item toc-h3"><a href="#6-khranenie-v-slayse-ili-mape-kotorye-mogut-perezhit-freym">6. Хранение в слайсе или мапе, которые могут пережить фрейм</a></li><li class="toc-item toc-h3"><a href="#7-peremennye-v-tsiklakh-na-kotorye-berutsya-ukazateli">7. Переменные в циклах, на которые берутся указатели</a></li><li class="toc-item toc-h2"><a href="#kak-uvidet-resheniya-escape-analysis">Как увидеть решения escape analysis</a></li><li class="toc-item toc-h2"><a href="#escape-analysis-pod-kapotom">Escape analysis под капотом</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-priyomy-upravleniya-escape-analysis">Практические приёмы управления escape analysis</a></li><li class="toc-item toc-h3"><a href="#1-izbegayte-vozvrata-ukazateley-na-lokalnye-peremennye-esli-eto-ne-neobkhodimo">1. Избегайте возврата указателей на локальные переменные, если это не необходимо</a></li><li class="toc-item toc-h3"><a href="#2-peredavayte-po-znacheniyu-a-ne-po-ukazatelyu-kogda-eto-umestno">2. Передавайте по значению, а не по указателю, когда это уместно</a></li><li class="toc-item toc-h3"><a href="#3-izbegayte-interfeysov-v-goryachikh-vyzovakh">3. Избегайте интерфейсов в горячих вызовах</a></li><li class="toc-item toc-h3"><a href="#4-ne-zakhvatyvayte-peremennye-gorutinami-bez-neobkhodimosti">4. Не захватывайте переменные горутинами без необходимости</a></li><li class="toc-item toc-h3"><a href="#5-ispolzuyte-gonoinline-tolko-dlya-otladki">5. Используйте //go:noinline только для отладки</a></li><li class="toc-item toc-h3"><a href="#6-sledite-za-razmerom-struktur">6. Следите за размером структур</a></li><li class="toc-item toc-h2"><a href="#proverka-rezultata-profili-pamyati-i-benchmarki">Проверка результата: профили памяти и бенчмарки</a></li><li class="toc-item toc-h2"><a href="#tipichnye-lovushki-i-neochevidnye-sluchai">Типичные ловушки и неочевидные случаи</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-ubeganie-vredit">Mechanical Sympathy: почему убегание вредит</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#pochemu-kompilyator-reshaet-gde-zhit-peremennoy">Почему компилятор решает, где жить переменной</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-escape-analysis">Что такое Escape Analysis</a></li><li class="toc-item toc-h3"><a href="#printsip-arkhitekturnogo-konservatizma">Принцип архитектурного консерватизма</a></li><li class="toc-item toc-h2"><a href="#kak-kompilyator-reshaet-osnovnye-kriterii-ubeganiya">Как компилятор решает: основные критерии убегания</a></li><li class="toc-item toc-h3"><a href="#1-vozvrat-ukazatelya-iz-funktsii">1. Возврат указателя из функции</a></li><li class="toc-item toc-h3"><a href="#2-otpravka-v-kanal">2. Отправка в канал</a></li><li class="toc-item toc-h3"><a href="#3-sokhranenie-v-globalnuyu-peremennuyu-ili-pole-struktury-kotoraya-perezhivyot-f">3. Сохранение в глобальную переменную или поле структуры, которая переживёт функцию</a></li><li class="toc-item toc-h3"><a href="#4-vyzov-metodov-cherez-interfeys">4. Вызов методов через интерфейс</a></li><li class="toc-item toc-h3"><a href="#5-zakhvat-peremennoy-zamykaniem">5. Захват переменной замыканием</a></li><li class="toc-item toc-h3"><a href="#6-khranenie-v-slayse-ili-mape-kotorye-mogut-perezhit-freym">6. Хранение в слайсе или мапе, которые могут пережить фрейм</a></li><li class="toc-item toc-h3"><a href="#7-peremennye-v-tsiklakh-na-kotorye-berutsya-ukazateli">7. Переменные в циклах, на которые берутся указатели</a></li><li class="toc-item toc-h2"><a href="#kak-uvidet-resheniya-escape-analysis">Как увидеть решения escape analysis</a></li><li class="toc-item toc-h2"><a href="#escape-analysis-pod-kapotom">Escape analysis под капотом</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-priyomy-upravleniya-escape-analysis">Практические приёмы управления escape analysis</a></li><li class="toc-item toc-h3"><a href="#1-izbegayte-vozvrata-ukazateley-na-lokalnye-peremennye-esli-eto-ne-neobkhodimo">1. Избегайте возврата указателей на локальные переменные, если это не необходимо</a></li><li class="toc-item toc-h3"><a href="#2-peredavayte-po-znacheniyu-a-ne-po-ukazatelyu-kogda-eto-umestno">2. Передавайте по значению, а не по указателю, когда это уместно</a></li><li class="toc-item toc-h3"><a href="#3-izbegayte-interfeysov-v-goryachikh-vyzovakh">3. Избегайте интерфейсов в горячих вызовах</a></li><li class="toc-item toc-h3"><a href="#4-ne-zakhvatyvayte-peremennye-gorutinami-bez-neobkhodimosti">4. Не захватывайте переменные горутинами без необходимости</a></li><li class="toc-item toc-h3"><a href="#5-ispolzuyte-gonoinline-tolko-dlya-otladki">5. Используйте //go:noinline только для отладки</a></li><li class="toc-item toc-h3"><a href="#6-sledite-za-razmerom-struktur">6. Следите за размером структур</a></li><li class="toc-item toc-h2"><a href="#proverka-rezultata-profili-pamyati-i-benchmarki">Проверка результата: профили памяти и бенчмарки</a></li><li class="toc-item toc-h2"><a href="#tipichnye-lovushki-i-neochevidnye-sluchai">Типичные ловушки и неочевидные случаи</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-ubeganie-vredit">Mechanical Sympathy: почему убегание вредит</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

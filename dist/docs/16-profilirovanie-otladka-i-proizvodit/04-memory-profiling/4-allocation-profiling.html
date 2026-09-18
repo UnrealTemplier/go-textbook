@@ -2169,42 +2169,89 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~34 мин чтения</span>
               
             </div>
             <h1 class="article-title">4. Allocation profiling</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="ot-gde-pamyat-k-pochemu-ona-tam-okazalas">От «где память» к «почему она там оказалась»</h2>
+            <h1>Allocation profiling</h1>
+<blockquote>
+<p><em>«Представьте себе банковский счет: остаток на конец дня может составлять скромные сто долларов, но за сутки через счет прокачались миллионы, породив гору комиссий и транзакционных издержек. Точно так же ведет себя и память: мгновенный снимок процесса может показывать тихие 50 мегабайт, в то время как аллокатор ежесекундно перемалывает гигабайты временных объектов, ввергая процессор в бесконечную войну за очистку мусора. Allocation profiling — это выписка всех операций по вашему счёту».</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<hr />
+<h2 id="ot-gde-pamyat-k-pochemu-ona-tam-okazalas">От «где память» к «почему она там оказалась»</h2>
 
-<p>В <a href="2-heap-vs-stack.html" class="wikilink">2. Heap vs stack</a> мы разделили память на быстрый стек и управляемую GC кучу. В <a href="3-escape-analysis.html" class="wikilink">3. Escape analysis</a> научились понимать, почему компилятор отправляет переменные в кучу. Но знать причины недостаточно — нужны точные цифры: сколько аллокаций совершается в конкретной функции, какого они размера, и как это влияет на производительность. Для этого существует <strong>allocation profiling</strong> — профилирование аллокаций.</p>
-<p>Allocation profiling — это мост между теорией escape analysis и практической оптимизацией. Он не просто показывает, сколько памяти занято <em>сейчас</em> (это inuse profile), а фиксирует <em>каждый факт выделения</em> за время наблюдения. Это делает его незаменимым инструментом для поиска источников мусора, нагружающего GC, и для проверки гипотез после изменения кода.</p>
-<p>Эта статья вооружит вас методикой сбора, чтения и интерпретации профиля аллокаций, свяжет с микроархитектурными последствиями и подготовит к детальному анализу через <a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>.</p>
+<p>В главе <a href="2-heap-vs-stack.html" class="wikilink">2. Heap vs stack</a> мы провели четкую грань между стремительным стеком и ресурсоемкой кучей, а в <a href="3-escape-analysis.html" class="wikilink">3. Escape analysis</a> выяснили, какие именно конструкции кода вынуждают компилятор эвакуировать переменные за пределы стекового фрейма.</p>
+<p>Однако теоретических знаний недостаточно для оптимизации боевой системы: в реальном сервисе работают сотни пакетов и тысячи сторонних функций. Чтобы направить усилия инженера в самую горячую точку, требуются <strong>точные эмпирические измерения</strong>:<br />
+- Сколько именно байт и объектов аллоцирует конкретная строка кода?<br />
+- Какие функции создают пиковый «тоннаж» временного мусора для трехцветного сборщика?<br />
+- Окупилась ли замена интерфейса или внедрение пула объектов?</p>
+<p>Для ответа на эти вопросы существует <strong>allocation profiling</strong> — систематическое профилирование динамических выделений памяти в куче. Это ключевой мост между абстрактным анализом побега и конкретным приростом throughput в продакшене.</p>
+<p>В этой статье мы освоим сбор, расшифровку и прикладную интерпретацию профилей аллокаций, разберем связь профиля с микроархитектурой процессора и подготовимся к продвинутому анализу через <a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>.</p>
+<hr />
 <h2 id="dva-vzglyada-na-pamyat-allocspace-protiv-inusespace">Два взгляда на память: alloc_space против inuse_space</h2>
 
-<p>Пакет <code>runtime/pprof</code> предоставляет два принципиально разных среза памяти:</p>
+<p>Пакет <code>runtime/pprof</code> собирает данные о куче и предоставляет разработчику две фундаментально различные проекции распределения байт:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">[ Старт профилирования ] =====================================&gt; [ Конец (30 сек) ]
+  Объект A (+10 МБ) ------&gt; (Освобожден GC)
+  Объект B (+20 МБ) ------------------------------------------&gt; [ ЖИВ ]
+  Объект C (+30 МБ) ------&gt; (Освобожден GC)
+
+  =&gt; alloc_space = 10 + 20 + 30 = 60 МБ  (Общий тоннаж работы аллокатора и GC)
+  =&gt; inuse_space = 20 МБ                  (Текущий живой остаток в памяти)
+</code></pre>
+</div>
+
 <ul>
-<li><strong>alloc_space</strong> — суммарный объём байт, которые были выделены в куче с момента старта (или с начала профилирования). Учитывает даже те объекты, которые уже освобождены и собраны GC. Это «общий тоннаж» аллокаций.</li>
-<li><strong>inuse_space</strong> — объём памяти, занятой живыми объектами в момент снятия профиля. Это «текущее население» кучи.</li>
+<li><strong><code>alloc_space</code> (и <code>alloc_objects</code>):</strong> Суммарный объем байт (и число объектов), выделенных в куче за наблюдаемый интервал времени. Сюда входят <strong>абсолютно все</strong> аллокации, включая короткоживущие временные структуры, которые сборщик мусора уже успел уничтожить. Это интеграл нагрузки на память.</li>
+<li><strong><code>inuse_space</code> (и <code>inuse_objects</code>):</strong> Объем памяти (и число объектов), удерживаемых живыми ссылками непосредственно в момент фиксации профиля.</li>
 </ul>
-<p>Для поиска горячих точек по аллокациям абсолютным приоритетом пользуется <strong>alloc_space</strong>. Именно он показывает, какие функции генерируют больше всего работы для аллокатора и GC. Inuse_space полезен для поиска утечек (<a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>) и оценки фрагментации (<a href="7-fragmentation.html" class="wikilink">7. Fragmentation</a>).</p>
+<h3 id="kogda-chto-ispolzovat">Когда что использовать?</h3>
+<p>Для устранения CPU-нагрузки и борьбы с задержками GC абсолютным приоритетом пользуется <strong><code>alloc_space</code></strong>. Сервис может иметь стабильный resident set size (RSS) в 100 МБ, но если его <code>alloc_space</code> генерирует 2 ГБ мусора в секунду, треть процессорного времени уйдет на работу фоновых сборщиков <code>gcBgMarkWorker</code>.</p>
+<p>Метрика <code>inuse_space</code> незаменима для другой задачи: обнаружения утечек памяти (<a href="6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>) и анализа фрагментации адресного пространства (<a href="7-fragmentation.html" class="wikilink">7. Fragmentation</a>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: alloc_space vs inuse_space</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Чем отличаются alloc_space и inuse_space, и когда какой использовать?<br />
-<strong>Ответ:</strong> alloc_space показывает все байты, выделенные за период, включая уже освобождённые. Он нужен для поиска функций, генерирующих максимальную нагрузку на аллокатор и GC. inuse_space показывает живые объекты — используется для диагностики утечек и оценки пикового потребления памяти.</p>
+    <p><strong>Вопрос:</strong> В чем принципиальное отличие между метриками <code>alloc_space</code> и <code>inuse_space</code> в профилировщике памяти Go, и какую из них следует анализировать для снижения нагрузки на CPU?<br />
+<strong>Ответ:</strong> Метрика <code>alloc_space</code> отражает совокупный объем всех аллокаций в куче за период наблюдения, включая объекты, которые уже были собраны сборщиком мусора. Именно она используется для снижения нагрузки на CPU, так как показывает функции, генерирующие максимальный поток мусора для GC и аллокатора. Метрика <code>inuse_space</code> учитывает только живые объекты, оставшиеся в памяти на момент снятия снимка, и применяется для поиска утечек памяти (memory leaks) и оценки общего потребления RAM.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kak-sobrat-profil-allokatsiy">Как собрать профиль аллокаций</h2>
 
-<h3 id="1-cherez-nethttppprof">1. Через `net/http/pprof`</h3>
+<p>Для захвата аллокационного профиля в экосистеме Go предусмотрено три надежных пути:</p>
+<h3 id="1-cherez-nethttppprof-dlya-prodakshen-servisov">1. Через net/http/pprof (для продакшен-сервисов)</h3>
+<p>В веб-сервисах достаточно подключить анонимный импорт:</p>
 
-<p>Самый простой способ для долгоживущего сервера. Импортируем <code>_ "net/http/pprof"</code> и выполняем HTTP-запрос:</p>
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">import _ &quot;net/http/pprof&quot;
+</code></pre>
+</div>
+
+<p>После этого эндпоинт <code>/debug/pprof/heap</code> становится доступным по HTTP. Чтобы получить именно динамический профиль аллокаций за интервал времени, <strong>обязательно передайте параметр <code>seconds</code></strong>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2218,15 +2265,22 @@
 </code></pre>
 </div>
 
-<p>Параметр <code>seconds=30</code> предписывает профилировщику отслеживать аллокации в течение 30 секунд. Без него будет снят мгновенный inuse-профиль, что не подходит для анализа аллокационной активности.</p>
-<p>Важно: при запросе с <code>seconds=N</code> перед стартом и после остановки принудительно вызывается <code>runtime.GC()</code>. Это помогает исключить шум от временных объектов, но всё же аллокации, сделанные за период, фиксируются полностью.</p>
-<p>Эндпоинт <code>/debug/pprof/heap</code> поддерживает параметры:<br />
-- <code>?seconds=N</code> — сбор в течение N секунд (alloc_space).<br />
-- <code>?debug=1</code> — текстовый дамп.<br />
-- <code>?gc=1</code> — принудительный GC перед снятием.</p>
-<h3 id="2-cherez-runtimepprof-v-kode">2. Через `runtime/pprof` в коде</h3>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Важно</span>
+  </div>
+  <div class="callout-body">
+    <p>Параметр <code>seconds=30</code> заставляет рантайм записать разницу (дельта-срез) аллокаций строго за эти 30 секунд. Дополнительно перед стартом и в конце замера рантайм вызывает <code>runtime.GC()</code>, отсекая старый шум. Без параметра <code>seconds</code> эндпоинт вернет мгновенный моментальный снимок (inuse_space), бесполезный для анализа потока аллокаций.</p>
+  </div>
+</div>
 
-<p>Для скриптов, CLI-утилит или тестов можно явно написать сохранение профиля:</p>
+<p>Поддерживаемые параметры эндпоинта <code>/debug/pprof/heap</code>:<br />
+- <code>/debug/pprof/heap?seconds=N</code> — сбор дельты аллокаций за $N$ секунд (<code>alloc_space</code>);<br />
+- <code>?debug=1</code> — человекочитаемый текстовый дамп спанов и статистики рантайма;<br />
+- <code>?gc=1</code> — принудительный запуск сборщика мусора перед выдачей профиля.</p>
+<h3 id="2-cherez-runtimepprof-v-kode-dlya-cli-testov-i-skriptov">2. Через runtime/pprof в коде (для CLI, тестов и скриптов)</h3>
+<p>Если программа не имеет HTTP-сервера, профиль можно зафиксировать программно:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2237,14 +2291,19 @@
     </button>
   </div>
   <pre class="language-go"><code class="language-go">f, _ := os.Create(&quot;alloc.prof&quot;)
+defer f.Close()
+
+// Принудительный сбор мусора для очистки старого состояния
+runtime.GC()
+
+// Запись текущего состояния кучи
 pprof.Lookup(&quot;heap&quot;).WriteTo(f, 0)
 </code></pre>
 </div>
 
-<p>Но перед этим необходимо настроить частоту сэмплирования и, возможно, вызвать <code>runtime.GC()</code>. Такой подход даёт мгновенный inuse-профиль, а не накопленный за период. Для записи накопленных аллокаций за интервал нужно вручную сбрасывать и читать счётчики через <code>runtime.ReadMemStats</code>, что сложнее. Проще использовать HTTP-эндпоинт с <code>seconds</code>.</p>
-<h3 id="3-cherez-go-test-bench-i-memprofile">3. Через `go test -bench` и `-memprofile`</h3>
-
-<p>При запуске бенчмарков:</p>
+<p>Для непрерывного отслеживания долгосрочной динамики без HTTP можно периодически считывать счетчики через вызов <code>runtime.ReadMemStats</code>.</p>
+<h3 id="3-cherez-go-test-bench-i-memprofile">3. Через go test -bench и -memprofile</h3>
+<p>При анализе производительности алгоритмов профиль аллокаций снимается напрямую флагом <code>-memprofile</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2258,11 +2317,30 @@ pprof.Lookup(&quot;heap&quot;).WriteTo(f, 0)
 </code></pre>
 </div>
 
-<p>Профиль <code>mem.prof</code> будет содержать два сэмпла: <code>alloc_space</code> и <code>inuse_space</code>. Открыв его через <code>go tool pprof</code>, можно переключаться между ними.</p>
-<h2 id="parametry-sbora-memprofilerate">Параметры сбора: `MemProfileRate`</h2>
+<p>Сгенерированный файл <code>mem.prof</code> содержит полную информацию, позволяя переключаться между <code>alloc_space</code>, <code>alloc_objects</code>, <code>inuse_space</code> и <code>inuse_objects</code> в интерактивном режиме <code>pprof</code>.</p>
+<hr />
+<h2 id="parametry-sbora-memprofilerate">Параметры сбора: MemProfileRate</h2>
 
-<p>По умолчанию профилировщик памяти записывает информацию о каждом 512-м килобайте выделений (<code>runtime.MemProfileRate = 512 * 1024</code>). Это означает, что сэмплирование <strong>не точное</strong>, а статистическое: мелкие аллокации могут быть не учтены, если их суммарный объём не достигает порога.</p>
-<p>Частоту можно изменить через переменную окружения:</p>
+<p>Выделение памяти в куче — высокочастотное событие. Если бы рантайм Go записывал трассировку стека абсолютно при каждом вызове <code>malloc</code>, накладные расходы уничтожили бы производительность продакшена.</p>
+<p>Поэтому аллокационный профилировщик работает по принципу <strong>вероятностного сэмплирования Пуассона</strong>. По умолчанию рантайм фиксирует один сэмпл приблизительно на каждые 512 килобайт выделенной памяти:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">runtime.MemProfileRate = 512 * 1024 // 512 КБ по умолчанию
+</code></pre>
+</div>
+
+<p>Это означает:<br />
+- Аллокация крупного объекта в 1 МБ гарантированно попадет в профиль (возможно, несколькими сэмплами);<br />
+- Серия из тысяч мелких аллокаций будет сэмплироваться пропорционально их общему накопительному объему;<br />
+- Профилировщик математически масштабирует значения в отчете, аппроксимируя реальный объем памяти.</p>
+<p>Для локальной отладки и микробенчмарков, где важна абсолютная точность до каждого байта, сэмплирование можно отключить, установив шаг в 1 байт:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2276,7 +2354,7 @@ pprof.Lookup(&quot;heap&quot;).WriteTo(f, 0)
 </code></pre>
 </div>
 
-<p>Или в коде:</p>
+<p>или программно:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2290,21 +2368,30 @@ pprof.Lookup(&quot;heap&quot;).WriteTo(f, 0)
 </code></pre>
 </div>
 
-<p>Установка в 1 означает «записывать каждую аллокацию». Это даёт максимальную точность, но резко замедляет программу и увеличивает размер профиля (профилирование может замедлить процесс в 10–100 раз). Используется только для локальной отладки.</p>
-<p>Для production-сборок обычно оставляют значение по умолчанию или слегка снижают до 131072 (128 КБ), чтобы получить более плотное покрытие без фатального overhead.</p>
-<div class="callout callout-warning">
+<div class="callout callout-caution">
   <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-icon">🛑</span>
+    <span class="callout-title">Предостережение</span>
   </div>
   <div class="callout-body">
-    <p>При стандартном <code>MemProfileRate=512KB</code> функции, выделяющие много мелких объектов (например, 100 тысяч объектов по 16 байт = 1.6 МБ), будут видны в профиле хорошо, потому что сумма превышает порог. Но функция, редко выделяющая единичные мелкие объекты, может быть пропущена. Профиль показывает статистически значимые источники.</p>
+    <p>Значение <code>runtime.MemProfileRate = 1</code> заставляет рантайм перехватывать каждую аллокацию и сохранять стек вызовов. Это замедляет программу в 10–100 раз и резко раздувает память! Применяйте его <strong>только локально</strong>. В боевой среде оставляйте стандартные <code>MemProfileRate=512KB</code> либо понижайте до умеренных <code>131072 (128 КБ)</code> для тонкого аудита.</p>
   </div>
 </div>
 
-<h2 id="analiz-profilya-go-tool-pprof">Анализ профиля: `go tool pprof`</h2>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка: Статистическая слепота редких мелких аллокаций</span>
+  </div>
+  <div class="callout-body">
+    <p>При стандартном <code>MemProfileRate=512KB</code> функция, которая суммарно выделила несколько мегабайт мелкими объектами, отлично видна в профиле. Но если вспомогательная функция редко создает единичный объект в 32 байта, она может ни разу не попасть в сэмпл и будет отсутствовать в профиле. Помните: pprof показывает статистически значимые очаги нагрузки.</p>
+  </div>
+</div>
 
-<p>Открываем профиль, полученный за 30 секунд:</p>
+<hr />
+<h2 id="analiz-profilya-go-tool-pprof">Анализ профиля: go tool pprof</h2>
+
+<p>Открываем сохраненный профиль в режиме анализа совокупных аллокаций:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2318,19 +2405,21 @@ pprof.Lookup(&quot;heap&quot;).WriteTo(f, 0)
 </code></pre>
 </div>
 
-<p>Ключевые команды:</p>
+<h3 id="osnovnye-analiticheskie-komandy-konsoli">Основные аналитические команды консоли:</h3>
 <ul>
-<li><strong><code>top</code></strong> — показывает функции, в которых было выделено больше всего памяти. По умолчанию сортировка по <code>flat</code> (память, выделенная непосредственно в теле функции). <code>top -cum</code> — по кумулятивной (включая потомков).</li>
-<li><strong><code>list FuncName</code></strong> — аннотированный исходный код с объёмами аллокаций на каждой строке.</li>
-<li><strong><code>tree</code></strong> — иерархическое представление, показывающее, кто кого вызывает и сколько памяти аллоцирует.</li>
-<li><strong><code>web</code></strong> — граф вызовов.</li>
-<li><strong><code>flamegraph</code></strong> через веб-интерфейс (<code>-http=:8080</code>) — визуализация alloc_space в виде пламени (аналогично <a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>, но для памяти).</li>
+<li><strong><code>top</code></strong> — список функций с наибольшим собственным объемом аллокаций (<code>flat</code>).</li>
+<li><strong><code>top -cum</code></strong> — список функций по кумулятивному объему памяти (с учетом дочерних вызовов).</li>
+<li><strong><code>list FuncName</code></strong> — построчный листинг исходного кода целевой функции с точным указанием объема аллокаций на каждой строке.</li>
+<li><strong><code>tree</code></strong> — текстовое дерево вызовов, наглядно показывающее цепочки вызовов от корня к потребителям.</li>
+<li><strong><code>web</code></strong> — генерация SVG-графа вызовов в браузере.</li>
+<li><strong><code>flamegraph</code></strong> — интерактивный запуск веб-интерфейса флеймграфа через флаг <code>-http=:8080</code> (аналогично <a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>, но где ширина плато пропорциональна <code>alloc_space</code>).</li>
 </ul>
-<p>Пример вывода <code>top</code>:</p>
+<h3 id="primer-realnogo-otcheta-top">Пример реального отчета `top`:</h3>
+
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
@@ -2346,45 +2435,57 @@ Showing nodes accounting for 1.50GB, 85% of 1.76GB total
 </code></pre>
 </div>
 
-<p>Здесь <code>encoding/json.Unmarshal</code> — главный «потребитель» аллокаций: 0.60 ГБ выделено непосредственно в ней, а с учётом вызываемых функций (например, <code>runtime.makeslice</code>) — 0.80 ГБ. Это прямое указание на то, что парсинг JSON — точка приложения усилий.</p>
+<p>Интерпретация:<br />
+- В <code>encoding/json.Unmarshal</code> непосредственно выделилось 0.60 ГБ (<code>flat</code>), а кумулятивно с дочерними вызовами — 0.80 ГБ (<code>cum</code>). Это главный кандидат на рефакторинг!<br />
+- Системные функции <code>runtime.makeslice</code> и <code>bytes.makeSlice</code> суммарно выделили 0.50 ГБ — явный признак динамического расширения срезов без предварительного выделения емкости (<code>cap</code>).</p>
+<hr />
 <h2 id="kak-khodit-ot-profilya-k-kodu">Как ходить от профиля к коду</h2>
 
+<p>Для системного устранения аллокаций используйте 6-шаговый протокол:</p>
 <ol>
-<li>Найти функцию с наибольшим <code>flat</code> или <code>cum</code> в <code>alloc_space</code>.</li>
-<li>Выполнить <code>list FuncName</code> и увидеть, на какой строке сколько памяти выделено.</li>
-<li>Сопоставить с исходным кодом. Если строка содержит <code>make</code>, <code>append</code>, <code>new</code>, вызов интерфейса — именно здесь аллокация.</li>
-<li>Проверить через <code>-gcflags="-m"</code>, какие переменные убегают (<a href="3-escape-analysis.html" class="wikilink">3. Escape analysis</a>).</li>
-<li>Применить соответствующий приём: предвыделение, переиспользование, <code>sync.Pool</code>, замена интерфейса на generic, value вместо pointer.</li>
-<li>Снять профиль повторно и убедиться в снижении <code>alloc_space</code>.</li>
+<li>Найти функцию-лидер по <code>flat</code> или <code>cum</code> в <code>alloc_space</code> (команда <code>top</code>).</li>
+<li>Запустить <code>list FuncName</code> и обнаружить конкретную строчку кода, на которой висит пиковый объем выделений.</li>
+<li>Сопоставить код со строкой: содержит ли она <code>make</code>, <code>append</code>, создание замыкания, конкатенацию строк или боксинг в интерфейс?</li>
+<li>Запустить <code>go build -gcflags="-m"</code> (<a href="3-escape-analysis.html" class="wikilink">3. Escape analysis</a>) и выяснить точную причину побега переменной в кучу.</li>
+<li>Применить инженерный прием устранения аллокации: предвыделение <code>cap</code>, замена указателя на значение, дженерики вместо <code>interface{}</code>, либо переиспользование через <code>sync.Pool</code>.</li>
+<li>Снять повторный профиль и зафиксировать падение <code>alloc_space</code> и метрики <code>B/op</code>.</li>
 </ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Агрегация сэмплов в рантайме</span>
   </div>
   <div class="callout-body">
-    <p>Профиль памяти в Go — это не непрерывная запись, а серия сэмплов, сохраняемая в хеш-таблице внутри рантайма. Каждый сэмпл содержит стек вызовов и объём аллокаций. При записи профиля в protobuf эти сэмплы агрегируются. Именно поэтому в <code>top</code> мы видим суммы, а не отдельные события. Также важно: профиль записывает только аллокации, прошедшие через <code>mallocgc</code>. Стековые переменные в профиль не попадают.</p>
+    <p>Профиль памяти в Go не хранит последовательную временную ленту событий. Внутри рантайма выделена хэш-таблица <code>buckhash</code>, где ключом является стек вызовов (Call Stack), а значением — структура с четырьмя счетчиками: <code>alloc_bytes</code>, <code>alloc_objects</code>, <code>free_bytes</code>, <code>free_objects</code>. Когда вызывается внутренняя функция аллокатора <code>runtime.mallocgc</code>, рантайм обновляет соответствующий бакет. Переменные, оставшиеся на стеке, проходят мимо <code>mallocgc</code> и физически не могут попасть в профиль.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="tipichnye-goryachie-istochniki-allokatsiy-i-strategii-borby">Типичные «горячие» источники аллокаций и стратегии борьбы</h2>
 
-<p>Повторяя классификацию из <a href="../03-cpu-profiling/4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a>, но для памяти:</p>
-<h3 id="1-serializatsiya-deserializatsiya">1. Сериализация / десериализация</h3>
-<p><code>json.Unmarshal</code>, <code>xml.Decode</code>, <code>protobuf.Marshal</code> часто порождают множество временных слайсов и строк. Решения: альтернативные библиотеки (sonic, easyjson), переиспользование буферов, <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</p>
+<p>Опираясь на системную классификацию горячих точек (<a href="../03-cpu-profiling/4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a>), выделим главных виновников кучевого мусора:</p>
+<h3 id="1-serializatsiya-i-deserializatsiya">1. Сериализация и десериализация</h3>
+<p>Пакеты сериализации <code>encoding/json.Unmarshal</code>, <code>xml.Decode</code>, <code>protobuf.Marshal</code> часто порождают огромное количество временных слайсов и строк. Стандартный парсер <code>encoding/json.Unmarshal</code> опирается на рефлексию (<code>reflect</code>), выделяя множество мелких структур под каждое поле документа.<br />
+- <strong>Решение:</strong> Использование кодогенерации (easyjson) или быстрых парсеров с нулевыми аллокациями (sonic, fastjson), а также переиспользование буферов декодера через <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</p>
 <h3 id="2-konstruirovanie-strok">2. Конструирование строк</h3>
-<p><code>strings.Builder</code>, конкатенация через <code>+</code> в цикле, <code>fmt.Sprintf</code>. <code>Builder</code> с <code>Grow</code> снижает аллокации до одной; <code>+</code> в цикле — множество.</p>
+<p>Конкатенация строк через оператор <code>+</code> в цикле или неаккуратные вызовы <code>fmt.Sprintf</code> порождают квадратичный поток мусора.<br />
+- <strong>Решение:</strong> Использование <code>strings.Builder</code> с предварительным вызовом метода <code>Grow(n)</code> (<code>strings.Builder.grow</code>), аллоцирующего весь буфер ровно один раз.</p>
 <h3 id="3-rost-slaysov">3. Рост слайсов</h3>
-<p><code>append</code> в слайс с неизвестной ёмкостью. Профиль покажет <code>runtime.growslice</code> и <code>runtime.makeslice</code>. Решение: предвыделение <code>make([]T, 0, cap)</code> (<a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>).</p>
-<h3 id="4-preobrazovaniya-mezhdu-tipami">4. Преобразования между типами</h3>
-<p><code>[]byte(s)</code> для строки копирует данные в новый слайс. Это может быть неожиданным источником аллокаций. Использовать <code>unsafe</code> не всегда оправдано, но для горячих путей существуют подходы zero-copy (<a href="../07-io-i-sistemnyy-uroven/5-zero-copy-podkhody.html" class="wikilink">5. Zero copy подходы</a>).</p>
+<p>Вызов <code>append</code> в слайс с неизвестной ёмкостью заставляет рантайм постоянно вызывать <code>runtime.growslice</code> и <code>runtime.makeslice</code>, копируя память.<br />
+- <strong>Решение:</strong> Предварительное выделение емкости через <code>make([]T, 0, cap)</code> или <code>make([]T, 0, expectedCapacity)</code> (<a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>).</p>
+<h3 id="4-preobrazovaniya-tipov-byte-i-string">4. Преобразования типов ([]byte и string)</h3>
+<p>Приведение строки к байтовому срезу <code>[]byte(s)</code> или обратно <code>string(b)</code> создает полную копию данных в новой аллокации кучи.<br />
+- <strong>Решение:</strong> Использование методов <code>unsafe.StringData</code>, <code>unsafe.SliceData</code> (Go 1.20+) или оптимизированных zero-copy подходов (<a href="../07-io-i-sistemnyy-uroven/5-zero-copy-podkhody.html" class="wikilink">5. Zero copy подходы</a>).</p>
 <h3 id="5-konvertatsiya-v-interfeys">5. Конвертация в интерфейс</h3>
-<p>Передача конкретного типа в <code>interface{}</code> боксит значение. Если это происходит в цикле — аллокации накапливаются. Использовать generics или пересмотреть API.</p>
+<p>Передача конкретного типа в <code>interface{}</code> боксит значение. Если это происходит в цикле — аллокации накапливаются.<br />
+- <strong>Решение:</strong> Параметризация функций дженериками (<code>[T any]</code>) с последующей мономорфизацией в коде.</p>
 <h3 id="6-zakhvat-peremennykh-v-zamykaniyakh">6. Захват переменных в замыканиях</h3>
-<p>Горутины и отложенные функции с замыканиями могут уводить переменные в кучу. Профиль покажет аллокации в месте объявления замыкания.</p>
+<p>Асинхронные горутины и отложенные функции (<code>defer</code>), захватывающие переменные по ссылке, насильно эвакуируют их в кучу.<br />
+- <strong>Решение:</strong> Передача параметров явно по значению через аргументы вызова.</p>
+<hr />
 <h2 id="prakticheskiy-primer-optimizatsiya-json-parsinga">Практический пример: оптимизация JSON парсинга</h2>
 
-<p>Исходный код обработчика:</p>
+<p>Рассмотрим типичный HTTP-обработчик входящих запросов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2403,11 +2504,11 @@ Showing nodes accounting for 1.50GB, 85% of 1.76GB total
 </code></pre>
 </div>
 
-<p>Профиль <code>alloc_space</code> за 30 секунд под нагрузкой показывает:</p>
+<p>Под нагрузкой профиль <code>alloc_space</code> за 30 секунд выдает неутешительную картину:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
@@ -2419,8 +2520,8 @@ Showing nodes accounting for 1.50GB, 85% of 1.76GB total
 </code></pre>
 </div>
 
-<p>Вывод: <code>Decode</code> генерирует 200 МБ аллокаций. Смотрим <code>list Decode</code>, видим, что внутри много <code>make</code> для строк и слайсов. Также видно, что <code>json.Decoder</code> использует буфер, который растёт с каждым запросом, если не переиспользовать <code>Decoder</code>.</p>
-<p>Оптимизация: переиспользуем <code>Decoder</code> через <code>sync.Pool</code> и предвыделяем буфер:</p>
+<p>Вывод: <code>Decode</code> генерирует 200 МБ аллокаций. Выполняем <code>list Decode</code> и видим, что внутри происходит множество <code>make</code> для строк и слайсов, а внутренний буфер <code>json.Decoder</code> растет с каждым запросом.</p>
+<p>Применим пул переиспользуемых декодеров <code>sync.Pool</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2438,6 +2539,7 @@ func handleOptimized(w http.ResponseWriter, r *http.Request) {
     dec := decoderPool.Get().(*json.Decoder)
     dec.Reset(r.Body)
     defer decoderPool.Put(dec)
+
     var req Request
     dec.Decode(&amp;req)
     fmt.Fprint(w, &quot;OK&quot;)
@@ -2445,70 +2547,70 @@ func handleOptimized(w http.ResponseWriter, r *http.Request) {
 </code></pre>
 </div>
 
-<p>Повторный профиль показывает снижение <code>alloc_space</code> на 40%, а <code>benchmem</code> фиксирует падение <code>allocs/op</code> с 25 до 8. Это напрямую снижает нагрузку на GC и улучшает p99 latency (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</p>
+<p>Повторный замер <code>pprof</code> демонстрирует снижение <code>alloc_space</code> на <strong>40%</strong>, а бенчмарки фиксируют падение <code>allocs/op</code> с 25 до 8. Сборщик мусора освобождается от постоянного сканирования буферов, стабилизируя хвостовую задержку p99 (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</p>
+<hr />
 <h2 id="lovushki-i-chastye-oshibki">Ловушки и частые ошибки</h2>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Анализ inuse_space вместо alloc_space</span>
   </div>
   <div class="callout-body">
-    <p><strong>Inuse_space вместо alloc_space.</strong> Разработчик открывает <code>go tool pprof</code> без параметра <code>-alloc_space</code> и видит текущую живую память. Функция, которая генерирует много мусора, но быстро освобождает, будет почти невидима. Всегда начинайте с <code>-alloc_space</code>.</p>
+    <p>Разработчик открывает профиль без флага <code>-alloc_space</code> и видит текущее распределение живой памяти. Если функция генерирует терабайты мусора, который мгновенно подбирается GC, она будет абсолютно невидима в <code>inuse_space</code>! Всегда начинайте аудит производительности с <code>-alloc_space</code>.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Слишком короткий интервал профилирования</span>
   </div>
   <div class="callout-body">
-    <p><strong>Слишком короткий профиль.</strong> Как и с CPU (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>), 5 секунд аллокационного профиля могут исказить картину из-за флуктуаций нагрузки. Минимум 30 секунд.</p>
+    <p>Как и при CPU-профилировании (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>), срез за 5 секунд рискует захватить случайный всплеск или оказаться пустым из-за квантования нагрузки. Минимальный рекомендованный интервал сбора профиля под нагрузкой — <strong>30 секунд</strong>.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Игнорирование погрешности MemProfileRate</span>
   </div>
   <div class="callout-body">
-    <p><strong>Игнорирование <code>MemProfileRate</code>.</strong> На production-сервере с настройками по умолчанию вы можете не увидеть функции, которые аллоцируют много мелких объектов, но суммарно не дотягивают до 512 КБ на сэмпл. Это искажает картину. Если вы охотитесь на конкретный участок, временно уменьшайте <code>MemProfileRate</code>.</p>
+    <p>При штатном значении <code>MemProfileRate=512KB</code> профилировщик может пропустить редкие точечные аллокации. Если при профилировании локального бенчмарка вы видите нулевые аллокации, но <code>benchmem</code> рапортует о <code>1 allocs/op</code>, временно форсируйте <code>GODEBUG=memprofilerate=1</code>.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Невидимые аллокации в стандартной библиотеке</span>
   </div>
   <div class="callout-body">
-    <p><strong>Скрытые аллокации в стандартной библиотеке.</strong> Например, <code>time.Parse</code> или <code>net/http</code> аллоцируют внутренние структуры. Профиль честно покажет их, но не всегда очевидно, что вызов идёт из вашего кода. Используйте <code>tree</code> для трассировки.</p>
+    <p>Системные функции вроде <code>time.Parse</code> или внутренности роутера <code>net/http</code> создают служебные объекты. Профиль зафиксирует их на стандартных пакетах, маскируя реальный источник в вашем бизнес-коде. Используйте команду <code>tree</code> или флеймграф, чтобы распутать цепочку вызовов.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-kak-allokatsii-vliyayut-na-kesh-i-tlb">Mechanical Sympathy: как аллокации влияют на кэш и TLB</h2>
 
-<p>Каждая аллокация в куче — это не просто вызов <code>malloc</code>. Это:<br />
-- Поиск свободного спана (возможно, блокировка на <code>mcentral</code>).<br />
-- Обнуление памяти (через <code>memclr</code>, которая, правда, использует SIMD и быстра).<br />
-- Добавление объекта в граф GC.<br />
-- Потенциальное вымывание кэш-линий при последующем доступе к объекту.<br />
-- Рост давления на TLB, если объекты разбросаны по новым страницам.</p>
-<p>Профиль аллокаций помогает не только снизить GC-паузы (<a href="../05-garbage-collector/6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>), но и улучшить cache friendliness (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>), уменьшив количество холодных объектов.</p>
+<p>Каждая аллокация в куче наносит системный удар по кремнию:<br />
+1. <strong>Блокировки спинлоков:</strong> Если локальный кэш <code>mcache</code> исчерпан, поток вынужден обращаться к центральному <code>mcentral</code>, конкурируя с другими ядрами.<br />
+2. <strong>Обнуление памяти:</strong> Рантайм обязан занулить выделенную память (<code>memclr</code>), расходуя такты на запись в L1/L2 кэш.<br />
+3. <strong>Загрязнение кэш-линий и TLB:</strong> Объекты, разбросанные по разным страницам виртуальной памяти, вызывают шквал промахов TLB и кэш-линий (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<p>Снижение темпа аллокаций защищает процессор от пауз GC (<a href="../05-garbage-collector/6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>) и удерживает рабочие структуры данных в горячем кэше.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Allocation profiling</strong> через <code>pprof</code> с <code>-alloc_space</code> — основной инструмент для поиска функций, генерирующих больше всего кучевых выделений.</li>
-<li>Он фиксирует суммарный объём аллокаций за период, в отличие от <code>inuse_space</code>, показывающего текущую живую память.</li>
-<li>Сбор профиля выполняется через HTTP (<code>/debug/pprof/heap?seconds=N</code>), флаги <code>go test</code> или прямой вызов <code>runtime/pprof</code>.</li>
-<li>Частота сэмплирования (<code>MemProfileRate</code>) по умолчанию 512 КБ; для точного анализа её можно снизить, но с осторожностью.</li>
-<li>Анализ <code>top -cum</code>, <code>list</code> и <code>tree</code> позволяет пройти от функции-лидера к конкретной строке, вызывающей аллокации.</li>
-<li>Типичные источники: JSON/XML, строки, рост слайсов, боксинг в интерфейсы, замыкания.</li>
-<li>Оптимизация, направляемая профилем аллокаций, снижает нагрузку на GC, улучшает latency и throughput.</li>
+<li><strong>Allocation profiling</strong> (<code>-alloc_space</code>) — главный практический инструмент инженера для выявления функций, создающих максимальный поток кучевого мусора.</li>
+<li>В отличие от <code>inuse_space</code>, метрика <code>alloc_space</code> фиксирует совокупный тоннаж всех выделенных байт за наблюдаемый период.</li>
+<li>Для долгоживущих систем профиль собирается через HTTP: <code>/debug/pprof/heap?seconds=30</code>.</li>
+<li>По умолчанию включено сэмплирование (<code>MemProfileRate = 512 КБ</code>). Для локальных микротестов используйте <code>GODEBUG=memprofilerate=1</code>.</li>
+<li>Анализ связки <code>top</code>, <code>list</code> и флеймграфа позволяет мгновенно локализовать строку, порождающую аллокации.</li>
+<li>Главные мишени оптимизации: JSON-парсинг, динамические срезы, конкатенация строк, боксинг в интерфейсы и замыкания.</li>
 </ul>
-<p>Теперь, умея собирать и интерпретировать профили аллокаций, мы готовы глубже изучить сам инструмент и его возможности: следующая статья — <a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>.</p>
+<p>В следующей лекции мы детально изучим сам профилировщик памяти во всех его режимах: <a href="5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a> — разберем дифференциальный анализ, текстовые дампы и чтение графов аллокаций.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2536,7 +2638,7 @@ func handleOptimized(w http.ResponseWriter, r *http.Request) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#ot-gde-pamyat-k-pochemu-ona-tam-okazalas">От «где память» к «почему она там оказалась»</a></li><li class="toc-item toc-h2"><a href="#dva-vzglyada-na-pamyat-allocspace-protiv-inusespace">Два взгляда на память: allocspace против inusespace</a></li><li class="toc-item toc-h2"><a href="#kak-sobrat-profil-allokatsiy">Как собрать профиль аллокаций</a></li><li class="toc-item toc-h3"><a href="#1-cherez-nethttppprof">1. Через net/http/pprof</a></li><li class="toc-item toc-h3"><a href="#2-cherez-runtimepprof-v-kode">2. Через runtime/pprof в коде</a></li><li class="toc-item toc-h3"><a href="#3-cherez-go-test-bench-i-memprofile">3. Через go test -bench и -memprofile</a></li><li class="toc-item toc-h2"><a href="#parametry-sbora-memprofilerate">Параметры сбора: MemProfileRate</a></li><li class="toc-item toc-h2"><a href="#analiz-profilya-go-tool-pprof">Анализ профиля: go tool pprof</a></li><li class="toc-item toc-h2"><a href="#kak-khodit-ot-profilya-k-kodu">Как ходить от профиля к коду</a></li><li class="toc-item toc-h2"><a href="#tipichnye-goryachie-istochniki-allokatsiy-i-strategii-borby">Типичные «горячие» источники аллокаций и стратегии борьбы</a></li><li class="toc-item toc-h3"><a href="#1-serializatsiya-deserializatsiya">1. Сериализация / десериализация</a></li><li class="toc-item toc-h3"><a href="#2-konstruirovanie-strok">2. Конструирование строк</a></li><li class="toc-item toc-h3"><a href="#3-rost-slaysov">3. Рост слайсов</a></li><li class="toc-item toc-h3"><a href="#4-preobrazovaniya-mezhdu-tipami">4. Преобразования между типами</a></li><li class="toc-item toc-h3"><a href="#5-konvertatsiya-v-interfeys">5. Конвертация в интерфейс</a></li><li class="toc-item toc-h3"><a href="#6-zakhvat-peremennykh-v-zamykaniyakh">6. Захват переменных в замыканиях</a></li><li class="toc-item toc-h2"><a href="#prakticheskiy-primer-optimizatsiya-json-parsinga">Практический пример: оптимизация JSON парсинга</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-chastye-oshibki">Ловушки и частые ошибки</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-allokatsii-vliyayut-na-kesh-i-tlb">Mechanical Sympathy: как аллокации влияют на кэш и TLB</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#ot-gde-pamyat-k-pochemu-ona-tam-okazalas">От «где память» к «почему она там оказалась»</a></li><li class="toc-item toc-h2"><a href="#dva-vzglyada-na-pamyat-allocspace-protiv-inusespace">Два взгляда на память: allocspace против inusespace</a></li><li class="toc-item toc-h3"><a href="#kogda-chto-ispolzovat">Когда что использовать?</a></li><li class="toc-item toc-h2"><a href="#kak-sobrat-profil-allokatsiy">Как собрать профиль аллокаций</a></li><li class="toc-item toc-h3"><a href="#1-cherez-nethttppprof-dlya-prodakshen-servisov">1. Через net/http/pprof (для продакшен-сервисов)</a></li><li class="toc-item toc-h3"><a href="#2-cherez-runtimepprof-v-kode-dlya-cli-testov-i-skriptov">2. Через runtime/pprof в коде (для CLI, тестов и скриптов)</a></li><li class="toc-item toc-h3"><a href="#3-cherez-go-test-bench-i-memprofile">3. Через go test -bench и -memprofile</a></li><li class="toc-item toc-h2"><a href="#parametry-sbora-memprofilerate">Параметры сбора: MemProfileRate</a></li><li class="toc-item toc-h2"><a href="#analiz-profilya-go-tool-pprof">Анализ профиля: go tool pprof</a></li><li class="toc-item toc-h3"><a href="#osnovnye-analiticheskie-komandy-konsoli">Основные аналитические команды консоли:</a></li><li class="toc-item toc-h3"><a href="#primer-realnogo-otcheta-top">Пример реального отчета top:</a></li><li class="toc-item toc-h2"><a href="#kak-khodit-ot-profilya-k-kodu">Как ходить от профиля к коду</a></li><li class="toc-item toc-h2"><a href="#tipichnye-goryachie-istochniki-allokatsiy-i-strategii-borby">Типичные «горячие» источники аллокаций и стратегии борьбы</a></li><li class="toc-item toc-h3"><a href="#1-serializatsiya-i-deserializatsiya">1. Сериализация и десериализация</a></li><li class="toc-item toc-h3"><a href="#2-konstruirovanie-strok">2. Конструирование строк</a></li><li class="toc-item toc-h3"><a href="#3-rost-slaysov">3. Рост слайсов</a></li><li class="toc-item toc-h3"><a href="#4-preobrazovaniya-tipov-byte-i-string">4. Преобразования типов ([]byte и string)</a></li><li class="toc-item toc-h3"><a href="#5-konvertatsiya-v-interfeys">5. Конвертация в интерфейс</a></li><li class="toc-item toc-h3"><a href="#6-zakhvat-peremennykh-v-zamykaniyakh">6. Захват переменных в замыканиях</a></li><li class="toc-item toc-h2"><a href="#prakticheskiy-primer-optimizatsiya-json-parsinga">Практический пример: оптимизация JSON парсинга</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-chastye-oshibki">Ловушки и частые ошибки</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-allokatsii-vliyayut-na-kesh-i-tlb">Mechanical Sympathy: как аллокации влияют на кэш и TLB</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
