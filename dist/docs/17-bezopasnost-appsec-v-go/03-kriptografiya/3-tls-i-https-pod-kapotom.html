@@ -2169,16 +2169,24 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. TLS и HTTPS под капотом</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="fundament-zashchishchyonnykh-soedineniy-ot-rukopozhatiya-do-peredachi-bayt">Фундамент защищённых соединений: от рукопожатия до передачи байт</h2>
+            <h1>3. TLS и HTTPS под капотом: Рукопожатие, криптографический стек и рантайм Go</h1>
+<blockquote>
+<p><em>"Network protocols are the nervous system of modern computing; make them secure, make them fast, and make them simple."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>Для большинства пользователей интернета протокол HTTPS ассоциируется с иконкой закрытого замочка в адресной строке браузера. Но для бэкенд-инженера <strong>TLS (Transport Layer Security)</strong> — это сложнейший криптографический протокол, работающий прямо на границе между прикладным кодом и системными сокетами ядра операционной системы.</p>
+<p>В экосистеме Go архитектура TLS уникальна: в отличие от C/C++ (где используются внешние библиотеки <code>libssl</code> / <code>OpenSSL</code>, <code>BoringSSL</code> или <code>mbedTLS</code> с ручным управлением структурами <code>SSL_CTX</code>, <code>SSL*</code> и вызовами <code>free()</code>) или Python/Java (делегирующих работу через FFI/JNI), стандартная библиотека Go содержит <strong>полную, самодостаточную реализацию TLS на чистом Go</strong> — пакет <code>crypto/tls</code>.</p>
+<p>Она скомпилирована статически, тесно интегрирована с системным планировщиком Go (<code>netpoll</code>, <code>epoll/kqueue</code>) и управлением памятью, обеспечивая феноменальную скорость и исключая классические уязвимости переполнения буфера в C.</p>
+<hr />
+<h2 id="fundament-zashchishchyonnykh-soedineniy-ot-rukopozhatiya-do-peredachi-bayt">Фундамент защищённых соединений: от рукопожатия до передачи байт</h2>
 
-<p>TLS (Transport Layer Security) — это не просто «замочек в браузере». Это сложный криптографический протокол, накладывающийся поверх транспортного уровня (TCP/UDP). В современном бэкенде на Go работа с TLS встроена глубоко в сетевой стек: от <code>crypto/tls</code> до интеграции с <code>net/http</code> и <code>netpoll</code> планировщиком. Понимание того, как происходит установление соединения, валидация сертификатов и согласование ключей, критично для настройки производительности, предотвращения атак и корректного управления жизненным циклом соединений.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2193,29 +2201,49 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Клиент&quot;]--&gt;|&quot;ClientHello&lt;br&gt;версия, cipher suites, key share&quot;|B[&quot;Сервер&quot;]
-B--&gt;|&quot;ServerHello&lt;br&gt;выбор параметров, key share, cert&quot;|A
-B--&gt;|&quot;ServerFinished&lt;br&gt;подтверждение готовности&quot;|A
-A--&gt;|&quot;ClientFinished&lt;br&gt;подтверждение готовности&quot;|B
-C[&quot;Защищённый канал&quot;]--&gt;|&quot;Прикладные данные&lt;br&gt;HTTP/2 gRPC&quot;|A
-C--&gt;|&quot;Прикладные данные&quot;|B
-style A fill:#4ecdc4,stroke:#333
-style B fill:#4ecdc4,stroke:#333
-style C fill:#ffd93d,stroke:#333
+subgraph Handshake[&quot;TLS 1.3 Handshake (1-RTT)&quot;]
+direction TB
+C[&quot;Клиент (Браузер / gRPC-клиент)&quot;]
+S[&quot;Сервер (Go net/http / tls.Listener)&quot;]
+
+C --&gt;|&quot;1. ClientHello&lt;br/&gt;версия, cipher suites, key share&quot;| S
+S --&gt;|&quot;2. ServerHello&lt;br/&gt;выбор параметров, key share, cert&quot;| C
+S --&gt;|&quot;3. ServerFinished&lt;br/&gt;подтверждение готовности&quot;| C
+C --&gt;|&quot;4. ClientFinished&lt;br/&gt;подтверждение готовности&quot;| S
+end
+
+subgraph DataTransfer[&quot;Передача данных&quot;]
+direction TB
+SecChan[&quot;Защищённый канал&lt;br/&gt;(AES-GCM / ChaCha20-Poly1305)&quot;]
+SecChan --&gt;|&quot;Прикладные данные&lt;br/&gt;HTTP/2 gRPC&quot;| C
+SecChan --&gt;|&quot;Прикладные данные&quot;| S
+end
+
+Handshake -.-&gt; DataTransfer
+
+style C fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+style S fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
+style SecChan fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
 <h3 id="evolyutsiya-rukopozhatiya-tls-1-2-protiv-1-3">Эволюция рукопожатия: TLS 1.2 против 1.3</h3>
 
-<p>В TLS 1.2 рукопожатие требовало двух круговых задержек (2-RTT) до начала передачи данных. TLS 1.3 оптимизировал этот процесс до 1-RTT, объединив согласование параметров и обмен ключами. Убраны небезопасные алгоритмы (RSA key exchange, RC4, SHA-1, CBC). Ключевой механизм — <strong>ECDHE</strong> (Elliptic Curve Diffie-Hellman Ephemeral), обеспечивающий Perfect Forward Secrecy (PFS). Сессионный ключ вычисляется на лету и никогда не передаётся по сети.</p>
-<h3 id="integratsiya-s-rantaymom-go-kak-cryptotls-obyortyvaet-soket">Интеграция с рантаймом Go: как `crypto/tls` обёртывает сокет</h3>
+<p>Представьте дипломатические переговоры через океан:<br />
+- <strong>В эпоху TLS 1.2</strong> рукопожатие требовало двух полных круговых задержек (<strong>2-RTT</strong>). Сначала клиент и сервер приветствовали друг друга и договаривались о списке поддерживаемых алгоритмов (<code>cipher suites</code>), затем сервер присылал сертификат (<code>cert</code>), клиент генерировал предварительный секрет, шифровал его и отправлял обратно, и лишь на четвертом шаге начиналась передача данных. Если сетевой пинг через океан составлял 100 мс, то перед отправкой первого байта HTTP-запроса соединение простаивало <strong>400 миллисекунд</strong>!<br />
+- <strong>В современном стандарте TLS 1.3 (RFC 8446)</strong> рукопожатие сокращено вдвое — ровно до <strong>1-RTT</strong>. Клиент оптимистично предполагает, что сервер поддерживает современные эллиптические кривые, и прямо в первом пакете <code>ClientHello</code> отправляет свой публичный ключ Диффи-Хеллмана (<code>key share</code>). Сервер отвечает своим <code>key share</code>, сертификатом и подтверждением <code>ServerFinished</code>. Сразу после этого обе стороны вычисляют общий секрет!</p>
+<p>Из TLS 1.3 беспощадно удалили весь устаревший и небезопасный легаси-код: статический <code>RSA key exchange</code>, поточный шифр <code>RC4</code>, функцию хеширования <code>SHA-1</code> и блочные режимы <code>CBC</code> с уязвимым выравниванием. Единственным механизмом обмена ключами остался <strong><code>ECDHE</code></strong> (Elliptic Curve Diffie-Hellman Ephemeral), гарантирующий <strong>Perfect Forward Secrecy (PFS)</strong>: даже если приватный ключ сервера будет похищен через 5 лет, злоумышленник не сможет расшифровать записанный трафик.</p>
+<hr />
+<h2 id="integratsiya-s-rantaymom-go-kak-cryptotls-obyortyvaet-soket">Интеграция с рантаймом Go: как crypto/tls обёртывает сокет</h2>
 
-<p>В Go TLS не реализован как отдельный демон или C-библиотека (в отличие от <code>libssl</code> в C++ или OpenSSL в Python). Это чистая Go-реализация поверх стандартных системных вызовов. <code>tls.Conn</code> — это декоратор вокруг <code>net.Conn</code>. При чтении/записи происходит:<br />
-- Захват данных из буфера сокета через <code>syscall.Read</code> или <code>netpoll</code> (epoll/kqueue).<br />
-- Парсинг TLS-записей (5 байт заголовка: тип, версия, длина).<br />
-- Расшифровка блоков в памяти процесса (аллокация буферов под AES/ChaCha20).<br />
-- Передача расшифрованных данных в <code>net/http</code> или ваше приложение.</p>
+<p>В стандартной библиотеке Go тип <code>tls.Conn</code> является классическим паттерном «Декоратор» вокруг базового интерфейса сетевого сокета <code>net.Conn</code>. </p>
+<p>Физический конвейер обработки данных:<br />
+1. Системный вызов ядра Linux (<code>epoll_wait</code>) через планировщик <code>netpoll</code> уведомляет рантайм Go о готовности входящих байтов в сокете.<br />
+2. Горутина захватывает сырые данные вызовом <code>syscall.Read</code> (или <code>syscall.read</code>/<code>write</code>).<br />
+3. Парсер <code>crypto/tls</code> разбирает 5-байтовый заголовок TLS-записи (Record Header: тип контента, версия протокола, длина фрагмента до 16 КБ).<br />
+4. Аппаратный блок процессора выполняет расшифровку блоков прямо в памяти процесса (<code>AES/ChaCha20</code>).<br />
+5. Декодированные прикладные данные передаются вышестоящему обработчику <code>net/http</code> или <code>gRPC</code> (<code>HTTP/2</code>).</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2235,15 +2263,17 @@ import (
 
 // Идиоматичная настройка TLS-сервера в Go
 func runTLSServer(certFile, keyFile string) {
+    // Загрузка сертификата и приватного ключа
     cert, err := tls.LoadX509KeyPair(certFile, keyFile)
     if err != nil {
         log.Fatalf(&quot;load cert: %v&quot;, err)
     }
 
+    // Конфигурация TLS: строгие современные параметры
     cfg := &amp;tls.Config{
         Certificates: []tls.Certificate{cert},
-        MinVersion:   tls.VersionTLS13, // Отключение устаревших версий
-        NextProtos:   []string{&quot;h2&quot;, &quot;http/1.1&quot;}, // ALPN для HTTP/2
+        MinVersion:   tls.VersionTLS13,               // Отключение устаревших версий (TLS 1.0, 1.1, 1.2)
+        NextProtos:   []string{&quot;h2&quot;, &quot;http/1.1&quot;},    // ALPN для согласования протоколов HTTP/2 и HTTP/1.1
     }
 
     ln, err := net.Listen(&quot;tcp&quot;, &quot;:443&quot;)
@@ -2251,18 +2281,20 @@ func runTLSServer(certFile, keyFile string) {
         log.Fatalf(&quot;listen: %v&quot;, err)
     }
 
-    // tls.Listener оборачивает TCP-соединения
+    // tls.Listener оборачивает входящие TCP-соединения в защищенные сессии
     tlsLn := tls.NewListener(ln, cfg)
     defer tlsLn.Close()
 
     log.Println(&quot;TLS server listening on :443&quot;)
     for {
+        // tlsLn.Accept() выполняет TCP accept, рукопожатие происходит при первом Read/Write
         conn, err := tlsLn.Accept()
         if err != nil {
             log.Printf(&quot;accept: %v&quot;, err)
             continue
         }
-        // Каждая горутина обрабатывает одно соединение
+
+        // Каждая горутина обслуживает одно TLS-соединение
         go handleConnection(conn)
     }
 }
@@ -2281,79 +2313,90 @@ func handleConnection(conn net.Conn) {
 </code></pre>
 </div>
 
+<hr />
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Парсинг сертификатов и давление на GC</span>
   </div>
   <div class="callout-body">
     <p><strong>Парсинг сертификатов и давление на GC</strong><br />
-При каждом новом соединении сервер парсит цепочку сертификатов клиента (если включён <code>tls.VerifyClientCertIfGiven</code>). Парсинг ASN.1DER (<code>encoding/asn1</code>) создаёт множество промежуточных структур, <code>interface{}</code> и слайсов. При высоком RPS это генерирует тысячи короткоживущих объектов, вызывая <code>Minor GC</code> паузы.</p>
+При каждом новом соединении сервер парсит цепочку сертификатов клиента (если включён <code>tls.VerifyClientCertIfGiven</code>). Парсинг <code>ASN.1DER</code> (<code>encoding/asn1</code>) создаёт множество промежуточных структур, <code>interface{}</code> и слайсов. При высоком RPS это генерирует тысячи короткоживущих объектов, вызывая <code>Minor GC</code> паузы.  </p>
 <p><strong>Оптимизация:</strong> Кэшируйте результаты парсинга или используйте <code>GetCertificate</code> для динамической загрузки без повторного парсинга. В современных версиях <code>tls.X509KeyPair</code> уже оптимизирован, но частая ротация сертификатов «на лету» требует аккуратного управления ссылками, чтобы старые <code>tls.Certificate</code> не удерживались в куче живыми ссылками дольше необходимого.</p>
   </div>
 </div>
 
-<h3 id="mekhanicheskoe-sochuvstvie-sistemnye-vyzovy-kesh-i-cpu">Механическое сочувствие: системные вызовы, кэш и CPU</h3>
+<hr />
+<h2 id="mekhanicheskoe-sochuvstvie-sistemnye-vyzovy-kesh-i-cpu">Механическое сочувствие: системные вызовы, кэш и CPU</h2>
 
-<p>TLS добавляет накладные расходы на каждом этапе сетевого взаимодействия:<br />
-- <strong>Системные вызовы:</strong> Каждое <code>conn.Read()</code>/<code>Write()</code> в <code>tls.Conn</code> может требовать нескольких <code>syscall.read</code>/<code>write</code> для чтения полного TLS-фрагмента (макс 16 КБ). <code>netpoll</code> мультиплексирует их через <code>epoll_wait</code> (Linux) или <code>kqueue</code> (macOS), но криптографическая обработка происходит в User Space, блокируя горутину до завершения расшифровки.<br />
-- <strong>CPU и кэш-линии:</strong> AES-GCM использует <code>PCLMULQDQ</code> и <code>AES-NI</code>. Однако вычисление MAC и проверка целостности происходят последовательно. При множестве одновременных соединений данные сертификатов и ключей постоянно вытесняются из L1/L2 кэша, увеличивая <code>memory stall</code>.<br />
-- <strong>Синхронизация состояния:</strong> <code>tls.Conn</code> не является потокобезопасным для параллельных чтений/записей. <code>net/http</code> решает это, выделяя по одной горутине на чтение и запись, используя внутренние примитивы синхронизации. Это предотвращает гонки, но добавляет контекстные переключения.</p>
-<h3 id="prodvinutye-mekhanizmy-resumption-sni-i-0-rtt">Продвинутые механизмы: Resumption, SNI и 0-RTT</h3>
+<p>TLS добавляет измеримые физические затраты на каждом такте:<br />
+1. <strong>Системные вызовы ядра:</strong> Каждый вызов <code>conn.Read()</code>/<code>Write()</code> в <code>tls.Conn</code> может транслироваться в несколько системных вызовов <code>syscall.read</code>/<code>write</code> для агрегации 16-килобайтного фрейма TLS. <code>netpoll</code> эффективно мультиплексирует дескрипторы через <code>epoll_wait</code> (Linux) или <code>kqueue</code> (macOS), но криптографическая обработка происходит в User Space.<br />
+2. <strong>Нагрузка на ALU и аппаратные инструкции:</strong> Для симметричного шифрования AES-GCM процессор задействует инструкции <code>PCLMULQDQ</code> и <code>AES-NI</code>. Однако проверка целостности и сверка MAC требуют работы с кэшем. При десятках тысяч одновременных горутин данные сессионных ключей непрерывно конкурируют за кэш-линии L1/L2, вызывая задержки обращения к DRAM (<code>memory stall</code>).<br />
+3. <strong>Синхронизация состояния:</strong> <code>tls.Conn</code> не поддерживает одновременную параллельную запись из нескольких горутин. В <code>net/http</code> эта проблема решена архитектурно: одна горутина выделяется на чтение, а запись буферизируется через внутренние мьютексы.</p>
+<hr />
+<h2 id="prodvinutye-mekhanizmy-resumption-sni-i-0-rtt">Продвинутые механизмы: Resumption, SNI и 0-RTT</h2>
 
 <ul>
-<li><strong>Session Resumption (Session Tickets):</strong> Вместо полного рукопожатия сервер выдаёт клиенту зашифрованный «билет» состояния. При повторном подключении клиент присылает билет, сервер расшифровывает его и восстанавливает параметры сессии. В Go это настраивается через <code>TicketKey(s)</code> и <code>SessionTicketsDisabled</code>. Ключи билетов должны регулярно ротироваться (каждые 12-24 часа) для PFS.</li>
-<li><strong>SNI (Server Name Indication):</strong> Позволяет хостить несколько доменов на одном IP. В Go обрабатывается через <code>tls.Config.GetCertificate</code>. Функция вызывается <em>до</em> завершения рукопожатия, поэтому она не должна содержать блокирующих операций (запрос к БД, долгие вычисления).</li>
-<li><strong>0-RTT (Early Data):</strong> Клиент отправляет данные сразу после <code>ClientHello</code>, до <code>ServerFinished</code>. Ускоряет повторные соединения, но подвержен replay-атакам. В Go <code>tls.Conn.SetSessionTicketKeys()</code> управляет этим, но <code>net/http</code> по умолчанию отключает 0-RTT из-за рисков.</li>
+<li><strong>Возобновление сессий (Session Resumption / Session Tickets):</strong><br />
+  Чтобы не тратить ресурсы CPU на вычисление эллиптических кривых при каждом повторном подключении, сервер выдает клиенту зашифрованный тикет (<code>Session Tickets</code>). При следующем подключении клиент передает этот тикет, и сервер восстанавливает сессию без тяжелой асимметричной математики. В Go это настраивается параметрами <code>TicketKey(s)</code> и <code>SessionTicketsDisabled</code>. Секретные ключи шифрования тикетов обязаны ротироваться каждые 12–24 часа для поддержания PFS.</li>
+<li><strong>SNI (Server Name Indication):</strong><br />
+  Позволяет размещать сотни различных доменов и SSL-сертификатов на одном IP-адресе. В Go динамическая диспетчеризация реализуется через колбэк <code>tls.Config.GetCertificate</code> или <code>GetConfigForClient</code>.</li>
+<li><strong>0-RTT (Early Data):</strong><br />
+  Режим TLS 1.3, позволяющий клиенту отправлять полезную нагрузку HTTP-запроса непосредственно в первом пакете <code>ClientHello</code> (вообще без задержки рукопожатия!). Однако <code>0-RTT</code> фундаментально уязвим к <strong>Replay-атакам</strong>: перехватив этот пакет, атакующий может повторно списать деньги со счета или отправить дублирующее сообщение. В Go <code>tls.Conn.SetSessionTicketKeys()</code> управляет этой логикой, но в <code>net/http</code> режим 0-RTT по умолчанию отключен ради безопасности.</li>
 </ul>
+<hr />
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Блокировка в GetCertificate и таймауты рукопожатия</span>
   </div>
   <div class="callout-body">
     <p><strong>Блокировка в <code>GetCertificate</code> и таймауты рукопожатия</strong><br />
-Если ваша функция <code>GetCertificate</code> выполняет сетевой запрос (например, к Vault или БД за сертификатом), вы блокируете горуину на этапе установления TCP+TLS. Клиент получит таймаут соединения, а в рантайме Go накопятся заблокированные горутины в состоянии <code>syscall</code> или <code>chan receive</code>.</p>
+Если ваша функция <code>GetCertificate</code> выполняет сетевой запрос (например, к Vault или БД за сертификатом), вы блокируете горутину на этапе установления TCP+TLS. Клиент получит таймаут соединения, а в рантайме Go накопятся заблокированные горутины в состоянии <code>syscall</code> или <code>chan receive</code>.  </p>
 <p><strong>Решение:</strong> Все тяжелые операции загрузки сертификатов выносите в фоновый процесс. <code>GetCertificate</code> должен работать только с уже загруженной в память структурой <code>tls.Certificate</code>, используя атомарное обновление указателя при ротации.</p>
   </div>
 </div>
 
-<h3 id="validatsiya-tsepochek-i-ocsp-stapling">Валидация цепочек и OCSP Stapling</h3>
+<hr />
+<h2 id="validatsiya-tsepochek-i-ocsp-stapling">Валидация цепочек и OCSP Stapling</h2>
 
-<p>По умолчанию <code>crypto/tls</code> проверяет цепочку сертификатов против системных корневых хранилищ (<code>crypto/x509.SystemCertPool()</code>). В минималистичных контейнерах (Alpine, distroless) корневые сертификаты могут отсутствовать, что вызывает <code>x509: failed to load system roots</code>.<br />
-<strong>OCSP Stapling:</strong> Сервер заранее запрашивает статус отзыва сертификата у CA и «прикрепляет» его к рукопожатию. Это снимает нагрузку с клиента и ускоряет проверку. В Go включается автоматически, если сертификаты валидны и сервер может достучаться до OCSP-респондера. Для высокой доступности кэшируйте ответы в <code>sync.Map</code> с TTL.</p>
+<p>По умолчанию <code>crypto/tls</code> проверяет цепочку сертификатов серверов против системных доверенных корневых центров сертификации (<code>crypto/x509.SystemCertPool()</code>). В ультра-минималистичных Docker-образах (Scratch, Distroless, Alpine) системный набор корневых сертификатов часто отсутствует, что вызывает фатальную ошибку рантайма: <code>x509: failed to load system roots</code>. Обязательно устанавливайте пакет <code>ca-certificates</code> на этапе сборки контейнера.</p>
+<p><strong>OCSP Stapling:</strong><br />
+Вместо того чтобы клиент сам обращался к серверу удостоверяющего центра (CA) за проверкой отзыва сертификата (раскрывая третьим лицам факт посещения сайта и добавляя сетевую задержку), сервер сам периодически запрашивает криптографически подписанную квитанцию об отзыве и «прикрепляет» ее к рукопожатию. В Go для высокой доступности кэшируйте ответы в потокобезопасной <code>sync.Map</code> с контролем TTL.</p>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему установка <code>tls.InsecureSkipVerify = true</code> в продакшене считается критической уязвимостью, и как правильно тестировать TLS без валидации?<br />
-<strong>Ответ:</strong><br />
-1 - Флаг полностью отключает проверку имени хоста и цепочки сертификатов. Любой самоподписанный или подставной сертификат (MITM-атака) будет принят.<br />
-2 - В производственном коде это эквивалентно открытым дверям для перехвата трафика.<br />
-3 - <strong>Правильный подход:</strong> Для интеграционных тестов создавайте собственный <code>x509.CertPool</code> с корневым сертификатом тестового CA. Передавайте его через <code>tls.Config.RootCAs</code>. Это сохраняет проверку целостности и аутентичности, но изолирует тестовое окружение от системных сертификатов.<br />
-4 - В рантайме <code>crypto/x509</code> проверяет расширение <code>Subject Alternative Name</code> (SAN), а не <code>Common Name</code>. Игнорирование SAN — частая ошибка при генерации самоподписанных сертификатов.</p>
+    <p><strong>Вопрос:</strong> «Почему установка флага <code>tls.InsecureSkipVerify = true</code> в коде Go-сервиса считается критической уязвимостью, и как правильно организовать тестирование самоподписанных сертификатов?»  </p>
+<p><strong>Ответ кандидата Senior-уровня:</strong><br />
+«1. Флаг <code>tls.InsecureSkipVerify = true</code> полностью отключает криптографическую валидацию цепочки сертификатов и проверку имени хоста. Приложение примет любой сертификат, сгенерированный атакующим «на лету», открывая прямую дорогу для атаки Man-in-the-Middle (MitM) и перехвата учетных данных.<br />
+2. <strong>Правильное инженерное решение:</strong> Для тестов и локальной разработки генерируется локальный корневой сертификат (Root CA). Затем создается изолированный пул сертификатов <code>x509.CertPool</code>, куда добавляется тестовый CA, и передается в конфигурацию клиента через параметр <code>tls.Config.RootCAs</code>. Это сохраняет строгую проверку подписи и целостности, но не требует отключения валидации.<br />
+3. В рантайме Go библиотека <code>crypto/x509</code> обязательно проверяет расширение <code>Subject Alternative Name</code> (SAN), а не устаревшее поле <code>Common Name</code>. Игнорирование SAN — самая частая причина ошибок при генерации тестовых сертификатов».</p>
   </div>
 </div>
 
-<h3 id="sravnenie-podkhodov-go-protiv-cpython">Сравнение подходов: Go против C++/Python</h3>
+<hr />
+<h2 id="sravnenie-podkhodov-go-protiv-c-i-python">Сравнение подходов: Go против C++ и Python</h2>
 
 <ul>
-<li><strong>C++:</strong> Обычно зависит от <code>OpenSSL</code>, <code>BoringSSL</code> или <code>mbedTLS</code>. Требует управления жизненным циклом <code>SSL_CTX</code>, <code>SSL*</code>, ручного <code>free()</code>. Уязвимости в C-библиотеке затрагивают все приложения, пока их не пересоберут.</li>
-<li><strong>Python/Java:</strong> Делегируют работу <code>ssl</code> модулю (обёртка над OpenSSL) или JSSE. Высокий уровень абстракции, но сложно кастомизировать низкоуровневые параметры без JNI/FFI.</li>
-<li><strong>Go:</strong> Статическая линковка <code>crypto/tls</code>. Полный контроль над аллокациями, отсутствие зависимости от ОС. Минус: обновление криптографических стандартов требует обновления компилятора или <code>go.mod</code>, а не просто патча системной библиотеки. Однако это даёт предсказуемость и безопасность памяти.</li>
+<li><strong>C++:</strong> Полностью зависит от динамических библиотек <code>OpenSSL</code>, <code>BoringSSL</code> или <code>mbedTLS</code>. Требует филигранного управления жизненным циклом <code>SSL_CTX</code>, <code>SSL*</code> и освобождения памяти через <code>free()</code>. Любая CVE в системной OpenSSL затрагивает все демоны на хосте.</li>
+<li><strong>Python / Java:</strong> Делегируют TLS системному модулю <code>ssl</code> (обертка над OpenSSL) или Java JSSE. Удобны, но не позволяют тюнить низкоуровневые параметры планировщика сокетов без FFI.</li>
+<li><strong>Go:</strong> Полная статическая линковка пакета <code>crypto/tls</code>. Нулевая зависимость от версий <code>libssl.so</code> в операционной системе, безупречная безопасность памяти. Обновление криптографических возможностей управляется релизом компилятора или версиями зависимостей в <code>go.mod</code>, обеспечивая предсказуемость сборки.</li>
 </ul>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>TLS в Go — это чистая реализация поверх <code>net.Conn</code>, интегрированная в планировщик и <code>netpoll</code>, что обеспечивает высокую производительность без зависимостей от внешних C-библиотек.</li>
-<li>Рукопожатие TLS 1.3 оптимизировано до 1-RTT, использует ECDHE для PFS и требует аккуратного управления session tickets для балансировки скорости и безопасности.</li>
-<li>Парсинг сертификатов и криптографические операции создают давление на <code>GC</code> и кэш-линии. Кэширование результатов, <code>GetConfigForClient</code> и атомарная ротация ключей обязательны для высоконагруженных сервисов.</li>
-<li>Блокирующие операции в <code>GetCertificate</code> или <code>GetConfigForClient</code> ломают процесс установления соединения. Все тяжелые загрузки должны выполняться асинхронно.</li>
-<li>Контейнерное окружение требует явного подключения <code>SystemCertPool</code> или кастомных пулов. <code>InsecureSkipVerify</code> допустим только в изолированных тестах с собственным <code>RootCAs</code>.</li>
+<li><strong>TLS в Go</strong> — это самодостаточная, типобезопасная реализация на чистом Go, оборачивающая <code>net.Conn</code> и напрямую использующая асинхронный планировщик <code>netpoll</code>.</li>
+<li><strong>TLS 1.3 сокращает задержку до 1-RTT</strong>, делает Perfect Forward Secrecy обязательным благодаря <code>ECDHE</code> и исключает уязвимые симметричные режимы и алгоритмы прошлого.</li>
+<li><strong>Механическое сочувствие:</strong> Учитывайте накладные расходы на парсинг сертификатов в <code>encoding/asn1</code>, избегайте аллокаций в куче, применяйте аппаратное ускорение <code>AES-NI</code> и <code>PCLMULQDQ</code>.</li>
+<li><strong>Запрет блокировок в Handshake:</strong> Функции <code>GetCertificate</code> и <code>GetConfigForClient</code> обязаны работать с атомарными структурами в оперативной памяти без походов в базу данных или сеть.</li>
+<li><strong>Строгая валидация:</strong> Никогда не используйте <code>InsecureSkipVerify = true</code> в продакшене. Настраивайте <code>RootCAs</code> и <code>Subject Alternative Name</code> (SAN).</li>
 </ol>
-<p><a href="4-rabota-s-crypto-paketom-go.html" class="wikilink">4. Работа с crypto пакетом Go</a></p>
+<p>В следующей лекции мы погрузимся в прикладную работу с инструментами стандартной библиотеки Go: <a href="4-rabota-s-crypto-paketom-go.html" class="wikilink">4. Работа с crypto пакетом Go</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2381,7 +2424,7 @@ func handleConnection(conn net.Conn) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#fundament-zashchishchyonnykh-soedineniy-ot-rukopozhatiya-do-peredachi-bayt">Фундамент защищённых соединений: от рукопожатия до передачи байт</a></li><li class="toc-item toc-h3"><a href="#evolyutsiya-rukopozhatiya-tls-1-2-protiv-1-3">Эволюция рукопожатия: TLS 1.2 против 1.3</a></li><li class="toc-item toc-h3"><a href="#integratsiya-s-rantaymom-go-kak-cryptotls-obyortyvaet-soket">Интеграция с рантаймом Go: как crypto/tls обёртывает сокет</a></li><li class="toc-item toc-h3"><a href="#mekhanicheskoe-sochuvstvie-sistemnye-vyzovy-kesh-i-cpu">Механическое сочувствие: системные вызовы, кэш и CPU</a></li><li class="toc-item toc-h3"><a href="#prodvinutye-mekhanizmy-resumption-sni-i-0-rtt">Продвинутые механизмы: Resumption, SNI и 0-RTT</a></li><li class="toc-item toc-h3"><a href="#validatsiya-tsepochek-i-ocsp-stapling">Валидация цепочек и OCSP Stapling</a></li><li class="toc-item toc-h3"><a href="#sravnenie-podkhodov-go-protiv-cpython">Сравнение подходов: Go против C++/Python</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#fundament-zashchishchyonnykh-soedineniy-ot-rukopozhatiya-do-peredachi-bayt">Фундамент защищённых соединений: от рукопожатия до передачи байт</a></li><li class="toc-item toc-h3"><a href="#evolyutsiya-rukopozhatiya-tls-1-2-protiv-1-3">Эволюция рукопожатия: TLS 1.2 против 1.3</a></li><li class="toc-item toc-h2"><a href="#integratsiya-s-rantaymom-go-kak-cryptotls-obyortyvaet-soket">Интеграция с рантаймом Go: как crypto/tls обёртывает сокет</a></li><li class="toc-item toc-h2"><a href="#mekhanicheskoe-sochuvstvie-sistemnye-vyzovy-kesh-i-cpu">Механическое сочувствие: системные вызовы, кэш и CPU</a></li><li class="toc-item toc-h2"><a href="#prodvinutye-mekhanizmy-resumption-sni-i-0-rtt">Продвинутые механизмы: Resumption, SNI и 0-RTT</a></li><li class="toc-item toc-h2"><a href="#validatsiya-tsepochek-i-ocsp-stapling">Валидация цепочек и OCSP Stapling</a></li><li class="toc-item toc-h2"><a href="#sravnenie-podkhodov-go-protiv-c-i-python">Сравнение подходов: Go против C++ и Python</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

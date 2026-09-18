@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Защита от replay атак</h1>
@@ -2178,8 +2178,13 @@
           <div class="article-markdown">
             <h2 id="arkhitektura-zashchity-ot-odnorazovykh-nomerov-k-kriptograficheskim-podpisyam">Архитектура защиты: от одноразовых номеров к криптографическим подписям</h2>
 
-<p>Replay-атака (атака повторного воспроизведения) возникает, когда атакующий перехватывает валидный сетевой запрос (например, с авторизационным заголовком или подписью) и повторно отправляет его без изменений. Сервер, не имея механизма отслеживания уникальности, обрабатывает запрос как легитимный, что приводит к дублированию финансовых операций, повторному списанию баланса или обходу однократных ограничений.</p>
-<p>В высоконагруженном бэкенде на Go защита от replay-атак строится на комбинации трёх криптографических примитивов: временного окна, уникального идентификатора (nonce) и криптографической привязки. Реализация требует баланса между строгостью проверок, задержками сетевого стека и потреблением памяти.</p>
+<p>В теории компьютерных сетей существует фундаментальный постулат: шифрование гарантирует конфиденциальность и целостность данных в канале, но само по себе не защищает от фактора времени.</p>
+<p>Представьте физическую модель: злоумышленник перехватывает зашифрованный сетевой пакет с командой: «Списать $1 000 со счета Алисы в пользу Боба». Даже если злоумышленник не знает закрытых ключей и не может расшифровать или подделать содержимое пакета, что мешает ему просто сохранить этот легитимный пакет и отправить его на сервер еще 500 раз подряд? Если сервер наивно обрабатывает каждый валидный пакет, Боб станет богачом, а счет Алисы опустеет.</p>
+<p>Эта угроза называется <strong>Replay-атакой (Атакой повторного воспроизведения)</strong>.</p>
+<p>В распределенных API, интеграционных вебхуках (Payment Webhooks, GitHub Webhooks) и системах межсервисного взаимодействия (M2M) защита от повторов строится на строгой комбинации трех криптографических примитивов:<br />
+1. <strong>Временного окна (Timestamp)</strong> — ограничивает срок годности сообщения в физическом времени.<br />
+2. <strong>Одноразового номера (Nonce)</strong> — гарантирует абсолютную уникальность каждого запроса.<br />
+3. <strong>Криптографической привязки (HMAC Signature)</strong> — делает timestamp и nonce неделимой частью подписанной полезной нагрузки.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2194,32 +2199,56 @@
   </div>
   <pre class="mermaid">
 flowchart TD
+subgraph Client[&quot;Клиентская система (Sender)&quot;]
 A[&quot;1 - Клиент формирует запрос&quot;] --&gt; B[&quot;2 - Генерация timestamp и nonce&quot;]
 B --&gt; C[&quot;3 - Подпись: HMAC timestamp nonce payload&quot;]
-C --&gt; D[&quot;4 - Отправка заголовков X-Timestamp&lt;br&gt;X-Nonce X-Signature&quot;]
-D --&gt; E[&quot;5 - Middleware извлекает значения&quot;]
-E --&gt; F[&quot;6 - Проверка временного окна&lt;br&gt;5 минут&quot;]
-F --&gt;|&quot;7 - Проверка уникальности nonce&lt;br&gt;Redis SET NX или LRU кэш&quot;| G[&quot;8 - Верификация подписи&quot;]
-G --&gt; H[&quot;9 - Разрешение запроса&quot;]
-F --&gt; I[&quot;10 - Отказ 400/401&quot;]
-G --&gt; I
+C --&gt; D[&quot;4 - Отправка заголовков X-Timestamp&lt;br/&gt;X-Nonce X-Signature&quot;]
+end
 
-style C fill:#4ecdc4,stroke:#333
-style F fill:#ffd93d,stroke:#333
-style I fill:#ff6b6b,stroke:#333
+subgraph Middleware[&quot;Go Ingress (Anti-Replay Middleware)&quot;]
+D --&gt; E[&quot;5 - Middleware извлекает значения&quot;]
+E --&gt; F[&quot;6 - Проверка временного окна&lt;br/&gt;(допустим дрейф 5 минут)&quot;]
+F --&gt;|&quot;Окно валидно&quot;| G[&quot;7 - Проверка уникальности nonce&lt;br/&gt;Redis SET NX или LRU кэш&quot;]
+G --&gt;|&quot;Nonce уникален&quot;| H[&quot;8 - Верификация подписи&lt;br/&gt;subtle.ConstantTimeCompare&quot;]
+end
+
+subgraph Decision[&quot;Маршрутизация&quot;]
+H --&gt;|&quot;Подпись верна&quot;| I[&quot;9 - Разрешение запроса&lt;br/&gt;(в бизнес-логику)&quot;]
+F --&gt;|&quot;Просрочено&quot;| J[&quot;10 - Отказ 400/401&quot;]
+G --&gt;|&quot;Дубликат&quot;| J
+H --&gt;|&quot;Не совпало&quot;| J
+end
+
+style Client fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#f8fafc
+style Middleware fill:#1e293b,stroke:#10b981,stroke-width:1px,color:#f8fafc
+style Decision fill:#0f172a,stroke:#6366f1,stroke-width:1px,color:#f8fafc
+style C fill:#1e293b,stroke:#4ecdc4,stroke-width:2px,color:#f8fafc
+style F fill:#1e293b,stroke:#ffd93d,stroke-width:2px,color:#f8fafc
+style J fill:#1e293b,stroke:#ff6b6b,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
+<hr />
 <h2 id="mekhanizmy-zashchity-i-ikh-kombinatsiya">Механизмы защиты и их комбинация</h2>
 
-<p>1 - <strong>Временное окно (Timestamp)</strong>: Клиент прикладывает текущее время Unix. Сервер сверяет его с <code>time.Now()</code>. Если разница превышает допустимый порог (обычно 1-5 минут), запрос отклоняется. Это ограничивает жизнь перехваченного пакета.<br />
-2 - <strong>Одноразовый номер (Nonce)</strong>: Криптографически стойкий случайный идентификатор, генерируемый для каждого запроса. Сервер сохраняет его на время, равное длительности временного окна. Повторное использование nonce приводит к отказу.<br />
-3 - <strong>Криптографическая привязка (Signature)</strong>: Timestamp и nonce включаются в тело, по которому вычисляется HMAC. Это предотвращает манипуляции атакующим: изменить timestamp или nonce без знания секрета невозможно, так как подпись станет невалидной.</p>
-<p>Разделение этих механизмов критично. Без nonce атака возможна внутри временного окна. Без timestamp хранилище nonce раздуется до бесконечности. Без подписи атакующий может подставить свои значения и обойти проверку.</p>
+<p>Эффективная защита от повторного воспроизведения невозможна, если исключить хотя бы один компонент триады:</p>
+<ol>
+<li><strong>Временное окно (Timestamp):</strong><br />
+   Клиент прикладывает текущее время Unix в секундах или миллисекундах. Сервер сверяет его со своим системным временем через <code>time.Now()</code>. Если разница между часами клиента и сервера превышает допустимый порог (обычно 1–5 минут), запрос мгновенно отклоняется. Это сужает временное окно жизни перехваченного сетевого пакета.</li>
+<li><strong>Одноразовый номер (Nonce — Number used ONCE):</strong><br />
+   Криптографически стойкий случайный идентификатор высокой энтропии (UUIDv4 или 128 бит случайных байт), генерируемый клиентом на каждый отдельный запрос. Сервер сохраняет этот идентификатор во временном хранилище ровно на длительность временного окна (5 минут). Попытка повторно использовать уже встречавшийся <code>nonce</code> пресекается как атака.</li>
+<li><strong>Криптографическая подпись (Signature):</strong><br />
+   Timestamp и nonce включаются в строку подписи, по которой вычисляется дайджест HMAC-SHA256 от тела запроса. Это лишает злоумышленника возможности манипулировать временем: изменить timestamp или сгенерировать свежий nonce невозможно без знания общего секрета, так как итоговая подпись станет невалидной.</li>
+</ol>
+<p><strong>Почему разделение критично?</strong><br />
+- Без nonce атакующий может повторить запрос сотни раз <em>внутри</em> разрешенного 5-минутного окна.<br />
+- Без timestamp сервер был бы вынужден хранить все nonce за всю историю существования системы, что приведет к бесконечному расходу оперативной памяти.<br />
+- Без подписи атакующий может просто подставить текущее время и новый nonce, обойдя все фильтры.</p>
+<hr />
 <h2 id="idiomatichnaya-realizatsiya-v-go">Идиоматичная реализация в Go</h2>
 
-<p>В Go защита реализуется как middleware, который извлекает заголовки, проверяет окно, валидирует nonce через атомарную операцию и верифицирует подпись. Для распределённых систем используется Redis, для монолитов или edge-сервисов — локальный LRU-кэш.</p>
+<p>В Go защита от replay-атак оформляется в виде Middleware. Он извлекает заголовки, проверяет допустимый дрейф часов, атомарно регистрирует <code>nonce</code> и сверяет HMAC-подпись за константное время:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2236,24 +2265,31 @@ import (
     &quot;crypto/hmac&quot;
     &quot;crypto/sha256&quot;
     &quot;crypto/subtle&quot;
-    &quot;errors&quot;
-    &quot;fmt&quot;
     &quot;net/http&quot;
     &quot;strconv&quot;
-    &quot;sync&quot;
     &quot;time&quot;
 )
 
-// AntiReplayMiddleware проверяет запрос на повторное воспроизведение
+// NonceStore определяет интерфейс атомарного сохранения одноразовых номеров с TTL
+type NonceStore interface {
+    Store(ctx context.Context, nonce string, ttl time.Duration) (bool, error)
+}
+
+// AntiReplayMiddleware проверяет входящий сетевой запрос на попытку повтора
 type AntiReplayMiddleware struct {
-    secret    []byte
-    window    time.Duration
-    maxDrift  time.Duration
+    secret     []byte
+    window     time.Duration
+    maxDrift   time.Duration
     nonceStore NonceStore // интерфейс для сохранения nonce с TTL
 }
 
-type NonceStore interface {
-    Store(ctx context.Context, nonce string, ttl time.Duration) (bool, error)
+func NewAntiReplayMiddleware(secret []byte, window, maxDrift time.Duration, store NonceStore) *AntiReplayMiddleware {
+    return &amp;AntiReplayMiddleware{
+        secret:     secret,
+        window:     window,
+        maxDrift:   maxDrift,
+        nonceStore: store,
+    }
 }
 
 func (m *AntiReplayMiddleware) ServeHTTP(next http.Handler) http.Handler {
@@ -2267,7 +2303,7 @@ func (m *AntiReplayMiddleware) ServeHTTP(next http.Handler) http.Handler {
             return
         }
 
-        // 1 - Парсинг и проверка временного окна
+        // 1 - Парсинг и проверка допустимого временного окна
         reqTime, err := strconv.ParseInt(tsStr, 10, 64)
         if err != nil {
             http.Error(w, &quot;invalid timestamp&quot;, http.StatusBadRequest)
@@ -2275,6 +2311,7 @@ func (m *AntiReplayMiddleware) ServeHTTP(next http.Handler) http.Handler {
         }
 
         now := time.Now().Unix()
+        // Проверяем как устаревание запроса, так и забегание часов клиента вперед
         if now-reqTime &gt; int64(m.window.Seconds()) || now-reqTime &lt; -int64(m.maxDrift.Seconds()) {
             http.Error(w, &quot;request expired or clock skew too large&quot;, http.StatusUnauthorized)
             return
@@ -2287,17 +2324,19 @@ func (m *AntiReplayMiddleware) ServeHTTP(next http.Handler) http.Handler {
             return
         }
         if !ok {
+            // Повторное появление того же самого nonce сигнализирует о Replay-атаке
             http.Error(w, &quot;replay attempt detected&quot;, http.StatusConflict)
             return
         }
 
-        // 3 - Верификация подписи. Привязываем timestamp и nonce к payload.
+        // 3 - Верификация подписи: привязываем timestamp и nonce к полезной нагрузке
         mac := hmac.New(sha256.New, m.secret)
         mac.Write([]byte(tsStr))
         mac.Write([]byte(nonce))
-        // В реальном коде здесь добавляется тело запроса или его хеш
+        // В реальном коде здесь также хешируется тело запроса r.Body
         expected := mac.Sum(nil)
 
+        // 🔒 Сравнение в константном времени для исключения атак по времени
         if subtle.ConstantTimeCompare([]byte(signature), expected) != 1 {
             http.Error(w, &quot;invalid signature&quot;, http.StatusUnauthorized)
             return
@@ -2309,48 +2348,68 @@ func (m *AntiReplayMiddleware) ServeHTTP(next http.Handler) http.Handler {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="pod-kapotom-vremya-atomarnost-i-davlenie-na-pamyat">Под капотом: время, атомарность и давление на память</h2>
 
-<p>Реализация антиповтора напрямую затрагивает низкоуровневые механизмы ОС и рантайма Go:</p>
-<p>1 - <strong>Получение времени (<code>time.Now</code>)</strong>: В Linux <code>time.Now()</code> вызывает системный вызов <code>clock_gettime(CLOCK_REALTIME)</code>. На современных ядрах это выполняется через VDSO (Virtual Dynamic Shared Object) без перехода в Kernel Space, что занимает ~10-30 нс. Однако при значительном рассинхронизации NTP или ручном изменении времени сервера проверка может давать ложные срабатывания.<br />
-2 - <strong>Атомарность хранения nonce</strong>: В Redis используется <code>SET key value NX PX &lt;ttl&gt;</code>. Команда выполняется в одном потоке Redis, что исключает гонки. В рантайме Go это один <code>syscall write/read</code> в сокет. При 10k RPS это создаёт 10k сетевых round-trip в секунду. Для снижения latency применяется локальный кэш (<code>sync.Map</code> или <code>ristretto</code>) с фоновой синхронизацией или шардированием по хешу nonce.<br />
-3 - <strong>Память и GC</strong>: Хранение nonce в памяти без TTL приводит к линейному росту потребления RAM. Каждый новый запрос аллоцирует строку для ключа. Сборщик мусора не очищает записи в <code>map</code> автоматически. Идиоматичное решение: использовать структуры с явным сроком жизни, фоновый worker для очистки или LRU-алгоритм с фиксированным размером, что ограничивает давление на <code>GC</code> и предотвращает <code>OOM Killer</code>.<br />
-4 - <strong>Константное сравнение</strong>: <code>crypto/subtle.ConstantTimeCompare</code> выполняется за фиксированное количество тактов CPU независимо от позиции первого несовпадающего байта. Это предотвращает timing-атаки, при которых атакующий измеряет время ответа для подбора сигнатуры. На x86_64 это реализуется через инструкции <code>XOR</code> и <code>OR</code>, исключающие ветвления (<code>JNE</code>/<code>JE</code>), что стабилизирует предсказатель переходов (Branch Predictor).</p>
+<p>Реализация антиповтора затрагивает самые низкоуровневые механизмы ядра ОС и рантайма Go:</p>
+<ol>
+<li><strong>Быстрое время ядра Linux через VDSO:</strong><br />
+   Функция <code>time.Now()</code> в современном Linux не совершает полноценного переключения контекста ядра. Она обращается к механизму <strong>VDSO (Virtual Dynamic Shared Object)</strong>, вызывая <code>clock_gettime(CLOCK_REALTIME)</code> прямо из пространства пользователя. Это занимает считанные 10–30 наносекунд. Однако разработчик обязан учитывать рассинхронизацию часов (Clock Skew / NTP Drift) между серверами клиентов и шлюза, закладывая безопасный допуск в 30–60 секунд.</li>
+<li><strong>Атомарность сохранения Nonce в распределенном кластере:</strong><br />
+   В распределенных системах <code>NonceStore</code> реализуется через Redis с помощью команды <code>SET key value NX PX &lt;ttl&gt;</code>. Флаг <code>NX</code> (Not eXists) атомарно записывает ключ только в том случае, если его еще нет в базе. Вся операция выполняется в одном потоке Redis без риска гонки состояний. На уровне Go это один вызов сокета (<code>syscall write/read</code>). При 10 000 RPS это генерирует 10 000 сетевых запросов в секунду. Для оптимизации применяют локальный кэш (<code>sync.Map</code> или <code>ristretto</code>) с TTL-инвалидацией на стороне Go-процесса.</li>
+<li><strong>Память и сборщик мусора (<code>GC</code>):</strong><br />
+   Хранение nonce в оперативной памяти без строгой очистки гарантированно приводит к линейной утечке памяти: Go-рантайм никогда автоматически не удаляет старые ключи из мапы. Решение: использование LRU-кэшей с ограниченной емкостью или фоновых горутин с тикером, очищающих устаревшие слоты, что защищает процесс от срабатывания <code>OOM Killer</code>.</li>
+<li><strong>Константное время и конвейер процессора:</strong><br />
+   Функция <code>crypto/subtle.ConstantTimeCompare</code> побайтово выполняет побитовые инструкции <code>XOR</code> и <code>OR</code>, не используя условных переходов (<code>JNE</code>/<code>JE</code>). Конвейер процессора исполняет строго фиксированное количество инструкций независимо от входных данных, стабилизируя предсказатель ветвлений (Branch Predictor) и полностью блокируя атаки по измерению времени ответа.</li>
+</ol>
+<hr />
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Гонка условий при проверке nonce в локальном кэше</span>
   </div>
   <div class="callout-body">
-    <p><strong>Гонка условий при проверке nonce в локальном кэше</strong><br />
-Если использовать обычную <code>map[string]bool</code> с <code>sync.RWMutex</code> для хранения nonce, возникает окно между <code>RLock</code> (проверка существования) и <code>Lock</code> (вставка). Два параллельных запроса с одинаковым nonce могут оба пройти проверку и вставиться, сломав защиту.<br />
-<strong>Решение:</strong> Использовать атомарные операции хранилища. В Redis это <code>SET NX</code>. В локальном Go-коде — <code>sync.Map</code> не подходит, так как <code>LoadOrStore</code> не возвращает флаг "было ли значение уже записано ранее" для TTL-инвалидации. Правильный паттерн: <code>singleflight.Group</code> для дедупликации запросов или <code>atomic.Pointer</code> с lock-free алгоритмами, либо делегирование проверки в распределённое хранилище с гарантированной атомарностью.</p>
+    <p><strong>Ловушка RWMutex при проверке уникальности:</strong><br />
+Если разработчик использует обычную карту <code>map[string]bool</code> с замком <code>sync.RWMutex</code>, он часто пишет уязвимый код:<br />
+<code>mu.RLock()</code> -&gt; проверяем <code>if seen[nonce]</code> -&gt; <code>mu.RUnlock()</code> -&gt; <code>mu.Lock()</code> -&gt; записываем <code>seen[nonce] = true</code> -&gt; <code>mu.Unlock()</code>.<br />
+Между снятием <code>RLock</code> и захватом <code>Lock</code> возникает фатальное временное окно (TOCTOU). Два параллельных запроса с одинаковым nonce могут одновременно пройти проверку существования и оба примениться в системе!<br />
+<strong>Решение:</strong> Использовать атомарные операции хранилища. В Redis это <code>SET NX</code>. В локальном Go-коде — <code>sync.Map</code> не подходит, так как <code>LoadOrStore</code> не возвращает флаг "было ли значение уже записано ранее" для TTL-инвалидации. Правильный паттерн: <code>singleflight.Group</code> для дедупликации параллельных запросов или <code>atomic.Pointer</code> с lock-free алгоритмами, либо делегирование проверки в распределённое хранилище с гарантированной атомарностью.</p>
   </div>
 </div>
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чём архитектурная разница между Idempotency Key и Anti-Replay Nonce, и почему их нельзя заменять друг другом?<br />
-<strong>Ответ:</strong><br />
-1 - <strong>Idempotency Key</strong> гарантирует, что повторный запрос с тем же ключом вернёт <em>тот же результат</em>, но не выполнит действие заново. Он привязан к бизнес-операции и живёт долго (дни/недели). Используется для безопасных повторных отправок при сетевых таймаутах.<br />
-2 - <strong>Anti-Replay Nonce</strong> гарантирует, что запрос <em>никогда не будет обработан дважды</em>, независимо от контекста. Он живёт мало (минуты) и служит исключительно для защиты от перехвата.<br />
-3 - Замена nonce на idempotency key опасна: при сбое сети клиент может отправить запрос дважды, idempotency-система вернёт кэшированный ответ, но если сервер перезагрузится и потеряет состояние, nonce-защита сработает корректно, а idempotency может пропустить дубликат.<br />
-4 - <strong>В Go</strong>: Idempotency часто реализуется через <code>redis SETNX</code> с долгим TTL и хранением ответа. Anti-Replay — через короткоживущий <code>SETNX</code> + криптографическую привязку к payload.</p>
+    <p><strong>Вопрос:</strong> «В чем принципиальная архитектурная разница между Idempotency Key (ключом идемпотентности) и Anti-Replay Nonce, и почему их нельзя заменять друг другом?»  </p>
+<p><strong>Ответ кандидата Senior-уровня:</strong><br />
+«1. <strong>Цель и поведение:</strong><br />
+   - <strong>Idempotency Key</strong> гарантирует, что повторный запрос с тем же ключом вернет <strong>тот же самый закэшированный результат</strong>, но не выполнит мутирующее действие повторно. Он спасает от сетевых разрывов и таймаутов на клиенте.<br />
+   - <strong>Anti-Replay Nonce</strong> гарантирует, что сетевой запрос <strong>ни при каких условиях не будет обработан дважды</strong>. Повторное предъявление того же nonce расценивается как атака и немедленно отклоняется с ошибкой <code>409 Conflict</code> или <code>401 Unauthorized</code>.<br />
+2. <strong>Время жизни (TTL):</strong><br />
+   - Idempotency Key живет долго: от 24 часов до нескольких недель, чтобы клиент мог безопасно повторить операцию после восстановления связи.<br />
+   - Nonce живет экстремально мало: ровно столько, сколько длится допустимое окно дрейфа времени (1–5 минут).<br />
+3. <strong>Реализация в Go:</strong><br />
+   - Idempotency часто реализуется через <code>redis SETNX</code> с долгим TTL и хранением ответа.<br />
+   - Anti-Replay — через короткоживущий <code>SETNX</code> (или <code>SET NX PX</code>) в связке с криптографической подписью HMAC, связывающей nonce с телом запроса и меткой времени».</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>1 - Защита от replay-атак требует комбинации временного окна, уникального nonce и криптографической подписи, связывающей эти параметры с телом запроса.<br />
-2 - В рантайме Go проверка времени использует VDSO для минимизации syscalls, но требует учёта сетевого рассинхронизования часов.<br />
-3 - Хранение nonce должно быть атомарным (<code>SET NX</code> в Redis или lock-free структуры в памяти) для предотвращения гонок при параллельных запросах.<br />
-4 - Память под nonce ограничивается через TTL и LRU-эвикцию, иначе неограниченный рост мапы приведёт к давлению на <code>GC</code> и <code>OOM</code> процесса.<br />
-5 - <code>crypto/subtle.ConstantTimeCompare</code> обязателен для верификации подписи, чтобы исключить timing-атаки на уровне предсказателя ветвлений CPU.</p>
-<p><a href="6-secure-headers.html" class="wikilink">6. Secure headers</a></p>
+<ol>
+<li><strong>Триада защиты от Replay:</strong> Надежная защита требует одновременного присутствия Timestamp (ограничение времени), Nonce (уникальность) и Signature (криптографическая привязка к телу).</li>
+<li><strong>Атомарность превыше всего:</strong> Регистрация Nonce обязана быть атомарной (<code>SET NX</code> в Redis). Разделение проверки и записи через <code>RWMutex</code> создает окно гонки TOCTOU.</li>
+<li><strong>Механическое сочувствие к рантайму:</strong> Получение времени через <code>time.Now()</code> опирается на быстрый VDSO в Linux (~10–30 нс). Учитывайте рассинхронизацию NTP между хостами.</li>
+<li><strong>Управление памятью:</strong> При локальном хранении nonce используйте структуры с жестким лимитом емкости (LRU) и TTL-инвалидацией во избежание деградации сборщика мусора и <code>OOM</code>.</li>
+<li><strong>Константное время:</strong> Сверка криптографических подписей всегда должна выполняться через <code>crypto/subtle.ConstantTimeCompare</code>, исключая утечки информации по времени выполнения инструкций.</li>
+</ol>
+<p>Как обеспечить браузерную защиту на уровне транспортных заголовков HTTP и предотвратить MIME-сниффинг, встраивание во фреймы и утечки реферера?<br />
+В следующей лекции мы разберем: <a href="6-secure-headers.html" class="wikilink">6. Secure headers</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

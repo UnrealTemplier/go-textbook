@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. SSRF</h1>
@@ -2178,7 +2178,9 @@
           <div class="article-markdown">
             <h2 id="vvedenie-kogda-server-stanovitsya-proksi-atakuyushchego">Введение: Когда сервер становится прокси атакующего</h2>
 
-<p>SSRF (Server-Side Request Forgery) позволяет злоумышленнику заставить ваш сервер выполнить исходящий сетевой запрос к ресурсам, доступным только из внутренней сети. В современных микросервисных архитектурах на Go, где сервисы общаются через Kubernetes DNS, service mesh и облачные метаданные, SSRF превращается из теоретической уязвимости в критический вектор атаки на инфраструктуру.</p>
+<p>В архитектуре распределенных систем существует классическая инженерная задача: серверу необходимо загрузить ресурс из внешнего мира по запросу пользователя. Типичные примеры — скачивание аватара по переданной ссылке, отправка Webhook-уведомления на сторонний адрес или валидация XML-схемы. </p>
+<p>Если эта функциональность спроектирована наивно, сервис открывает прямую дорогу для уязвимости <strong>SSRF (Server-Side Request Forgery — подделка запроса на стороне сервера)</strong>.</p>
+<p>Суть проблемы кроется в концепции неявного доверия: сервер бэкенда физически находится внутри защищенного сетевого периметра компании (VPC, локальная сеть, приватный кластер Kubernetes). Внешний клиент не имеет прямого доступа к закрытым сервисам, однако он может заставить ваш Go-сервер сделать запрос <em>от своего имени</em>. Для внутренней сети этот исходящий сетевой пакет выглядит полностью легитимным.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2193,31 +2195,57 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Атакующий&quot;] --&gt;|&quot;Вредоносный URL&quot;| B[&quot;Go обработчик&quot;]
-B --&gt; C[&quot;Парсинг URL&lt;br&gt;резолвинг DNS&quot;]
-C --&gt; D[&quot;Установление TCP соединения&quot;]
-D --&gt; E[&quot;Отправка HTTP запроса&quot;]
-E --&gt; F[&quot;Внутренний сервис или облачные метаданные&quot;]
-F --&gt; G[&quot;Ответ попадает в память процесса&quot;]
+subgraph External[&quot;Внешний недоверенный периметр&quot;]
+A[&quot;Злоумышленник / Клиент&quot;]
+end
 
-style A fill:#ff6b6b,stroke:#333
-style D fill:#ffd93d,stroke:#333
-style F fill:#4ecdc4,stroke:#333
+subgraph Host[&quot;Хост приложения (Go Runtime)&quot;]
+B[&quot;Go HTTP Handler&quot;]
+C[&quot;Парсинг URL&lt;br/&gt;и DNS-резолвинг&quot;]
+D[&quot;net.Dialer &amp; syscall connect&quot;]
+E[&quot;Пакет net/http &amp; crypto/tls&quot;]
+G[&quot;Ответ попадает в память процесса&quot;]
+end
+
+subgraph Internal[&quot;Защищенная приватная инфраструктура&quot;]
+F1[&quot;Облачные метаданные&lt;br/&gt;(169.254.169.254, 100.100.100.200)&quot;]
+F2[&quot;Внутренние сервисы &amp; K8s DNS&lt;br/&gt;(http://billing.internal)&quot;]
+F3[&quot;Локальные Unix-сокеты &amp; localhost&lt;br/&gt;(127.0.0.1:6379 Redis)&quot;]
+end
+
+A --&gt;|&quot;1. Вредоносный URL&quot;| B
+B --&gt; C
+C --&gt; D
+D --&gt; E
+E --&gt;|&quot;2. Отправка HTTP-запроса&quot;| F1
+E -.-&gt;|&quot;Сканирование портов&quot;| F2
+E -.-&gt;|&quot;Обращение к сервисам&quot;| F3
+F1 --&gt; G
+F2 -.-&gt; G
+F3 -.-&gt; G
+
+style External fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#f8fafc
+style Host fill:#1e293b,stroke:#10b981,stroke-width:1px,color:#f8fafc
+style Internal fill:#0f172a,stroke:#f43f5e,stroke-width:1px,color:#f8fafc
+style A fill:#1e293b,stroke:#f43f5e,stroke-width:2px,color:#f8fafc
+style D fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+style F1 fill:#1e293b,stroke:#f43f5e,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
 <p>Для разработчика на Go SSRF опасен не только доступом к внутренним API. Успешная эксплуатация позволяет:<br />
-- Прочитать метаданные облачных провайдеров (<code>169.254.169.254</code> в AWS, <code>100.100.100.200</code> в Yandex Cloud).<br />
-- Сканировать внутренние порты и сервисы.<br />
-- Вызвать отказ в обслуживании через бесконечные редиректы или долгие таймауты.<br />
-- Получить доступ к локальным unix-сокетам или <code>localhost</code> эндпоинтам.</p>
+- <strong>Прочитать метаданные облачных провайдеров</strong> (<code>169.254.169.254</code> в AWS EC2/GCP, <code>100.100.100.200</code> в Yandex Cloud), мгновенно скомпрометировав временные IAM-токены и ключи доступа к инфраструктуре.<br />
+- <strong>Сканировать внутренние порты и сервисы</strong>, составляя карту топологии сети предприятия.<br />
+- <strong>Вызвать отказ в обслуживании (DoS)</strong> через бесконечные редиректы, циклы или удержание открытых сетевых сокетов с таймаутами ядра.<br />
+- <strong>Получить доступ к локальным unix-сокетам или <code>localhost</code> эндпоинтам</strong> (Redis, Memcached, Docker daemon), не требующим пароля в доверенной петле обратной связи.</p>
+<hr />
 <h2 id="mekhanika-ssrf-v-rantayme-go-ot-rezolvinga-do-syscall">Механика SSRF в рантайме Go: от резолвинга до syscall</h2>
 
-<p>В Go сетевые запросы обслуживаются пакетом <code>net/http</code> и низкоуровневым <code>net</code>. Понимание того, как они взаимодействуют с ОС, помогает проектировать устойчивую защиту.</p>
+<p>В Go сетевые запросы обслуживаются высокоуровневым пакетом <code>net/http</code> и низкоуровневым примитивом <code>net</code>. Понимание того, как рантайм взаимодействует с ядром Linux, помогает осознать скрытые риски стандартных библиотечных абстракций.</p>
 <h3 id="1-arkhitektura-http-client-po-umolchaniyu">1. Архитектура `http.Client` по умолчанию</h3>
 
-<p>Стандартный <code>http.DefaultClient</code> и <code>http.Get</code> <strong>не имеют таймаутов</strong> и автоматически следуют за редиректами до 10 раз. Это историческое решение для удобства, но в продакшене оно создаёт уязвимость для DoS и SSRF.</p>
+<p>Стандартный <code>http.DefaultClient</code> и вспомогательная функция <code>http.Get</code> исторически спроектированы для быстрого прототипирования: <strong>они не имеют таймаутов вообще</strong> и автоматически следуют за редиректами до 10 раз. В продакшене использование такого клиента для внешних ссылок — прямая дорога к аварии.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2227,41 +2255,58 @@ style F fill:#4ecdc4,stroke:#333
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ❌ Опасно: стандартный клиент без ограничений
+  <pre class="language-go"><code class="language-go">package handlers
+
+import (
+    &quot;net/http&quot;
+)
+
+// ❌ Опасно: стандартный клиент без ограничений
 func FetchURLBad(w http.ResponseWriter, r *http.Request) {
     target := r.URL.Query().Get(&quot;url&quot;)
-    resp, err := http.Get(target) // 🔴 Нет таймаута, авто-редиректы, нет валидации
+    // 🔴 Нет общего таймаута, авто-редиректы до 10 шагов, нет валидации адресата
+    resp, err := http.Get(target)
     if err != nil {
-        http.Error(w, &quot;failed&quot;, http.StatusInternalServerError)
+        http.Error(w, &quot;failed to fetch url&quot;, http.StatusInternalServerError)
         return
     }
     defer resp.Body.Close()
-    // ... обработка
+    // ... обработка ответа
 }
 </code></pre>
 </div>
 
+<hr />
 <h3 id="2-pod-kapotom-setevoy-stek-planirovshchik-i-allokatsii">2. Под капотом: сетевой стек, планировщик и аллокации</h3>
 
-<p>Когда вы вызываете <code>http.Client.Get(url)</code>, рантайм проходит через несколько этапов:<br />
-1. <strong>Парсинг и резолвинг DNS</strong>: <code>net.DefaultResolver.LookupIPAddr</code> вызывает <code>getaddrinfo</code> (через <code>cgo</code>) или использует pure-Go резолвер, читающий <code>/etc/resolv.conf</code>. Каждая операция создаёт аллокации в куче (<code>[]byte</code> для буферов, структуры <code>IP</code>, <code>Addr</code>).<br />
-2. <strong>Установление соединения</strong>: <code>net.Dialer.DialContext</code> выполняет <code>syscall connect</code>. В Linux вызов блокирующий, но <code>netpoll</code> (через <code>epoll</code>) асинхронно отслеживает его завершение. Горутина переходит в состояние <code>syscall</code> или <code>netpoll</code>, не занимая <code>P</code>.<br />
-3. <strong>TLS Handshake</strong>: Если <code>https://</code>, происходит полное рукопожатие в User Space (<code>crypto/tls</code>). Выделяются буферы под сертификаты, ключи, состояния шифра.<br />
-4. <strong>Чтение ответа</strong>: <code>http.ReadResponse</code> буферизует заголовки и тело. Без <code>io.LimitReader</code> большой ответ аллоцирует мегабайты в куче, провоцируя <code>Minor GC</code> и вытесняя кэш-линии.</p>
+<p>Когда сервис вызывает <code>http.Client.Get(url)</code>, рантайм Go выполняет сложный конвейер операций:</p>
+<ol>
+<li><strong>Парсинг и резолвинг DNS:</strong><br />
+<code>net.DefaultResolver.LookupIPAddr</code> вызывает либо системный <code>getaddrinfo</code> (через механизм <code>cgo</code>), либо использует встроенный pure-Go DNS-резолвер, читающий <code>/etc/resolv.conf</code>. Каждая операция поиска порождает аллокации в куче: срезы <code>[]byte</code> для буферов сокетов, структуры <code>IP</code>, <code>Addr</code> и списки адресов.</li>
+<li><strong>Установление соединения (<code>syscall connect</code>):</strong><br />
+   Метод <code>net.Dialer.DialContext</code> выполняет системный вызов <code>connect</code>. В ядре Linux при неблокирующем сокете этот вызов возвращает <code>EINPROGRESS</code>, и рантайм Go передает файловый дескриптор в сетевой поллер (<code>netpoll</code> на базе <code>epoll</code>). Горутина переходит в состояние ожидания <code>netpoll</code>, освобождая логический процессор <code>P</code> для исполнения других задач.</li>
+<li><strong>TLS Handshake:</strong><br />
+   Если запрошен протокол <code>https://</code>, сетевой стек инициирует TLS-рукопожатие в пространстве пользователя (<code>crypto/tls</code>). Рантайм аллоцирует буферы под парсинг цепочек X.509 сертификатов, ключи Диффи-Хеллмана и сессионные шифротексты.</li>
+<li><strong>Чтение ответа:</strong><br />
+   Функция <code>http.ReadResponse</code> буферизует заголовки и тело. Если разработчик забывает ограничить размер читаемого ответа через <code>io.LimitReader</code>, многогигабайтный ответ от вредоносного ресурса аллоцирует мегабайты памяти в куче, провоцирует взрывные циклы <code>Minor GC</code> и вытесняет процессорные кэш-линии L1/L2/L3.</li>
+</ol>
+<hr />
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Влияние на планировщик и файловые дескрипторы</span>
   </div>
   <div class="callout-body">
-    <p><strong>Влияние на планировщик и файловые дескрипторы</strong><br />
-Если атакующий укажет адрес, который не отвечает (например, чёрная дыра <code>10.255.0.1:9999</code>), <code>connect</code> будет ждать таймаута ядра (обычно 60-120 секунд). Горутина заблокирована, но файловый дескриптор сокета открыт. При 1000 одновременных таких запросов сервис упрётся в <code>ulimit -n</code>, начнёт возвращать <code>EMFILE</code>, а <code>http.Server</code> перестанет принимать новые соединения. Это не CPU-буря, а истощение ресурсов ОС.</p>
+    <p><strong>Истощение ресурсов ОС при SSRF:</strong><br />
+Если атакующий передаст адрес, находящийся в «чёрной дыре» маршрутизации (например, заблокированный IP <code>10.255.0.1:9999</code> или хост, сбрасывающий TCP SYN пакеты в тишину), сетевой стек ядра будет ожидать TCP-таймаута (по умолчанию в Linux от 60 до 120 секунд).<br />
+Горутина переходит в состояние ожидания, но ассоциированный файловый дескриптор сетевого сокета остается открытым в таблице дескрипторов процесса. При 1 000 таких одновременных запросов сервис стремительно упирается в лимит процесса <code>ulimit -n</code>, ядро возвращает ошибку <code>EMFILE (Too many open files)</code>, и сетевой слушатель <code>http.Server</code> перестает принимать любые входящие соединения пользователей. Это не CPU-буря, а незаметный, но фатальный паралич дескрипторов ОС.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="idiomatichnaya-zashchita-transport-redirekty-i-validatsiya">Идиоматичная защита: транспорт, редиректы и валидация</h2>
 
-<p>Защита от SSRF в Go должна быть многоуровневой: валидация до резолвинга, проверка после резолвинга, ограничение редиректов и строгие таймауты.</p>
+<p>Эффективная защита от SSRF в Go не может быть реализована простой строковой проверкой URL перед вызовом. Защита обязана быть эшелонированной: строгая валидация протокола, низкоуровневая фильтрация IP-адресов в <code>DialContext</code> после DNS-резолвинга, контроль редиректов и жесткие таймауты на каждом этапе.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2282,37 +2327,38 @@ import (
     &quot;time&quot;
 )
 
-// NewSecureHTTPClient создаёт клиент, защищённый от SSRF
+// NewSecureHTTPClient создаёт клиент, гарантированно защищённый от SSRF и зависаний
 func NewSecureHTTPClient() *http.Client {
     dialer := &amp;net.Dialer{
-        Timeout:   5 * time.Second,
-        KeepAlive: 30 * time.Second,
-        // DUALSTACK разрешает пробовать IPv6 и IPv4 параллельно
+        Timeout:   5 * time.Second,  // Таймаут на установление TCP-соединения
+        KeepAlive: 30 * time.Second, // Поддержание Keep-Alive
+        // DUALSTACK разрешает параллельный опрос IPv6 и IPv4
     }
 
     transport := &amp;http.Transport{
         DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-            // 1. Извлекаем хост и порт
-            host, _, err := net.SplitHostPort(addr)
+            // 1. Извлекаем хост и порт из адреса назначения
+            host, port, err := net.SplitHostPort(addr)
             if err != nil {
                 return nil, fmt.Errorf(&quot;split host port: %w&quot;, err)
             }
 
-            // 2. Резолвим адрес принудительно перед соединением
+            // 2. Принудительно резолвим адрес перед вызовом системного сокета
             ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
             if err != nil {
                 return nil, fmt.Errorf(&quot;dns lookup: %w&quot;, err)
             }
 
-            // 3. Проверяем все разрешённые адреса на попадание в запрещённые диапазоны
+            // 3. 🔒 Проверяем каждый полученный IP-адрес на принадлежность к запрещенным диапазонам
             for _, ip := range ips {
                 if isBlockedIP(ip.IP) {
                     return nil, fmt.Errorf(&quot;blocked IP range: %s&quot;, ip.IP.String())
                 }
             }
 
-            // 4. Устанавливаем соединение только после проверки
-            return dialer.DialContext(ctx, network, addr)
+            // 4. Подключаемся напрямую к первому проверенному IP для защиты от DNS Rebinding
+            targetAddr := net.JoinHostPort(ips[0].IP.String(), port)
+            return dialer.DialContext(ctx, network, targetAddr)
         },
         TLSHandshakeTimeout:   5 * time.Second,
         ResponseHeaderTimeout: 5 * time.Second,
@@ -2323,12 +2369,12 @@ func NewSecureHTTPClient() *http.Client {
 
     return &amp;http.Client{
         Transport: transport,
-        Timeout:   10 * time.Second, // Жёсткий общий таймаут
+        Timeout:   10 * time.Second, // 🔒 Жёсткий суммарный таймаут всего запроса
         CheckRedirect: func(req *http.Request, via []*http.Request) error {
             if len(via) &gt;= 5 {
                 return fmt.Errorf(&quot;stopped after 5 redirects&quot;)
             }
-            // 🔒 Повторная проверка URL перед каждым редиректом
+            // 🔒 Повторная проверка URL перед каждым переходом по редиректу
             if err := validateURL(req.URL.String()); err != nil {
                 return fmt.Errorf(&quot;redirect blocked: %w&quot;, err)
             }
@@ -2337,26 +2383,28 @@ func NewSecureHTTPClient() *http.Client {
     }
 }
 
-// isBlockedIP проверяет, находится ли адрес в приватных или зарезервированных диапазонах
+// isBlockedIP проверяет, находится ли адрес в приватных, локальных или метаданных диапазонах
 func isBlockedIP(ip net.IP) bool {
+    // Петля обратной связи (127.0.0.0/8, ::1)
     if ip.IsLoopback() {
         return true
     }
+    // Приватные подсети RFC 1918 (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
     if ip.IsPrivate() {
         return true
     }
-    // Облачные метаданные и link-local
+    // Канальные локальные адреса и облачные метаданные (169.254.0.0/16, fe80::/10)
     if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
         return true
     }
-    // Обработка IPv4-mapped IPv6 (::ffff:127.0.0.1)
+    // Нормализация IPv4-mapped IPv6 (например, ::ffff:127.0.0.1)
     if ip4 := ip.To4(); ip4 != nil {
         return isBlockedIP(ip4)
     }
     return false
 }
 
-// validateURL базовая проверка схемы и хоста до резолвинга
+// validateURL проводит базовую проверку допустимости сетевой схемы
 func validateURL(rawURL string) error {
     if !strings.HasPrefix(rawURL, &quot;http://&quot;) &amp;&amp; !strings.HasPrefix(rawURL, &quot;https://&quot;) {
         return fmt.Errorf(&quot;only HTTP/HTTPS allowed&quot;)
@@ -2366,51 +2414,71 @@ func validateURL(rawURL string) error {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="podvodnye-kamni-i-vektory-obkhoda">Подводные камни и векторы обхода</h2>
 
+<p>Реализация защиты от SSRF полна скрытых граблей, о которые регулярно спотыкаются разработчики:</p>
 <ol>
-<li><strong>DNS Rebinding</strong>: Атакующий контролирует домен. Сначала <code>LookupIP</code> возвращает публичный IP (проходит проверку), но во время редиректа или медленного чтения атакующий меняет DNS-запись на <code>127.0.0.1</code>. <code>http.Client</code> переиспользует соединение, но новые запросы к тому же хосту могут резолвиться заново.<br />
-<strong>Решение:</strong> В <code>DialContext</code> проверка должна быть жёсткой. Для полной защиты используют allowlist доменов и <code>http.Transport.TLSClientConfig</code> с привязкой к ожидаемым сертификатам, либо проксируют трафик через sidecar с собственным DNS-кэшем.</li>
-<li><strong>Обход через форматы адресов</strong>: <code>http://[0:0:0:0:0:ffff:127.0.0.1]</code>, <code>http://127.0.0.1.nip.io</code>, <code>http://127.0.0.1%00.example.com</code>. Стандартный <code>net/url</code> и <code>net</code> парсеры в Го строго следуют RFC, но разработчик должен проверять результат <code>net.ParseIP</code> и <code>ip.IsPrivate()</code>, а не строковые совпадения.</li>
-<li><strong>Локальные файлы и протоколы</strong>: <code>file:///etc/passwd</code>, <code>gopher://</code>, <code>dict://</code>. <code>http.Client</code> блокирует не-HTTP схемы автоматически, но если используется кастомный <code>RoundTripper</code> или <code>exec.Command</code> для проксирования, необходимо явно валидировать схему.</li>
-<li><strong>Повторное использование соединений (<code>Keep-Alive</code>)</strong>: <code>http.Transport</code> кеширует соединения. Если атакующий инициирует запрос к разрешённому домену, а затем сервер пытается соединиться с внутренним ресурсом через тот же пул, возможны утечки контекста. Отключение <code>DisableKeepAlives</code> для пользовательских запросов снижает риск, но увеличивает нагрузку на TCP-стек.</li>
+<li><strong>DNS Rebinding (Повторное связывание DNS):</strong><br />
+   Атакующий регистрирует собственный домен <code>attacker.com</code> с TTL = 0 секунд. При первой проверке в приложении <code>LookupIPAddr</code> возвращает публичный IP (например, <code>1.2.3.4</code>), и валидация успешно проходит. Но пока клиент инициирует TCP-соединение, DNS-сервер атакующего возвращает <code>127.0.0.1</code> или IP облачных метаданных.<br />
+<strong>Решение:</strong> Как показано в коде выше, после DNS-резолвинга вызывайте <code>net.JoinHostPort</code> с конкретным проверенным <code>IP</code>, а не с исходным доменным именем! Для полной изоляции в production используют <code>http.Transport.TLSClientConfig</code> с указанием ServerName для корректного TLS SNI, либо выносят исходящий сетевой трафик в отдельный egress-прокси (sidecar Envoy) с изолированным DNS-кэшем.</li>
+<li><strong>Экзотические форматы адресов:</strong><br />
+   Хакеры используют нестандартные формы записи IP-адресов, чтобы обмануть регулярные выражения:<br />
+   - Шестнадцатеричный или восьмеричный IP: <code>http://0177.0.0.1</code> (восьмеричный 127.0.0.1).<br />
+   - Десятичный integer: <code>http://2130706433/</code> (эквивалент 127.0.0.1).<br />
+   - IPv4-mapped IPv6: <code>http://[0:0:0:0:0:ffff:127.0.0.1]</code> или <code>http://[::ffff:7f00:1]</code>.<br />
+   - Сервисы разрешения wildcard-доменов: <code>http://127.0.0.1.nip.io</code>.<br />
+   - Внедрение спецсимволов и нулевых байтов: <code>http://127.0.0.1%00.example.com</code>.<br />
+   Стандартные парсеры <code>net/url</code> и <code>net</code> следуют строгим RFC, поэтому единственным надежным фильтром является преобразование строки через <code>net.ParseIP</code> и проверка свойств объекта <code>net.IP</code>.</li>
+<li><strong>Опасные локальные схемы и протоколы:</strong><br />
+   Попытки передачи URL вида <code>file:///etc/passwd</code>, <code>gopher://</code>, <code>dict://</code>. Стандартный <code>http.Client</code> блокирует не-HTTP схемы, однако при использовании низкоуровневых оберток, кастомного <code>RoundTripper</code> или системных утилит через <code>exec.Command</code> (например, <code>curl</code> или <code>ffmpeg</code>) необходимо строго запрещать любые схемы, кроме <code>http</code> и <code>https</code>.</li>
+<li><strong>Повторное использование соединений (<code>Keep-Alive</code>):</strong><br />
+   Пул соединений <code>http.Transport</code> кэширует TCP-сокеты. Если злоумышленник заставляет сервис обращаться к контролируемому хосту, сервер может удерживать соединение открытым. В сценариях работы с ненадежными источниками опция <code>DisableKeepAlives: true</code> устраняет риск загрязнения пула ценой дополнительных затрат на установку TCP/TLS-сессий.</li>
 </ol>
+<hr />
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Специфика IPv6 и метод ip.IsPrivate() в Go</span>
   </div>
   <div class="callout-body">
-    <p><strong><code>net.Dialer.LocalAddr</code> и IPv6</strong><br />
-При проверке <code>ip.IsPrivate()</code> помните, что в IPv6 диапазоны приватных сетей (<code>fc00::/7</code>) и loopback (<code>::1</code>) отличаются от IPv4. <code>net.ParseIP</code> корректно обрабатывает оба формата, но <code>ip.IsPrivate()</code> в Go 1.21+ учитывает только RFC-1918 для IPv4 и <code>fc00::/7</code> для IPv6. Обязательно приводите адрес к <code>ip4 := ip.To4()</code> перед проверкой, если ваша инфраструктура использует IPv4-mapped адреса.</p>
+    <p><strong><code>net.Dialer.LocalAddr</code> и IPv6:</strong><br />
+При проверке приватных сетей следует помнить, что диапазоны IPv6 отличаются от классического RFC 1918. В IPv6 приватными являются адреса Unique Local Addresses (<code>fc00::/7</code>), а адресом петли обратной связи — <code>::1</code>.<br />
+Функция <code>net.ParseIP</code> корректно обрабатывает обе спецификации, но метод <code>ip.IsPrivate()</code> в Go 1.21+ строго разграничивает форматы. Если адрес передан в виде IPv4-mapped IPv6 (<code>::ffff:192.168.1.1</code>), <code>ip.IsPrivate()</code> может повести себя неожиданно, если массив байт не приведен к 4-байтовому представлению через <code>ip4 := ip.To4()</code>. Всегда проверяйте адрес нормализованным!</p>
   </div>
 </div>
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему простой <code>strings.Contains(url, "localhost")</code> или <code>ip.IsPrivate()</code> недостаточен для защиты от SSRF, и как Go обрабатывает IPv4-mapped IPv6 адреса?<br />
-<strong>Ответ:</strong><br />
-1. Строковые проверки обходятся через кодирование (<code>%6C%6F%63%61%6C%68%6F%73%74</code>), DNS-туннели или альтернативные представления (<code>127.0.0.1</code> = <code>2130706433</code> десятичный).<br />
-2. <code>ip.IsPrivate()</code> корректен, но не покрывает link-local (<code>169.254.0.0/16</code>), loopback (<code>127.0.0.0/8</code>), multicast и зарезервированные диапазоны.<br />
-3. Go поддерживает IPv4-mapped IPv6 (<code>::ffff:192.168.1.1</code>). <code>net.ParseIP</code> возвращает 16-байтовый массив. Метод <code>ip.To4()</code> конвертирует его в 4-байтовый формат. Без этого <code>IsPrivate()</code> может вернуть <code>false</code> для <code>::1</code> или <code>::ffff:127.0.0.1</code>, если логика проверки не рекурсивна.<br />
-4. <strong>Правильная защита:</strong> Валидация на уровне <code>DialContext</code>, использование <code>net</code> API для парсинга, проверка <code>IsLoopback/IsPrivate/IsLinkLocal</code>, строгие таймауты и редирект-полиси.</p>
+    <p><strong>Вопрос:</strong> «Почему простой <code>strings.Contains(url, "localhost")</code> или вызов <code>ip.IsPrivate()</code> недостаточен для защиты от SSRF, и как Go обрабатывает IPv4-mapped IPv6 адреса?»  </p>
+<p><strong>Ответ кандидата Senior-уровня:</strong><br />
+«1. <strong>Неэффективность текстовых фильтров:</strong> Строковые проверки легко обходятся URL-кодированием (<code>%6C%6F%63%61%6C%68%6F%73%74</code>), альтернативными доменами (DNS-туннели, <code>nip.io</code>), а также записью IP в виде десятичного целого числа (<code>2130706433</code> эквивалентно <code>127.0.0.1</code>).<br />
+2. <strong>Неполнота метода <code>IsPrivate()</code>:</strong> Стандартный метод <code>ip.IsPrivate()</code> проверяет диапазоны RFC 1918 (<code>10.0.0.0/8</code>, <code>172.16.0.0/12</code>, <code>192.168.0.0/16</code>), но оставляет открытыми link-local адреса (<code>169.254.0.0/16</code>, где живут облачные метаданные AWS/GCP), loopback-диапазон (<code>127.0.0.0/8</code>), multicast и зарезервированные адреса.<br />
+3. <strong>Тонкость IPv4-mapped IPv6:</strong> Go поддерживает IPv4-mapped IPv6 адреса (<code>::ffff:192.168.1.1</code>). Функция <code>net.ParseIP</code> возвращает 16-байтовый срез <code>net.IP</code>. Без предварительного вызова <code>ip.To4()</code> проверка <code>IsPrivate()</code> может вернуть <code>false</code> для адресов <code>::1</code> или <code>::ffff:127.0.0.1</code>, если логика валидации не учитывает вложенные представления.<br />
+4. <strong>Каноническая архитектура защиты:</strong><br />
+   - Проверка должна происходить внутри кастомного <code>DialContext</code> строго <strong>после DNS-резолвинга</strong>.<br />
+   - Валидируются флаги <code>IsLoopback/IsPrivate/IsLinkLocal</code> (а также <code>IsLinkLocalMulticast</code>).<br />
+   - Соединение устанавливается непосредственно по проверенному IP-адресу, исключая атаку Time-of-Check to Time-of-Use (DNS Rebinding)».</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><code>http.Client</code> в Go по умолчанию не имеет таймаутов и следует редиректам, что делает его уязвимым к SSRF и DoS без явной конфигурации.</li>
-<li>Сетевой стек рантайма (<code>net.Dialer</code>, <code>netpoll</code>, <code>epoll</code>) асинхронно обрабатывает соединения, но отсутствие таймаутов приводит к исчерпанию файловых дескрипторов и утечке горутин.</li>
-<li>Валидация IP-адресов должна происходить в <code>DialContext</code> после DNS-резолвинга, с обязательной проверкой <code>IsLoopback</code>, <code>IsPrivate</code>, <code>IsLinkLocalUnicast</code> и учётом IPv4-mapped IPv6 форматов.</li>
-<li>Редиректы требуют отдельной проверки (<code>CheckRedirect</code>), так как атакующий может изменить целевой адрес после первоначальной валидации.</li>
-<li>Защита от SSRF — это комбинация строгого <code>http.Transport</code>, временных ограничений, пула соединений и многоуровневой валидации, встроенной в сетевой примитив, а не в бизнес-логику.</li>
+<li><strong>Опасность стандартного клиента:</strong> <code>http.Client</code> в Go по умолчанию не имеет таймаутов и следует редиректам, что делает его уязвимым к SSRF и DoS без явной конфигурации.</li>
+<li><strong>Сетевой стек и системные вызовы:</strong> Сетевой стек рантайма (<code>net.Dialer</code>, <code>netpoll</code>, <code>epoll</code>) асинхронно обрабатывает соединения, но отсутствие таймаутов приводит к исчерпанию файловых дескрипторов и утечке горутин.</li>
+<li><strong>Валидация на уровне транспорта:</strong> Валидация IP-адресов должна происходить в <code>DialContext</code> после DNS-резолвинга, с обязательной проверкой <code>IsLoopback</code>, <code>IsPrivate</code>, <code>IsLinkLocalUnicast</code> и учётом IPv4-mapped IPv6 форматов.</li>
+<li><strong>Контроль редиректов:</strong> Редиректы требуют отдельной проверки (<code>CheckRedirect</code>), так как атакующий может изменить целевой адрес после первоначальной валидации.</li>
+<li><strong>Эшелонированная архитектура:</strong> Защита от SSRF — это комбинация строгого <code>http.Transport</code>, временных ограничений, пула соединений и многоуровневой валидации, встроенной в сетевой примитив, а не в бизнес-логику.</li>
 </ol>
-<p><a href="4-command-injection.html" class="wikilink">4. Command injection</a></p>
+<p>Как предотвратить выполнение вредоносных системных команд операционной системы, когда бэкенду необходимо взаимодействовать с утилитами хоста?<br />
+В следующей лекции мы разберем: <a href="4-command-injection.html" class="wikilink">4. Command injection</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

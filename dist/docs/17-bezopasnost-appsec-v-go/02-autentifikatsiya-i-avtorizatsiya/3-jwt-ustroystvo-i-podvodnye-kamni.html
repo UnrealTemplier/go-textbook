@@ -2169,17 +2169,25 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~20 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. JWT. Устройство и подводные камни</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="stateless-arkhitektura-i-tsena-nezavisimosti">Stateless-архитектура и цена независимости</h2>
+            <h1>3. JWT: Устройство, криптография и подводные камни</h1>
+<blockquote>
+<p><em>"A distributed system is one in which the failure of a computer you didn't even know existed can render your own computer unusable."</em><br />
+— Лесли Лэмпорт</p>
+</blockquote>
+<p>В архитектуре современных микросервисов аутентификация часто сталкивается с дилеммой масштабируемости. Если на каждый входящий HTTP-запрос сервис обязан обращаться к центральной базе данных или кластеру Redis за проверкой сессии, то база сессий мгновенно превращается в узкое горлышко всей системы (Single Point of Failure).</p>
+<p>Решением этой проблемы стал формат <strong>JSON Web Token (JWT)</strong>. Метафорически JWT похож на посадочный талон на авиарейс со штрихкодом и криптографической печатью авиакомпании: сотруднику у выхода на посадку не нужно звонить диспетчеру в штаб-квартиру, чтобы проверить каждого пассажира. Ему достаточно проверить целостность цифровой подписи авиакомпании и дату вылета прямо на бланке билета. Вся необходимая информация для авторизации встроена в сам токен и криптографически защищена от изменений.</p>
+<p>Однако за эту независимость (<strong>stateless</strong>) приходится платить: токены раздувают HTTP-заголовки, нагружают процессор криптографическими расчетами при каждом запросе, порождают скрытые аллокации памяти в рантайме Go и создают одну из сложнейших проблем распределенных систем — проблему мгновенного отзыва полномочий.</p>
+<hr />
+<h2 id="anatomiya-tokena-i-serializatsiya-base64url">Анатомия токена и сериализация Base64URL</h2>
 
-<p>JSON Web Token (JWT) — это компактный, URL-безопасный формат для безопасной передачи утверждений (claims) между сторонами. Его главное архитектурное преимущество — <strong>отсутствие состояния (stateless)</strong>. Серверу не нужно хранить сессию в памяти или БД: вся необходимая для авторизации информация встроена в сам токен и криптографически защищена от изменений.</p>
-<p>Однако за независимость приходится платить: токены увеличивают размер заголовков запросов, создают нагрузку на парсинг и верификацию при каждом запросе, а их отзыв (revocation) требует дополнительных механизмов. Для бэкенда на Go это означает особое внимание к аллокациям, работе с памятью и криптографическим примитивам.</p>
+<p>JWT (RFC 7519) представляет собой компактную строку, состоящую из трех частей, разделенных точками: <code>Header.Payload.Signature</code>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2194,77 +2202,107 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Header: алгоритм, тип&quot;] --&gt; B[&quot;Base64URL Encode&quot;]
-C[&quot;Payload: claims&quot;] --&gt; B
-B --&gt; D[&quot;Конкатенация Header.Payload&quot;]
-E[&quot;Secret / Private Key&quot;] --&gt; F[&quot;Создание подписи&quot;]
-D --&gt; F
-F --&gt; G[&quot;Base64URL Encode Signature&quot;]
-G --&gt; H[&quot;JWT: part1.part2.part3&quot;]
+subgraph TokenCreation[&quot;Формирование токена&quot;]
+direction TB
+H[&quot;1. Header (JSON)&lt;br/&gt;typ: JWT, alg: HS256 / RS256 / ES256&quot;] --&gt; B64H[&quot;Base64URL Encode&quot;]
+P[&quot;2. Payload (JSON Claims)&lt;br/&gt;sub, exp, iat, jti, roles&quot;] --&gt; B64P[&quot;Base64URL Encode&quot;]
+B64H --&gt; Cat[&quot;Конкатенация: Header.Payload&quot;]
+B64P --&gt; Cat
+Cat --&gt; Sign[&quot;Криптографическая подпись&lt;br/&gt;(Secret / Private Key)&quot;]
+Sign --&gt; B64S[&quot;Base64URL Encode Signature&quot;]
+end
 
-style A fill:#4ecdc4,stroke:#333
-style C fill:#4ecdc4,stroke:#333
-style E fill:#ffd93d,stroke:#333
-style H fill:#ff6b6b,stroke:#333
+Cat -.-&gt; Res[&quot;JWT: part1.part2.part3&quot;]
+B64S --&gt; Res
+
+style H fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+P fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+Sign fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+Res fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
-<h2 id="anatomiya-tokena-i-serializatsiya">Анатомия токена и сериализация</h2>
+<p>Каждая часть кодируется алгоритмом <strong>Base64URL</strong> (RFC 4648, Section 5). В отличие от классического Base64, здесь заменяются небезопасные для URL и заголовков символы: <code>+</code> заменяется на <code>-</code>, <code>/</code> заменяется на <code>_</code>, а хвостовой заполнитель выравнивания <code>=</code> отбрасывается:</p>
+<ol>
+<li><strong><code>Header</code></strong>: JSON-объект с метаданными. Обязательно указывает тип токена (<code>typ: JWT</code>) и криптографический алгоритм подписи (<code>alg: HS256</code>, <code>RS256</code>, <code>ES256</code>).</li>
+<li><strong><code>Payload</code></strong>: JSON-объект с полезной нагрузкой — утверждениями (claims). Стандартные зарегистрированные поля:<br />
+   - <code>sub</code> (subject) — уникальный идентификатор субъекта (ID пользователя).<br />
+   - <code>exp</code> (expiration) — Unix-время истечения срока действия токена.<br />
+   - <code>iat</code> (issued at) — время выпуска токена.<br />
+   - <code>jti</code> (JWT ID) — уникальный идентификатор конкретного токена для предотвращения атак повторного воспроизведения и построения черных списков.</li>
+<li><strong><code>Signature</code></strong>: Цифровая подпись, вычисляемая над первыми двумя частями. Гарантирует целостность и аутентичность данных:<br />
+<code>HMAC(Header.Payload, secret)</code> или <code>RSA-SHA256(Header.Payload, private_key)</code>:<br />
+   $$\text{Signature} = \text{HMAC}(\text{Header} \mathbin{\Vert} \text{Payload}, \text{secret})$$<br />
+   или<br />
+   $$\text{Signature} = \text{RSA-SHA256}(\text{Header} \mathbin{\Vert} \text{Payload}, \text{private_key})$$</li>
+</ol>
+<hr />
+<h2 id="pod-kapotom-serializatsiya-i-tsena-na-takt-protsessora">Под капотом: сериализация и цена на такт процессора</h2>
 
-<p>JWT состоит из трёх частей, разделённых точками: <code>Header</code>, <code>Payload</code>, <code>Signature</code>. Каждая часть кодируется алгоритмом <strong>Base64URL</strong> (RFC 4648, Section 5), который заменяет <code>+</code> на <code>-</code>, <code>/</code> на <code>_</code> и убирает заполнитель <code>=</code>. Это делает токен безопасным для передачи в заголовках и URL без дополнительного экранирования.</p>
-<p>1 - <strong>Header</strong>: JSON-объект с метаданными. Содержит тип токена (<code>typ: JWT</code>) и алгоритм подписи (<code>alg: HS256</code>, <code>RS256</code>, <code>ES256</code>).<br />
-2 - <strong>Payload</strong>: JSON-объект с утверждениями. Стандартные поля: <code>sub</code> (subject), <code>exp</code> (expiration), <code>iat</code> (issued at), <code>jti</code> (JWT ID). Произвольные поля добавляются при необходимости.<br />
-3 - <strong>Signature</strong>: Вычисляется как <code>HMAC(Header.Payload, secret)</code> или <code>RSA-SHA256(Header.Payload, private_key)</code>. Гарантирует целостность и аутентичность.</p>
+<p>В Go вызов библиотечной функции парсинга вроде <code>jwt.Parse()</code> выглядит обманчиво легковесно. Однако заглянем внутрь рантайма при обработке каждого входящего HTTP-запроса:</p>
+<ol>
+<li><strong>Чтение из сетевого буфера:</strong> Срез байт извлекается из <code>net/http</code> буфера сокета.</li>
+<li><strong>Декодирование Base64URL:</strong> Алгоритм считывает чанки по 4 байта и преобразует их в 3 байта сырых данных. Стандартный пакет <code>encoding/base64</code> в Go требует аллокации нового среза в куче под декодированные байты, если буфер не переиспользуется.</li>
+<li><strong>Парсинг JSON (<code>json.Unmarshal</code>):</strong> Декодирование JSON-объекта в Go опирается на <code>reflect</code>. Создается множество мелких объектов: строки для ключей и значений, вложенные структуры и мапы.</li>
+<li><strong>Давление на сборщик мусора:</strong> При нагрузке в 10 000 RPS рутинная валидация JWT способна порождать свыше 30 000 короткоживущих аллокаций в секунду. Это провоцирует частые срабатывания <code>Minor GC</code>, раздувает <code>mcache</code> потоков и приводит к вымыванию горячих строк процессорного кэша L1/L2.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Влияние сериализации на рантайм Go</span>
   </div>
   <div class="callout-body">
-    <p><strong>Влияние сериализации на рантайм Go</strong><br />
-Каждый вызов <code>jwt.Parse()</code> или ручной валидации запускает цепочку: чтение байт из <code>net/http</code> буфера → декодирование Base64 → выделение новой памяти для результата → <code>json.Unmarshal</code> → аллокация мап и строк для claims. При 10 000 RPS это создаёт ~30 000 короткоживущих аллокаций в секунду, что провоцирует частые <code>Minor GC</code> и увеличивает латентность. Стандартный <code>encoding/base64</code> и <code>encoding/json</code> оптимизированы, но не избегают аллокаций полностью. Для высоконагруженных систем рекомендуется кэширование или использование специализированных парсеров с <code>[]byte</code> буферами.</p>
+    <p>Каждый вызов <code>jwt.Parse()</code> или ручной валидации запускает цепочку: чтение байт из <code>net/http</code> буфера → декодирование Base64 → выделение новой памяти для результата → <code>json.Unmarshal</code> → аллокация мап и строк для claims. При 10 000 RPS это создаёт ~30 000 короткоживущих аллокаций в секунду, что провоцирует частые <code>Minor GC</code> и увеличивает латентность. Стандартный <code>encoding/base64</code> и <code>encoding/json</code> оптимизированы, но не избегают аллокаций полностью. Для высоконагруженных систем рекомендуется кэширование или использование специализированных парсеров с <code>[]byte</code> буферами.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kriptografiya-i-podpis-ot-hmac-do-ecdsa">Криптография и подпись: от HMAC до ECDSA</h2>
 
-<p>Выбор алгоритма подписи определяет баланс между производительностью, размером токена и криптостойкостью.</p>
+<p>Выбор алгоритма подписи определяет баланс между вычислительной сложностью, безопасностью распределения ключей и размером HTTP-пакетов.</p>
 <div class="table-container"><table>
 <thead>
 <tr>
 <th>Алгоритм</th>
 <th>Тип ключа</th>
-<th>Скорость в Go</th>
+<th>Скорость верификации в Go</th>
 <th>Размер подписи</th>
-<th>Использование</th>
+<th>Типичное применение</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><strong>HS256</strong> (HMAC-SHA256)</td>
-<td>Симметричный</td>
-<td>Очень высокая (~50-100 мкс)</td>
+<td><strong><code>HS256</code></strong> (HMAC-SHA256)</td>
+<td>Симметричный (общий секрет)</td>
+<td>Сверхвысокая (~50–100 нс)</td>
 <td>32 байта</td>
-<td>Внутренние сервисы, монолиты</td>
+<td>Внутренние микросервисы одной доверенной зоны</td>
 </tr>
 <tr>
-<td><strong>RS256</strong> (RSA-SHA256)</td>
-<td>Асимметричный</td>
-<td>Средняя (~200-400 мкс)</td>
-<td>256 байт</td>
-<td>Публичные API, федеративная аутентификация</td>
+<td><strong><code>RS256</code></strong> (RSA-SHA256)</td>
+<td>Асимметричный (Public/Private)</td>
+<td>Средняя (~200–400 мкс)</td>
+<td>256 байт (2048-bit)</td>
+<td>Публичные API, Identity Provider (IdP), OIDC</td>
 </tr>
 <tr>
-<td><strong>ES256</strong> (ECDSA-SHA256)</td>
-<td>Асимметричный</td>
-<td>Высокая (~50-150 мкс)</td>
+<td><strong><code>ES256</code></strong> (ECDSA-SHA256, P-256)</td>
+<td>Асимметричный (эллиптические кривые)</td>
+<td>Высокая (~50–150 мкс)</td>
 <td>64 байта</td>
-<td>Мобильные клиенты, IoT, оптимизация трафика</td>
+<td>Мобильные клиенты, IoT, оптимизация заголовков</td>
 </tr>
 </tbody>
 </table></div>
-<p>В Go для асимметричных операций используется пакет <code>crypto/rsa</code> и <code>crypto/ecdsa</code>. Эти пакеты реализованы на чистом Go с ассемблерными оптимизациями для <code>amd64</code> и <code>arm64</code>. Верификация RS256 требует операции <code>big.Int.ModExp</code>, которая активно использует кэш-линии L1 и регистры общего назначения. При высокой нагрузке может наблюдаться <code>CPU throttling</code> из-за конкуренции за арифметические вычислительные блоки.</p>
+<p>В стандартной библиотеке Go криптографические операции реализованы в пакетах <code>crypto/rsa</code> и <code>crypto/ecdsa</code>. На архитектурах <code>amd64</code> и <code>arm64</code> эти пакеты содержат оптимизированные ассемблерные вставки с использованием векторных инструкций.</p>
+<p>Однако у асимметричной криптографии есть аппаратная специфика:<br />
+* <strong>RSA-2048 (<code>RS256</code>):</strong> Проверка подписи требует вычисления модульного возведения в степень <code>big.Int.ModExp</code>. Это интенсивная операция над длинными числами, монопольно загружающая арифметико-логические устройства (ALU) процессора и активно перемещающая данные через кэш L1. При пиковых нагрузках без кэширования публичных ключей и результатов сервис рискует столкнуться с <code>CPU throttling</code> в контейнерах Kubernetes.<br />
+* <strong>ECDSA (<code>ES256</code>):</strong> Работает на эллиптических кривых NIST P-256. Она требует значительно меньше памяти, подпись занимает всего 64 байта (в 4 раза компактнее RSA-2048), а нагрузка на процессор заметно ниже.</p>
+<hr />
+<h2 id="ruchnaya-verifikatsiya-anatomiya-bez-storonnikh-bibliotek">Ручная верификация: анатомия без сторонних библиотек</h2>
+
+<p>Чтобы понимать, как устроен JWT, напишем надежный валидатор на чистом Go, строго соблюдающий требования криптографической безопасности:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2274,14 +2312,28 @@ style H fill:#ff6b6b,stroke:#333
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ✅ Пример ручной верификации с обработкой ошибок и очисткой памяти
+  <pre class="language-go"><code class="language-go">package auth
+
+import (
+    &quot;crypto/hmac&quot;
+    &quot;crypto/sha256&quot;
+    &quot;crypto/subtle&quot;
+    &quot;encoding/base64&quot;
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
+    &quot;fmt&quot;
+    &quot;strings&quot;
+)
+
+// verifyJWT выполняет разбор и криптографическую проверку токена
 func verifyJWT(tokenStr string, secret []byte) (map[string]any, error) {
+    // 1. JWT обязан строго состоять из трех сегментов
     parts := strings.Split(tokenStr, &quot;.&quot;)
     if len(parts) != 3 {
         return nil, errors.New(&quot;invalid token format&quot;)
     }
 
-    // Декодируем только Header для проверки алгоритма
+    // 2. Декодируем Header для верификации разрешенного алгоритма
     headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
     if err != nil {
         return nil, fmt.Errorf(&quot;base64 decode header: %w&quot;, err)
@@ -2295,30 +2347,31 @@ func verifyJWT(tokenStr string, secret []byte) (map[string]any, error) {
         return nil, fmt.Errorf(&quot;parse header json: %w&quot;, err)
     }
 
+    // 🛡️ Защита от атаки alg: none и подмены алгоритма
     if header.Alg != &quot;HS256&quot; {
         return nil, errors.New(&quot;unsupported algorithm&quot;)
     }
 
-    // Формируем сообщение для проверки подписи
+    // 3. Формируем сообщение подписи: &quot;Header.Payload&quot;
     message := []byte(parts[0] + &quot;.&quot; + parts[1])
     sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
     if err != nil {
         return nil, fmt.Errorf(&quot;base64 decode sig: %w&quot;, err)
     }
 
-    // Вычисляем HMAC
+    // 4. Вычисляем ожидаемую подпись HMAC-SHA256
     mac := hmac.New(sha256.New, secret)
     mac.Write(message)
     expectedSig := mac.Sum(nil)
 
-    // 🔒 Constant-time comparison
+    // 🔒 Constant-time comparison: защита от Timing Attacks!
     if subtle.ConstantTimeCompare(sigBytes, expectedSig) != 1 {
         clear(expectedSig)
         return nil, errors.New(&quot;invalid signature&quot;)
     }
-    clear(expectedSig)
+    clear(expectedSig) // Очищаем буфер подписи из памяти
 
-    // Парсим Payload
+    // 5. Декодируем и парсим Payload
     payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
     if err != nil {
         return nil, fmt.Errorf(&quot;base64 decode payload: %w&quot;, err)
@@ -2334,46 +2387,95 @@ func verifyJWT(tokenStr string, secret []byte) (map[string]any, error) {
 </code></pre>
 </div>
 
-<h2 id="podvodnye-kamni-gotchas-i-arkhitekturnye-riski">Подводные камни (Gotchas) и архитектурные риски</h2>
+<hr />
+<h2 id="podvodnye-kamni-gotchas-i-uyazvimosti-v-realnom-mire">Подводные камни (Gotchas) и уязвимости в реальном мире</h2>
 
-<p>1 - <strong>Атака <code>alg: none</code></strong>. Если сервер слепо доверяет полю <code>alg</code> из заголовка, атакующий может передать токен с <code>"alg": "none"</code> и пустой подписью. Некоторые ранние реализации принимали такие токены как валидные. Всегда используйте строгий allowlist алгоритмов на стороне сервера.</p>
-<p>2 - <strong>Algorithm Confusion (Confused Deputy)</strong>. Атакующий подставляет токен, подписанный RSA-приватным ключом, но меняет заголовок на <code>alg: HS256</code> и использует публичный RSA-ключ как секрет для HMAC. Сервер вычисляет HMAC с публичным ключом и совпадение подтверждается. Защита: используйте отдельные ключи для разных алгоритмов или строго привязывайте алгоритм к типу ключа.</p>
-<p>3 - <strong>Отсутствие встроенного отзыва</strong>. JWT по дизайну живёт до <code>exp</code>. Если токен скомпрометирован или пользователь сменил пароль, старый токен останется валидным. Для отзыва используют:<br />
-   - <strong>Short-lived Access Token + Refresh Token</strong> (рекомендуется)<br />
-   - <strong>Блок-лист (JTI)</strong> в Redis с TTL, равным времени жизни токена<br />
-   - <strong>Версионирование токенов</strong> (хранение <code>token_version</code> в БД, проверка при каждом запросе)</p>
-<p>4 - <strong>Timing-атаки при сравнении подписи</strong>. Оператор <code>==</code> в Go сравнивает байты слева направо и останавливается при первом несовпадении. Атакующий может подбирать подпись байт за байтом, измеряя микросекундные задержки ответа. Всегда используйте <code>crypto/subtle.ConstantTimeCompare</code>.</p>
-<p>5 - <strong>JSON-бомбы и oversized claims</strong>. Большой payload увеличивает размер заголовка <code>Authorization</code>, что ведёт к фрагментации пакетов на уровне TCP и росту нагрузки на <code>net/http</code> парсер. Максимальный размер заголовка в Go по умолчанию ограничен, но атакующий может вызвать <code>Header size too large</code> или <code>Slowloris</code>. Устанавливайте <code>http.Server.MaxHeaderBytes</code> и валидируйте размер payload до парсинга.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Attackers[&quot;Векторы атак на JWT&quot;]
+
+Attackers --&gt; A1[&quot;1. alg: none Attack&lt;br/&gt;Отключение проверки подписи&quot;]
+Attackers --&gt; A2[&quot;2. Algorithm Confusion&lt;br/&gt;HMAC vs RSA публичный ключ&quot;]
+Attackers --&gt; A3[&quot;3. Timing Attacks&lt;br/&gt;Побайтовый подбор через ==&quot;]
+Attackers --&gt; A4[&quot;4. DoS / Memory Bombs&lt;br/&gt;Раздутый Payload, перегрузка net/http&quot;]
+Attackers --&gt; A5[&quot;5. Невозможность отзыва&lt;br/&gt;Утечка долгоживущего токена&quot;]
+
+style Attackers fill:#1e293b,stroke:#f43f5e,stroke-width:2px,color:#f8fafc
+style A1 fill:#1e293b,stroke:#f59e0b,stroke-width:1px,color:#f8fafc
+style A2 fill:#1e293b,stroke:#f59e0b,stroke-width:1px,color:#f8fafc
+style A3 fill:#1e293b,stroke:#f59e0b,stroke-width:1px,color:#f8fafc
+style A4 fill:#1e293b,stroke:#f59e0b,stroke-width:1px,color:#f8fafc
+style A5 fill:#1e293b,stroke:#f59e0b,stroke-width:1px,color:#f8fafc
+  </pre>
+</div>
+
+
+<h3 id="1-ataka-alg-none">1. Атака `alg: none`</h3>
+<p>Стандарт JWT специфицирует алгоритм <code>"none"</code> для сценариев, где подпись якобы уже проверена внешним протоколом (например, внутри взаимного TLS).<br />
+Если парсер на бэкенде безоговорочно верит полю <code>alg</code> из входящего незашифрованного заголовка, злоумышленник меняет в токене <code>sub</code> на <code>"admin"</code>, устанавливает <code>"alg": "none"</code>, стирает сегмент подписи (<code>header.payload.</code>) — и наивный сервер считает такой токен полностью легитимным!<br />
+<em>Защита:</em> Жесткий allowlist доверенных алгоритмов на стороне сервера. Никакого доверия заголовку.</p>
+<h3 id="2-algorithm-confusion-confused-deputy">2. Algorithm Confusion (Confused Deputy)</h3>
+<p>Классическая брешь в сервисах, поддерживающих и симметричные, и асимметричные ключи:<br />
+Сервер выпускает токены, подписывая их приватным RSA-ключом (<code>RS256</code>), а микросервисы проверяют подпись публичным RSA-ключом.<br />
+Злоумышленник берет публичный ключ сервера (который лежит в открытом доступе, например, на <code>/.well-known/jwks.json</code>), подписывает свой модифицированный токен алгоритмом <code>HS256</code>, используя <strong>публичный RSA-ключ как симметричный HMAC-секрет</strong>.<br />
+Если уязвимый middleware использует универсальный верификатор без строгой фиксации типа алгоритма, он загрузит публичный ключ, выполнит расчет HMAC и примет поддельный токен!</p>
+<h3 id="3-timing-ataki-pri-validatsii-podpisi">3. Timing-атаки при валидации подписи</h3>
+<p>Стандартный оператор <code>==</code> в Go для строк или срезов байт выполняет быстрое побайтовое сравнение и немедленно завершает работу при первом несовпадении.<br />
+Злоумышленник посылает тысячи запросов с поддельными подписями и с микросекундной точностью замеряет время ответа сервиса. Если первый байт угадан верно — время проверки чуть дольше. Сложность взлома падает до линейной.<br />
+<em>Защита:</em> Всегда использовать <code>crypto/subtle.ConstantTimeCompare</code>.</p>
+<h3 id="4-dos-i-razdutye-claims">4. DoS и раздутые claims</h3>
+<p>JWT передается в HTTP-заголовке <code>Authorization: Bearer &lt;token&gt;</code>. Если нерадивые разработчики складывают в Payload профили пользователей, права и списки разрешенных организаций, размер токена легко вырастает до 4–8 КБ.<br />
+Это приводит к фрагментации TCP-пакетов, дополнительным round-trip'ам сети и расходу буферов веб-сервера. Если входящий заголовок превышает порог, <code>net/http</code> возвращает ошибку <code>Header size too large</code>. Атакующий также может удерживать соединения открытыми с помощью атаки типа <code>Slowloris</code>. Регулируйте поле <code>http.Server.MaxHeaderBytes</code> и никогда не перегружайте Payload избыточными данными.</p>
+<h3 id="5-nevozmozhnost-mgnovennogo-otzyva-revocation">5. Невозможность мгновенного отзыва (Revocation)</h3>
+<p>Пока не наступило время <code>exp</code>, JWT считается абсолютно валидным. Если токен украден через XSS или сотрудника уволили прямо сейчас — закрыть ему доступ обычным stateless-способом невозможно.</p>
+<p>Для решения проблемы отзыва применяются три подхода:<br />
+- <strong>Short-lived Access Token + Refresh Token</strong> (золотой стандарт индустрии): токен живет всего 5–15 минут.<br />
+- <strong>Блок-лист (JTI)</strong> в Redis: при выходе из системы идентификатор <code>jti</code> помещается в Redis с TTL, равным остатку времени жизни токена.<br />
+- <strong>Версионирование токенов (<code>token_version</code>)</strong>: в таблице пользователей хранится целочисленная версия <code>token_version</code>. При смене пароля или компрометации версия инкрементируется, и все старые токены отвергаются.</p>
+<hr />
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Аллокация строк при парсинге JWT в middleware</span>
   </div>
   <div class="callout-body">
-    <p><strong>Аллокация строк при парсинге JWT в middleware</strong><br />
-Стандартный подход <code>claims := token.Claims.(jwt.MapClaims)["user_id"].(string)</code> создаёт новые строки при каждом запросе из-за конвертации <code>[]byte</code> в <code>string</code>. В высоконагруженном сервисе это генерирует гигабайты мусора в час.<br />
-<strong>Решение:</strong> Извлекайте нужные поля в типизированную структуру с указателями или используйте <code>[]byte</code> для ключей, избегайте <code>interface{}</code> кастов в критических путях. Применяйте <code>sync.Pool</code> для буферов декодирования.</p>
+    <p>Стандартный подход <code>claims := token.Claims.(jwt.MapClaims)["user_id"].(string)</code> создаёт новые строки при каждом запросе из-за конвертации <code>[]byte</code> в <code>string</code>. В высоконагруженном сервисе это генерирует гигабайты мусора в час.</p>
+<p><strong>Решение:</strong> Извлекайте нужные поля в типизированную структуру с указателями или используйте <code>[]byte</code> для ключей, избегайте <code>interface{}</code> кастов в критических путях. Применяйте <code>sync.Pool</code> для буферов декодирования.</p>
   </div>
 </div>
 
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как реализовать отзыв токена в stateless-архитектуре без потери производительности?<br />
-<strong>Ответ:</strong> <br />
-1. Использовать короткоживущие Access Tokens (5-15 минут) и долгоживущие Refresh Tokens (хранятся в БД/хранилище с флагом <code>revoked</code>).<br />
+    <p><strong>Вопрос:</strong> Как реализовать отзыв токена в stateless-архитектуре без потери производительности?</p>
+<p><strong>Ответ кандидата Senior-уровня:</strong><br />
+1. Использовать короткоживущие Access Tokens (5–15 минут) и долгоживущие Refresh Tokens (хранятся в БД/хранилище с флагом <code>revoked</code>).<br />
 2. При выходе из системы или сбросе пароля записывать <code>jti</code> (JWT ID) в распределённый кэш (Redis) с TTL, равным времени жизни токена.<br />
 3. На уровне API Gateway или middleware проверять <code>jti</code> против блок-листа только если токен валиден по подписи и <code>exp</code>.<br />
 4. Альтернатива: версионирование токенов. Хранить <code>token_version</code> в профиле пользователя. При валидации сверять версию из токена с текущей в БД. Кэшировать <code>token_version</code> в Redis с коротким TTL для снижения нагрузки.</p>
   </div>
 </div>
 
-<h2 id="idiomatichnaya-integratsiya-v-go-servis">Идиоматичная интеграция в Go-сервис</h2>
+<hr />
+<h2 id="idiomatichnaya-realizatsiya-na-go-github-comgolang-jwtjwtv5">Идиоматичная реализация на Go: github.com/golang-jwt/jwt/v5</h2>
 
-<p>В продакшене рекомендуется использовать проверенную библиотеку <code>github.com/golang-jwt/jwt/v5</code> (официальный форк), которая покрывает большинство edge cases, но она делает под капотом.</p>
+<p>В промышленной разработке ручной парсинг не пишут с нуля, а используют протестированную комьюнити библиотеку <code>github.com/golang-jwt/jwt/v5</code>. Ниже приведен образец строгого и типобезопасного валидатора:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2383,19 +2485,34 @@ func verifyJWT(tokenStr string, secret []byte) (map[string]any, error) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type JWTVerifier struct {
-    key     []byte
-    claims  Claims
-}
+  <pre class="language-go"><code class="language-go">package auth
 
+import (
+    &quot;errors&quot;
+    &quot;fmt&quot;
+
+    &quot;github.com/golang-jwt/jwt/v5&quot;
+)
+
+// Claims строго типизирует ожидаемые поля в Payload
 type Claims struct {
     UserID string `json:&quot;sub&quot;`
     Role   string `json:&quot;role&quot;`
     jwt.RegisteredClaims
 }
 
+type JWTVerifier struct {
+    key []byte
+}
+
+func NewVerifier(secret []byte) *JWTVerifier {
+    return &amp;JWTVerifier{key: secret}
+}
+
 func (v *JWTVerifier) Parse(tokenStr string) (*Claims, error) {
+    // ParseWithClaims берет типизированную структуру Claims
     token, err := jwt.ParseWithClaims(tokenStr, &amp;Claims{}, func(t *jwt.Token) (any, error) {
+        // 🛡️ Защита от Algorithm Confusion: валидируем конкретный алгоритм
         if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
             return nil, fmt.Errorf(&quot;unexpected signing method: %v&quot;, t.Header[&quot;alg&quot;])
         }
@@ -2416,7 +2533,8 @@ func (v *JWTVerifier) Parse(tokenStr string) (*Claims, error) {
 </code></pre>
 </div>
 
-<h2 id="sravnenie-podkhodov-jwt-vs-session-cookies">Сравнение подходов: JWT vs Session Cookies</h2>
+<hr />
+<h2 id="arkhitekturnyy-vybor-jwt-vs-session-cookies">Архитектурный выбор: JWT vs Session Cookies</h2>
 
 <div class="table-container"><table>
 <thead>
@@ -2439,8 +2557,8 @@ func (v *JWTVerifier) Parse(tokenStr string) (*Claims, error) {
 </tr>
 <tr>
 <td><strong>Размер запроса</strong></td>
-<td>Большой (заголовок ~200-500 байт)</td>
-<td>Малый (кука ~32-64 байта)</td>
+<td>Большой (заголовок ~200–500 байт)</td>
+<td>Малый (кука ~32–64 байта)</td>
 </tr>
 <tr>
 <td><strong>Масштабирование</strong></td>
@@ -2460,16 +2578,17 @@ func (v *JWTVerifier) Parse(tokenStr string) (*Claims, error) {
 </tbody>
 </table></div>
 <p>Для большинства современных микросервисных архитектур на Go оптимален гибрид: короткий JWT для аутентификации запросов + долгоживущий Refresh Token в <code>HttpOnly, Secure, SameSite=Strict</code> cookie для обновления сессий.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>JWT обеспечивает stateless-аутентификацию, но ценой увеличения размера запросов, нагрузки на парсинг и сложностей с отзывом.</li>
-<li>Сериализация и парсинг токенов в Go создают значительное давление на GC и кэш-линии. Требуется контроль аллокаций и валидация размеров.</li>
-<li>Криптографическая верификация должна использовать <code>crypto/subtle.ConstantTimeCompare</code> и строгий allowlist алгоритмов для защиты от <code>alg: none</code> и Algorithm Confusion.</li>
-<li>Отзыв токенов реализуется через комбинацию короткоживущих Access Tokens, Refresh Tokens в защищённых куках и распределённых блок-листов или версионирования.</li>
-<li>Выбор между JWT и сессиями зависит от архитектуры: микросервисы и мобильные клиенты выигрывают от JWT, высокозащищённые веб-приложения — от <code>HttpOnly</code> сессий.</li>
+<li><strong>Stateless-компромисс:</strong> JWT избавляет микросервисы от синхронных походов в БД сессий, но перекладывает накладные расходы на сеть (раздутые заголовки) и CPU (криптографическая верификация).</li>
+<li><strong>Механическое сочувствие к рантайму:</strong> Парсинг токенов через рефлексию и строки порождает десятки тысяч аллокаций в секунду. Проектируйте типизированные структуры и используйте пулы буферов (<code>sync.Pool</code>).</li>
+<li><strong>Бескомпромиссная валидация:</strong> Защищайтесь от атак <code>alg: none</code> и Algorithm Confusion с помощью жестких белых списков алгоритмов. Сравнение подписи выполняйте исключительно через <code>crypto/subtle.ConstantTimeCompare</code>.</li>
+<li><strong>Решение проблемы отзыва:</strong> Сочетайте короткоживущие токены доступа с долгоживущими refresh-токенами, используйте <code>token_version</code> и временные черные списки <code>jti</code> в Redis.</li>
 </ol>
-<p><a href="4-access-i-refresh-tokeny.html" class="wikilink">4. Access и refresh токены</a></p>
+<p>Как выстроить безопасный жизненный цикл пары токенов и защитить их от кражи в браузере и мобильных приложениях?<br />
+Об этом подробно поговорим в следующей статье: <a href="4-access-i-refresh-tokeny.html" class="wikilink">4. Access и refresh токены</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2497,7 +2616,7 @@ func (v *JWTVerifier) Parse(tokenStr string) (*Claims, error) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#stateless-arkhitektura-i-tsena-nezavisimosti">Stateless-архитектура и цена независимости</a></li><li class="toc-item toc-h2"><a href="#anatomiya-tokena-i-serializatsiya">Анатомия токена и сериализация</a></li><li class="toc-item toc-h2"><a href="#kriptografiya-i-podpis-ot-hmac-do-ecdsa">Криптография и подпись: от HMAC до ECDSA</a></li><li class="toc-item toc-h2"><a href="#podvodnye-kamni-gotchas-i-arkhitekturnye-riski">Подводные камни (Gotchas) и архитектурные риски</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-integratsiya-v-go-servis">Идиоматичная интеграция в Go-сервис</a></li><li class="toc-item toc-h2"><a href="#sravnenie-podkhodov-jwt-vs-session-cookies">Сравнение подходов: JWT vs Session Cookies</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#anatomiya-tokena-i-serializatsiya-base64url">Анатомия токена и сериализация Base64URL</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-serializatsiya-i-tsena-na-takt-protsessora">Под капотом: сериализация и цена на такт процессора</a></li><li class="toc-item toc-h2"><a href="#kriptografiya-i-podpis-ot-hmac-do-ecdsa">Криптография и подпись: от HMAC до ECDSA</a></li><li class="toc-item toc-h2"><a href="#ruchnaya-verifikatsiya-anatomiya-bez-storonnikh-bibliotek">Ручная верификация: анатомия без сторонних библиотек</a></li><li class="toc-item toc-h2"><a href="#podvodnye-kamni-gotchas-i-uyazvimosti-v-realnom-mire">Подводные камни (Gotchas) и уязвимости в реальном мире</a></li><li class="toc-item toc-h3"><a href="#1-ataka-alg-none">1. Атака alg: none</a></li><li class="toc-item toc-h3"><a href="#2-algorithm-confusion-confused-deputy">2. Algorithm Confusion (Confused Deputy)</a></li><li class="toc-item toc-h3"><a href="#3-timing-ataki-pri-validatsii-podpisi">3. Timing-атаки при валидации подписи</a></li><li class="toc-item toc-h3"><a href="#4-dos-i-razdutye-claims">4. DoS и раздутые claims</a></li><li class="toc-item toc-h3"><a href="#5-nevozmozhnost-mgnovennogo-otzyva-revocation">5. Невозможность мгновенного отзыва (Revocation)</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-realizatsiya-na-go-github-comgolang-jwtjwtv5">Идиоматичная реализация на Go: github.com/golang-jwt/jwt/v5</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnyy-vybor-jwt-vs-session-cookies">Архитектурный выбор: JWT vs Session Cookies</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

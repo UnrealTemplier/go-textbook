@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Secure headers</h1>
@@ -2178,7 +2178,10 @@
           <div class="article-markdown">
             <h2 id="http-zagolovki-kak-politiki-bezopasnosti-na-granitse-doveriya">HTTP-заголовки как политики безопасности на границе доверия</h2>
 
-<p>Secure HTTP Headers — это не метаданные для отладки, а строгие директивы, которые браузер применяет до начала рендеринга или выполнения скриптов. Они формируют последний рубеж защиты на клиентской стороне, дополняя серверную валидацию и криптографические механизмы. Для разработчика бэкенда на Go понимание их работы означает умение правильно настраивать <code>net/http</code> сервер, минимизировать накладные расходы на сериализацию и избегать конфликтов с современными сетевыми протоколами.</p>
+<p>В повседневной веб-разработке легко поддаться иллюзии, будто сервер обладает абсолютной властью над тем, как будут отображаться и исполняться его данные. Однако как только HTTP-пакет ответа покидает сетевой интерфейс и сокет закрывается, данные попадают во враждебную и неконтролируемую среду — удаленный браузер пользователя.</p>
+<p>Как серверная система может принудительно заставить браузер соблюдать строгие правила гигиены?</p>
+<p>Ответом служат <strong>Secure HTTP Headers (Заголовки безопасности HTTP)</strong>. Это не декоративные метаданные для отладки, а декларативные директивы операционной системы браузера. Браузер парсит эти директивы в момент получения первого сетевого фрейма ответа и применяет жесткие ограничения <em>до</em> того, как начнется рендеринг DOM-дерева или исполнение JavaScript.</p>
+<p>Для Go-разработчика понимание механики заголовков безопасности — это не просто знание строковых констант, а глубокое понимание устройства буферизации <code>net/http</code>, эффективного сжатия HPACK в HTTP/2 и HTTP/3, а также предотвращения утечек памяти при работе с хэш-таблицами заголовков.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2193,47 +2196,71 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;1 - Go сервер формирует ответ&quot;] --&gt; B[&quot;2 - Установка заголовков&lt;br&gt;w.Header.Set&quot;]
-B --&gt; C[&quot;3 - Запись в bufio.Writer&lt;br&gt;буферизация&quot;]
-C --&gt; D[&quot;4 - syscall write&lt;br&gt;отправка в сокет&quot;]
-D --&gt; E[&quot;5 - Браузер парсит ответ&quot;]
-E --&gt; F[&quot;6 - Применение политик&lt;br&gt;CSP HSTS nosniff&quot;]
-F --&gt; G[&quot;7 - Блокировка опасных операций&lt;br&gt;до рендеринга&quot;]
+subgraph GoBackend[&quot;Go Server (net/http Runtime)&quot;]
+A[&quot;1 - Go сервер формирует ответ&quot;] --&gt; B[&quot;2 - Установка заголовков&lt;br/&gt;w.Header.Set / maps.Copy&quot;]
+B --&gt; C[&quot;3 - Запись в bufio.Writer&lt;br/&gt;буферизация сетевого фрейма&quot;]
+C --&gt; D[&quot;4 - syscall write&lt;br/&gt;отправка в TCP-сокет&quot;]
+end
 
-style B fill:#4ecdc4,stroke:#333
-style F fill:#ffd93d,stroke:#333
-style G fill:#ff6b6b,stroke:#333
+subgraph BrowserEngine[&quot;Браузерный движок (WebKit / Blink / Gecko)&quot;]
+D --&gt; E[&quot;5 - Браузер парсит ответ&lt;br/&gt;до рендеринга страницы&quot;]
+E --&gt; F[&quot;6 - Применение политик&lt;br/&gt;CSP HSTS nosniff&quot;]
+F --&gt; G[&quot;7 - Блокировка опасных операций&lt;br/&gt;до рендеринга и исполнения JS&quot;]
+end
+
+style GoBackend fill:#1e293b,stroke:#10b981,stroke-width:1px,color:#f8fafc
+style BrowserEngine fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#f8fafc
+style B fill:#1e293b,stroke:#4ecdc4,stroke-width:2px,color:#f8fafc
+style F fill:#1e293b,stroke:#ffd93d,stroke-width:2px,color:#f8fafc
+style G fill:#1e293b,stroke:#ff6b6b,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
+<hr />
 <h2 id="klyuchevye-zagolovki-i-mekhanizm-enforcement">Ключевые заголовки и механизм enforcement</h2>
 
-<p>Каждый заголовок решает конкретную задачу безопасности. Смешивание их целей или дублирование функционала ведёт к конфликтам политик и ложному чувству защищённости.</p>
-<p>1 - <code>Strict-Transport-Security (HSTS)</code>: Принудительно переводит все запросы к домену на HTTPS на заданный период (<code>max-age</code>). Браузер сохраняет правило в внутренней таблице. При попытке открыть <code>http://...</code> браузер локально редиректит на <code>https://</code> до установления TCP-соединения, что исключает SSL-stripping атаки на уровне сети.<br />
-2 - <code>Content-Security-Policy (CSP)</code>: Декларативный список разрешённых источников для скриптов, стилей, фреймов, шрифтов и изображений. Браузер парсит директивы до выполнения JS. Нарушение CSP не блокирует загрузку страницы, но подаёт <code>Refused to load</code> в консоль и отправляет <code>report-uri</code>/<code>report-to</code> для аудита.<br />
-3 - <code>X-Content-Type-Options: nosniff</code>: Отключает MIME-сниффинг. Браузер строго следует <code>Content-Type</code>, указанному сервером. Без этого заголовок IE/Chrome могли интерпретировать <code>.txt</code> файл с JS-кодом как исполняемый скрипт, открывая вектор для XSS.<br />
-4 - <code>Referrer-Policy</code>: Контролирует передачу заголовка <code>Referer</code> при переходах. <code>strict-origin-when-cross-origin</code> скрывает путь и query-параметры при кросс-доменных запросах, защищая токены и сессионные идентификаторы от утечки.<br />
-5 - <code>Permissions-Policy</code>: Ограничивает доступ к аппаратным API браузера (камера, микрофон, геолокация, акселерометр). Заменяет устаревший <code>Feature-Policy</code> и работает на уровне инициализации iframe или основного документа.</p>
+<p>Каждый заголовок решает узкую задачу изоляции клиентского окружения:</p>
+<ol>
+<li><strong><code>Strict-Transport-Security (HSTS)</code>:</strong><br />
+   Принудительно переводит все последующие сетевые обращения браузера к домену строго на протокол HTTPS на указанный период (<code>max-age</code>). Браузер локально кэширует это правило. При любой попытке пользователя ввести <code>http://...</code> браузер совершает внутренний редирект на <code>https://</code> еще <strong>до открытия TCP-соединения</strong>, полностью исключая вектор атак Man-in-the-Middle (SSL-stripping).</li>
+<li><strong><code>Content-Security-Policy (CSP)</code>:</strong><br />
+   Мощнейший инструмент защиты от XSS. Это декларативный белый список доверенных источников для загрузки скриптов, стилей, фреймов, шрифтов и медиа. Если злоумышленник внедрил вредоносный тег <code>&lt;script src="https://evil.com/xss.js"&gt;</code>, браузер откажется загружать файл, выбросит ошибку <code>Refused to load</code> в консоль и отправит телеметрию на указанный в директивах <code>report-uri</code>/<code>report-to</code> эндпоинт.</li>
+<li><strong><code>X-Content-Type-Options: nosniff</code>:</strong><br />
+   Запрещает браузеру производить автоматическое определение типа контента (MIME-sniffing). Браузер обязан строго следовать типу, объявленному в заголовке <code>Content-Type</code>. Без этого заголовка браузеры могли попытаться интерпретировать загруженный пользователем текстовый файл <code>.txt</code> с JS-кодом как исполняемый скрипт при неверной отдаче сервером.</li>
+<li><strong><code>Referrer-Policy</code>:</strong><br />
+   Регулирует передачу адреса источника запроса в заголовке <code>Referer</code>. Значение <code>strict-origin-when-cross-origin</code> передает полный URL только внутри одного домена, а при кросс-доменных переходах скрывает путь и query-параметры (где могут случайно оказаться приватные токены сброса пароля или ID сессий).</li>
+<li><strong><code>Permissions-Policy</code>:</strong><br />
+   Ограничивает доступ страницы и встраиваемых <code>iframe</code> к аппаратным API устройства (камера, микрофон, геолокация, датчики движения). Полностью заменяет устаревший заголовок <code>Feature-Policy</code>.</li>
+</ol>
+<hr />
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Почему устаревшие X- заголовки считаются deprecated?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Почему <code>X-</code> заголовки считаются deprecated?</strong><br />
-Заголовки <code>X-XSS-Protection</code>, <code>X-Frame-Options</code>, <code>X-Content-Type-Options</code> исторически вводились браузерами как экспериментальные расширения. Современный стандарт IETF требует удаления префикса <code>X-</code> после стабилизации спецификации. <br />
-<code>X-XSS-Protection</code> признан вредным: он включал неэффективные фильтры, которые атакующие обходили через полиморфные пейлоады, создавая иллюзию защиты. В современных браузерах (Chrome 78+, Safari 16+) он игнорируется. <br />
-<code>X-Frame-Options</code> заменён на <code>Content-Security-Policy: frame-ancestors</code>, который даёт гранулярный контроль над встраиванием. Оставлять <code>X-</code> заголовки в продакшене — технический долг, который усложняет аудит и увеличивает размер ответа.</p>
+    <p><strong>Эволюция стандартов IETF и W3C:</strong><br />
+Префиксы <code>X-</code> (<code>X-XSS-Protection</code>, <code>X-Frame-Options</code>, <code>X-Content-Type-Options</code>) исторически использовались для экспериментальных возможностей конкретных браузеров. Согласно RFC 6648, стандартизированные заголовки обязаны избавляться от приставки <code>X-</code>.<br />
+- Заголовок <code>X-XSS-Protection</code> официально признан устаревшим и вредоносным: встроенные эвристические фильтры Internet Explorer и старого Chrome приводили к ложным срабатываниям и сами становились вектором для кражи данных. Современные браузеры (Chrome 78+, Safari 16+, Firefox) полностью игнорируют его.<br />
+- Заголовок <code>X-Frame-Options</code> успешно вытеснен более гибкой директивой <code>Content-Security-Policy: frame-ancestors 'self' https://trusted.com</code>, позволяющей задавать список доверенных родителей для встраивания. Оставлять устаревшие заголовки имеет смысл исключительно для поддержки антикварных браузеров.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="pod-kapotom-http2-hpack-bufio-i-syscall-write">Под капотом: HTTP/2 HPACK, bufio и syscall write</h2>
 
-<p>В Go заголовки обрабатываются пакетом <code>net/http</code>. При вызове <code>w.Header().Set(key, value)</code> запись попадает в <code>http.Header</code>, который является <code>map[string][]string</code>. Это создаёт скрытые накладные расходы:</p>
-<p>1 - <strong>Аллокации мапы</strong>: <code>http.Header</code> инициализируется лениво. Каждый <code>Set</code> вызывает <code>make([]string, 1)</code> или <code>append</code> для слайса значений. При 50k RPS это генерирует сотни тысяч короткоживущих объектов, нагружая <code>GC</code>.<br />
-2 - <strong>HTTP/2 и HPACK сжатие</strong>: Протокол HTTP/2 использует HPACK для сжатия заголовков. Он поддерживает статическую таблицу индексации (стандартные заголовки) и динамическую таблицу для пользовательских. <code>HSTS</code>, <code>CSP</code> и <code>nosniff</code> попадают в сжатый фрейм <code>HEADERS</code> с минимальным оверхедом. Однако порядок установки не влияет на размер сжатого пакета в HTTP/2, но критичен для HTTP/1.1 прокси, которые могут обрезать ответ при превышении лимита заголовков (обычно 8 КБ).<br />
-3 - <strong>Буферизация и syscall</strong>: Заголовки записываются в <code>bufio.Writer</code> внутреннего <code>*http.response</code>. Вызов <code>next.ServeHTTP(w, r)</code> не отправляет данные сразу. Только при первом <code>w.Write()</code> или <code>w.WriteHeader()</code> буфер сбрасывается через <code>syscall.Write</code> (Linux) или <code>WriteFile</code> (Windows). Это означает, что модификация заголовков после начала записи тела ответа игнорируется или вызывает панику.</p>
+<p>В Go обработка заголовков возложена на пакет <code>net/http</code>. При каждом вызове <code>w.Header().Set(key, value)</code> рантайм манипулирует структурой <code>http.Header</code>, которая под капотом является картой <code>map[string][]string</code>.</p>
+<p>В высоконагруженных шлюзах это порождает скрытую цену:<br />
+1. <strong>Аллокации в куче на каждый запрос:</strong><br />
+   Карта <code>http.Header</code> аллоцируется лениво. Каждый вызов метода <code>Set</code> или <code>Add</code> аллоцирует слайс строк <code>make([]string, 1)</code> или выполняет операцию <code>append</code>. При потоке в 50 000 RPS ручная установка 7–10 заголовков на каждый запрос выбрасывает в кучу сотни тысяч мелких объектов в секунду, перегружая сборщик мусора (<code>GC</code>).<br />
+2. <strong>Сжатие HPACK в протоколах HTTP/2 и HTTP/3:</strong><br />
+   Протокол HTTP/2 сжимает заголовки алгоритмом HPACK, используя статическую таблицу стандартных заголовков и динамическую таблицу для пользовательских значений. Стандартные заголовки (<code>HSTS</code>, <code>nosniff</code>, <code>CSP</code>) один раз упаковываются во фрейм <code>HEADERS</code> и передаются с минимальным оверхедом. Однако в протоколе HTTP/1.1 сжатие отсутствует: чрезмерно раздутые заголовки увеличивают размер первого TCP-пакета ответа, а промежуточные прокси-серверы могут аварийно разорвать соединение с ошибкой при превышении лимита размера заголовков (традиционно 8 КБ).<br />
+3. <strong>Буферизация <code>bufio.Writer</code> и системные вызовы:</strong><br />
+   Заголовки ответа сериализуются во внутренний буфер <code>bufio.Writer</code> структуры <code>*http.response</code>. Вызов <code>next.ServeHTTP(w, r)</code> не отправляет данные в сокет немедленно. Буфер сбрасывается в ядро через системный вызов <code>syscall.Write</code> (в Linux) или <code>WriteFile</code> (в Windows) только в момент первого вызова <code>w.WriteHeader()</code> или <code>w.Write()</code>. Любая попытка изменить заголовки <em>после</em> первой записи тела ответа будет проигнорирована Go-сервером или приведет к предупреждению в логах.</p>
+<h3 id="idiomatichnyy-pattern-pul-predvychislennykh-zagolovkov">Идиоматичный паттерн: Пул предвычисленных заголовков</h3>
+
+<p>Чтобы избежать лавинообразных аллокаций памяти в куче, в высоконагруженных Go-сервисах предкомпилируют базовый набор заголовков один раз через <code>sync.Once</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2287,34 +2314,46 @@ func SecureHeadersMiddleware(next http.Handler) http.Handler {
 </code></pre>
 </div>
 
-<h2 id="lovushki-i-arkhitekturnye-riski">Ловушки и архитектурные риски</h2>
+<hr />
+<h2 id="lovushki-i-arkhitekturnye-riski-gotchas">Ловушки и архитектурные риски (Gotchas)</h2>
 
-<p>1 - <strong>CSP <code>unsafe-inline</code> и nonce-генерация</strong>: Использование <code>'unsafe-inline'</code> в CSP полностью нейтрализует защиту от XSS. Правильный подход — динамическая генерация криптографического <code>nonce</code> для каждого запроса и встраивание его в тег <code>&lt;script nonce="..."&gt;</code>. В Go это требует интеграции с генератором <code>crypto/rand</code> и передачи значения в шаблон. Кэширование HTML-страниц с CSP ломает nonce-механизм, так как nonce должен быть уникальным для каждого HTTP-ответа.<br />
-2 - <strong>HSTS <code>max-age</code> и Preload List</strong>: Установка <code>max-age=31536000</code> (1 год) с <code>includeSubDomains</code> означает, что откатить HTTP на год будет невозможно без очистки кэша браузера. Добавление домена в HSTS Preload List (встроен в Chrome/Firefox/Safari) — это irreversible операция. Удаление из списка занимает месяцы. Тестируйте политику с <code>max-age=0</code> и <code>report-only</code> перед продакшен-деплоем.<br />
-3 - <strong>Размер заголовков и HTTP/431</strong>: Современные балансировщики и <code>net/http</code> серверы ограничивают размер заголовков (по умолчанию 1 МБ в Go, но часто 8-16 КБ в прокси). CSP-директивы с длинными URI или hashes могут превысить лимит, вызывая <code>431 Request Header Fields Too Large</code> или <code>ERR_RESPONSE_HEADERS_TOO_BIG</code> на клиенте. Оптимизация: выносить длинные списки доменов в отдельные конфигурационные эндпоинты или использовать <code>frame-src</code> вместо <code>default-src</code> с гранулярным контролем.<br />
-4 - <strong>Порядок middleware</strong>: Security Headers должны устанавливаться <strong>до</strong> middleware авторизации, валидации и бизнес-логики. Если хендлер возвращает <code>500 Internal Server Error</code> до установки заголовков, клиент получит ответ без политик безопасности. Используйте глобальный <code>http.Server.Handler</code> или <code>chi</code>/<code>gorilla</code> роутер на верхнем уровне.</p>
+<ol>
+<li><strong>CSP <code>unsafe-inline</code> и динамические Nonce:</strong><br />
+   Использование директивы <code>'unsafe-inline'</code> в секции <code>script-src</code> полностью умножает на ноль всю пользу CSP, позволяя злоумышленнику беспрепятственно выполнять внедренный JS-код. Единственный правильный путь для динамических приложений — генерация криптографически стойкого <code>nonce</code> на каждый HTTP-запрос с помощью <code>crypto/rand</code> и передача его в заголовке <code>script-src 'nonce-...';</code> и теге <code>&lt;script nonce="..."&gt;</code>. Помните: кэширование HTML-страниц с CSP ломает эту защиту, так как nonce обязан быть одноразовым!</li>
+<li><strong>Ловушка HSTS Preload List:</strong><br />
+   Установка <code>max-age=31536000</code> (1 год) или <code>max-age=63072000</code> (2 года) с <code>includeSubDomains</code> и подача заявки в глобальный реестр HSTS Preload List (встроенный в ядро Chromium, Safari и Firefox) является <strong>необратимым решением</strong>. Если какой-либо внутренний поддомен компании временно не сможет получить валидный TLS-сертификат, пользователи вообще не смогут открыть ресурс. Исключение домена из Preload-списка занимает от нескольких месяцев до полугода. Тестируйте политику с <code>max-age=0</code> и <code>report-only</code> перед продакшен-деплоем.</li>
+<li><strong>Переполнение буфера заголовков и ошибка HTTP 431:</strong><br />
+   Сложные политики CSP с перечислением сотен внешних аналитических сервисов могут раздуть размер заголовка ответа до десятков килобайт. Прокси-серверы (Nginx, Cloudflare) и балансировщики по умолчанию ограничивают размер заголовков (часто лимитом 8–16 КБ). В результате клиенты получают ошибку <code>431 Request Header Fields Too Large</code> или сбой <code>ERR_RESPONSE_HEADERS_TOO_BIG</code>. Оптимизация: выносить длинные списки доменов в отдельные конфигурационные эндпоинты или использовать <code>frame-src</code> вместо <code>default-src</code> с гранулярным контролем.</li>
+<li><strong>Порядок Middleware в цепочке вызовов:</strong><br />
+   Middleware установки защитных заголовков обязан находиться <strong>на самом верху стека HTTP-обработчиков</strong>. Если middleware аутентификации или бизнес-логика выбросит панику или завершит запрос статусом <code>500 Internal Server Error</code> до применения политик безопасности, браузер получит страницу ошибки без заголовков изоляции, открывая простор для Clickjacking и других атак. Используйте глобальный <code>http.Server.Handler</code> или <code>chi</code>/<code>gorilla</code> роутер на верхнем уровне.</li>
+</ol>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как браузер обрабатывает CSP в контексте HTTP/2 Server Push и prefetch, и почему Go-разработчику это важно?<br />
-<strong>Ответ:</strong><br />
-1 - HTTP/2 Server Push позволяет серверу заранее отправить ресурсы до запроса клиента. CSP применяется к push-ресурсам так же, как к обычным: если источник не в <code>script-src</code> или <code>style-src</code>, браузер отбрасывает push-фрейм.<br />
-2 - В Go <code>http.Pusher</code> интерфейс доступен через type assertion <code>w.(http.Pusher)</code>. Если вы используете Server Push без учёта CSP, вы генерируете бесполезный трафик и забиваете соединение.<br />
-3 - <strong>Архитектурный вывод:</strong> Всегда синхронизируйте CSP-политики с конфигурацией HTTP/2 push и <code>link rel="preload"</code>. Асинхронная загрузка ресурсов должна явно разрешаться в заголовках, иначе браузер будет логировать CSP-violations, увеличивая нагрузку на <code>report-uri</code> эндпоинт.</p>
+    <p><strong>Вопрос:</strong> «Как браузер обрабатывает политику CSP в контексте HTTP/2 Server Push и директив prefetch/preload, и почему Go-разработчику важно учитывать это при оптимизации доставки контента?»  </p>
+<p><strong>Ответ кандидата Senior-уровня:</strong><br />
+«1. <strong>Применение политик к Push-ресурсам:</strong> Механизм HTTP/2 Server Push позволяет бэкенду отправить ресурсы клиенту до получения явного запроса. Однако браузер применяет CSP к push-фреймам по тем же строгим правилам: если ресурс отправлен сервером, но его домен или тип не разрешен директивами <code>script-src</code> или <code>style-src</code>, браузер немедленно отбросит полученный push-фрейм.<br />
+2. <strong>Интерфейс <code>http.Pusher</code> в Go:</strong> В стандартной библиотеке Go push инициируется через проверку интерфейса: <code>if pusher, ok := w.(http.Pusher); ok { pusher.Push(...) }</code>. Если бэкенд пушит ресурсы, запрещенные CSP, сервер генерирует бесполезный сетевой трафик и попусту забивает сокет.<br />
+3. <strong>Синхронизация контуров:</strong> Все ресурсы, передаваемые через Server Push или предзагрузку <code>&lt;link rel="preload"&gt;</code>, обязаны быть жестко согласованы с CSP. Несоответствие приводит к всплеску предупреждений CSP-violations и паразитной нагрузке на эндпоинты <code>report-uri</code>».</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>1 - Secure HTTP Headers — это декларативные политики безопасности, применяемые браузером до выполнения кода. Они дополняют серверную защиту, но не заменяют её.<br />
-2 - Устаревшие <code>X-</code> заголовки игнорируются современными браузерами. Индустриальный стандарт сместился к <code>CSP</code>, <code>Permissions-Policy</code> и <code>Referrer-Policy</code>.<br />
-3 - В рантайме Go заголовки аллоцируются в <code>http.Header</code> мапе. Преинициализация и пакетное применение снижают давление на <code>GC</code> и ускоряют обработку в высоконагруженных сценариях.<br />
-4 - HPACK в HTTP/2 эффективно сжимает стандартные заголовки, но CSP-директивы с hashes/nonces могут увеличивать размер ответа и влиять на буферизацию <code>bufio.Writer</code>.<br />
-5 - Архитектурно верное размещение middleware безопасности — на самом верхнем уровне обработки запроса, до авторизации и бизнес-валидации, чтобы политики применялись даже к ответам с ошибками.</p>
-<p><a href="../06-infrastruktura-i-sekrety/1-secrets-management.html" class="wikilink">1. Secrets management</a></p>
+<ol>
+<li><strong>Декларативная изоляция:</strong> Secure HTTP Headers — это директивы безопасности для песочницы браузера, применяемые до начала отрисовки страницы и выполнения пользовательского кода.</li>
+<li><strong>Отказ от легаси:</strong> Устаревшие заголовки <code>X-XSS-Protection</code> и <code>X-Frame-Options</code> вытеснены современными и гранулярными стандартами <code>CSP</code> (<code>frame-ancestors</code>), <code>Permissions-Policy</code> и <code>Referrer-Policy</code>.</li>
+<li><strong>Механическое сочувствие:</strong> Преинициализация карты <code>http.Header</code> через <code>sync.Once</code> устраняет сотни тысяч мусорных аллокаций в куче при высоких RPS. Учитывайте буферизацию <code>bufio.Writer</code> — заголовки нельзя менять после первого <code>w.Write()</code>.</li>
+<li><strong>Осторожность с HSTS Preload:</strong> Включение HSTS с предзагрузкой необратимо ломает доступ к поддоменам без TLS. Тестируйте политики постепенно.</li>
+<li><strong>Верхний эшелон:</strong> Security Headers Middleware всегда размещается на самом входе в пайплайн обработки HTTP, защищая даже страницы системных ошибок <code>500</code> и <code>404</code>.</li>
+</ol>
+<p>Мы полностью завершили блок безопасности API. Впереди нас ждет масштабный инженерный раздел: <strong>Инфраструктура и секреты</strong>.<br />
+В следующей лекции мы разберем: <a href="../06-infrastruktura-i-sekrety/1-secrets-management.html" class="wikilink">1. Secrets management</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2342,7 +2381,7 @@ func SecureHeadersMiddleware(next http.Handler) http.Handler {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#http-zagolovki-kak-politiki-bezopasnosti-na-granitse-doveriya">HTTP-заголовки как политики безопасности на границе доверия</a></li><li class="toc-item toc-h2"><a href="#klyuchevye-zagolovki-i-mekhanizm-enforcement">Ключевые заголовки и механизм enforcement</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-http2-hpack-bufio-i-syscall-write">Под капотом: HTTP/2 HPACK, bufio и syscall write</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-arkhitekturnye-riski">Ловушки и архитектурные риски</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#http-zagolovki-kak-politiki-bezopasnosti-na-granitse-doveriya">HTTP-заголовки как политики безопасности на границе доверия</a></li><li class="toc-item toc-h2"><a href="#klyuchevye-zagolovki-i-mekhanizm-enforcement">Ключевые заголовки и механизм enforcement</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-http2-hpack-bufio-i-syscall-write">Под капотом: HTTP/2 HPACK, bufio и syscall write</a></li><li class="toc-item toc-h3"><a href="#idiomatichnyy-pattern-pul-predvychislennykh-zagolovkov">Идиоматичный паттерн: Пул предвычисленных заголовков</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-arkhitekturnye-riski-gotchas">Ловушки и архитектурные риски (Gotchas)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

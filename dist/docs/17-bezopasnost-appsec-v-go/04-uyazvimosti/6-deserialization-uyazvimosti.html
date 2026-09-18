@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Deserialization уязвимости</h1>
@@ -2178,7 +2178,13 @@
           <div class="article-markdown">
             <h2 id="vvedenie-kogda-parser-dannykh-stanovitsya-ispolnitelem">Введение: Когда парсер данных становится исполнителем</h2>
 
-<p>Десериализация — это процесс преобразования неструктурированного потока байт (JSON, XML, Protobuf, Gob) во внутренние структуры приложения. В высоконагруженном бэкенде это не просто «парсинг», а критическая точка конвертации ненадёжного внешнего ввода в исполняемый код и аллоцируемые объекты. Уязвимости десериализации исторически ассоциируются с RCE через <code>__wakeup</code> в PHP или <code>readObject</code> в Java. В Go ситуация иная благодаря строгой статической типизации и отсутствию произвольного инстанцирования классов, но риски смещаются в сторону DoS, логических инъекций и скрытых вызовов через интерфейсы.</p>
+<p>В компьютерных науках сериализация — это процесс «замораживания» живого графа структур данных из оперативной памяти в плоский линейный поток байтов (JSON, XML, Protobuf, Gob). Десериализация — это процесс обратного «воскрешения» объектов из этого байтового потока.</p>
+<p>В языках с развитой динамической рефлексией и полиморфизмом (Java, Python, PHP, Ruby) десериализация исторически является синонимом катастрофы. Знаменитые уязвимости с удаленным выполнением кода (RCE) через <code>__wakeup</code> в PHP, метод <code>readObject</code> в Java или библиотеку <code>pickle</code> в Python возникают потому, что сериализованный поток содержит не просто сырые данные, но и метаинформацию о типах классов. Парсер послушно инстанциирует произвольные классы из кодовой базы, запуская цепочки вызовов гаджетов (gadget chains) прямо в момент распаковки.</p>
+<p>В Go ситуация фундаментально иная: благодаря строгой статической типизации, отсутствию динамической загрузки байт-кода и невозможности произвольного инстанцирования произвольных типов по строковому имени, классический вектор Java-style RCE в чистом Go отсутствует.</p>
+<p>Однако иллюзия абсолютной безопасности обманчива. В Go риски десериализации смещаются в сторону:<br />
+1. <strong>Катастрофического исчерпания ресурсов (DoS)</strong>: миллиардные рекурсивные аллокации, парализующие <code>GC</code> и вызывающие <code>OOM Killer</code>.<br />
+2. <strong>Логических инъекций и подмены состояний (Mass Assignment)</strong> через нетипизированные структуры <code>map[string]any</code>.<br />
+3. <strong>Скрытых вызовов произвольного кода</strong> через реализацию библиотечных интерфейсов (<code>GobDecoder</code>, кастомные unmarshaler-хуки).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2193,35 +2199,70 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Внешний поток байт&quot;] --&gt; B[&quot;Парсер десериализации&quot;]
-B --&gt; C[&quot;reflect.New reflect.Set&quot;]
-C --&gt; D[&quot;Аллокация структур в куче&quot;]
-D --&gt; E[&quot;Вызов кастомных методов&quot;]
-E --&gt; F[&quot;Валидация бизнес-логики&quot;]
+subgraph Stream[&quot;Входящий сетевой трафик&quot;]
+A[&quot;Внешний поток байт (Socket io.Reader)&quot;]
+end
 
-G[&quot;Атакующий&quot;] -.-&gt;|&quot;1 - Экспоненциальная вложенность&quot;| B
-G -.-&gt;|&quot;2 - Неизвестные поля&quot;| D
-G -.-&gt;|&quot;3 - Кастомные интерфейсы&quot;| E
+subgraph Runtime[&quot;Go Runtime &amp; Десериализатор&quot;]
+B[&quot;Парсер десериализации (json.Decoder / gob)&quot;]
+C[&quot;reflect.New &amp; reflect.Set&lt;br/&gt;(Кэш типов в sync.Map)&quot;]
+D[&quot;Аллокация структур в куче (Escape Analysis)&quot;]
+E[&quot;Вызов кастомных методов&lt;br/&gt;(GobDecode, UnmarshalJSON)&quot;]
+end
 
-style B fill:#ffd93d,stroke:#333
-style E fill:#ff6b6b,stroke:#333
-style G fill:#ff6b6b,stroke:#333
+subgraph AppLogic[&quot;Бизнес-логика приложения&quot;]
+F[&quot;Валидация бизнес-логики и сохранение в БД&quot;]
+end
+
+subgraph Attacker[&quot;Векторы атаки злоумышленника&quot;]
+G[&quot;Атакующий&quot;]
+end
+
+A --&gt; B
+B --&gt; C
+C --&gt; D
+D --&gt; E
+E --&gt; F
+
+G -.-&gt;|&quot;1 - Экспоненциальная вложенность (DoS / OOM)&quot;| B
+G -.-&gt;|&quot;2 - Неизвестные поля (Mass Assignment)&quot;| D
+G -.-&gt;|&quot;3 - Кастомные интерфейсы (RCE в Gob)&quot;| E
+
+style Stream fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#f8fafc
+style Runtime fill:#1e293b,stroke:#10b981,stroke-width:1px,color:#f8fafc
+style AppLogic fill:#1e293b,stroke:#38bdf8,stroke-width:1px,color:#f8fafc
+style Attacker fill:#0f172a,stroke:#f43f5e,stroke-width:1px,color:#f8fafc
+style B fill:#1e293b,stroke:#ffd93d,stroke-width:2px,color:#f8fafc
+style E fill:#1e293b,stroke:#ff6b6b,stroke-width:2px,color:#f8fafc
+style G fill:#1e293b,stroke:#f43f5e,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
+<hr />
 <h2 id="pod-kapotom-otrazhenie-kucha-i-skrytye-vyzovy">Под капотом: отражение, куча и скрытые вызовы</h2>
 
-<p>Стандартные пакеты <code>encoding/json</code>, <code>encoding/xml</code> и <code>encoding/gob</code> активно используют пакет <code>reflect</code>. При вызове <code>Unmarshal</code> рантайм выполняет:<br />
-1 - <strong>Кэширование типа:</strong> Компилятор генерирует метаданные структур. <code>reflect.Type</code> хранит смещения полей, теги, типы. Это происходит один раз и кешируется в <code>sync.Map</code>.<br />
-2 - <strong>Рекурсивный обход:</strong> Парсер сопоставляет ключи из потока с полями структуры. Для каждого поля вызывается <code>reflect.ValueOf</code> и <code>reflect.Set</code>.<br />
-3 - <strong>Аллокация:</strong> Указатели, слайсы и мапы аллоцируются в куче. Escape Analysis не может предсказать размер входящих данных, поэтому <code>Unmarshal</code> почти всегда генерирует <code>heap</code> аллокации.<br />
-4 - <strong>Кастомные хуки:</strong> Если тип реализует интерфейсы <code>Unmarshaler</code>, <code>GobDecoder</code> или <code>encoding.BinaryUnmarshaler</code>, парсер вызывает их методы автоматически. Именно здесь кроется вектор для выполнения произвольного кода.</p>
+<p>Стандартные пакеты сериализации Go (<code>encoding/json</code>, <code>encoding/xml</code> и <code>encoding/gob</code>) опираются на пакет <code>reflect</code>. Чтобы осознавать накладные расходы и скрытые угрозы, рассмотрим внутренний конвейер вызова <code>Unmarshal</code>:</p>
+<ol>
+<li><strong>Кэширование метаданных типов:</strong><br />
+   При первом анализе структуры компилятор и рантайм генерируют дескриптор <code>reflect.Type</code>. В нем содержатся смещения полей структуры (struct offsets), строковые теги (tags) и правила выравнивания. Этот дескриптор вычисляется единожды и кэшируется внутри рантайма в потокобезопасной карте <code>sync.Map</code>.</li>
+<li><strong>Рекурсивный обход и сопоставление полей:</strong><br />
+   Парсер читает токен за токеном, находит соответствующее поле целевой структуры и задействует вызовы <code>reflect.ValueOf</code> и <code>reflect.Set</code>. Для глубоко вложенных объектов глубина рекурсии стека растет пропорционально вложенности документа.</li>
+<li><strong>Неизбежные аллокации в куче (Heap Escape):</strong><br />
+   Компилятор Go через механизм Escape Analysis не может предсказать размер и форму внешних входящих данных во время компиляции. Поэтому указатели, срезы (<code>slices</code>) и мапы (<code>maps</code>), заполняемые внутри <code>Unmarshal</code>, гарантированно «убегают» в кучу, порождая тысячи короткоживущих аллокаций.</li>
+<li><strong>Скрытые диспетчеризации методов (Custom Hooks):</strong><br />
+   Если целевой тип или его внутренние поля реализуют интерфейсы <code>Unmarshaler</code>, <code>GobDecoder</code> или <code>encoding.BinaryUnmarshaler</code>, парсер обязан передать управление их методам. Именно в этой точке пользовательский код берет на себя управление потоком исполнения.</li>
+</ol>
+<hr />
 <h2 id="1-json-bomby-glubina-i-interface">1. JSON: Бомбы, глубина и `interface{}`</h2>
 
-<p>Формат JSON сам по себе не исполняет код, но его структура позволяет эффективно истощать ресурсы процесса.</p>
-<p><strong>JSON-бомбы (Zip Bomb аналог):</strong> Вложенные объекты или массивы. Парсер рекурсивно создаёт <code>map[string]any</code> и <code>[]any</code>. Для глубины 30 и коэффициента ветвления 5 это ~10^21 аллокаций. Рантайм падает с <code>runtime: goroutine stack exceeds</code> или OOM до завершения парсинга.<br />
-<strong>Массовое назначение (Mass Assignment):</strong> Использование <code>map[string]any</code> или динамических DTO позволяет атакующему передавать поля, которых не ожидает бизнес-логика (<code>is_admin</code>, <code>price</code>, <code>role</code>). При последующей сериализации в БД или передаче в другой сервис это ведёт к логическим уязвимостям.</p>
+<p>Сам по себе текстовый формат JSON пассивен и не содержит исполняемых инструкций. Однако его грамматика позволяет конструировать разрушительные нагрузки, бьющие по физическим ресурсам хоста:</p>
+<h3 id="json-bomby-analog-zip-bomb">JSON-бомбы (Аналог Zip Bomb)</h3>
+<p>Злоумышленник формирует компактный текстовый документ размером всего в несколько десятков килобайт, содержащий экстремальную вложенность скобок:<br />
+<code>&lt;span class="wikilink-unresolved" title="Заметка в разработке"&gt;[[[[[[[[[[[[[[...&lt;/span&gt;]]]]]]]]]]]]]]</code>.<br />
+Если приложение десериализует такой ввод в нетипизированный <code>map[string]any</code> или <code>[]any</code>, парсер запускает глубокую рекурсию. При глубине вложенности 30 уровней и коэффициенте ветвления 5 число узлов дерева стремится к $10^{21}$. Рантайм Go аварийно завершает работу с паникой <code>runtime: goroutine stack exceeds</code> (переполнение 1 ГБ стека горутины в 64-битных системах) либо сервер уничтожается ядром по <code>OOM Killer</code> из-за безудержного разрастания кучи.</p>
+<h3 id="massovoe-naznachenie-mass-assignment">Массовое назначение (Mass Assignment)</h3>
+<p>Если разработчик использует <code>map[string]any</code> или применяет одну и ту же структуру как для внешнего HTTP API, так и для сущности базы данных, атакующий передает скрытые служебные поля: <code>is_admin: true</code>, <code>role: "superuser"</code>, <code>price: 0.0</code>. Если бэкенд без валидации передает эту структуру в ORM или SQL-запрос обновления, происходит несанкционированное повышение привилегий.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2239,16 +2280,20 @@ import (
     &quot;net/http&quot;
 )
 
-// SecureJSONHandler демонстрирует защиту от массового назначения и DoS
+// SecureJSONHandler демонстрирует защиту от массового назначения и DoS-атак
 func SecureJSONHandler(w http.ResponseWriter, r *http.Request) {
-    // 🔒 Ограничение размера тела запроса. 1 МБ достаточно для большинства API.
+    // 🔒 1. Ограничение размера входящего потока байт.
+    // 1 МБ достаточно для 99.9% легитимных JSON-пейлоадов.
     limitedReader := io.LimitReader(r.Body, 1&lt;&lt;20)
 
-    // 🔒 DisallowUnknownFields запрещает инъекцию лишних полей
-    // Это критично для защиты от mass assignment
+    // 🔒 2. Инициализация потокового декодера с запретом неизвестных полей
     decoder := json.NewDecoder(limitedReader)
+
+    // DisallowUnknownFields пресекает Mass Assignment на корню:
+    // если клиент передаст неизвестное поле (например, &quot;is_admin&quot;), декодер вернет ошибку!
     decoder.DisallowUnknownFields()
 
+    // 🔒 3. Строго типизированное DTO без лишних системных полей
     var payload struct {
         ID    int64  `json:&quot;id&quot;`
         Name  string `json:&quot;name&quot;`
@@ -2256,31 +2301,34 @@ func SecureJSONHandler(w http.ResponseWriter, r *http.Request) {
     }
 
     if err := decoder.Decode(&amp;payload); err != nil {
-        // Ошибка может быть: превышение лимита, неизвестное поле, malformed JSON
-        http.Error(w, &quot;invalid payload&quot;, http.StatusBadRequest)
+        // Ошибка возвращается при: превышении лимита размера, наличии лишних полей или битом JSON
+        http.Error(w, &quot;invalid payload or unknown fields&quot;, http.StatusBadRequest)
         return
     }
 
-    // Дальнейшая бизнес-логика...
+    // Безопасная передача проверенного DTO в бизнес-логику...
 }
 </code></pre>
 </div>
 
+<hr />
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Почему DisallowUnknownFields работает быстро?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Почему <code>DisallowUnknownFields</code> работает быстро?</strong><br />
-Парсер сравнивает каждый ключ из JSON с кэшированной картой полей структуры. Если ключ отсутствует, он сразу возвращает ошибку без выделения памяти для значения. Это предотвращает аллокацию <code>any</code> и последующую нагрузку на GC при парсинге вредоносных запросов с тысячами неизвестных полей.</p>
+    <p><strong>Эффективность <code>DisallowUnknownFields</code>:</strong><br />
+При вызове <code>decoder.DisallowUnknownFields()</code> парсер сверяет каждый входящий ключ JSON с предвычисленным кэшем полей целевой структуры. Если ключа нет в списке разрешенных, декодер мгновенно прерывает разбор и возвращает ошибку, <strong>не выделяя память под значение</strong>. Это предотвращает аллокацию тяжелых структур <code>any</code> в куче и полностью защищает сборщик мусора от лавинообразной нагрузки при отправке вредоносного запроса с тысячами фиктивных параметров.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="2-gob-gobdecoder-i-vektor-rce-v-go">2. Gob: `GobDecoder` и вектор RCE в Go</h2>
 
-<p>Пакет <code>encoding/gob</code> бинарный, эффективный, но <strong>категорически не предназначен для приёма ненадёжных данных</strong>. Его архитектура подразумевает обмен между доверенными микросервисами одной экосистемы.</p>
-<p>Если структура реализует интерфейс <code>gob.GobDecoder</code>, метод <code>GobDecode([]byte) error</code> вызывается автоматически в процессе распаковки. В отличие от JSON, где вы контролируете десериализацию, <code>gob</code> даёт библиотеке возможность выполнять произвольную логику при чтении байт.</p>
+<p>Пакет стандартной библиотеки <code>encoding/gob</code> — это высокопроизводительный бинарный кодек, разработанный специально для экосистемы Go. Он чрезвычайно эффективен при передаче структур через RPC между внутренними сервисами.</p>
+<p><strong>Однако <code>encoding/gob</code> категорически запрещено использовать для десериализации данных, полученных от внешних недоверенных клиентов!</strong></p>
+<p>Причина кроется в интерфейсе <code>gob.GobDecoder</code>. Если распаковываемый тип данных реализует метод <code>GobDecode([]byte) error</code>, пакет <code>encoding/gob</code> вызывает этот метод автоматически прямо во время парсинга:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2290,75 +2338,93 @@ func SecureJSONHandler(w http.ResponseWriter, r *http.Request) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ⚠️ ОПАСНО: Пример структуры, которая может выполнить код при десериализации
+  <pre class="language-go"><code class="language-go">package rce_demo
+
+// ⚠️ ОПАСНО: Структура, содержащая исполняемую логику в хуке десериализации
 type UnsafeCacheItem struct {
     Key   string
     Value []byte
 }
 
-// Этот метод вызовется АВТОМАТИЧЕСКИ при gob.Decode
+// GobDecode вызывается АВТОМАТИЧЕСКИ рантаймом при выполнении gob.Decode()
 func (u *UnsafeCacheItem) GobDecode(data []byte) error {
-    // 🔴 Если атакующий подставит данные, которые десериализуются в эту структуру,
-    // здесь может выполниться exec.Command, os.Remove, или сетевой вызов.
-    return nil 
+    // 🔴 КРИТИЧЕСКИЙ РИСК: Если атакующий способен сформировать валидный поток gob,
+    // десериализуемый в этот тип, любой находящийся здесь код выполнится в контексте процесса.
+    // Здесь могут оказаться вызовы exec.Command, os.Remove, или обращение к сетевому сокету.
+    return nil
 }
 </code></pre>
 </div>
 
+<hr />
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Никогда не декодируйте gob от внешних клиентов</span>
   </div>
   <div class="callout-body">
-    <p><strong>Никогда не декодируйте <code>gob</code> от клиентов</strong><br />
-<code>gob</code> не имеет встроенной защиты от <code>GobDecoder</code> векторов. Любой байт-поток, соответствующий формату, запустит ваши кастомные методы. Для внешних API используйте Protobuf или JSON. Для внутреннего обмена в Go экосистеме <code>gob</code> допустим, но только между компонентами с одинаковыми версиями бинарников и строгим контролем трафика.</p>
+    <p><strong>Отсутствие песочницы в пакете <code>gob</code>:</strong><br />
+Пакет <code>encoding/gob</code> не предоставляет встроенных механизмов изоляции или песочницы для интерфейса <code>GobDecoder</code>. Любой байт-поток, соответствующий спецификации формата, инициирует автоматический вызов методов ваших структур.<br />
+Для внешних публичных API используйте только форматы со строгой статической валидацией схемы (Protobuf или JSON). Обмен через <code>gob</code> допустим исключительно внутри доверенного контура микросервисов, скомпилированных одной версией Go и с жестким контролем сетевого периметра (mTLS).</p>
   </div>
 </div>
 
+<hr />
 <h2 id="3-xml-xxe-i-parsing-dtd">3. XML: XXE и парсинг DTD</h2>
 
-<p>Стандартный <code>encoding/xml</code> в Go защищён от XXE (XML External Entity) по умолчанию. Начиная с версии 1.15, парсер игнорирует <code>&lt;!DOCTYPE&gt;</code> и внешние сущности, предотвращая чтение локальных файлов или SSRF через DTD. Однако, при использовании сторонних библиотек (<code>libxml2</code> bindings) или кастомных <code>Decoder</code> с включённым <code>Strict</code>, риск возвращается. Всегда проверяйте документацию сторонних XML-парсеров на наличие флагов <code>ExternalEntities</code> или <code>DTD</code>.</p>
-<h2 id="idiomatichnaya-zashchita-v-rantayme">Идиоматичная защита в рантайме</h2>
+<p>В старых реализациях и других языках программирования парсеры XML по умолчанию поддерживают обработку внешних сущностей DTD (Document Type Definition), что приводит к уязвимости <strong>XXE (XML External Entity)</strong>: через конструкцию <code>&lt;!ENTITY xxe SYSTEM "file:///etc/passwd"&gt;</code> атакующий может читать локальные файлы или осуществлять SSRF-запросы.</p>
+<p>В Go стандартный пакет <code>encoding/xml</code> защищен от XXE из коробки: начиная с Go 1.15, встроенный парсер категорически игнорирует директивы <code>&lt;!DOCTYPE&gt;</code> и внешние DTD-сущности. Однако будьте бдительны: при использовании сторонних библиотек (например, CGo-биндингов к <code>libxml2</code>) или при включении кастомных режимов <code>Strict</code> в некоторых сторонних парсерах поддержка DTD может активироваться. Всегда проверяйте конфигурации XML-декодеров на флаги <code>ExternalEntities</code> или <code>DTD</code>.</p>
+<hr />
+<h2 id="idiomatichnaya-zashchita-v-rantayme-go">Идиоматичная защита в рантайме Go</h2>
 
-<p>Архитектура безопасной десериализации в Go строится на трёх принципах: строгие контракты, лимиты ресурсов и отказ от динамики в критическом пути.</p>
-<p>1 - <strong>Структуры вместо <code>interface{}</code>:</strong> Жёсткие DTO компилятор проверяет на этапе сборки. Это исключает type confusion и mass assignment.<br />
-2 - <strong>Лимиты на входе:</strong> <code>io.LimitReader</code> + <code>http.MaxBytesReader</code> (для <code>http.Server</code>) отрезают DoS до начала парсинга.<br />
-3 - <strong>Глубина и сложность:</strong> Для JSON в Go 1.24+ добавлен <code>Decoder.MaxDepth</code>, но в более ранних версиях требуется кастомная обёртка или использование библиотек вроде <code>jsoniter</code> с лимитами.<br />
-4 - <strong>Валидация до десериализации:</strong> Сырой JSON можно проверить на структуру через <code>json.RawMessage</code> или использовать OpenAPI-генераторы (<code>oapi-codegen</code>, <code>deepmap/oapi-codegen</code>), которые генерируют строгие валидаторы.</p>
+<p>Надежная архитектура обработки внешних данных строится на четырех рубежах:</p>
+<ol>
+<li><strong>Строгие DTO вместо <code>interface{}</code>:</strong> Откажитесь от динамических мап <code>map[string]any</code> в публичных обработчиках. Использование жестких структур позволяет компилятору и линтерам проверять типы на этапе сборки, полностью исключая атаки класса Type Confusion и Mass Assignment.</li>
+<li><strong>Лимиты на входе:</strong> Всегда ограничивайте объем входящих данных. Обертка <code>io.LimitReader(r.Body, maxBytes)</code> или серверная директива <code>http.MaxBytesReader(w, r.Body, maxBytes)</code> (для <code>http.Server</code>) пресекает DoS-атаки до того, как парсер начнет аллоцировать память в куче.</li>
+<li><strong>Контроль глубины вложенности:</strong> В Go 1.24+ в декодеры добавлен механизм ограничения глубины <code>Decoder.MaxDepth</code>. В более ранних версиях для защиты от рекурсивных бомб используйте стриминговые SAX-подобные токены или сторонние проверенные библиотеки (например, <code>jsoniter</code> с настроенным лимитом глубины).</li>
+<li><strong>Схемная валидация до десериализации:</strong> Для сложных структур используйте отложенное чтение сырых срезов через <code>json.RawMessage</code> либо привлекайте валидаторы OpenAPI (<code>oapi-codegen</code>, <code>deepmap/oapi-codegen</code>), которые автоматически генерируют код строгой проверки контрактов запросов.</li>
+</ol>
+<hr />
 <h2 id="mekhanicheskoe-sochuvstvie-davlenie-na-gc-i-allokatsii">Механическое сочувствие: давление на GC и аллокации</h2>
 
-<p>Десериализация — один из главных источников короткоживущего мусора в бэкенде. Каждый вызов <code>json.Unmarshal</code> создаёт:<br />
-- <code>[]byte</code> буферы для строк<br />
-- <code>reflect</code> структуры для полей<br />
-- Временные объекты для маппинга типов</p>
-<p>При 50к RPS это сотни мегабайт мусора в секунду. Частые <code>Minor GC</code> фазы приостанавливают все горутины, вытесняя кэш-линии L1/L2 из-за сканирования кучи. <strong>Оптимизации:</strong><br />
-- Используйте <code>sync.Pool</code> для структур-запросов, если они аллоцируются часто.<br />
-- Предпочитайте <code>json.Decoder</code> поверх <code>json.Unmarshal</code>, так как он стримит данные и может избежать создания промежуточного <code>[]byte</code> всего тела.<br />
-- В критичных к latency путях рассмотрите <code>go-json</code> (от <code>goccy</code>) или <code>sonic</code> (от <code>Bytedance</code>), которые используют JIT-компиляцию или ассемблерные оптимизации для снижения отражения и аллокаций, но учитывайте, что это сторонние зависимости с собственным threat modeling.</p>
+<p>Десериализация — один из главных генераторов короткоживущего мусора в бэкенд-системах. Каждый вызов функции <code>json.Unmarshal</code>:<br />
+- Создает временные байтовые срезы <code>[]byte</code> для строковых литералов.<br />
+- Инициализирует служебные структуры пакета <code>reflect</code> для каждого поля.<br />
+- Создает промежуточные объекты для маппинга интерфейсов.</p>
+<p>При входящем потоке в 50 000 RPS это транслируется в сотни мегабайт мусора в секунду! Частые фазы <code>Minor GC</code> вызывают остановки горутин (STW / GC preemption), сбрасывают процессорный кэш L1/L2 из-за непрерывного сканирования заголовков кучи и приводят к резкому росту задержки P99.</p>
+<h3 id="inzhenernye-optimizatsii">Инженерные оптимизации:</h3>
+<ul>
+<li><strong>Пул структур (<code>sync.Pool</code>):</strong> Если структуры запросов содержат емкие срезы, используйте <code>sync.Pool</code> для переиспользования уже выделенной памяти.</li>
+<li><strong>Стриминг через <code>json.Decoder</code>:</strong> Предпочитайте потоковый <code>json.NewDecoder(r.Body)</code> вместо <code>json.Unmarshal(data)</code>, так как декодер читает данные порциями из <code>io.Reader</code> и не аллоцирует монолитный гигантский буфер под все тело запроса.</li>
+<li><strong>Высокопроизводительные библиотеки:</strong> В сервисах с жесткими требованиями к микросекундным задержкам применяйте оптимизированные кодеки: <code>go-json</code> (от автора <code>goccy</code>) или <code>sonic</code> (от <code>Bytedance</code>). Они задействуют JIT-компиляцию и SIMD-инструкции ассемблера для прямого разбора байт в обход тяжелой рефлексии, снижая аллокации памяти в разы. Однако помните, что сторонний код требует отдельного аудита безопасности (Threat Modeling).</li>
+</ul>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему <code>json.Unmarshal</code> медленнее <code>json.Decoder</code> при работе с большими потоками, и как это связано с управлением памятью в Go?<br />
-<strong>Ответ:</strong><br />
-1 - <code>json.Unmarshal</code> сначала читает всё тело в <code>[]byte</code> (полная аллокация), затем парсит его дважды: первый раз для валидации структуры, второй для заполнения полей.<br />
-2 - <code>json.Decoder</code> работает с <code>io.Reader</code> и парсит по мере поступления байт. Это позволяет избежать загрузки гигантских буферов в кучу и снижает давление на GC.<br />
-3 - <code>Decoder</code> также кеширует состояние парсера между вызовами <code>Decode</code>, тогда как <code>Unmarshal</code> каждый раз создаёт новый парсер с нуля.<br />
-4 - <strong>Архитектурный вывод:</strong> Для HTTP-хендлеров всегда используйте <code>json.NewDecoder(r.Body)</code>. Для локальных структур фиксированного размера <code>Unmarshal</code> допустим, но требует контроля <code>MaxPayloadSize</code>.</p>
+    <p><strong>Вопрос:</strong> «Почему функция <code>json.Unmarshal</code> работает значительно медленнее и потребляет больше памяти, чем потоковый <code>json.Decoder</code> при обработке сетевых HTTP-запросов?»  </p>
+<p><strong>Ответ кандидата Senior-уровня:</strong><br />
+«1. <strong>Двойная аллокация и проход по памяти:</strong> Функция <code>json.Unmarshal</code> требует готового среза байтов <code>[]byte</code>. Это вынуждает разработчика сначала прочитать весь поток сокета в память через <code>io.ReadAll</code> (монолитная аллокация в куче), а затем <code>Unmarshal</code> производит повторный проход по этому буферу для парсинга и валидации.<br />
+2. <strong>Потоковая обработка <code>json.Decoder</code>:</strong> Метод <code>json.NewDecoder(r.Body)</code> работает напрямую с интерфейсом <code>io.Reader</code>. Он читает данные фиксированными чанками во внутренний буфер (обычно 512 байт или 4 КБ), заполняя поля структуры на лету. Это снижает пиковое потребление памяти и минимизирует нагрузку на сборщик мусора (<code>GC</code>).<br />
+3. <strong>Переиспользование внутреннего состояния:</strong> Объект <code>json.Decoder</code> кэширует внутренние парсерные таблицы между последовательными вызовами <code>Decode</code>, тогда как <code>json.Unmarshal</code> при каждом запуске пересоздает структуры декодирования с нуля.<br />
+4. <strong>Архитектурный стандарт:</strong> В HTTP-хендлерах всегда следует предпочитать <code>json.NewDecoder(r.Body)</code> в связке с <code>io.LimitReader</code> (или проверкой <code>MaxPayloadSize</code>) и <code>DisallowUnknownFields</code>».</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>1 - Десериализация в Go защищена от классического RCE благодаря статической типизации, но остаётся критическим вектором для DoS и логических инъекций.<br />
-2 - <code>GobDecoder</code> интерфейс позволяет выполнять произвольный код при распаковке. <code>encoding/gob</code> не должен использоваться для ненадёжных внешних данных.<br />
-3 - JSON-бомбы и массовое назначение нейтрализуются через <code>io.LimitReader</code>, <code>DisallowUnknownFields</code> и строгие DTO вместо <code>map[string]any</code>.<br />
-4 - Парсинг через <code>reflect</code> генерирует значительное давление на GC. Стриминг через <code>json.Decoder</code> и переиспользование буферов снижают latency в высоконагруженных системах.<br />
-5 - Безопасная десериализация — это комбинация архитектурных ограничений (строгие схемы, лимиты ресурсов) и контроля сторонних зависимостей.</p>
-<p><a href="7-race-condition-kak-uyazvimost.html" class="wikilink">7. Race condition как уязвимость</a></p>
+<ol>
+<li><strong>Безопасность по сравнению с динамическими языками:</strong> В Go статическая типизация и отсутствие динамического инстанцирования классов исключают классический вектор Java/PHP-style RCE при парсинге JSON.</li>
+<li><strong>Опасность формата <code>gob</code>:</strong> Пакет <code>encoding/gob</code> поддерживает интерфейс <code>GobDecoder</code>, методы которого исполняются автоматически при распаковке. <code>gob</code> категорически запрещено применять для данных из недоверенных источников.</li>
+<li><strong>Защита от DoS и Mass Assignment в JSON:</strong> Всегда ограничивайте объем входящих потоков через <code>io.LimitReader</code>, запрещайте лишние поля через <code>decoder.DisallowUnknownFields()</code> и используйте строго типизированные DTO вместо <code>map[string]any</code>.</li>
+<li><strong>Механическое сочувствие к памяти:</strong> Разбор JSON через <code>reflect</code> создает колоссальное давление на сборщик мусора. Используйте потоковый <code>json.Decoder</code>, задействуйте <code>sync.Pool</code> и оценивайте целесообразность SIMD-оптимизированных кодеков (<code>sonic</code>, <code>go-json</code>) в критических по задержкам узлах.</li>
+</ol>
+<p>Как конкурентная природа Go и несинхронизированный доступ к разделяемым ресурсам могут стать источником критических уязвимостей в бизнес-логике?<br />
+В следующей лекции мы разберем: <a href="7-race-condition-kak-uyazvimost.html" class="wikilink">7. Race condition как уязвимость</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2386,7 +2452,7 @@ func (u *UnsafeCacheItem) GobDecode(data []byte) error {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vvedenie-kogda-parser-dannykh-stanovitsya-ispolnitelem">Введение: Когда парсер данных становится исполнителем</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-otrazhenie-kucha-i-skrytye-vyzovy">Под капотом: отражение, куча и скрытые вызовы</a></li><li class="toc-item toc-h2"><a href="#1-json-bomby-glubina-i-interface">1. JSON: Бомбы, глубина и interface{}</a></li><li class="toc-item toc-h2"><a href="#2-gob-gobdecoder-i-vektor-rce-v-go">2. Gob: GobDecoder и вектор RCE в Go</a></li><li class="toc-item toc-h2"><a href="#3-xml-xxe-i-parsing-dtd">3. XML: XXE и парсинг DTD</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-zashchita-v-rantayme">Идиоматичная защита в рантайме</a></li><li class="toc-item toc-h2"><a href="#mekhanicheskoe-sochuvstvie-davlenie-na-gc-i-allokatsii">Механическое сочувствие: давление на GC и аллокации</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#vvedenie-kogda-parser-dannykh-stanovitsya-ispolnitelem">Введение: Когда парсер данных становится исполнителем</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-otrazhenie-kucha-i-skrytye-vyzovy">Под капотом: отражение, куча и скрытые вызовы</a></li><li class="toc-item toc-h2"><a href="#1-json-bomby-glubina-i-interface">1. JSON: Бомбы, глубина и interface{}</a></li><li class="toc-item toc-h3"><a href="#json-bomby-analog-zip-bomb">JSON-бомбы (Аналог Zip Bomb)</a></li><li class="toc-item toc-h3"><a href="#massovoe-naznachenie-mass-assignment">Массовое назначение (Mass Assignment)</a></li><li class="toc-item toc-h2"><a href="#2-gob-gobdecoder-i-vektor-rce-v-go">2. Gob: GobDecoder и вектор RCE в Go</a></li><li class="toc-item toc-h2"><a href="#3-xml-xxe-i-parsing-dtd">3. XML: XXE и парсинг DTD</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-zashchita-v-rantayme-go">Идиоматичная защита в рантайме Go</a></li><li class="toc-item toc-h2"><a href="#mekhanicheskoe-sochuvstvie-davlenie-na-gc-i-allokatsii">Механическое сочувствие: давление на GC и аллокации</a></li><li class="toc-item toc-h3"><a href="#inzhenernye-optimizatsii">Инженерные оптимизации:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

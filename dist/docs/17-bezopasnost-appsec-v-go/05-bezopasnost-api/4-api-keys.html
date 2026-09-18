@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. API keys</h1>
@@ -2178,8 +2178,13 @@
           <div class="article-markdown">
             <h2 id="vvedenie-dolgozhivushchie-sekrety-i-tsena-komprometatsii">Введение: Долгоживущие секреты и цена компрометации</h2>
 
-<p>API-ключи — это криптографические идентификаторы, предназначенные преимущественно для аутентификации машинных клиентов (M2M), интеграций и сервисных аккаунтов. В отличие от пользовательских сессий или JWT, они не имеют короткого времени жизни, не подразумевают частой ротации и часто обладают широким набором прав на длительном отрезке времени. </p>
-<p>Для бэкенд-архитектуры это означает, что утечка API-ключа равносильна компрометации приватного ключа сервера. Задача разработчика — спроектировать систему хранения, валидации и отзыва таким образом, чтобы даже при чтении базы данных атакующий не мог восстановить оригинальный ключ, а процесс проверки не становился bottleneck'ом на высоких нагрузках.</p>
+<p>В современной микросервисной архитектуре значительная доля сетевого взаимодействия происходит не между человеком и браузером, а между независимыми программными системами: Machine-to-Machine (M2M), webhook-интеграции, фоновые демоны и партнерские SDK.</p>
+<p>Основным инструментом аутентификации в таких сценариях выступают <strong>API-ключи (API Keys)</strong>.</p>
+<p>В отличие от пользовательских сессий или JWT-токенов, API-ключи обладают фундаментальной спецификой: они <strong>долгоживущие</strong> (действуют месяцами или годами), не требуют регулярного ввода пароля и часто наделены широкими системными полномочиями. С точки зрения модели угроз компрометация API-ключа практически тождественна компрометации мастер-пароля или приватного ключа сервиса.</p>
+<p>Перед бэкенд-инженером на Go встает сложная инженерная дилемма:<br />
+- С одной стороны, хранить ключи в открытом виде (plaintext) в базе данных категорически недопустимо — любая SQL-инъекция или утечка дампа скомпрометирует всех партнеров.<br />
+- С другой стороны, применять тяжелые функции формирования ключа (KDF вроде bcrypt или argon2id), как для паролей пользователей, здесь невозможно: API-шлюз обрабатывает десятки тысяч запросов в секунду. Задержка в 100–300 мс на проверку каждого входящего пакета полностью парализует пропускную способность кластера.</p>
+<p>Инженерное решение этой проблемы — <strong>архитектура секционированных ключей с префиксом и аппаратным хешированием</strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2194,31 +2199,58 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;1 - Клиент отправляет запрос&lt;br&gt;X-API-Key заголовок&quot;] --&gt; B[&quot;2 - ExtractPrefix&lt;br&gt;извлечение sk_live_&quot;]
-B --&gt; C[&quot;3 - Поиск хеша в БД&lt;br&gt;по префиксу&quot;]
-C --&gt; D[&quot;4 - Вычисление HMAC&lt;br&gt;входящего ключа&quot;]
-D --&gt; E[&quot;5 - ConstantTimeCompare&lt;br&gt;с хранимым хешем&quot;]
-E --&gt; F[&quot;6 - Загрузка политик&lt;br&gt;и scope&quot;]
-F --&gt; G[&quot;7 - Продолжение цепочки&lt;br&gt;обработки запроса&quot;]
+subgraph Client[&quot;Клиентская система (M2M / SDK)&quot;]
+A[&quot;1 - Клиент отправляет запрос&lt;br/&gt;X-API-Key заголовок&quot;]
+end
 
-style B fill:#4ecdc4,stroke:#333
-style C fill:#ffd93d,stroke:#333
-style E fill:#ff6b6b,stroke:#333
+subgraph Gateway[&quot;Go API Gateway (Middleware)&quot;]
+B[&quot;2 - ExtractPrefix&lt;br/&gt;извлечение sk_live_&quot;]
+C[&quot;3 - Поиск хеша в БД&lt;br/&gt;по префиксу (B-Tree Index)&quot;]
+D[&quot;4 - Вычисление HMAC&lt;br/&gt;входящего ключа (SHAEXT)&quot;]
+E[&quot;5 - ConstantTimeCompare&lt;br/&gt;с хранимым хешем&quot;]
+F[&quot;6 - Загрузка политик&lt;br/&gt;и scope в context.Context&quot;]
+end
+
+subgraph Service[&quot;Бизнес-логика&quot;]
+G[&quot;7 - Продолжение цепочки&lt;br/&gt;обработки запроса&quot;]
+end
+
+A --&gt; B
+B --&gt; C
+C --&gt; D
+D --&gt; E
+E --&gt; F
+F --&gt; G
+
+style Client fill:#0f172a,stroke:#38bdf8,stroke-width:1px,color:#f8fafc
+style Gateway fill:#1e293b,stroke:#10b981,stroke-width:1px,color:#f8fafc
+style Service fill:#0f172a,stroke:#6366f1,stroke-width:1px,color:#f8fafc
+style B fill:#1e293b,stroke:#4ecdc4,stroke-width:2px,color:#f8fafc
+style C fill:#1e293b,stroke:#ffd93d,stroke-width:2px,color:#f8fafc
+style E fill:#1e293b,stroke:#ff6b6b,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
+<hr />
 <h2 id="arkhitektura-khraneniya-prefiksy-kheshi-i-otkaz-ot-plaintext">Архитектура хранения: префиксы, хеши и отказ от plaintext</h2>
 
-<p>Хранить API-ключи в открытом виде — архитектурный дефект. Однако применение медленных KDF (bcrypt, argon2), рекомендованных для паролей, здесь неприемлемо. API-шлюзы обрабатывают десятки тысяч проверок в секунду. Задержка в 100-300 мс на каждый запрос уничтожит пропускную способность.</p>
-<p>Индустриальный стандарт — <strong>комбинация префикса и быстрого криптографического хеша</strong> (обычно SHA-256 или HMAC-SHA256 с глобальным <code>pepper</code>).</p>
-<p>1 - <strong>Префикс</strong>: Человекочитаемая часть (<code>pk_live_</code>, <code>sk_test_</code>). Позволяет быстро отфильтровать окружение и использовать его как индекс в БД для точечного поиска, минуя сканирование всей таблицы.<br />
-2 - <strong>Суффикс (Secret)</strong>: Случайная криптографическая часть, генерируемая <code>crypto/rand</code>. Именно она проверяется.<br />
-3 - <strong>Хранение в БД</strong>: <code>prefix</code> + <code>hash(suffix + global_pepper)</code>. Сам ключ нигде не сохраняется целиком после выдачи клиенту.</p>
-<p>При валидации система извлекает префикс из заголовка, находит строку с хешом по индексу, вычисляет HMAC входящего суффикса с тем же <code>pepper</code> и сравнивает результаты за константное время.</p>
+<p>Индустриальным стандартом (популяризированным Stripe и GitHub) является разделение API-ключа на две функциональные части:</p>
+<ol>
+<li><strong>Человекочитаемый префикс (Prefix):</strong><br />
+   Публичная часть ключа (например, <code>pk_live_</code>, <code>sk_test_</code>). Она решает три критические задачи:<br />
+   - Позволяет инженеру и автоматическим сканерам секретов (GitHub Secret Scanning) мгновенно определить тип токена и среду окружения (<code>prod</code> или <code>test</code>).<br />
+   - Служит уникальным первичным ключом для поиска записи в базе данных за $O(\log N)$ через B-Tree индекс, полностью исключая необходимость последовательного сканирования таблицы (Full Table Scan).</li>
+<li><strong>Криптографический суффикс (Secret Suffix):</strong><br />
+   Случайная последовательность байт высокой энтропии (обычно 256 бит), сгенерированная криптографически стойким генератором <code>crypto/rand</code>. Именно этот суффикс является секретом.</li>
+<li><strong>Хранение в БД:</strong><br />
+   В базе данных сохраняется пара: <code>prefix</code> + <code>hash(suffix + global_pepper)</code>. Оригинальный сырой ключ показывается пользователю <strong>ровно один раз при создании</strong> и никогда больше не сохраняется ни на диске, ни в логах.</li>
+</ol>
+<p>В качестве алгоритма хеширования применяется быстрый криптографический дайджест: <strong>HMAC-SHA256</strong> с добавлением серверного глобального секрета (<code>pepper</code>). Это защищает базу от атак по предвычисленным радужным таблицам в случае утечки дампа, но выполняется центральным процессором за микросекунды.</p>
+<hr />
 <h2 id="idiomatichnaya-validatsiya-v-go">Идиоматичная валидация в Go</h2>
 
-<p>В Go проверка должна быть вынесена в отдельный middleware, интегрированный с <code>context.Context</code> для передачи метаданных авторизации глубже в стек.</p>
+<p>В Go проверка API-ключа инкапсулируется в выделенный HTTP Middleware. При успешной проверке метаданные учетной записи (Scopes, KeyID, Env) упаковываются в <code>context.Context</code> для дальнейшего использования обработчиками:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2240,21 +2272,26 @@ import (
     &quot;strings&quot;
 )
 
-// KeyValidator содержит зависимости для проверки ключей
+// KeyStore определяет интерфейс к базе данных или кэшу ключей
+type KeyStore interface {
+    GetHashByPrefix(ctx context.Context, prefix string) ([]byte, *APIKeyClaims, error)
+}
+
+// KeyValidator содержит зависимости для безопасной проверки ключей
 type KeyValidator struct {
-    pepper  []byte
-    store   KeyStore // интерфейс к БД или кэшу
+    pepper []byte
+    store  KeyStore // интерфейс к БД или кэшу
 }
 
 type ctxKey struct{}
 
 type APIKeyClaims struct {
-    KeyID  string
-    Scope  []string
-    Env    string // &quot;prod&quot;, &quot;test&quot;
+    KeyID string
+    Scope []string
+    Env   string // &quot;prod&quot;, &quot;test&quot;
 }
 
-// ValidateMiddleware извлекает и проверяет API-ключ
+// ValidateMiddleware извлекает и проверяет API-ключ за константное время
 func (v *KeyValidator) ValidateMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         rawKey := r.Header.Get(&quot;X-API-Key&quot;)
@@ -2263,14 +2300,14 @@ func (v *KeyValidator) ValidateMiddleware(next http.Handler) http.Handler {
             return
         }
 
-        // Извлечение префикса (например, &quot;sk_live_&quot;)
+        // Извлечение префикса (например, &quot;sk_live_&quot;) через strings.Cut без лишних аллокаций
         prefix, suffix, ok := strings.Cut(rawKey, &quot;_&quot;)
         if !ok || prefix == &quot;&quot; || suffix == &quot;&quot; {
             http.Error(w, &quot;invalid key format&quot;, http.StatusBadRequest)
             return
         }
 
-        // 1 - Быстрый поиск хеша по префиксу в БД/кэше
+        // 1 - Быстрый точечный поиск хеша по префиксу в БД/кэше через индекс
         storedHash, claims, err := v.store.GetHashByPrefix(r.Context(), prefix)
         if err != nil {
             // Логируем ошибку, но не раскрываем детали клиенту
@@ -2278,7 +2315,7 @@ func (v *KeyValidator) ValidateMiddleware(next http.Handler) http.Handler {
             return
         }
 
-        // 2 - Вычисление HMAC входящего ключа
+        // 2 - Вычисление HMAC входящего ключа с глобальным pepper
         mac := hmac.New(sha256.New, v.pepper)
         mac.Write([]byte(suffix))
         computedHash := mac.Sum(nil)
@@ -2298,49 +2335,66 @@ func (v *KeyValidator) ValidateMiddleware(next http.Handler) http.Handler {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="pod-kapotom-proizvoditelnost-kesh-i-davlenie-na-bd">Под капотом: производительность, кэш и давление на БД</h2>
 
-<p>Валидация API-ключей на высоких RPS создает специфичный профиль нагрузки на рантайм и инфраструктуру:</p>
-<p>1 - <strong>Хеш-таблицы и B-Tree индексы</strong>: Поиск по <code>prefix</code> в PostgreSQL использует B-Tree индекс. Глубина дерева обычно 3-4 уровня. Каждый уровень — это произвольный доступ к памяти (random I/O) при отсутствии кэша shared_buffers. В Go <code>pgx</code> или <code>database/sql</code> сериализует запрос в wire-протокол, вызывает <code>syscall write</code>, ждет ответа через <code>netpoll</code>. Это блокирует горутину в <code>syscall</code> или <code>chan receive</code>.<br />
-2 - <strong>Кэш-локальность</strong>: Если использовать локальный <code>sync.Map</code> или <code>ristretto</code> для кеширования валидных префиксов, поиск происходит в L1/L2 кэше CPU. <code>hmac</code> вычисления на SHA-256 используют аппаратные инструкции <code>SHAEXT</code> (на x86), что занимает ~150-200 наносекунд на ядро. Это в 1000 раз быстрее сетевого запроса к БД.<br />
-3 - <strong>Давление на GC</strong>: Парсинг HTTP-заголовков (<code>r.Header.Get</code>) и создание промежуточных слайсов (<code>strings.Cut</code>, <code>[]byte(suffix)</code>) генерирует короткоживущие аллокации. При 20k RPS это ~100-200 МБ мусора в секунду. Оптимизация: переиспользование буферов через <code>sync.Pool</code> для преобразования строк в байты, если хешер принимает <code>[]byte</code>.<br />
-4 - <strong>Константное время и CPU</strong>: <code>crypto/subtle.ConstantTimeCompare</code> выполняет XOR всех байт независимо от данных. Это исключает branch misprediction и timing-атаки, но означает, что CPU всегда проходит полный цикл сравнения. Для 32-байтовых хешей разница в производительности с обычным <code>bytes.Equal</code> пренебрежимо мала (~1-2 нс), но безопасность критична.</p>
+<p>Проверка ключа находится в критическом пути абсолютно каждого сетевого запроса. Какое влияние это оказывает на физические компоненты сервера?</p>
+<ol>
+<li><strong>Хеш-таблицы и B-Tree индексы:</strong><br />
+   Поиск по <code>prefix</code> в PostgreSQL опирается на индекс B-Tree. Глубина дерева индекса обычно составляет 3–4 уровня. Каждый уровень — это произвольный доступ к страницам памяти (Random I/O), если индекс не помещается целиком в <code>shared_buffers</code>. В Go драйвер (<code>pgx</code> или <code>database/sql</code>) сериализует SQL-запрос, выполняет <code>syscall write</code>, передает управление в <code>netpoll</code> и блокирует горутину в системном вызове <code>syscall</code> или в ожидании канала <code>chan receive</code>.</li>
+<li><strong>Аппаратное ускорение SHA-256 (SHAEXT):</strong><br />
+   На современных процессорах x86-64 и ARM64 вычисление SHA-256 выполняется аппаратными инструкциями (набор расширений <code>SHAEXT</code> / ARMv8 Crypto). Вычисление 32-байтового HMAC занимает <strong>всего 150–200 наносекунд</strong> процессорного времени! Если валидированные префиксы закэшированы в локальной памяти Go (<code>sync.Map</code> или кэш <code>ristretto</code>), поиск и проверка происходят целиком в L1/L2 кэше CPU — это в 1000 раз быстрее, чем сетевой запрос к базе данных.</li>
+<li><strong>Давление на сборщик мусора (<code>GC</code>):</strong><br />
+   Парсинг заголовков через <code>r.Header.Get</code> и создание срезов байтов (<code>[]byte(suffix)</code>) аллоцируют память в куче. При 20 000 RPS это дает 100–200 МБ мусора в секунду. Применение пула буферов <code>sync.Pool</code> снижает аллокации до минимума.</li>
+<li><strong>Защита от утечек времени (Timing Attacks):</strong><br />
+   Функция <code>crypto/subtle.ConstantTimeCompare</code> побитово выполняет операцию <code>XOR</code> над всеми элементами срезов независимо от того, совпадают байты или нет. Это исключает спекулятивное предсказание переходов (Branch Misprediction) и предотвращает атаки по сторонним каналам измерения времени (Side-Channel Timing Attacks). Разница по времени между обычным <code>bytes.Equal</code> и константным сравнением составляет считанные 1–2 нс, но гарантирует безопасность.</li>
+</ol>
+<hr />
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Почему strings.Cut безопаснее strings.Split?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Почему <code>strings.Cut</code> безопаснее <code>strings.Split</code>?</strong><br />
-<code>Split</code> аллоцирует слайс <code>[]string</code>, даже если разделитель не найден. <code>Cut</code> возвращает две подстроки и булево значение без дополнительных аллокаций в куче (работает со сдвигом указателей внутри исходной строки). В высоконагруженном middleware это снижает давление на <code>GC</code> на ~30-40%.</p>
+    <p><strong>Экономия аллокаций через <code>strings.Cut</code>:</strong><br />
+Функция <code>strings.Split</code> всегда выделяет в куче срез строк <code>[]string</code>, даже если разделитель не найден вовсе. Функция <code>strings.Cut</code> (появившаяся в Go 1.18) возвращает две подстроки и логический флаг без дополнительных аллокаций памяти — она просто манипулирует указателем на массив байт и длиной внутри уже существующей строки. В высоконагруженном middleware это снижает суммарное давление на <code>GC</code> на 30–40%.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="lovushki-i-vektory-atak-gotchas">Ловушки и векторы атак (Gotchas)</h2>
 
-<p>1 - <strong>Логирование ключей в URL или заголовках</strong>: Фреймворки и reverse-proxy часто логируют <code>r.URL</code> или <code>r.Header</code> при отладке. Если клиент передает ключ в query-параметре (<code>/api/data?key=sk_live_...</code>), он попадает в логи сервера, прокси и систем мониторинга. <br />
-<strong>Решение:</strong> Разрешить передачу только через заголовок <code>X-API-Key</code> или <code>Authorization: Bearer</code>. В middleware явно маскировать ключ перед логированием: <code>sk_live_****abcd</code>.</p>
-<p>2 - <strong>Отсутствие scope и rate-limiting на уровне ключа</strong>: Один ключ для всего приложения — это монолитная точка отказа. Если ключ утечет, атакующий получит доступ ко всем ресурсам.<br />
-<strong>Решение:</strong> При создании ключа явно задавать <code>scopes</code> (<code>read:users</code>, <code>write:orders</code>). Middleware должен проверять scope перед выполнением операции. Rate-limiting должен применяться на <code>KeyID</code>, а не только на IP.</p>
-<p>3 - <strong>Тайминг-атаки на поиск по префиксу</strong>: Если БД возвращает <code>404</code> мгновенно для несуществующего префикса, но тратит 20 мс на HMAC-сравнение для существующего, атакующий может перебрать валидные префиксы.<br />
-<strong>Решение:</strong> Добавлять искусственную задержку или выполнять HMAC-вычисление даже для несуществующих ключей (dummy hash), чтобы время ответа было константным независимо от наличия префикса.</p>
+<ol>
+<li><strong>Утечка ключей через логи и URL:</strong><br />
+   Передача API-ключа в параметрах адресной строки (<code>/api/data?key=sk_live_...</code>) категорически запрещена. Веб-серверы, обратные прокси (Nginx, Cloudflare), корпоративные фаерволы и системы APM по умолчанию логируют полный <code>r.URL</code>.<br />
+<strong>Решение:</strong> Принимайте ключи строго через заголовки <code>X-API-Key</code> или <code>Authorization: Bearer</code>. В логах приложения всегда применяйте маскирование: <code>sk_live_****abcd</code>.</li>
+<li><strong>Монолитные ключи без Scopes:</strong><br />
+   Выдача одного ключа со всеми правами — грубейшая ошибка. Если ключ партнера утек, злоумышленник получает полный контроль над системой.<br />
+<strong>Решение:</strong> Каждый ключ обязан иметь гранулярный набор полномочий (<code>scopes</code>: <code>read:users</code>, <code>write:orders</code>). Кроме того, лимиты запросов (Rate Limiting) должны привязываться к <code>KeyID</code>, а не только к IP-адресу клиента.</li>
+<li><strong>Тайминг-атаки на префиксный поиск:</strong><br />
+   Если база данных мгновенно отвечает <code>404 Not Found</code> на несуществующий префикс (за 0.5 мс), но тратит 20 мс на проверку существующего ключа, злоумышленник может методом перебора определить валидные префиксы в системе.<br />
+<strong>Решение:</strong> Выполняйте вычисление фиктивного HMAC (dummy hash) даже для несуществующих префиксов, чтобы время ответа оставалось строго константным.</li>
+</ol>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как реализовать ротацию API-ключей без downtime для клиентов, использующих старые ключи?<br />
-<strong>Ответ:</strong><br />
-1 - Использовать схему «двойного ключа»: при ротации генерируется новый ключ, старый помечается как <code>deprecated</code> с TTL (например, 7 дней).<br />
-2 - Middleware проверяет оба ключа. Если запрос пришел со старым, он пропускается, но в лог пишется предупреждение, а клиенту в заголовок ответа <code>X-Warning: key-deprecated</code> добавляется уведомление.<br />
-3 - По истечении TTL старый ключ инвалидируется на уровне БД/кэша. Клиенты, не обновившие ключ, получают 401.<br />
-4 - На уровне инфраструктуры использовать Canary-деплой валидации или feature-flag для плавного перехода.</p>
+    <p><strong>Вопрос:</strong> «Как организовать процесс плановой ротации API-ключей для корпоративных клиентов без остановки сервиса (Zero Downtime)?»  </p>
+<p><strong>Ответ кандидата Senior-уровня:</strong><br />
+«1. <strong>Схема двойного активного ключа (Dual-Key Pattern):</strong> В интерфейсе управления при ротации создается новый API-ключ, а старый помечается статусом <code>deprecated</code> с установкой срока жизни (TTL, например, 7–14 дней).<br />
+2. <strong>Параллельная валидация:</strong> Middleware шлюза валидирует входящие запросы по обоим ключам. Если клиент использует старый ключ, запрос успешно пропускается, но сервер добавляет в ответ заголовок <code>X-Warning: key-deprecated</code> и шлет метрику в мониторинг.<br />
+3. <strong>Инвалидация:</strong> По истечении TTL старый ключ окончательно деактивируется в базе данных. Не обновившиеся клиенты получают 401 Unauthorized.<br />
+4. <strong>Инфраструктурная безопасность:</strong> Ротация валидаторов осуществляется через Canary-деплой или плавное переключение через Feature Flags».</p>
   </div>
 </div>
 
+<hr />
 <h2 id="sravnenie-podkhodov-api-keys-vs-jwt-vs-mtls">Сравнение подходов: API Keys vs JWT vs mTLS</h2>
 
+<p>Взглянем на сопоставление ключевых протоколов аутентификации:</p>
 <div class="table-container"><table>
 <thead>
 <tr>
@@ -2355,43 +2409,47 @@ func (v *KeyValidator) ValidateMiddleware(next http.Handler) http.Handler {
 <td><strong>Жизненный цикл</strong></td>
 <td>Долгоживущие (месяцы/годы)</td>
 <td>Краткоживущие (минуты/часы)</td>
-<td>Сертификаты (годы, авто-ротация)</td>
+<td>Сертификаты X.509 (годы, авто-ротация)</td>
 </tr>
 <tr>
-<td><strong>State</strong></td>
+<td><strong>Состояние (State)</strong></td>
 <td>Stateful (lookup в БД/кэше)</td>
-<td>Stateless (проверка подписи)</td>
-<td>Stateful (CRL/OCSP, но реже)</td>
+<td>Stateless (проверка криптоподписи)</td>
+<td>Stateful (проверка списков отзыва CRL/OCSP)</td>
 </tr>
 <tr>
 <td><strong>Накладные расходы</strong></td>
 <td>Низкие при кэшировании, высокие при БД</td>
-<td>Средние (криптоверификация, аллокации)</td>
-<td>Высокие (TLS handshake, CPU)</td>
+<td>Средние (асимметричная криптография)</td>
+<td>Высокие (TLS-рукопожатие на установлении)</td>
 </tr>
 <tr>
 <td><strong>Безопасность</strong></td>
-<td>Зависит от хранения и передачи</td>
-<td>Зависит от секрета подписи, XSS-риски</td>
-<td>Максимальная (инфраструктурный уровень)</td>
+<td>Зависит от защищенности хранилища</td>
+<td>Риск кражи через XSS, размер токена</td>
+<td>Максимальная (криптографическая изоляция хостов)</td>
 </tr>
 <tr>
-<td><strong>Использование</strong></td>
-<td>Внешние интеграции, webhook, SDK</td>
-<td>Пользовательские сессии, SPA/Mobile</td>
-<td>Service Mesh, zero-trust, внутреннее M2M</td>
+<td><strong>Сфера применения</strong></td>
+<td>Внешние интеграции, M2M, SDK</td>
+<td>Пользовательские сессии, SPA, Mobile</td>
+<td>Service Mesh (K8s), Zero-Trust межсервисный обмен</td>
 </tr>
 </tbody>
 </table></div>
 <p>В современной Go-архитектуре API-ключи оптимальны для внешних потребителей, JWT — для аутентификации пользователей, а mTLS (через sidecar или <code>crypto/tls</code>) — для внутренней коммуникации микросервисов.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>1 - API-ключи требуют баланса между безопасностью хранения и скоростью валидации. Использование префикса + HMAC-SHA256 с глобальным <code>pepper</code> является индустриальным стандартом для high-load систем.<br />
-2 - В Go проверка должна использовать <code>crypto/subtle.ConstantTimeCompare</code>, минимизировать аллокации через <code>strings.Cut</code> и <code>sync.Pool</code>, и интегрироваться с <code>context.Context</code> для передачи метаданных.<br />
-3 - Кэширование результатов валидации в локальной памяти или Redis критично для снижения нагрузки на БД и сетевой стек. Отсутствие кэша превратит проверку в bottleneck.<br />
-4 - Логирование, передача через query-параметры и отсутствие scope-контроля — типичные архитектурные ошибки, ведущие к компрометации.<br />
-5 - Ротация ключей должна быть прозрачной: поддержка параллельной валидации старого и нового ключа с TTL на отключение обеспечивает плавный переход без разрыва клиентских интеграций.</p>
-<p><a href="5-zashchita-ot-replay-atak.html" class="wikilink">5. Защита от replay атак</a></p>
+<ol>
+<li><strong>Безопасное хранение:</strong> Хранить API-ключи в открытом виде недопустимо. Использование схемы «префикс + HMAC-SHA256 с pepper» является эталоном баланса между надежностью и микросекундной скоростью проверки.</li>
+<li><strong>Константное время:</strong> Валидация секретной части обязана производиться через <code>crypto/subtle.ConstantTimeCompare</code> для исключения атак по сторонним каналам.</li>
+<li><strong>Механическое сочувствие:</strong> Использование <code>strings.Cut</code> исключает лишние аллокации памяти, а локальное кэширование ключей в L1/L2 устраняет миллионы холостых системных вызовов к базе данных.</li>
+<li><strong>Гранулярный контроль:</strong> Ограничивайте права ключей через <code>scopes</code>, связывайте Rate Limiting с идентификатором <code>KeyID</code> и никогда не передавайте секреты в параметрах URL.</li>
+<li><strong>Бесшовная ротация:</strong> Поддержка переходного периода с двумя активными ключами (Dual-Key) позволяет клиентам обновлять интеграции без простоя сервиса.</li>
+</ol>
+<p>Как защитить API от атак повторного воспроизведения, когда перехваченный злоумышленником легитимный сетевой пакет отправляется серверу повторно?<br />
+В следующей лекции мы детально изучим: <a href="5-zashchita-ot-replay-atak.html" class="wikilink">5. Защита от replay атак</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 17</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Безопасность Docker</h1>
@@ -2178,7 +2178,8 @@
           <div class="article-markdown">
             <h2 id="konteynerizatsiya-kak-granitsa-doveriya">Контейнеризация как граница доверия</h2>
 
-<p>Docker-контейнеры исторически воспринимаются как «лёгкие виртуальные машины», но с точки зрения системной архитектуры и безопасности это фундаментально иная модель. Контейнер не эмулирует железо и не запускает отдельное ядро ОС. Это обычный процесс Linux, изолированный с помощью механизмов ядра: <code>namespaces</code>, <code>cgroups</code>, <code>capabilities</code> и <code>seccomp</code>. Для разработчика уровня Senior/Lead понимание этой механики критично, так как уязвимости контейнерного окружения возникают именно на стыке конфигурации изоляции, поведения рантайма Go и политик ядра.</p>
+<p>В среде разработчиков до сих пор бытует опасное заблуждение: контейнеры Docker часто называют «легковесными виртуальными машинами». Однако с точки зрения низкоуровневой архитектуры операционных систем и информационной безопасности это фундаментально ложная аналогия. Виртуальная машина запускает собственное независимое ядро операционной системы поверх аппаратного гипервизора (KVM, Xen, Hyper-V) со строгой изоляцией процессорных инструкций (VT-x, AMD-V). Контейнер же не эмулирует аппаратное обеспечение и не имеет своего ядра. Это самый обычный процесс пространства пользователя (User Space) Linux, который делит единое ядро хоста со всеми остальными процессами, но ограничен четырьмя платформенными барьерами: <code>namespaces</code>, <code>cgroups</code>, <code>capabilities</code> и <code>seccomp</code>.</p>
+<p>Для Senior/Lead инженера на Go понимание этой механики критично: контейнер — это не крепость, а тонкая перегородка из гипсокартона внутри общего здания ядра Linux. Любая брешь в конфигурации изоляции, непредусмотренное поведение планировщика Go или уязвимость в системных вызовах ядра превращает видимость изоляции в фикцию.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2206,22 +2207,23 @@ style E fill:#ff6b6b,stroke:#333
 </div>
 
 
+<hr />
 <h3 id="1-arkhitektura-izolyatsii-namespaces-cgroups-i-yadro">1. Архитектура изоляции: namespaces, cgroups и ядро</h3>
 
-<p>Изоляция в Docker строится на системных вызовах <code>clone()</code> и <code>unshare()</code>, которые создают новые пространства имён (namespaces). Каждый namespace изолирует определённый ресурс ядра:</p>
+<p>Механизм контейнеризации в Linux активируется при создании процесса через системные вызовы <code>clone()</code> (с флагами изоляции) или <code>unshare()</code>. Ядро выделяет процессу изолированные пространства имен (Namespaces):</p>
 <ul>
-<li><code>PID Namespace</code>: Видимость процессов. Внутри контейнера приложение видит PID 1, но в хостовой таблице процессов это обычный тред с высоким номером.</li>
-<li><code>NET Namespace</code>: Сетевой стек. Свои таблицы маршрутизации, правила <code>iptables</code>, сокеты и сетевые интерфейсы.</li>
-<li><code>MNT Namespace</code>: Файловая система. Контейнер видит только смонтированные слои UnionFS (overlay2/aufs). Прямой доступ к <code>/proc</code>, <code>/sys</code> хоста ограничен.</li>
-<li><code>UTS/IPC/User Namespaces</code>: Изоляция hostname, межпроцессного взаимодействия и UID/GID.</li>
+<li><code>PID Namespace</code>: Управляет видимостью дерева процессов. Внутри контейнера ваше Go-приложение искренне считает себя PID 1 (инициализатор контейнера), однако в таблице процессов хостового ядра это рядовой тред с обычным высоким номером вроде PID 14205.</li>
+<li><code>NET Namespace</code>: Полностью изолирует сетевой стек. Процесс получает персональные виртуальные сетевые интерфейсы (<code>veth</code>), собственные таблицы маршрутизации, локальные правила <code>iptables</code> и независимые сокеты.</li>
+<li><code>MNT Namespace</code>: Изолирует точки монтирования файловой системы. Контейнер видит лишь собранный слоеный пирог UnionFS (драйверы overlay2 или устаревший aufs). Прямой доступ к служебным каталогам хоста <code>/proc</code> и <code>/sys</code> жестко ограничен или подменен виртуальными заглушками.</li>
+<li><code>UTS/IPC/User Namespaces</code>: Обеспечивают изоляцию сетевого имени хоста (hostname), очередей межпроцессного взаимодействия (POSIX/SysV IPC) и отображение идентификаторов пользователей (UID/GID хоста в UID/GID контейнера).</li>
 </ul>
-<p>Важно понимать: namespaces не являются криптографическими границами. Они защищают от случайного доступа, но не от malicious-кода, эксплуатирующего уязвимости ядра или неправильные <code>capabilities</code>. Например, процесс с <code>CAP_SYS_ADMIN</code> может монтировать файловую систему хоста внутрь своего namespace, эффективно вырываясь из контейнера.</p>
+<p>Ключевой вывод безопасности: <strong>Namespaces не являются криптографической границей</strong>. Они скрывают ресурсы от случайного просмотра, но не спасают от вредоносного кода при наличии уязвимостей ядра или избыточных Linux Capabilities. Если контейнеру опрометчиво выдана привилегия <code>CAP_SYS_ADMIN</code>, скомпрометированный процесс может выполнить обратное монтирование дисковых разделов хоста прямо внутрь своего MNT namespace, мгновенно вырвавшись из контейнера на свободу (Container Escape).</p>
+<hr />
 <h3 id="2-go-rantaym-v-konteynere-planirovshchik-i-limity-resursov">2. Go-рантайм в контейнере: планировщик и лимиты ресурсов</h3>
 
-<p>Планировщик горутин Go (<code>G-M-P</code>) полагается на информацию о количестве доступных логических ядер для создания пула <code>P</code> (processors). До версии Go 1.25 рантайм читал <code>/proc/cpuinfo</code>, что возвращало количество ядер хоста, а не лимиты cgroups. Это приводило к созданию избыточного количества <code>P</code>, троттлингу CPU и росту latency из-за переключений контекста между тредами.</p>
-<p>Решение <code>go.uber.org/automaxprocs</code> (и нативная поддержка в Go 1.25+) читает <code>cgroups v2</code> файл <code>cpu.max</code>. Рантайм корректирует <code>GOMAXPROCS</code> под фактические лимиты, что синхронизирует пул <code>P</code> с разрешёнными CPU-квантами.</p>
-<p><strong>Влияние на сборщик мусора:</strong><br />
-Cgroups также ограничивают память (<code>memory.max</code>). Когда контейнер приближается к лимиту, ядро начинает aggressively thrash страницы. Go-рантайм получает сигналы <code>SIGBUS</code> или <code>ENOMEM</code> при аллокации. Если <code>GOMEMLIMIT</code> не настроен, <code>GC</code> пытается освободить память, но cgroups-тормоз вызывает OOM Killer, который завершает процесс без graceful shutdown. Правильная конфигурация требует явного указания <code>GOMEMLIMIT</code>, согласованного с лимитом контейнера, чтобы рантайм начал агрессивную сборку <em>до</em> вмешательства ядра.</p>
+<p>Планировщик рантайма Go (модель <code>G-M-P</code>) спроектирован для выжимания максимальной производительности из многоядерного кремния. Количество логических процессоров <code>P</code>, определяемое переменной <code>GOMAXPROCS</code>, напрямую задает количество одновременно работающих системных тредов ОС (<code>M</code>), исполняющих горутины.</p>
+<p>Исторически (вплоть до версий Go 1.24/1.25) рантайм при старте определял доступное число CPU тривиальным чтением псевдофайла <code>/proc/cpuinfo</code> или системным вызовом <code>sysconf(_SC_NPROCESSORS_ONLN)</code>. На 64-ядерном сервере bare-metal рантайм Go инициализировал <code>GOMAXPROCS = 64</code>. Но если оркестратор (Kubernetes) выделил контейнеру жесткий лимит cgroups в 2 ядра (<code>cpu.max = "200000 100000"</code>), планировщик Linux (CFS) применял жесткий троттлинг: исчерпав двухъядерную квоту за первые 20 миллисекунд периода, 64 треда Go впадали в принудительный сон до следующего периода CFS. Результат — катастрофический рост latency (хвостовые задержки p99) и непредсказуемая деградация производительности.</p>
+<p>Эту проблему решает библиотека <code>go.uber.org/automaxprocs</code> (а также нативная интеграция в современных версиях Go), которая парсит интерфейс <code>cgroups v2</code> (файл <code>cpu.max</code> или <code>/sys/fs/cgroup/cpu.cfs_quota_us</code>) и корректирует <code>GOMAXPROCS</code> в точном соответствии с выделенными долями CPU.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2263,15 +2265,20 @@ func main() {
 </code></pre>
 </div>
 
+<p><strong>Влияние на память и сборщик мусора (<code>GC</code>):</strong><br />
+Подсистема памяти cgroups ограничивает максимальный объем RAM через параметр <code>memory.max</code>. Когда контейнер приближается к лимиту, ядро начинает агрессивно вытеснять страницы, а рантайм Go может получать сигналы <code>SIGBUS</code> или ошибки <code>ENOMEM</code> при попытке аллокаций. Если суммарная память процесса превышает установленный порог, ядро Linux включает OOM Killer (Out Of Memory Killer), который мгновенно прибивает процесс сигналом <code>SIGKILL</code> (код 137). Никакие блоки <code>defer</code> и graceful shutdown не успевают сработать!<br />
+Если в приложении не настроен лимит рантайма <code>GOMEMLIMIT</code>, сборщик мусора Go ориентируется на <code>GOGC=100</code> и продолжает удваивать кучу, провоцируя вмешательство ядра. Корректная инженерная конфигурация (например, через <code>automemlimit</code> или явный вызов <code>debug.SetMemoryLimit</code>) устанавливает лимит памяти Go на 15–20% ниже жесткого лимита контейнера. Тогда рантайм Go агрессивно запускает цикл сборки мусора заранее, не доводя контейнер до расстрела со стороны OOM Killer ядра.</p>
+<hr />
 <h3 id="3-sistemnye-vyzovy-i-seccomp-filtry">3. Системные вызовы и seccomp-фильтры</h3>
 
-<p>Docker по умолчанию применяет <code>seccomp</code> (Secure Computing Mode), который фильтрует системные вызовы через BPF-программу ядра. Go-рантайм активно использует сотни syscall:<br />
-- <code>epoll_create1</code>, <code>epoll_ctl</code>, <code>epoll_wait</code> для <code>netpoll</code><br />
-- <code>mmap</code>, <code>madvise</code>, <code>munmap</code> для аллокатора и <code>GC</code><br />
-- <code>futex</code> для примитивов синхронизации (<code>sync.Mutex</code>, <code>sync.Cond</code>)<br />
-- <code>clone3</code>, <code>rt_sigprocmask</code> для управления горутинами<br />
-- <code>getrandom</code> для <code>crypto/rand</code></p>
-<p>Если применить строгий профиль <code>seccomp</code> (например, <code>syscall-whitelist</code>), разрешающий только <code>read/write/open</code>, Go-приложение мгновенно упадёт с <code>SIGSYS</code>. Стандартный Docker-профиль (<code>default.json</code>) уже содержит необходимые исключения для Go. Однако для high-security сценариев рекомендуется использовать профили, разрешающие только минимальный набор syscall, требуемый рантайму, и явно блокировать <code>mount</code>, <code>ptrace</code>, <code>unshare</code>, <code>personality</code>.</p>
+<p>По умолчанию Docker накладывает на изолированные процессы фильтр системных вызовов <code>seccomp</code> (Secure Computing Mode). Seccomp компилирует правила фильтрации в байткод ядра eBPF/cBFP, проверяя каждый системный вызов на входе в ядро.</p>
+<p>Рантайм Go — чрезвычайно сложная система, взаимодействующая с ядром через сотни системных вызовов:<br />
+- <code>epoll_create1</code>, <code>epoll_ctl</code>, <code>epoll_wait</code> — сердце сетевого поллера <code>netpoll</code>.<br />
+- <code>mmap</code>, <code>madvise</code>, <code>munmap</code> — управление виртуальными страницами аллокатора памяти и <code>GC</code>.<br />
+- <code>futex</code> — низкоуровневая реализация мьютексов (<code>sync.Mutex</code>, <code>sync.Cond</code>) в пространстве ядра.<br />
+- <code>clone3</code>, <code>rt_sigprocmask</code> — порождение системных потоков ОС под управлением планировщика горутин.<br />
+- <code>getrandom</code> — аппаратный сбор энтропии для генератора случайных чисел <code>crypto/rand</code>.</p>
+<p>Если применить к контейнеру с Go чрезмерно жесткий белый список вызовов (например, профиль <code>syscall-whitelist</code>), разрешающий только примитивные <code>read/write/open</code>, приложение мгновенно рухнет с сигналом <code>SIGSYS</code> при первой же попытке рантайма инициализировать сетевой поллер или выделить память. Стандартный профиль Docker (<code>default.json</code>) сбалансирован и разрешает вызовы, необходимые рантайму Go. Однако в изолированных банковских контурах формируют кастомные seccomp-профили, жестко запрещающие опасные вызовы ядра: <code>mount</code>, <code>ptrace</code>, <code>unshare</code>, <code>personality</code>, <code>kexec_load</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2279,13 +2286,15 @@ func main() {
   </div>
   <div class="callout-body">
     <p><strong>Почему <code>mlock</code> и <code>MADV_DONTDUMP</code> требуют дополнительных прав?</strong><br />
-Системные вызовы <code>mlock()</code> и <code>madvise()</code> с флагом <code>MADV_DONTDUMP</code> ограничены по умолчанию для непривилегированных процессов (<code>ulimit -l</code>). В контейнере они вернут <code>EPERM</code>. Для защиты криптографических ключей в памяти необходимо запускать контейнер с <code>--cap-add=IPC_LOCK</code> или настраивать <code>sysctl vm.max_map_count</code> и <code>limits.conf</code> на хосте. Без этого секреты могут быть вытеснены в swap или попасть в core dump при <code>panic</code>.</p>
+Системные вызовы <code>mlock()</code> (блокировка страниц в RAM для предотвращения сброса в swap) и <code>madvise()</code> с флагом <code>MADV_DONTDUMP</code> (исключение буфера из аварийных дампов ядра при <code>panic</code>) по умолчанию ограничены лимитом <code>ulimit -l</code> для непривилегированных процессов. Внутри контейнера попытка выполнить эти вызовы завершится ошибкой ядра <code>EPERM</code>.<br />
+Чтобы ваше Go-приложение могло защищать криптографические ключи в оперативной памяти, контейнеру необходимо явно выдать возможность ядра <code>--cap-add=IPC_LOCK</code> либо скорректировать лимиты хоста <code>limits.conf</code> и параметр ядра <code>sysctl vm.max_map_count</code>. В противном случае незашифрованные секреты могут оказаться в swap-разделе хоста или в незащищенном файле core dump.</p>
   </div>
 </div>
 
+<hr />
 <h3 id="4-idiomatichnyy-dockerfile-dlya-go">4. Идиоматичный Dockerfile для Go</h3>
 
-<p>Безопасность начинается на этапе сборки. Многоэтапные сборки и минималистичные базовые образы (<code>distroless</code>, <code>alpine</code> без шелла) сокращают attack surface.</p>
+<p>Безопасность контейнера начинается задолго до рантайма — на этапе формирования образа в Dockerfile. Двухэтапные сборки (Multi-stage builds) и микроскопические базовые образы (<code>distroless</code> или минимальный <code>alpine</code> без командного процессора <code>/bin/sh</code>) сводят площадь атаки (Attack Surface) к теоретическому минимуму.</p>
 
 <div class="code-block" data-lang="dockerfile">
   <div class="code-header">
@@ -2315,7 +2324,7 @@ ENTRYPOINT [&quot;/app/server&quot;]
 </code></pre>
 </div>
 
-<p>При запуске в <code>docker run</code> или Kubernetes <code>securityContext</code>:</p>
+<p>При запуске в <code>docker run</code> или секции <code>securityContext</code> манифеста Kubernetes используйте принцип наименьших привилегий:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2333,40 +2342,48 @@ ENTRYPOINT [&quot;/app/server&quot;]
 </code></pre>
 </div>
 
-<ul>
-<li><code>--read-only</code>: Rootfs только для чтения. Исключает запись malware или изменение бинарников.</li>
-<li><code>--cap-drop ALL</code>: Убирает все capabilities. Приложение работает с правами обычного пользователя.</li>
-<li><code>--security-opt=no-new-privileges:true</code>: Ядро запрещает <code>execve</code> получать расширенные права через setuid/setgid бинарники.</li>
-<li><code>--tmpfs /tmp</code>: Временные файлы пишутся в RAM, не касаясь диска.</li>
-</ul>
+<p>Разбор защитных флагов:<br />
+- <code>--read-only</code>: Корневая файловая система монтируется только на чтение. Злоумышленник, даже получив возможность исполнения кода, физически не сможет перезаписать бинарник <code>/app/server</code> или скачать троянский скрипт.<br />
+- <code>--cap-drop ALL</code>: Сбрасывает все без исключения привилегии Linux Capabilities. Процесс лишается возможности вызывать привилегированные функции ядра.<br />
+- <code>--security-opt=no-new-privileges:true</code>: Ядро гарантирует, что вызовы <code>execve</code> никогда не повысят привилегии процесса через бинарники с битами setuid/setgid (например, через системный <code>sudo</code> или <code>su</code>).<br />
+- <code>--tmpfs /tmp</code>: Временные файлы и сокеты размещаются в оперативной памяти (RAM) и бесследно исчезают при остановке контейнера, не затрагивая диск.</p>
+<hr />
 <h3 id="5-lovushki-i-vektory-atak">5. Ловушки и векторы атак</h3>
 
-<p>1 - <strong>Escalation через <code>/proc</code></strong>: Даже с <code>--cap-drop ALL</code>, процесс может читать <code>/proc/1/environ</code>, <code>/proc/1/fd</code>, <code>/proc/sys/kernel</code> хоста, если namespace не настроен корректно или контейнер запущен с <code>--privileged</code>. Решение: явно мапить только необходимые файлы, использовать <code>rootfs</code> без доступа к хостовому <code>/proc</code>.<br />
-2 - <strong>CGO и динамические библиотеки</strong>: <code>CGO_ENABLED=1</code> тянет <code>glibc</code> или <code>musl</code>. Уязвимости в <code>libc</code> (например, <code>GHOST</code>, <code>Pwnkit</code>) становятся уязвимостями приложения. <code>CGO_ENABLED=0</code> компилирует всё статически, исключая этот вектор, но отключает <code>netgo</code> и <code>cgo</code>-зависимые профилировщики в некоторых случаях.<br />
-3 - <strong>Температурные и CPU-троттлинг атаки</strong>: Атакующий может запустить внутри контейнера бесконечный цикл вычислений, если не настроены <code>cpu.cfs_quota_us</code> и <code>memory.limit</code>. Rantaйм Go не ограничивает CPU сам, он полагается на cgroups. Отсутствие лимитов ведёт к DoS всего хоста.<br />
-4 - <strong>Логирование в stdout</strong>: <code>docker logs</code> собирает всё из stdout/stderr. Если приложение логирует секреты, токены или стек-трейсы с пользовательскими данными, они попадают в хостовый <code>/var/lib/docker/containers/...</code>, доступный root-пользователю демона.</p>
+<ol>
+<li><strong>Эскалация привилегий через <code>/proc</code>:</strong><br />
+   Даже если контейнер запущен с флагом <code>--cap-drop ALL</code>, некорректно изолированный псевдокаталог <code>/proc</code> может позволить прочитать переменные окружения соседних сервисов (<code>/proc/1/environ</code>), открытые дескрипторы сокетов (<code>/proc/1/fd</code>) или параметры ядра (<code>/proc/sys/kernel</code>). Категорически избегайте проброса хостовых директорий <code>/proc</code> и <code>/sys</code> внутрь контейнера, монтируйте только минимально необходимый изолированный <code>rootfs</code> без доступа к хостовому <code>/proc</code>.</li>
+<li><strong>CGO и уязвимости динамических библиотек:</strong><br />
+   Сборка с <code>CGO_ENABLED=1</code> динамически линкует рантайм Go с системными библиотеками C (<code>glibc</code> или <code>musl</code>). Любая критическая уязвимость в реализации <code>libc</code> (вспомним исторические эксплойты вроде <code>GHOST</code> или <code>Pwnkit</code>) автоматически становится уязвимостью вашего Go-сервиса. Сборка с <code>CGO_ENABLED=0</code> производит полностью самодостаточный статический исполняемый файл ELF, исключая зависимости от сторонних <code>.so</code> библиотек, хотя и отключает в некоторых случаях <code>netgo</code> и низкоуровневые профилировщики на базе <code>cgo</code>.</li>
+<li><strong>DoS-атаки на процессор и температурный троттлинг:</strong><br />
+   Если в конфигурации контейнера не заданы лимиты <code>cpu.cfs_quota_us</code> и <code>memory.limit</code>, вредоносный входящий запрос может загнать рантайм Go в бесконечный цикл вычислений, загрузив 100% всех физических ядер сервера и вызвав отказ в обслуживании (Denial of Service) для всех соседних контейнеров на ноде.</li>
+<li><strong>Слив секретов в стандартные потоки вывода (stdout/stderr):</strong><br />
+   Демон Docker (<code>dockerd</code>) перехватывает все байты из <code>stdout/stderr</code> и сохраняет их на хостовом накопителе в каталоге <code>/var/lib/docker/containers/...</code> для утилиты <code>docker logs</code>. Если ваше приложение пишет в лог неотфильтрованные дампы структур с секретами или трассировки стека, эти данные оседают на диске хоста в открытом виде.</li>
+</ol>
+<hr />
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему запуск Go-приложения с <code>--privileged</code> в Kubernetes или Docker считается критической архитектурной ошибкой, даже если код не использует <code>os/exec</code>?<br />
+    <p><strong>Вопрос:</strong> Почему запуск Go-приложения с флагом <code>--privileged</code> в Kubernetes или Docker считается критической архитектурной ошибкой, даже если код сервиса не использует пакет <code>os/exec</code>?<br />
 <strong>Ответ:</strong><br />
-1 - <code>--privileged</code> включает все capabilities, отключает <code>seccomp</code> и <code>AppArmor</code>, пробрасывает все устройства <code>/dev</code> и отключает <code>no-new-privileges</code>.<br />
-2 - Это превращает контейнер в процесс с почти полным доступом к ядру. Любая уязвимость в рантайме Go, стандартной библиотеке или сторонней зависимости позволяет выполнить kernel exploit и получить полный контроль над хостом.<br />
-3 - <strong>Альтернатива:</strong> Использовать минимальные capabilities (<code>CAP_NET_BIND_SERVICE</code> если порт &lt; 1024), <code>readOnlyRootFilesystem</code>, <code>runAsNonRoot</code> и изолировать сеть через <code>NetworkPolicy</code>. Для доступа к устройствам использовать <code>devicePlugin</code> или CSI-драйверы, а не монтирование <code>/dev</code>.</p>
+1. <strong>Анатомия флага <code>--privileged</code>:</strong> Этот флаг полностью отключает все механизмы изоляции: ядро выдает контейнеру все возможные capabilities, отключает фильтрацию <code>seccomp</code> и профили <code>AppArmor</code>/<code>SELinux</code>, пробрасывает все физические блочные устройства из <code>/dev</code> хоста и деактивирует флаг <code>no-new-privileges</code>.<br />
+2. <strong>Угроза Escape-атаки:</strong> Контейнер превращается в обычный root-процесс хоста. Любая уязвимость повреждения памяти в рантайме Go, стандартных парсерах или уязвимой сторонней зависимости позволяет злоумышленнику смонтировать корневой диск хоста (<code>mount /dev/sda1 /mnt</code>) и получить полный контроль над физическим сервером или всей нодой кластера Kubernetes.<br />
+3. <strong>Архитектурная альтернатива:</strong> Руководствоваться принципом минимальных привилегий: выдавать точечные capabilities (например, <code>CAP_NET_BIND_SERVICE</code>, только если сервер обязан слушать порты ниже 1024), включать <code>readOnlyRootFilesystem: true</code>, принудительно задавать <code>runAsNonRoot: true</code> и изолировать межсервисный трафик политиками <code>NetworkPolicy</code>. Для взаимодействия со специализированным оборудованием используются Kubernetes <code>devicePlugin</code> или CSI-драйверы, а не прямое монтирование хостового каталога <code>/dev</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Контейнеры изолируют процессы через <code>namespaces</code>, <code>cgroups</code>, <code>capabilities</code> и <code>seccomp</code>, но не предоставляют криптографической защиты. Граница доверия остаётся на уровне ядра Linux.</li>
-<li>Go-рантайм должен синхронизироваться с лимитами cgroups через <code>automaxprocs</code> и <code>GOMEMLIMIT</code>, чтобы планировщик горутин и <code>GC</code> не вызывали троттлинг или OOM-киллер.</li>
-<li>Seccomp-фильтры критичны для блокировки опасных syscall (<code>mount</code>, <code>ptrace</code>), но стандартный профиль Docker уже оптимизирован под нужды Go-рантайма.</li>
-<li>Идиоматичная сборка требует <code>CGO_ENABLED=0</code>, статической линковки, <code>distroless</code> базовых образов и запуска от непривилегированного пользователя с <code>--cap-drop ALL</code> и <code>--read-only</code>.</li>
-<li>Векторы атак на контейнеры часто связаны с избыточными правами (<code>--privileged</code>), доступом к <code>/proc</code> хоста и незащищённым логированием. Безопасность строится на минимальной поверхности атаки и строгом контроле системных вызовов.</li>
+<li>Контейнеры изолируют процессы средствами ядра Linux (<code>namespaces</code>, <code>cgroups</code>, <code>capabilities</code> и <code>seccomp</code>), но не являются криптографической границей и делят общее ядро хоста.</li>
+<li>Рантайм Go обязан синхронизироваться с квотами cgroups через <code>automaxprocs</code> и параметр <code>GOMEMLIMIT</code>, предотвращая разрушительный CPU-троттлинг планировщика и аварийное завершение процесса от рук OOM Killer.</li>
+<li>Фильтры <code>seccomp</code> отсекают опасные системные вызовы (<code>mount</code>, <code>ptrace</code>), однако стандартные профили контейнеризации уже настроены для поддержки сетевого поллера (<code>epoll</code>) и аллокатора Go.</li>
+<li>Идиоматичная промышленная сборка требует отключения CGO (<code>CGO_ENABLED=0</code>), статической линковки бинарника, использования минимальных базовых образов <code>distroless</code> и запуска от непривилегированного пользователя с флагами <code>--cap-drop ALL</code> и <code>--read-only</code>.</li>
+<li>Использование флага <code>--privileged</code> и бесконтрольный доступ к файловым системам хоста аннулируют изоляцию, превращая любую локальную уязвимость приложения в полный захват инфраструктурного кластера.</li>
 </ol>
 <p><a href="5-supply-chain-ataki.html" class="wikilink">5. Supply chain атаки</a></p>
           </div>
