@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~56 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Goroutines под капотом</h1>
           </header>
@@ -2178,11 +2178,13 @@
           <div class="article-markdown">
             <h2 id="kak-ustroena-gorutina-ot-starta-do-zaversheniya">Как устроена горутина: от старта до завершения</h2>
 
-<p>В <a href="1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a> мы разобрали три ключевые сущности планировщика: G, M и P. Мы узнали, что P — логический процессор, M — поток ОС, а G — сама горутина. Но что именно представляет собой G? Как она запускается, как устроен её стек, как происходит переключение контекста и почему миллион горутин потребляют меньше ресурсов, чем тысяча потоков ОС?</p>
-<p>Ответы на эти вопросы раскрывают механическую симпатию к рантайму: понимая, сколько тактов стоит запуск <code>go func()</code>, почему стек горутины растёт и как работает преемпция, Senior-инженер может проектировать эффективные конкурентные паттерны и избегать скрытых узких мест. Эта статья — погружение «под капот» горутины, от структуры <code>g</code> в исходниках до её жизненного цикла, с прицелом на практические выводы для производительности.</p>
+<p>В лекции <a href="1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a> (или <a href="1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>) мы детально исследовали фундаментальную архитектуру планировщика Go и познакомились с его главной триадой: логическим процессором P, потоком операционной системы M и горутиной G. Мы узнали, что процессор P задает аппаратный лимит параллелизма, а системный поток M выполняет роль неутомимого исполнителя инструкций. Но что представляет собой сама <strong>горутина (G)</strong> на физическом уровне? Как она зарождается из простого синтаксического выражения <code>go func()</code>, каким образом устроен и расширяется ее стек, почему переключение между горутинами обходится процессору в считаные наносекунды и почему миллион горутин в памяти Go-сервиса — это обычный рабочий вторник, в то время как миллион потоков ядра Linux немедленно отправил бы операционную систему в нокаут?</p>
+<p>Программисты часто называют горутины «легковесными зелеными потоками», но эта аналогия скрывает фундаментальную микроархитектурную суть: горутина — это вообще не поток в понимании операционной системы. У неё нет собственного дескриптора <code>task_struct</code> в адресном пространстве ядра, нет выделенной страницы в таблицах MMU, нет прямого прерывания по таймеру APIC. С точки зрения машины горутина — это компактная структура данных в памяти пользовательского пространства, непрерывный фрагмент виртуальной памяти размером всего от 2 КБ под динамический стек и скромный набор сохраненных регистров центрального процессора.</p>
+<p>Понимание внутреннего устройства сопрограммы раскрывает истинную механическую симпатию к рантайму: зная точную цену создания <code>go func()</code>, физику копирования растущего стека и алгоритмы принудительного вытеснения, senior-инженер проектирует надежные конкурентные архитектуры, исключая скрытые задержки и коварные утечки памяти. В этой лекции мы заглянем в недра горутины: от исходного кода структуры <code>g</code> в файле <code>runtime/runtime2.go</code> до фаз ее жизненного цикла и микроархитектурного влияния на кэши процессора.</p>
+<hr />
 <h2 id="struktura-g-chto-vnutri-gorutiny">Структура `g`: что внутри горутины</h2>
 
-<p>Горутина в Go — это не поток ОС и не зелёный поток в классическом понимании. Это структура <code>g</code>, определённая в <code>runtime/runtime2.go</code>. Вот её ключевые поля (упрощённо):</p>
+<p>В исходном коде рантайма Go горутина представлена структурой <code>g</code>, объявленной в файле <code>runtime/runtime2.go</code>. Это один из самых объемных типов данных в рантайме, содержащий более сотни полей. Однако концептуально ее можно разделить на пять логических блоков:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2193,43 +2195,70 @@
     </button>
   </div>
   <pre class="language-go"><code class="language-go">type g struct {
-    stack       stack   // lo, hi — границы стека
-    sched       gobuf   // сохранённый контекст выполнения (SP, PC, BP...)
-    atomicstatus atomic.Uint32 // состояние: _Gidle, _Grunnable, _Grunning, _Gwaiting, _Gdead
-    goid        int64   // уникальный идентификатор
-    m           *m      // поток M, на котором выполняется (если _Grunning)
-    lockedm     *m      // если привязана через runtime.LockOSThread
-    gopc        uintptr // адрес инструкции go, которая породила горутину
-    parent      *g      // горутина-родитель (для профилирования)
+    // 1. Границы динамического стека
+    stack       stack   // Структура stack: lo (нижняя граница), hi (верхняя граница)
+    stackguard0 uintptr // Маркер границы стека для проверки переполнения и прерываний
+    stackguard1 uintptr // Маркер для системного стека g0 при вызовах CGO
+
+    // 2. Сохраненный контекст процессора при переключении
+    sched       gobuf   // Регистры CPU: SP, PC, BP, ret, lr, g
+
+    // 3. Управление жизненным циклом и планированием
+    atomicstatus atomic.Uint32 // Атомарное состояние: _Gidle, _Grunnable, _Grunning, _Gwaiting, _Gdead
+    goid        int64          // Уникальный 64-битный числовой идентификатор горутины
+    gopc        uintptr        // Адрес инструкции go, породившей эту горутину (Program Counter)
+    startpc     uintptr        // Адрес первой исполняемой инструкции целевой функции
+    parent      *g             // Указатель на родительскую горутину (для профилирования и трассировки)
+
+    // 4. Связь с потоками и процессорами
+    m           *m             // Системный поток M, исполняющий горутину в данный момент (если _Grunning)
+    lockedm     *m             // Привязка к конкретному потоку M при вызове runtime.LockOSThread()
+
+    // 5. Очереди ожидания и синхронизация
+    waiting     *sudog         // Дескриптор ожидания при блокировке на каналах или мьютексах
     ...
 }
 </code></pre>
 </div>
 
-<ul>
-<li><strong><code>stack</code></strong> — границы непрерывного участка виртуальной памяти, выделенного под стек. Начальный размер — 2 КБ.</li>
-<li><strong><code>sched</code></strong> — gobuf, сохраняющий регистры процессора в момент остановки горутины. Именно через него планировщик «запоминает», где горутина была прервана, и «восстанавливает» её при следующем запуске.</li>
-<li><strong><code>atomicstatus</code></strong> — атомарное состояние, которое меняется по ходу жизни: <code>_Gidle</code> (только создана), <code>_Grunnable</code> (ждёт в очереди), <code>_Grunning</code> (активна на M), <code>_Gwaiting</code> (заблокирована), <code>_Gdead</code> (завершена, стек освобождён).</li>
-</ul>
+<p>Разберём ключевые поля этой структуры:<br />
+- <strong><code>stack</code></strong> — описывает непрерывный диапазон адресов виртуальной памяти <code>[lo, hi]</code>. Начальный размер стека новой горутины составляет ровно <strong>2 КБ</strong> (константа <code>_StackMin</code>).<br />
+- <strong><code>sched</code></strong> — экземпляр структуры <code>gobuf</code>, хранящий состояние регистров центрального процессора в момент, когда горутина уступает управление. Именно <code>g.sched</code> позволяет планировщику мгновенно замораживать и возобновлять выполнение с точностью до ассемблерной инструкции:<br />
+  - <code>sp</code> — Stack Pointer (указатель вершины стека, регистр <code>RSP</code>);<br />
+  - <code>pc</code> — Program Counter (<code>PC</code>, счетчик команд, регистр <code>RIP</code>);<br />
+  - <code>bp</code> — Base Pointer (базовый указатель текущего стекового фрейма, регистр <code>RBP</code> на x86-64);<br />
+  - <code>lr</code> — Link Register (регистр адреса возврата на архитектурах ARM64);<br />
+  - <code>g</code> — указатель на саму структуру <code>g</code>.<br />
+- <strong><code>atomicstatus</code></strong> — атомарный флаг состояния горутины, с помощью которого планировщик координирует переходы между очередями без дорогих системных блокировок.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Ассемблерная магия переключения через gobuf</span>
   </div>
   <div class="callout-body">
-    <p><code>gobuf</code> — это структура, сохраняемая в <code>g.sched</code>. В ней лежат значения регистров SP (stack pointer), PC (program counter), BP (base pointer) и других, специфичных для архитектуры. Когда планировщик выполняет <code>gogo(g)</code>, он загружает эти регистры из <code>g.sched</code> в реальные регистры процессора, и выполнение продолжается ровно с того места, где горутина была приостановлена. Это классический механизм переключения контекста в userspace, без дорогих syscall'ов.</p>
+    <p><code>gobuf</code> — это минималистичный слепок регистров, сохраняемый в поле <code>g.sched</code>. Когда планировщик решает запустить задачу, он выполняет вызов ассемблерной процедуры <code>gogo(g)</code> (или <code>gogo</code>).<br />
+Процедура <code>gogo</code> берет значения из <code>g.sched</code> и за десяток инструкций процессора загружает их в физические регистры CPU: восстанавливает указатель стека в регистр <code>SP</code>, базовый указатель в <code>BP</code>, связывает текущую горутину и выполняет инструкцию косвенного перехода <code>JMP</code> по адресу регистра <code>PC</code>. Выполнение возобновляется ровно в той точке, где горутина отдала управление. Это чистый Userspace Context Switch: никаких обращений к ядру ОС, никаких таблиц прерываний, никаких сбросов очередей ядра!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="sozdanie-gorutiny-chto-proiskhodit-pri-go-func">Создание горутины: что происходит при `go func()`</h2>
 
-<p>Когда компилятор встречает ключевое слово <code>go</code>, он преобразует вызов в обращение к <code>runtime.newproc</code>. Упрощённая цепочка:</p>
-<ol>
-<li><strong>Получить G.</strong> Рантайм пытается взять свободную <code>g</code> из списка переиспользования (<code>p.gFree</code>). Если список пуст, выделяется новая через <code>malg</code> с начальным стеком 2 КБ.</li>
-<li><strong>Настроить стек и gobuf.</strong> В стеке резервируется место для аргументов функции, которые копируются туда (аргументы «убегают» в кучу горутины). В <code>g.sched.pc</code> записывается адрес функции-обёртки <code>runtime.goexit</code>, которая гарантирует, что после завершения пользовательской функции горутина корректно завершится (перейдёт в <code>_Gdead</code>).</li>
-<li><strong>Перевести в состояние <code>_Grunnable</code>.</strong> Горутина помещается в локальную очередь P (<code>runq</code>), а если она переполнена — в глобальную очередь. В этот момент родительская горутина продолжает выполнение.</li>
-</ol>
-<p>Всё это занимает десятки наносекунд — на порядки быстрее, чем создание потока ОС, которое требует системного вызова и выделения стека в 1-8 МБ.</p>
+<p>Каждый раз, когда в Go-коде встречается ключевое слово <code>go</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">go processOrder(orderID)
+</code></pre>
+</div>
+
+<p>компилятор преобразует эту конструкцию в вызов служебной функции рантайма <code>runtime.newproc</code> (находится в <code>runtime/proc.go</code>).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2244,33 +2273,66 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant Parent as Родительская G
-participant Runtime as Рантайм
-participant P as Локальная очередь P
-Parent-&gt;&gt;Runtime: go func()
-Runtime-&gt;&gt;Runtime: Взять свободную G из gFree
-Runtime-&gt;&gt;Runtime: Настроить стек (2 КБ) и gobuf
-Runtime-&gt;&gt;P: Поместить G в runq (состояние _Grunnable)
-Parent-&gt;&gt;Parent: Продолжить выполнение
-Note over P: P позже запустит G
+autonumber
+actor Parent as Родительская G
+participant RT as Рантайм Go (runtime.newproc)
+participant Pool as Пул свободных G (p.gFree)
+participant Heap as Аллокатор памяти (malg)
+participant P as Локальный процессор P
+
+Parent-&gt;&gt;RT: go func(args...)
+RT-&gt;&gt;Pool: Запрос переиспользуемой структуры g
+alt gFree не пуст
+Pool--&gt;&gt;RT: Возврат готовой g из пула
+else gFree пуст
+RT-&gt;&gt;Heap: malg(2048): выделение новой g и стека 2 КБ
+Heap--&gt;&gt;RT: Новая структура g
+end
+RT-&gt;&gt;RT: Копирование аргументов в стек новой g
+RT-&gt;&gt;RT: Настройка gobuf: g.sched.pc = runtime.goexit
+RT-&gt;&gt;P: runqput(p, newg): помещение в runq или runnext
+Note over P: newg переведена в статус _Grunnable
+RT--&gt;&gt;Parent: Возврат управления: родитель продолжает работу!
   </pre>
 </div>
 
 
+<p>Пошаговый конвейер инициализации:</p>
+<ol>
+<li><strong>Получение структуры <code>g</code>:</strong><br />
+   Рантайм стремится свести аллокации к нулю. Сначала он проверяет локальный список свободных структур текущего логического процессора <code>p.gFree</code>. Если в пуле есть свободные объекты <code>g</code> (оставшиеся от завершившихся ранее горутин), рантайм мгновенно берет одну из них. Если локальный пул пуст, проверяется глобальный пул <code>sched.gFree</code>. И только если свободных структур нет нигде, вызывается внутренняя функция <code>malg</code>, которая выделяет память в куче под дескриптор <code>g</code> и инициализирует непрерывный стек начальным объемом 2 КБ.</li>
+<li><strong>Копирование аргументов и инициализация контекста:</strong><br />
+   Параметры вызываемой функции копируются напрямую в новый стек горутины.<br />
+   В структуре <code>gobuf</code> настраивается точка входа:<br />
+   - В поле <code>g.sched.pc</code> прописывается адрес функции-обёртки <code>runtime.goexit</code> (а точнее, адрес возврата, смещенный относительно точки старта функции). Это гарантирует, что как только пользовательская функция выполнит последний <code>return</code>, управление автоматически передастся в <code>runtime.goexit</code>, которая корректно демонтирует стек, очистит ресурсы и переведет горутину в статус <code>_Gdead</code>.<br />
+   - В поле <code>g.sched.sp</code> заносится выровненный адрес вершины нового стека.</li>
+<li><strong>Регистрация в планировщике:</strong><br />
+   Статус новой горутины атомарно выставляется в <code>_Grunnable</code>. Она помещается либо в высокоприоритетный слот <code>runnext</code> текущего процессора <code>P</code>, либо в хвост локального кольцевого буфера <code>runq</code>. Если локальная очередь переполнена (достигнут лимит в 256 элементов), рантайм выгружает половину очереди в глобальный пул <code>sched.runq</code>.</li>
+<li><strong>Мгновенный возврат:</strong><br />
+   Родительская горутина не ждет старта дочерней: вызов <code>runtime.newproc</code> завершается за <strong>20–40 наносекунд</strong>, и родительский поток исполнения продолжает свою работу.</li>
+</ol>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос с собеседования: Стоимость создания горутины</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Сколько времени занимает запуск горутины в Go? Из чего складывается эта стоимость?<br />
-<strong>Ответ:</strong> Порядка десятков наносекунд. Основные затраты: получение структуры <code>g</code> из пула свободных (или аллокация новой), настройка стека (2 КБ) и копирование аргументов, помещение в очередь. Создание потока ОС занимает микросекунды, поэтому горутины значительно легковеснее.</p>
+    <p><strong>Вопрос:</strong> «Сколько времени занимает запуск новой горутины в Go и из каких компонентов складывается эта стоимость?»<br />
+<strong>Ответ:</strong><br />
+Запуск горутины занимает <strong>порядка 20–50 наносекунд</strong> (в сотни раз быстрее создания потока ОС, требующего от 5 до 30 микросекунд).<br />
+Затраты складываются из:<br />
+1. Извлечения структуры <code>g</code> из пула <code>p.gFree</code> (в 95% случаев обходится без аллокации в куче благодаря переиспользованию);<br />
+2. Копирования аргументов вызова на стек;<br />
+3. Настройки структуры <code>gobuf</code> (запись указателей <code>SP</code>, <code>PC</code>);<br />
+4. Атомарного добавления указателя в кольцевой буфер <code>runq</code> процессора <code>P</code>.<br />
+Никаких обращений к ядру ОС, создания системных дескрипторов или вызовов <code>clone(2)</code> не происходит.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="zhiznennyy-tsikl-konechnyy-avtomat-g">Жизненный цикл: конечный автомат G</h2>
 
-<p>Горутина проходит через строго определённые состояния, управляемые атомарным полем <code>atomicstatus</code>. Переходы между состояниями — это и есть работа планировщика.</p>
+<p>Состояние каждой горутины жестко детерминировано и отслеживается планировщиком с помощью атомарного поля <code>atomicstatus</code>. Переходы между состояниями образуют строгий конечный автомат:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2285,128 +2347,351 @@ Note over P: P позже запустит G
   </div>
   <pre class="mermaid">
 flowchart TD
-Idle[&quot;_Gidle&lt;br&gt;Только создана&quot;] --&gt;|&quot;newproc&quot;| Runnable[&quot;_Grunnable&lt;br&gt;В очереди P или глобальной&quot;]
-Runnable --&gt;|&quot;schedule -&gt; execute&quot;| Running[&quot;_Grunning&lt;br&gt;Выполняется на M&quot;]
-Running --&gt;|&quot;Блокировка&lt;br&gt;chan, syscall, Mutex&quot;| Waiting[&quot;_Gwaiting&lt;br&gt;Ожидает событие&quot;]
-Waiting --&gt;|&quot;Событие наступило&lt;br&gt;goready&quot;| Runnable
-Running --&gt;|&quot;Завершилась&lt;br&gt;goexit&quot;| Dead[&quot;_Gdead&lt;br&gt;Стек освобождён&quot;]
-Dead --&gt;|&quot;Переиспользование&quot;| Idle
+Idle[&quot;_Gidle&lt;br/&gt;(выделена в памяти, не инициализирована)&quot;] --&gt;|&quot;runtime.newproc / malg&quot;| Runnable[&quot;_Grunnable&lt;br/&gt;(в очереди runq или runnext, готова к запуску)&quot;]
+Runnable --&gt;|&quot;schedule() -&gt; execute(g)&quot;| Running[&quot;_Grunning&lt;br/&gt;(активно исполняется потоком M на CPU)&quot;]
+Running --&gt;|&quot;Блокировка: chan, Mutex, sleep&lt;br/&gt;вызов gopark()&quot;| Waiting[&quot;_Gwaiting&lt;br/&gt;(заблокирована, ожидает событие)&quot;]
+Waiting --&gt;|&quot;Событие наступило (чтение канала, таймер)&lt;br/&gt;вызов goready()&quot;| Runnable
+Running --&gt;|&quot;Завершение функции return&lt;br/&gt;вызов goexit()&quot;| Dead[&quot;_Gdead&lt;br/&gt;(завершена, стек готов к очистке)&quot;]
+Dead --&gt;|&quot;Очистка и возврат в p.gFree&quot;| Idle
+
+Running -.-&gt;|&quot;Преемпция по сигналу SIGURG&lt;br/&gt;или вызов Gosched()&quot;| Runnable
+Running -.-&gt;|&quot;Синхронный Syscall&lt;br/&gt;entersyscallblock()&quot;| Syscall[&quot;_Gsyscall&lt;br/&gt;(выполняет системный вызов ядра)&quot;]
+Syscall -.-&gt;|&quot;exitsyscall()&quot;| Running
+Syscall -.-&gt;|&quot;exitsyscall() при занятом P&quot;| Runnable
+  </pre>
+</div>
+
+
+<p>Разберём ключевые переходы:</p>
+<ul>
+<li><strong><code>_Gidle</code> $\to$ <code>_Grunnable</code>:</strong> Структура <code>g</code> инициализирована функцией <code>newproc</code>, стек настроен, задача поставлена в очередь <code>runq</code> процессора <code>P</code>.</li>
+<li><strong><code>_Grunnable</code> $\to$ <code>_Grunning</code>:</strong> Диспетчер <code>schedule</code> выбрал задачу, процедура <code>execute(g)</code> назначила <code>m.curg = g</code> и выполнила ассемблерный прыжок <code>gogo</code>, запустив код горутины на процессоре.</li>
+<li><strong><code>_Grunning</code> $\to$ <code>_Gwaiting</code>:</strong> Горутина обратилась к ресурсу, который сейчас недоступен (попытка чтения из пустого канала, ожидание заблокированного <code>sync.Mutex</code>, системный таймер <code>time.Sleep</code>, ожидание сетевого сокета в netpoller). Рантайм вызывает процедуру <code>gopark</code>. Контекст регистров замораживается в <code>g.sched</code>, поток <code>M</code> освобождается и возвращается в цикл <code>schedule</code> для поиска других задач.</li>
+<li><strong><code>_Gwaiting</code> $\to$ <code>_Grunnable</code>:</strong> Ожидаемое событие произошло (другая горутина отправила сообщение в канал, мьютекс освободился, сработал сетевой <code>epoll</code>). Сторонняя горутина или netpoller вызывает процедуру <code>goready</code>, которая атомарно переводит спящую горутину в состояние <code>_Grunnable</code> и возвращает ее в очередь выполнения <code>runq</code>.</li>
+<li><strong><code>_Grunning</code> $\to$ <code>_Gdead</code>:</strong> Функция завершила выполнение, достигнув финального <code>return</code>. Управление переходит в <code>runtime.goexit</code>, которая вызывает деструкторы, открепляет горутину, освобождает избыточную память стека и помещает структуру <code>g</code> в пул переиспользования <code>p.gFree</code>.</li>
+</ul>
+<div class="callout callout-tip">
+  <div class="callout-header">
+    <span class="callout-icon">💡</span>
+    <span class="callout-title">Диагностика зависших состояний</span>
+  </div>
+  <div class="callout-body">
+    <p>Инструмент <code>/debug/pprof/goroutine?debug=2</code> позволяет увидеть снимок всех горутин сервиса с их актуальными состояниями.<br />
+Если в отчете обнаружены тысячи горутин в статусе <code>_Gwaiting</code> на операциях с каналами (<code>chan receive</code>) — это верный признак утечки горутин (Goroutine Leak). Если же тысячи горутин зависли в статусе <code>_Grunnable</code>, но утилизация CPU низкая — это указывает на жесткий Lock Contention или блокировку процессоров системными вызовами.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="stek-gorutiny-nepreryvnyy-rastushchiy-kopiruemyy">Стек горутины: непрерывный, растущий, копируемый</h2>
+
+<p>Одним из величайших инженерных достижений рантайма Go является архитектура <strong>динамического непрерывного стека (Contiguous Stacks)</strong>.</p>
+<p>В большинстве традиционных языков программирования (C, C++, Java) каждому потоку выделяется фиксированный стек огромного размера (от 1 до 8 МБ). Это вынужденная мера: если стек переполнится, произойдет фатальная аппаратная ошибка Stack Overflow (<code>SIGSEGV</code>). Но выделение 8 МБ под каждую задачу делает невозможным запуск сотен тысяч потоков: 100 000 потоков по 8 МБ потребовали бы почти терабайт физической памяти!</p>
+<h3 id="evolyutsiya-ot-segmented-stacks-k-contiguous-stacks">Эволюция: от Segmented Stacks к Contiguous Stacks</h3>
+
+<p>В версиях Go 1.0–1.2 использовалась модель <strong>сегментированных стеков (Segmented Stacks)</strong>: стек начинался с малого размера (4 КБ), а при исчерпании рантайм выделял отдельный несвязанный фрагмент памяти в куче и соединял их двусвязным списком через указатели.<br />
+У этой схемы обнаружился фатальный архитектурный недостаток — <strong>Hot Split Problem</strong>:<br />
+Если вызов функции происходил ровно на границе заполнения стека внутри горячего цикла:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">for i := 0; i &lt; 1_000_000; i++ {
+    step() // Стек переполняется -&gt; аллокация сегмента в куче!
+           // Функция возвращается -&gt; сегмент освобождается!
+}
+</code></pre>
+</div>
+
+<p>на каждой итерации происходила дорогостоящая аллокация и освобождение сегмента памяти в куче, обрушивая производительность в сотни раз.</p>
+<h3 id="sovremennyy-podkhod-nepreryvnyy-stek-s-kopirovaniem">Современный подход: непрерывный стек с копированием</h3>
+
+<p>Начиная с Go 1.3, рантайм перешел на непрерывные стеки (<strong>Contiguous Stacks</strong>).<br />
+Начальный размер стека горутины составляет всего <strong>2 КБ</strong> (2048 байт). В прологе каждой функции компилятор размещает проверку регистра <code>stackguard0</code>. Если текущий фрейм не помещается в оставшееся пространство:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph OldStack [&quot;Старый стек (2 КБ)&quot;]
+F1[&quot;Фрейм main()&quot;]
+F2[&quot;Фрейм worker()&quot;]
+F3[&quot;Фрейм compute() -&gt; ПЕРЕПОЛНЕНИЕ!&quot;]
+end
+
+subgraph NewStack [&quot;Новый непрерывный стек (4 КБ)&quot;]
+NF1[&quot;Фрейм main() (адреса пересчитаны)&quot;]
+NF2[&quot;Фрейм worker() (адреса пересчитаны)&quot;]
+NF3[&quot;Фрейм compute() (адреса пересчитаны)&quot;]
+Free[&quot;Свободное пространство (2 КБ)&quot;]
+end
+
+OldStack --&gt;|&quot;copystack(): аллокация x2, побайтовое копирование, пересчет указателей через Stack Maps&quot;| NewStack
+  </pre>
+</div>
+
+
+<p>Алгоритм расширения стека (<code>runtime.copystack</code>):</p>
+<ol>
+<li><strong>Аллокация:</strong> Рантайм выделяет в пуле стеков новый непрерывный блок памяти ровно в <strong>два раза большего размера</strong> ($2 \to 4 \to 8 \to 16 \to \dots$ КБ).</li>
+<li><strong>Копирование:</strong> Все данные текущего стека (локальные переменные, стековые фреймы, сохраненные адреса возврата) побайтово копируются в новый блок.</li>
+<li><strong>Пересчет указателей (Pointer Adjustment):</strong> Это самая сложная фаза. Если переменная в стеке указывала на другую переменную в том же самом стеке, ее абсолютный виртуальный адрес изменился! Компилятор Go генерирует специальные битовые карты (<strong>Stack Maps</strong>), описывающие, какие ячейки стека содержат указатели. Рантайм обходит стек по этим картам и корректирует все внутренние указатели, прибавляя дельту смещения адресов.</li>
+<li><strong>Утилизация:</strong> Старый блок памяти освобождается и возвращается в пул аллокатора.</li>
+</ol>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Ограничение максимального размера стека</span>
+  </div>
+  <div class="callout-body">
+    <p>Стек горутины не может расти бесконечно. По умолчанию максимальный размер стека на 64-битных системах ограничен <strong>1 ГБ</strong>, а на 32-битных — <strong>250 МБ</strong>.<br />
+Потолок задается функцией <code>runtime/debug.SetMaxStack</code>. Достижение этого предела вызывает фатальную панику <code>panic</code>, и рантайм немедленно аварийно завершает программу с сообщением:<br />
+<code>fatal error: runtime: goroutine stack exceeds 1000000000-byte limit</code>.</p>
+  </div>
+</div>
+
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Рекурсивные вызовы и скрытое копирование стека</span>
+  </div>
+  <div class="callout-body">
+    <p>Хотя расширение стека происходит относительно быстро (сотни наносекунд), при частом вызове глубокой рекурсии непрерывное копирование стека ($2 \to 4 \to 8 \to 16$ МБ) создаёт колоссальное давление на шину памяти и сборщик мусора. Кроме того, во время сборки мусора рантайм выполняет обратную операцию — <strong>Stack Shrinking</strong> (сжатие стека вдвое, если используется менее 25% его емкости). Если горутина в цикле то раздувает стек, то сжимает его, вы получите новую вариацию Hot Split Problem. Проектируйте глубокие алгоритмы итеративно или переносите крупные буферы в кучу!</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="pereklyuchenie-konteksta-chto-sokhranyaetsya-i-vosstanavlivaetsya">Переключение контекста: что сохраняется и восстанавливается</h2>
+
+<p>Переключение контекста между горутинами, выполняющимися на одном логическом процессоре <code>P</code> (и одном машинном потоке <code>M</code>), осуществляется исключительно силами рантайма через функции <code>gogo</code> и <code>gopark</code>.</p>
+<p>Сравним архитектуру переключения горутин и потоков операционной системы:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Характеристика</th>
+<th>Поток ОС (Linux Kernel Thread)</th>
+<th>Горутина Go (Goroutine)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Пространство выполнения</strong></td>
+<td>Переход между User Space и Kernel Space (Ring 3 $\leftrightarrow$ Ring 0)</td>
+<td>Исключительно User Space (без вызова системных прерываний)</td>
+</tr>
+<tr>
+<td><strong>Сохраняемый контекст</strong></td>
+<td>Сотни байт: все регистры общего назначения, флаги CPU, FPU, векторные регистры SSE/AVX</td>
+<td>Минимальный набор: <strong>14 регистров общего назначения</strong> в структуре <code>gobuf</code> (SP, PC, BP и др.)</td>
+</tr>
+<tr>
+<td><strong>Таблицы памяти MMU</strong></td>
+<td>Смена каталога страниц CR3, частичная или полная инвалидация TLB</td>
+<td>Адресное пространство общее, регистр CR3 не меняется, TLB сохраняется</td>
+</tr>
+<tr>
+<td><strong>Длительность переключения</strong></td>
+<td><strong>1 000 – 2 500 наносекунд</strong> (тысячи тактов CPU)</td>
+<td><strong>10 – 15 наносекунд</strong> (несколько десятков тактов CPU)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Благодаря тому, что горутины делят общее виртуальное адресное пространство процесса, аппаратный блок управления памятью (MMU) не замечает переключения: кэш трансляции страниц TLB остается горячим, а конвейер процессора продолжает исполнять код без глубоких сбросов.</p>
+<hr />
+<h2 id="preemptsiya-kak-rantaym-otbiraet-upravlenie">Преемпция: как рантайм отбирает управление</h2>
+
+<p>Исторически планировщик Go опирался на <strong>кооперативную многозадачность</strong>: горутина добровольно уступала процессор в точках синхронизации (Safe Points):<br />
+- вызовы функций (проверка границы стека <code>morestack</code>);<br />
+- выделение динамической памяти в куче (<code>mallocgc</code>);<br />
+- системные вызовы ввода-вывода;<br />
+- операции синхронизации с каналами и мьютексами (<code>gopark</code>).</p>
+<p>Однако этот подход порождал критическую проблему: если в коде запускалась горутина с жестким математическим циклом без вызовов функций (например, криптографический расчет или обработка пикселей):</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func tightLoop() {
+    for {
+        // Нет вызовов функций, нет работы с памятью!
+    }
+}
+</code></pre>
+</div>
+
+<p>такая задача намертво монополизировала физическое ядро. Логический процессор <code>P</code> оказывался заблокирован навсегда: планировщик не мог переключить задачу, а сборщик мусора не мог войти в фазу остановки мира (STW), парализуя весь сервис.</p>
+<h3 id="signalnaya-nevytesnyayushchaya-preemptsiya-go-1-14">Сигнальная невытесняющая преемпция (Go 1.14+)</h3>
+
+<p>В Go 1.14 инженеры реализовали революционный механизм <strong>асинхронной преемпции на базе системных сигналов</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Mon as Поток мониторинга sysmon
+participant CPU as Системный поток M (исполняет G)
+participant Sig as Обработчик сигнала sighandler
+participant Sched as Диспетчер schedule()
+
+Note over CPU: Горутина крутится в бесконечном цикле for {}
+Mon-&gt;&gt;Mon: Детекция: горутина занимает P &gt; 10 мс
+Mon-&gt;&gt;CPU: Отправка сигнала ядра: tgkill(pid, tid, SIGURG)
+CPU-&gt;&gt;Sig: Ядро прерывает поток M и вызывает sighandler
+Sig-&gt;&gt;Sig: Сохранение регистров CPU в gobuf
+Sig-&gt;&gt;Sig: Помещение G в очередь runq (статус _Grunnable)
+Sig-&gt;&gt;Sched: Вызов планировщика schedule() на стеке g0
+Sched-&gt;&gt;CPU: Запуск следующей готовой горутины
   </pre>
 </div>
 
 
 <ul>
-<li><strong><code>_Gidle</code> → <code>_Grunnable</code></strong>: горутина готова, но ещё не выбрана планировщиком.</li>
-<li><strong><code>_Grunnable</code> → <code>_Grunning</code></strong>: <code>execute(g)</code> переводит её на M, начинается исполнение.</li>
-<li><strong><code>_Grunning</code> → <code>_Gwaiting</code></strong>: <code>gopark</code> вызывается при блокировке на канале, мьютексе, таймере, сетевом вызове. G отдаёт управление планировщику.</li>
-<li><strong><code>_Gwaiting</code> → <code>_Grunnable</code></strong>: когда ожидаемое событие наступает (сообщение в канале, таймер сработал), <code>goready</code> помещает G обратно в очередь.</li>
-<li><strong><code>_Grunning</code> → <code>_Gdead</code></strong>: функция завершилась, <code>goexit</code> освобождает стек и возвращает G в пул.</li>
+<li>Фоновый служебный поток рантайма <code>sysmon</code> (который работает без привязки к <code>P</code>) каждые несколько миллисекунд инспектирует состояние всех процессоров.</li>
+<li>Если обнаруживается, что горутина непрерывно выполняется дольше <strong>10 миллисекунд</strong>, <code>sysmon</code> отправляет операционной системе команду послать системному потоку <code>M</code> сигнал <code>SIGURG</code>.</li>
+<li>Ядро Linux прерывает выполнение инструкций потока <code>M</code> и вызывает обработчик сигналов Go-рантайма (<code>runtime.sighandler</code>).</li>
+<li>Обработчик корректирует адрес возврата так, чтобы горутина принудительно вызвала процедуру <code>runtime.asyncPreempt</code>, которая замораживает регистры, возвращает задачу в очередь <code>runq</code> и вызывает диспетчер <code>schedule()</code>.</li>
 </ul>
-<p>Состояния важны для профилирования: <code>/debug/pprof/goroutine?debug=2</code> показывает все горутины с их состояниями. Большое число <code>_Gwaiting</code> — нормально (ожидание сети), но тысячи <code>_Grunnable</code> при простаивающих P — сигнал проблемы (например, все горутины ждут глобальную блокировку).</p>
-<h2 id="stek-gorutiny-nepreryvnyy-rastushchiy-kopiruemyy">Стек горутины: непрерывный, растущий, копируемый</h2>
-
-<p>В отличие от потоков ОС со стеком фиксированного размера (обычно 1-8 МБ), стек горутины начинается с 2 КБ и растёт по необходимости. Реализовано это через <strong>непрерывный стек</strong> (contiguous stack) с копированием.</p>
-<p>Когда горутина требует больше стека, чем доступно (например, глубокая рекурсия или крупный локальный фрейм), рантайм:</p>
-<ol>
-<li>Выделяет новый стек удвоенного размера.</li>
-<li>Копирует туда всё содержимое старого стека (фреймы вызовов, локальные переменные, gobuf).</li>
-<li>Обновляет все указатели внутри горутины, ссылающиеся на старый стек (stack maps, сгенерированные компилятором, помогают найти эти указатели).</li>
-<li>Освобождает старый стек.</li>
-</ol>
-<p>Это копирование — тяжёлая операция (сотни наносекунд — микросекунды в зависимости от размера). Но происходит редко, обычно в первые миллисекунды жизни горутины, пока стек «разогревается» до рабочего размера. В хорошо спроектированной системе горутины не должны требовать гигантских стеков; для больших объёмов данных используют кучу.</p>
-<p>Максимальный размер стека — 1 ГБ на 64-битных системах (управляется <code>runtime/debug.SetMaxStack</code>). Достижение этого предела вызывает <code>panic</code>, а не бесконечный рост.</p>
-<div class="callout callout-warning">
+<div class="callout callout-interview">
   <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Вопрос с собеседования: Бесконечный цикл без вызовов функций</span>
   </div>
   <div class="callout-body">
-    <p>Рекурсивные функции без выхода или с очень глубокой рекурсией могут расти до максимума и вызывать панику. В production-коде всегда должна быть гарантия ограниченной глубины рекурсии или итеративная альтернатива.</p>
+    <p><strong>Вопрос:</strong> «Что произойдет в современном Go, если запустить горутину с тесным бесконечным циклом <code>for {}</code> без аллокаций и вызовов функций?»<br />
+<strong>Ответ:</strong><br />
+До версии Go 1.14 такая горутина намертво захватывала поток M и процессор P, вызывая starvation остальных горутин и зависание сборщика мусора.<br />
+Начиная с Go 1.14, фоновый поток мониторинга <code>sysmon</code>, зафиксировав выполнение дольше 10 мс, пошлет потоку POSIX-сигнал <code>SIGURG</code>. Рантайм асинхронно вытеснит горутину, вернет ее в очередь <code>_Grunnable</code> и передаст процессор другим задачам. Однако следует помнить, что обработка сигналов ОС создает дополнительную нагрузку на ядро, поэтому намеренно полагаться на асинхронную преемпцию в бизнес-логике не рекомендуется.</p>
   </div>
 </div>
 
-<h2 id="pereklyuchenie-konteksta-chto-sokhranyaetsya-i-vosstanavlivaetsya">Переключение контекста: что сохраняется и восстанавливается</h2>
-
-<p>Переключение контекста между горутинами на одном P (и одном M) происходит через функции <code>gogo</code> и <code>gopark</code>, написанные на ассемблере для каждой архитектуры.</p>
-<ul>
-<li><strong>gogo(g)</strong>: загружает регистры из <code>g.sched</code> в реальные регистры процессора и передаёт управление по адресу <code>PC</code>. Всё, что было сохранено в gobuf, восстанавливается.</li>
-<li><strong>gopark</strong>: обратная операция. Сохраняет текущие регистры в <code>g.sched</code> и передаёт управление планировщику (<code>schedule</code>), который выберет следующую горутину.</li>
-</ul>
-<p>Важно: переключение между горутинами происходит <strong>в userspace</strong>. Нет системного вызова, нет перехода в ядро, нет сброса TLB. Это делает переключение горутин чрезвычайно дёшевым — десятки наносекунд против микросекунд для потоков ОС.</p>
-<p>Однако переключение всё же имеет стоимость:<br />
-- Сохранение/восстановление 10-15 регистров.<br />
-- Потенциальный cache miss при доступе к стеку новой горутины, если она была мигрирована с другого ядра.<br />
-- Накладные расходы на планировщик (поиск следующей G).</p>
-<h2 id="preemptsiya-kak-rantaym-otbiraet-upravlenie">Преемпция: как рантайм отбирает управление</h2>
-
-<p>Долгое время планировщик Go полагался исключительно на <strong>кооперативную многозадачность</strong>: горутина сама отдавала управление в safe points (вызов функций, операции с памятью). Это создавало проблемы: CPU-bound горутина без вызовов могла удерживать P бесконечно, вызывая starvation других горутин.</p>
-<p>Начиная с Go 1.14, реализована <strong>асинхронная преемпция</strong> (asynchronous preemption). Механизм:<br />
-- Отдельный поток M (sysmon) мониторит, не застряла ли горутина в CPU-bound коде дольше определённого времени (обычно 10 мс).<br />
-- Если да, рантайм посылает сигнал <code>SIGURG</code> потоку M, исполняющему эту G.<br />
-- Обработчик сигнала сохраняет состояние горутины и вынуждает её войти в планировщик, где она может быть перепланирована.</p>
-<p>Это гарантирует, что даже горутина в тесном цикле без вызовов не заблокирует P навсегда. Однако преемпция через сигнал стоит дороже, чем кооперативная (обработка сигнала — это десятки тактов плюс потенциальные cache и TLB сбросы). Поэтому код, часто попадающий под принудительную преемпцию, должен быть пересмотрен.</p>
+<hr />
 <h2 id="privyazka-k-potoku-os-lockosthread">Привязка к потоку ОС: LockOSThread</h2>
 
-<p>Иногда горутину необходимо жёстко привязать к потоку ОС. Например, при использовании графических библиотек (OpenGL), CGO-кода, который полагается на thread-local storage, или при взаимодействии с некоторыми системными вызовами.</p>
-<p><code>runtime.LockOSThread()</code> блокирует текущую горутину на текущем M. С этого момента:<br />
-- Только эта горутина может исполняться на этом M.<br />
-- Если горутина паркуется, M не может быть передан другой G.<br />
-- Когда горутина завершается, M может быть освобождён.</p>
-<p>Цена привязки высока: M не может быть переиспользован для других горутин, что снижает гибкость планировщика и может привести к созданию лишних потоков ОС. Применять только в крайних случаях.</p>
+<p>В стандартном режиме работы планировщик Go вправе в любой момент переместить горутину с одного системного потока <code>M</code> на другой. Однако в некоторых сценариях требуется строгая гарантия того, что горутина будет всегда выполняться на одном и том же физическом потоке ОС:</p>
+<ol>
+<li><strong>Работа с графическими библиотеками:</strong> Интерфейсные фреймворки (OpenGL, macOS Cocoa/Metal) жестко требуют, чтобы любые операции рендеринга выполнялись строго из главного потока процесса (Thread 0).</li>
+<li><strong>Интеграция с кодом на C/C++ через CGO:</strong> Си-библиотеки часто хранят состояние в локальной памяти потока (Thread-Local Storage, переменные <code>__thread</code> или вызовы <code>pthread_setspecific</code>). Если горутина мигрирует на другой поток, она потеряет доступ к своему контексту.</li>
+<li><strong>Системные вызовы привязки ядра Linux:</strong> Модификация системных пространств имен через вызов <code>setns(2)</code> (например, при конфигурировании сетевых неймспейсов контейнеров в Docker/Kubernetes) применяется исключительно к текущему потоку ядра.</li>
+</ol>
+<p>Для решения этих задач стандартный пакет <code>runtime</code> предоставляет вызов <code>runtime.LockOSThread()</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;runtime&quot;
+)
+
+func init() {
+    // Гарантируем, что главная горутина привязана к главному потоку ОС
+    runtime.LockOSThread()
+}
+</code></pre>
+</div>
+
+<p>Когда горутина вызывает <code>runtime.LockOSThread()</code>:<br />
+- Текущий поток <code>M</code> жестко привязывается к данной горутине (<code>m.lockedg = g</code>, <code>g.lockedm = m</code>).<br />
+- Никакая другая горутина не сможет запуститься на этом потоке <code>M</code>.<br />
+- Если привязанная горутина блокируется, поток <code>M</code> засыпает вместе с ней и не передается планировщику.<br />
+- Освобождение потока выполняется парным вызовом <code>runtime.UnlockOSThread()</code>. Если горутина завершится без снятия блокировки, рантайм навсегда уничтожит этот поток <code>M</code>, породив взамен новый.</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Злоупотребление LockOSThread</span>
+  </div>
+  <div class="callout-body">
+    <p>Вызов <code>LockOSThread</code> выводит системный поток из пула эффективного мультиплексирования. Если вы вызовете <code>LockOSThread</code> внутри тысячи одновременно работающих горутин, рантайм будет вынужден создать тысячу реальных потоков ОС, что мгновенно приведет к исчерпанию лимитов ядра, деградации производительности и перерасходу сотен мегабайт памяти.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="prakticheskie-vyvody-i-lovushki">Практические выводы и ловушки</h2>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Не путайте горутины с потоками</span>
   </div>
   <div class="callout-body">
-    <p><strong>Не путайте горутины с потоками.</strong> Миллион горутин — это нормально для Go (около 2 ГБ стека, если все стартуют, но обычно меньше). Миллион потоков ОС убьёт систему. Однако миллион горутин, каждая из которых что-то ждёт, — это миллион стеков, потребляющих память. Следите за числом горутин через <code>/debug/pprof/goroutine</code>.</p>
+    <p>Миллион горутин — это нормальный, штатный сценарий для Go (суммарный стек в покое займет около 2 ГБ оперативной памяти). Однако миллион системных потоков ОС немедленно уничтожит сервер из-за исчерпания памяти таблиц ядра <code>task_struct</code> и перегрузки планировщика ОС.<br />
+Тем не менее помните: миллион заблокированных горутин, забытых на незакрытых каналах (Goroutine Leak), удерживают в куче свои стеки и все связанные объекты, постепенно приближая катастрофу OOMKilled. Всегда мониторьте объем горутин через эндпоинты <code>/debug/pprof/goroutine</code> и <code>/debug/pprof/goroutine?debug=2</code>.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Горутины бесплатны, но не совсем</span>
   </div>
   <div class="callout-body">
-    <p><strong>Горутины бесплатны, но не совсем.</strong> Создание горутины стоит наносекунды, но её стек растёт, потребляя память и вызывая копирование. Переключение контекста стоит десятки тактов. Десятки тысяч горутин, активно работающих с CPU, могут создать измеримые накладные расходы.</p>
+    <p>Хотя создание сопрограммы стоит ничтожные наносекунды, ее активная работа требует аппаратных ресурсов. Каждая активная горутина:<br />
+- конкурирует за кэш-линии процессора L1/L2;<br />
+- расширяет свой стек, вызывая редкие, но ощутимые фазы копирования памяти <code>copystack</code>;<br />
+- создает накладные расходы на балансировку планировщика.<br />
+Если сервис создает 100 000 горутин, непрерывно выполняющих тяжелые вычисления, система потеряет производительность в очередях планировщика.</p>
   </div>
 </div>
 
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдёт, если запустить горутину, которая никогда не завершается и не блокируется?<br />
-<strong>Ответ:</strong> Она будет бесконечно выполняться, не отдавая управление. До Go 1.14 это приводило к starvation других горутин на том же P. Сейчас планировщик асинхронно прервёт её через <code>SIGURG</code> и передаст управление другим горутинам. Однако это всё равно плохая практика, так как добавляет накладные расходы на преемпцию.</p>
-  </div>
-</div>
-
+<hr />
 <h2 id="mechanical-sympathy-gorutiny-i-protsessor">Mechanical Sympathy: горутины и процессор</h2>
 
-<p>С точки зрения процессора, горутина — это поток инструкций, который то исполняется, то прерывается. Частые переключения между горутинами на одном ядре:</p>
-<ul>
-<li><strong>Вымывают L1/L2 кэш.</strong> Данные и стек одной горутины вытесняют данные другой. Если переключения происходят слишком часто (микросекунды), постоянные cache miss могут существенно замедлить выполнение.</li>
-<li><strong>Нагружают предсказатель ветвлений.</strong> Каждая горутина имеет свой паттерн исполнения. При переключении предсказатель должен заново «разогреваться».</li>
-<li><strong>Преемпция через сигнал</strong> вызывает переключение в ядро и обратно, что стоит дороже кооперативного переключения.</li>
-</ul>
-<p>Отсюда вывод: горутины следует проектировать так, чтобы они либо быстро завершались, либо блокировались на IO, оставляя CPU для небольшого количества вычислительных горутин. Для CPU-bound задач количество активных горутин не должно значительно превышать <code>GOMAXPROCS</code> (см. <a href="../01-fundament/3-cpu-bound-vs-io-bound-zadachi.html" class="wikilink">3. CPU bound vs IO bound задачи</a>).</p>
+<p>С точки зрения кремниевого кристалла процессора горутина — это непрерывный поток инструкций, загружаемый в вычислительный конвейер. Частые переключения между неродственными горутинами на одном ядре вызывают специфические аппаратные эффекты:</p>
+<ol>
+<li><strong>Вымывание кэшей L1d и L2 (Cache Eviction):</strong><br />
+   Стек и локальные структуры одной горутины загружаются в кэш данных L1d (32–48 КБ). Когда планировщик переключает задачу на другую горутину, ее стек вытесняет предыдущие данные. При возврате к первой горутине ядро процессора фиксирует волну промахов кэша (Cache Misses), теряя сотни тактов на подкачку данных из L3 и оперативной памяти.</li>
+<li><strong>Сброс истории предсказателя ветвлений (Branch Target Buffer):</strong><br />
+   Каждая функция имеет собственный уникальный паттерн переходов <code>if/else</code>. При частой ротации горутин аппаратный блок предсказания ветвлений процессора (Branch Predictor) не успевает накапливать статистику, что приводит к частым сбросам конвейера (Pipeline Flushes).</li>
+<li><strong>Разделение задач по профилю нагрузки:</strong><br />
+   Для вычислительных (CPU-bound) задач количество одновременно активных горутин не должно существенно превышать аппаратное значение <code>GOMAXPROCS</code> (подробнее в лекции <a href="../01-fundament/3-cpu-bound-vs-io-bound-zadachi.html" class="wikilink">3. CPU bound vs IO bound задачи</a>). Для сетевых же задач (I/O-bound), где горутины большую часть времени спят в очередях netpoller, количество параллельных задач может исчисляться сотнями тысяч без ущерба для кэша процессора.</li>
+</ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
+<p>Подведём итоги анатомии горутины:</p>
 <ul>
-<li>Горутина — это структура <code>g</code> с растущим стеком (начало 2 КБ), состоянием и сохранённым контекстом. Создаётся за наносекунды, живёт в userspace.</li>
-<li>Жизненный цикл: <code>_Gidle → _Grunnable → _Grunning → _Gwaiting → _Gdead</code>, с возможностью переиспользования.</li>
-<li>Стек непрерывный, растёт копированием (дорого, но редко). Максимальный размер — 1 ГБ.</li>
-<li>Переключение контекста между горутинами — чистый userspace, без syscall'ов, очень дёшево, но не бесплатно из-за кэша.</li>
-<li>Планировщик использует кооперативную многозадачность с асинхронной преемпцией (SIGURG) для предотвращения starvation.</li>
-<li><code>LockOSThread</code> жёстко привязывает горутину к потоку, что дорого и редко нужно.</li>
-<li>Понимание внутренностей горутины необходимо для осознанного управления конкурентностью и диагностики производительности.</li>
+<li><strong>Горутина</strong> — это не поток ОС, а легковесная структура <code>g</code> в пространстве пользователя, содержащая динамический стек (от 2 КБ), указатели контекста <code>gobuf</code> и атомарный статус.</li>
+<li><strong>Жизненный цикл</strong> управляется конечным автоматом состояний: <code>_Gidle</code> $\to$ <code>_Grunnable</code> $\to$ <code>_Grunning</code> $\to$ <code>_Gwaiting</code> $\to$ <code>_Gdead</code>.</li>
+<li>Создание горутины через <code>go func()</code> занимает <strong>20–50 наносекунд</strong> благодаря пулу переиспользования <code>p.gFree</code>.</li>
+<li>Стек горутины является <strong>непрерывным (Contiguous Stack)</strong>: он динамически растет путем удвоения и копирования (<code>copystack</code>) с коррекцией указателей по битовым картам компилятора (Stack Maps). Максимальный размер ограничен 1 ГБ (<code>runtime/debug.SetMaxStack</code>).</li>
+<li>Переключение контекста в userspace (<code>gogo</code>/<code>gopark</code>) обходится всего в <strong>10–15 наносекунд</strong>, сохраняя только 14 ключевых регистров CPU без смены таблиц виртуальной памяти.</li>
+<li>Рантайм Go сочетает кооперативные точки переключения (Safe Points) и <strong>асинхронную преемпцию</strong> по сигналу <code>SIGURG</code> (начиная с Go 1.14), предотвращающую монополизацию ядер бесконечными циклами.</li>
+<li>Функция <code>runtime.LockOSThread()</code> жестко закрепляет горутину за системным потоком ОС для специфических задач (OpenGL, CGO, namespaces).</li>
 </ul>
-<p>Теперь, разобрав, как горутины создаются и переключаются, мы переходим к механизму, который распределяет их между P — к <strong>work stealing</strong>. Следующая статья: <a href="3-work-stealing.html" class="wikilink">3. Work stealing</a>.</p>
+<p>Разобравшись в том, как горутины рождаются, растут и переключаются, мы готовы перейти к механизму, благодаря которому логические процессоры P идеально распределяют миллионы задач между ядрами — к алгоритму воровства работы. Следующая статья: <a href="3-work-stealing.html" class="wikilink">3. Work stealing</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2434,7 +2719,7 @@ Dead --&gt;|&quot;Переиспользование&quot;| Idle
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#kak-ustroena-gorutina-ot-starta-do-zaversheniya">Как устроена горутина: от старта до завершения</a></li><li class="toc-item toc-h2"><a href="#struktura-g-chto-vnutri-gorutiny">Структура g: что внутри горутины</a></li><li class="toc-item toc-h2"><a href="#sozdanie-gorutiny-chto-proiskhodit-pri-go-func">Создание горутины: что происходит при go func()</a></li><li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-konechnyy-avtomat-g">Жизненный цикл: конечный автомат G</a></li><li class="toc-item toc-h2"><a href="#stek-gorutiny-nepreryvnyy-rastushchiy-kopiruemyy">Стек горутины: непрерывный, растущий, копируемый</a></li><li class="toc-item toc-h2"><a href="#pereklyuchenie-konteksta-chto-sokhranyaetsya-i-vosstanavlivaetsya">Переключение контекста: что сохраняется и восстанавливается</a></li><li class="toc-item toc-h2"><a href="#preemptsiya-kak-rantaym-otbiraet-upravlenie">Преемпция: как рантайм отбирает управление</a></li><li class="toc-item toc-h2"><a href="#privyazka-k-potoku-os-lockosthread">Привязка к потоку ОС: LockOSThread</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-vyvody-i-lovushki">Практические выводы и ловушки</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-gorutiny-i-protsessor">Mechanical Sympathy: горутины и процессор</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#kak-ustroena-gorutina-ot-starta-do-zaversheniya">Как устроена горутина: от старта до завершения</a></li><li class="toc-item toc-h2"><a href="#struktura-g-chto-vnutri-gorutiny">Структура g: что внутри горутины</a></li><li class="toc-item toc-h2"><a href="#sozdanie-gorutiny-chto-proiskhodit-pri-go-func">Создание горутины: что происходит при go func()</a></li><li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-konechnyy-avtomat-g">Жизненный цикл: конечный автомат G</a></li><li class="toc-item toc-h2"><a href="#stek-gorutiny-nepreryvnyy-rastushchiy-kopiruemyy">Стек горутины: непрерывный, растущий, копируемый</a></li><li class="toc-item toc-h3"><a href="#evolyutsiya-ot-segmented-stacks-k-contiguous-stacks">Эволюция: от Segmented Stacks к Contiguous Stacks</a></li><li class="toc-item toc-h3"><a href="#sovremennyy-podkhod-nepreryvnyy-stek-s-kopirovaniem">Современный подход: непрерывный стек с копированием</a></li><li class="toc-item toc-h2"><a href="#pereklyuchenie-konteksta-chto-sokhranyaetsya-i-vosstanavlivaetsya">Переключение контекста: что сохраняется и восстанавливается</a></li><li class="toc-item toc-h2"><a href="#preemptsiya-kak-rantaym-otbiraet-upravlenie">Преемпция: как рантайм отбирает управление</a></li><li class="toc-item toc-h3"><a href="#signalnaya-nevytesnyayushchaya-preemptsiya-go-1-14">Сигнальная невытесняющая преемпция (Go 1.14+)</a></li><li class="toc-item toc-h2"><a href="#privyazka-k-potoku-os-lockosthread">Привязка к потоку ОС: LockOSThread</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-vyvody-i-lovushki">Практические выводы и ловушки</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-gorutiny-i-protsessor">Mechanical Sympathy: горутины и процессор</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

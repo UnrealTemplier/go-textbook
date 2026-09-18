@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~40 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Contention и lock profiling</h1>
           </header>
@@ -2178,74 +2178,145 @@
           <div class="article-markdown">
             <h2 id="contention-i-lock-profiling-kak-nayti-i-ustranit-konkurentsiyu-za-blokirovki">Contention и lock profiling: как найти и устранить конкуренцию за блокировки</h2>
 
-<p>В предыдущих статьях мы разобрали стоимость примитивов синхронизации (<a href="5-sync-primitives-i-ikh-stoimost.html" class="wikilink">5. Sync primitives и их стоимость</a>) и критерии выбора между Mutex и Channel (<a href="6-mutex-vs-channel.html" class="wikilink">6. Mutex vs channel</a>). Но даже правильный выбор примитива не спасает, если горутины выстраиваются в очередь к блокировке. Это явление — <strong>contention</strong> (конкуренция) — способно обрушить throughput, раздуть хвостовые задержки и свести на нет все усилия по оптимизации CPU и памяти.</p>
-<p>Contention — это не ошибка в логике, а следствие архитектуры: слишком много горутин хотят получить эксклюзивный доступ к одному ресурсу одновременно. Senior-инженер должен не просто избегать contention, а уметь находить его инструментально, количественно измерять и применять структурные решения: шардирование, lock-free структуры, пересмотр гранулярности блокировок.</p>
-<p>Эта статья — практическое руководство по <strong>lock profiling</strong> в Go. Мы разберём два штатных профиля (mutex и block), их внутреннее устройство, способы включения, интерпретацию результатов и связь с планировщиком (<a href="1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>) и «железом» (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>). В завершение мы выйдем на одну из самых коварных низкоуровневых причин ложного contention — false sharing (<a href="8-false-sharing.html" class="wikilink">8. False sharing</a>).</p>
+<p>В предыдущих главах мы всесторонне исследовали стоимость примитивов синхронизации (<a href="5-sync-primitives-i-ikh-stoimost.html" class="wikilink">5. Sync primitives и их стоимость</a>) и сформулировали фундаментальные критерии выбора между разделяемой памятью и каналами (<a href="6-mutex-vs-channel.html" class="wikilink">6. Mutex vs channel</a>). Однако даже самый безупречный архитектурный выбор превращается в фикцию, когда сотни горутин одновременно выстраиваются в очередь к одному и тому же замку. Это разрушительное явление называется <strong>Lock Contention</strong> (конфликт за блокировку).</p>
+<p>В инженерной механике существует золотое правило: <em>«Хотите узнать, где сломается конструкция при пиковой нагрузке — ищите точку максимального механического напряжения»</em>. В многопоточных бэкенд-системах на Go такой точкой напряжения неизбежно становится разделяемый мьютекс или канал. Вы можете написать идеально оптимизированный алгоритм, свести к нулю аллокации памяти и выровнять байты структур под кэш-линии, но если 64 ядра вашего сервера вынуждены по очереди пролезать через игольное ушко одного <code>sync.Mutex</code>, производительность системы неизбежно рухнет в пропасть.</p>
+<p>Согласно закону Амдала (<a href="../01-fundament/4-amdahl-law-i-masshtabirovanie.html" class="wikilink">4. Amdahl law и масштабирование</a>), если всего 5% времени выполнения программы приходится на монопольную критическую секцию под замком, то даже при наличии 1 000 физических ядер процессора теоретический предел ускорения сервиса составит <strong>не более 20 раз</strong>! Оставшиеся 980 ядер будут простаивать, сжигая электроэнергию в бесполезных ожиданиях.</p>
+<p>Senior-инженер обязан не просто знать об опасности Lock Contention, а виртуозно владеть инструментами его детекции, количественного измерения и архитектурной ликвидации. В этой лекции мы детально разберем два штатных профилировщика Go — <strong>mutex profile</strong> и <strong>block profile</strong>, погрузимся в их внутреннее устройство, научимся интерпретировать двусторонние графы блокировок и устранять аппаратное биение кэш-линий на шине памяти (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>), подготовив почву для разбора феномена False Sharing (<a href="8-false-sharing.html" class="wikilink">8. False sharing</a>).</p>
+<hr />
 <h2 id="chto-takoe-contention-i-pochemu-on-razrushaet-proizvoditelnost">Что такое contention и почему он разрушает производительность</h2>
 
-<p><strong>Contention</strong> — ситуация, когда несколько горутин конкурируют за один и тот же ресурс (мьютекс, канал, атомарную переменную), и как минимум одна из них вынуждена ожидать. В отличие от последовательного выполнения, где горутина просто делает свою работу, при contention возникают:</p>
-<ul>
-<li><strong>Ожидание в очереди.</strong> Горутина переходит в состояние <code>_Gwaiting</code>, паркуется (<a href="2-goroutines-pod-kapotom.html" class="wikilink">2. Goroutines под капотом</a>), а при пробуждении заново проходит через планировщик. Это добавляет задержку и накладные расходы на контекстное переключение (<a href="4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>).</li>
-<li><strong>Spinning и выгорание CPU.</strong> На коротких критических секциях горутина может не парковаться, а крутиться в spin-цикле, сжигая такты и генерируя трафик когерентности кэша.</li>
-<li><strong>Cache line bouncing.</strong> Даже если ожидания нет, сам акт частого захвата/освобождения мьютекса заставляет кэш-линию, содержащую состояние мьютекса, переходить между ядрами. Это снижает эффективную пропускную способность памяти.</li>
-<li><strong>Снижение масштабируемости.</strong> Ускорение от добавления ядер исчезает, когда все они упираются в одну точку синхронизации (закон Амдала, <a href="../01-fundament/4-amdahl-law-i-masshtabirovanie.html" class="wikilink">4. Amdahl law и масштабирование</a>).</li>
-</ul>
-<p>Симптомы contention: высокий CPU при неполной загрузке ядер полезной работой, «плоский» throughput при увеличении GOMAXPROCS, рост p99/p999 без видимых причин в CPU-профиле (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>), потому что время ожидания не считается процессорным временем.</p>
+<p><strong>Contention (конкуренция / конфликт)</strong> — это состояние многозадачной системы, при котором несколько независимых горутин одновременно требуют эксклюзивного доступа к разделяемому ресурсу (мьютексу, буферу канала, атомарной переменной), и как минимум одна из них вынуждена приостановить свое выполнение и ожидать освобождения ресурса.</p>
+<p>В отличие от штатного последовательного кода, при возникновении высокой конкуренции включается каскад скрытых накладных расходов:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+A[&quot;Лавина запросов к одному замку mu.Lock()&quot;] --&gt; B{&quot;Мьютекс занят?&quot;}
+B -- Да --&gt; C[&quot;1. Active Spinning:&lt;br/&gt;пустое выгорание тактов CPU на инструкции PAUSE&quot;]
+C --&gt; D[&quot;2. Уход в ядро Linux:&lt;br/&gt;gopark() -&gt; futex(FUTEX_WAIT) -&gt; статус _Gwaiting&quot;]
+D --&gt; E[&quot;3. Cache Line Bouncing:&lt;br/&gt;строка кэша со state непрерывно мечется между ядрами&quot;]
+E --&gt; F[&quot;4. Деградация закона Амдала:&lt;br/&gt;добавление новых ядер CPU не увеличивает RPS!&quot;]
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>Ожидание в очереди и переключения контекста:</strong><br />
+   Горутина переходит в статус <code>_Gwaiting</code>, уступает поток <code>M</code> и засыпает на системном вызове <code>futex</code> (<a href="2-goroutines-pod-kapotom.html" class="wikilink">2. Goroutines под капотом</a>). При освобождении замка она пробуждается, встает в очередь <code>_Grunnable</code> и ожидает кванта времени. Это порождает накладные расходы контекстных переключений в тысячи наносекунд (<a href="4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>).</li>
+<li><strong>Паразитное выгорание процессорных тактов (Spinning):</strong><br />
+   На коротких критических секциях горутины крутятся в spin-циклах, пытаясь перехватить замок на быстром пути. При 30–50 конкурирующих горутинах ядра процессора нагреваются до 100%, но полезный индекс инструкций за такт (IPC) падает практически до нуля.</li>
+<li><strong>Биение кэш-линий (Cache Line Bouncing):</strong><br />
+   Атомарные инструкции <code>LOCK CMPXCHG</code> над полем <code>state</code> мьютекса принудительно переводят строку кэша в статус <code>Modified</code> на одном ядре, инвалидируя ее во всех остальных кэшах L1d. Межъядерная шина процессора захлебывается трафиком когерентности MESI.</li>
+<li><strong>Коллапс масштабируемости:</strong><br />
+   Классический симптом: вы удваиваете количество ядер пода в Kubernetes (например, с 8 до 16 CPU), но пропускная способность сервиса (RPS) не растет ни на йоту, а хвостовые задержки p99 и p99.9 взлетают в разы. При этом стандартный CPU-профиль (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>) выглядит абсолютно чистым — ведь время сна горутин в ожидании мьютекса не тарифицируется как процессорное время!</li>
+</ol>
+<hr />
 <h2 id="dva-profilya-dlya-diagnostiki-mutex-i-block">Два профиля для диагностики: mutex и block</h2>
 
-<p>Go предоставляет два ортогональных профиля для анализа ожиданий:</p>
+<p>Для исчерпывающей диагностики ожиданий рантайм Go предоставляет два специализированных и взаимодополняющих инструмента:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph MutexProf [&quot;Mutex Profile (/debug/pprof/mutex)&quot;]
+MP1[&quot;Фокус: Борьба за sync.Mutex и sync.RWMutex&quot;]
+MP2[&quot;Двусторонний граф: КТО ЖДАЛ -&gt; КТО ДЕРЖАЛ&quot;]
+MP3[&quot;Метрика: Время задержки из-за Contention&quot;]
+end
+
+subgraph BlockProf [&quot;Block Profile (/debug/pprof/block)&quot;]
+BP1[&quot;Фокус: ВСЕ типы блокировок в рантайме&quot;]
+BP2[&quot;Каналы: chansend, chanrecv, selectgo&quot;]
+BP3[&quot;Синхронизация: sync.Cond, sync.WaitGroup&quot;]
+BP4[&quot;Сетевые сокеты: netpollblock&quot;]
+end
+  </pre>
+</div>
+
+
 <h3 id="mutex-profile">Mutex profile</h3>
-<p>Регистрирует события <strong>конкуренции за мьютексы</strong>: когда горутина пытается захватить <code>sync.Mutex</code> или <code>sync.RWMutex</code>, но он уже занят другой горутиной. Фиксируется не время ожидания как таковое, а сам факт contention — «кто на ком стоял». Профиль показывает, какие мьютексы и какие функции вызывают наибольшее количество конфликтов.</p>
+<p>Специализированный профилировщик, регистрирующий события <strong>непосредственной борьбы за мьютексы</strong>: когда горутина вызывает <code>Lock()</code>, но замок уже удерживается кем-то другим. Главная суперсила Mutex-профиля — двусторонняя фиксация стеков вызовов: он показывает не только функцию, которая страдала в ожидании, но и функцию, которая удерживала замок в этот момент!</p>
 <h3 id="block-profile">Block profile</h3>
-<p>Регистрирует события <strong>блокировки</strong> горутины на:<br />
-- Операциях с каналами (send/recv).<br />
-- Захвате мьютексов (то же, что mutex profile, но измеряет время ожидания).<br />
-- Системных вызовах (по желанию).<br />
-- Ожидании на <code>sync.Cond</code>, <code>sync.WaitGroup</code>.</p>
-<p>Главное отличие: mutex profile — про <strong>частоту contention</strong> (и время задержки из-за contention), block profile — про <strong>время, проведённое в заблокированном состоянии</strong> по любой причине.</p>
+<p>Универсальный профилировщик, фиксирующий <strong>любые события засыпания горутин</strong> в рантайме Go:<br />
+- ожидание отправки или чтения из каналов (<code>chansend</code>, <code>chanrecv</code>);<br />
+- блокировки в конструкции <code>select</code>;<br />
+- ожидание освобождения мьютексов (измеряет чистое время блокировки);<br />
+- ожидание сигналов условных переменных <code>sync.Cond</code> и барьеров <code>sync.WaitGroup</code>;<br />
+- блокировки на системных вызовах и сетевом вводе-выводе (<code>netpollblock</code>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос с собеседования: Mutex Profile против Block Profile</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Чем отличается mutex profile от block profile в Go?<br />
-<strong>Ответ:</strong> Mutex profile фокусируется исключительно на contention за <code>sync.Mutex</code>/<code>RWMutex</code> и показывает, как часто и как долго горутины конкурировали за конкретный мьютекс. Block profile шире: фиксирует любые блокировки — каналы, сетевой ввод-вывод, ожидание на <code>sync.Cond</code>, а также мьютексы.</p>
+    <p><strong>Вопрос:</strong> «В чем принципиальная разница между mutex profile и block profile в Go и какой инструмент вы выберете первым при деградации p99?»<br />
+<strong>Ответ:</strong><br />
+Mutex profile сфокусирован исключительно на конкуренции за замки <code>sync.Mutex</code> и <code>sync.RWMutex</code>: он фиксирует факт конфликта (кто держал и кто ждал) и измеряет дельту времени от начала попытки захвата до получения замка.<br />
+Block profile охватывает все возможные блокировки горутин в рантайме, включая каналы, таймеры и сетевой поллер.<br />
+<strong>Стратегия расследования:</strong> Если задержка растет при нормальной утилизации CPU, первым снимают <code>mutex profile</code> для выявления горячих замков; если мьютексы чисты — снимают <code>block profile</code>, чтобы обнаружить заторы в каналах и сокетах.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kak-rabotaet-profilirovanie-contention-iznutri">Как работает профилирование contention изнутри</h2>
 
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Механизм сэмплирования</span>
   </div>
   <div class="callout-body">
-    <p>Оба профиля основаны на сэмплировании с заданной частотой, чтобы минимизировать overhead.</p>
+    <p>Непрерывная трассировка каждой блокировки в продакшене породила бы неприемлемые накладные расходы. Поэтому оба профилировщика базируются на статистическом сэмплировании.</p>
   </div>
 </div>
 
 <h3 id="mutex-profile">Mutex profile</h3>
 
-<p>Управляется переменной <code>runtime.mutexProfileFraction</code> (устанавливается через <code>runtime.SetMutexProfileFraction(rate)</code>). По умолчанию <code>rate=0</code> — профилирование отключено. При <code>rate &gt; 0</code> каждый <code>rate</code>-й случай contention на мьютексе записывается в хеш-таблицу профиля.</p>
-<p>Когда горутина вызывает <code>Mutex.Lock()</code> и обнаруживает, что мьютекс занят, она входит в медленный путь. В этот момент, если счётчик contention совпадает с <code>rate</code>, рантайм сохраняет:<br />
-- Стек вызовов текущей горутины (кто ждал).<br />
-- Стек вызовов горутины, удерживавшей мьютекс (кто держал).<br />
-- Время ожидания (дельта между моментом блокировки и моментом успешного захвата).</p>
-<p>Таким образом, mutex profile — это не просто «сколько ждали», а двунаправленная картина: кто терпел и кто мешал.</p>
+<p>Интенсивность сбора управляется внутренней переменной рантайма <code>runtime.mutexProfileFraction</code>, которая настраивается функцией <code>runtime.SetMutexProfileFraction(rate)</code>.<br />
+- По умолчанию <code>rate=0</code> — профилирование полностью отключено, оверхед равен строго нулю.<br />
+- Если установлен <code>rate &gt; 0</code>, рантайм использует генератор псевдослучайных чисел: в среднем событие конфликта записывается в профиль с вероятностью $1/\text{rate}$. При значении <code>rate = 1</code> записывается <strong>каждый факт конкуренции</strong>.</p>
+<p>Когда горутина вызывает <code>Mutex.Lock()</code> и обнаруживает, что мьютекс занят (переход в <code>lockSlow</code>), рантайм:<br />
+1. Фиксирует текущую метку времени начала ожидания.<br />
+2. После того как замок успешно захвачен, вычисляет дельту времени задержки.<br />
+3. Сохраняет в кольцевой буфер профилировщика:<br />
+   - стек вызовов текущей горутины (кто ждал);<br />
+   - стек вызовов горутины, удерживавшей мьютекс (кто держал);<br />
+   - время ожидания и количество циклов конфликта.</p>
 <h3 id="block-profile">Block profile</h3>
 
-<p>Управляется <code>runtime.SetBlockProfileRate(rate)</code>. По умолчанию <code>rate=0</code>. При <code>rate &gt; 0</code> каждый <code>rate</code>-й случай блокировки (на канале, мьютексе, select, syscall и т.д.) записывается с указанием стека и длительности блокировки. Типичные значения <code>rate</code>: 1 (записывать всё) — для отладки, 10000 — для production с низким overhead.</p>
-<p>Оба профиля доступны через HTTP-эндпоинты:<br />
+<p>Управляется вызовом <code>runtime.SetBlockProfileRate(rate)</code>.<br />
+- По умолчанию <code>rate=0</code> (отключено).<br />
+- Параметр <code>rate</code> в block profile трактуется иначе: он задает <strong>порог длительности в наносекундах</strong>. Рантайм гарантированно сэмплирует одну блокировку на каждые <code>rate</code> наносекунд ожидания. Значение <code>rate = 1</code> заставляет записывать абсолютно каждую блокировку с наносекундной точностью.</p>
+<p>Оба профиля отдаются стандартным HTTP-сервером <code>net/http/pprof</code> по эндпоинтам:<br />
 - <code>/debug/pprof/mutex</code><br />
 - <code>/debug/pprof/block</code></p>
-<p>Или через <code>runtime/pprof.Lookup("mutex").WriteTo(w, 0)</code>.</p>
-<p>Важно: overhead профилирования contention может быть значительным при высоких частотах событий (тысячи блокировок в секунду). На production обычно ставят rate &gt; 1000 или включают точечно для диагностики.</p>
+<p>Либо программно извлекаются через <code>runtime/pprof.Lookup("mutex").WriteTo(w, 0)</code>.</p>
+<hr />
 <h2 id="kak-vklyuchit-i-sobrat-profil">Как включить и собрать профиль</h2>
 
 <h3 id="dlya-production-servisa-http">Для production-сервиса (HTTP)</h3>
 
+<p>Для безопасного профилирования боевого микросервиса включите сэмплирование в точке инициализации приложения с разумным коэффициентом прореживания:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2255,21 +2326,32 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import (
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;net/http&quot;
     _ &quot;net/http/pprof&quot;
     &quot;runtime&quot;
 )
 
 func main() {
-    runtime.SetMutexProfileFraction(1)  // записывать каждый contention
-    runtime.SetBlockProfileRate(1)      // записывать каждую блокировку
-    // ...
-    http.ListenAndServe(&quot;localhost:6060&quot;, nil)
+    // Включаем сэмплирование: 1 из 100 событий contention мьютексов
+    runtime.SetMutexProfileFraction(100)
+
+    // Включаем сэмплирование блокировок длительностью от 10 микросекунд (10_000 нс)
+    runtime.SetBlockProfileRate(10_000)
+
+    go func() {
+        // Служебный порт мониторинга (закрытый от внешнего мира)
+        http.ListenAndServe(&quot;localhost:6060&quot;, nil)
+    }()
+
+    // Основная бизнес-логика...
 }
 </code></pre>
 </div>
 
-<p>Затем снять профиль:</p>
+<p>Снятие диагностических срезов под реальной нагрузкой:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2279,13 +2361,17 @@ func main() {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">curl -o mutex.prof http://localhost:6060/debug/pprof/mutex
-curl -o block.prof http://localhost:6060/debug/pprof/block
+  <pre class="language-bash"><code class="language-bash"># Сбор профиля конкуренции мьютексов за 30 секунд
+curl -o mutex.prof &quot;http://localhost:6060/debug/pprof/mutex?seconds=30&quot;
+
+# Сбор профиля блокировок за 30 секунд
+curl -o block.prof &quot;http://localhost:6060/debug/pprof/block?seconds=30&quot;
 </code></pre>
 </div>
 
 <h3 id="dlya-testov-i-benchmarkov">Для тестов и бенчмарков</h3>
 
+<p>При проведении нагрузочных тестов и микробенчмарков профили можно сгенерировать автоматически с максимальной детализацией (<code>rate = 1</code>):</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2295,13 +2381,14 @@ curl -o block.prof http://localhost:6060/debug/pprof/block
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go test -mutexprofile=mutex.out -blockprofile=block.out -bench=.
+  <pre class="language-bash"><code class="language-bash">go test -bench=. -benchmem -mutexprofile=mutex.out -blockprofile=block.out
 </code></pre>
 </div>
 
+<hr />
 <h2 id="analiz-mutex-profile">Анализ mutex profile</h2>
 
-<p>Интерактивный анализ аналогичен CPU-профилю:</p>
+<p>Для исследования профиля запустите стандартный инструмент визуализации:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2315,18 +2402,18 @@ curl -o block.prof http://localhost:6060/debug/pprof/block
 </code></pre>
 </div>
 
-<p>Команда <code>top</code> показывает функции с наибольшим суммарным временем задержки из-за contention:</p>
+<p>Команда <code>top</code> выводит список функций, создавших максимальную суммарную задержку в системе:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
   </div>
   <pre class="language-text"><code class="language-text">(pprof) top
-Showing nodes accounting for 4.5s, 90% of 5s total
+Showing nodes accounting for 4.50s, 90.00% of 5.00s total
       flat  flat%   sum%        cum   cum%
      2.00s 40.00% 40.00%      2.00s 40.00%  sync.(*Mutex).Lock
      1.50s 30.00% 70.00%      1.50s 30.00%  mypkg.updateCache
@@ -2334,11 +2421,53 @@ Showing nodes accounting for 4.5s, 90% of 5s total
 </code></pre>
 </div>
 
-<p>Здесь цифры — время ожидания (в секундах или миллисекундах, зависит от профиля). <code>sync.(*Mutex).Lock</code> — это точка, где горутина ждала. <code>mypkg.updateCache</code> — место, где был вызван <code>Lock</code>.</p>
-<p>Команда <code>list updateCache</code> покажет строки кода с указанием, сколько времени горутины провели в ожидании именно этого вызова.</p>
-<p>Mutex profile также сохраняет информацию о том, <strong>какая горутина удерживала мьютекс</strong>. Увидеть её можно через опцию <code>-show_from</code> или в веб-интерфейсе (<code>-http</code>), где отображается двухсторонний граф: кто ждал → кто держал.</p>
+<p>Разбор колонок:<br />
+- <code>sync.(*Mutex).Lock</code> — служебная точка, в которой горутины засыпали в ожидании.<br />
+- <code>mypkg.updateCache</code> — прикладная функция вашего кода, вызов <code>Lock</code> в которой суммарно украл 1.5 секунды времени.</p>
+<p>Детализация по строкам исходного кода выполняется командой <code>list updateCache</code>:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) list updateCache
+ROUTINE ======================== mypkg.updateCache
+     1.50s      1.50s (flat, cum) 30.00% of Total
+         .          .     42: func updateCache(key, val string) {
+     1.50s      1.50s     43:     mu.Lock() // Горячая точка! Здесь горутины ждали 1.5 секунды
+         .          .     44:     cache[key] = val
+         .          .     45:     mu.Unlock()
+         .          .     46: }
+</code></pre>
+</div>
+
+<h3 id="dvustoronniy-graf-kto-zhdal-to-kto-derzhal">Двусторонний граф: «Кто ждал $\to$ Кто держал»</h3>
+
+<p>Самая мощная возможность Mutex-профилировщика — веб-интерфейс, запускаемый флагом <code>-http</code>:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go tool pprof -http=:8080 mutex.prof
+</code></pre>
+</div>
+
+<p>В интерактивном графе отображаются два взаимосвязанных потока вызовов:<br />
+1. Входящие ребра показывают цепочки вызовов горутин, которые ожидали освобождения замка.<br />
+2. Специальная опция <code>-show_from</code> или переключение на режим Holder Stack подсвечивает цепочки вызовов тех горутин, которые в этот момент удерживали мьютекс. Это моментально разоблачает скрытого виновника: вы можете увидеть, что горутины блокировались в <code>updateCache</code>, но мьютекс удерживался совершенно другой фоновой горутиной, сбрасывающей метрики на диск!</p>
+<hr />
 <h2 id="analiz-block-profile">Анализ block profile</h2>
 
+<p>Запустите анализ профиля блокировок:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2352,17 +2481,18 @@ Showing nodes accounting for 4.5s, 90% of 5s total
 </code></pre>
 </div>
 
-<p><code>top</code> покажет, где горутины проводят больше всего времени в заблокированном состоянии:</p>
+<p>Команда <code>top</code> выявит системные функции рантайма, на которых горутины провели максимальное суммарное время в заблокированном состоянии:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
   </div>
   <pre class="language-text"><code class="language-text">(pprof) top
+Showing nodes accounting for 4.50s, 90.00% of 5.00s total
       flat  flat%   sum%        cum   cum%
      3.00s 60.00% 60.00%      3.00s 60.00%  runtime.chanrecv1
      1.00s 20.00% 80.00%      1.00s 20.00%  runtime.selectgo
@@ -2370,22 +2500,51 @@ Showing nodes accounting for 4.5s, 90% of 5s total
 </code></pre>
 </div>
 
-<p>Это говорит о том, что горутины тратят время в ожидании приёма из канала (<code>chanrecv1</code>), в <code>select</code> и в сетевом вводе-выводе (<code>netpollblock</code>).</p>
-<p>Block profile не различает, было ли ожидание продуктивным (IO-bound) или следствием contention. Интерпретировать нужно в контексте: если 60% времени в <code>chanrecv</code> на пустом канале — возможно, потребитель не успевает за продюсером (проблема архитектуры пайплайна), а не contention.</p>
+<p>Инженерная расшифровка точек ожидания:<br />
+- <code>runtime.chanrecv1</code> (или просто <code>chanrecv</code>): горутины спят на пустом канале. Возможные причины: продюсер не справляется с нагрузкой, или воркеров слишком много.<br />
+- <code>runtime.selectgo</code>: горутины заблокированы в мультиплексоре <code>select</code> в ожидании хотя бы одного готового канала.<br />
+- <code>runtime.netpollblock</code>: нормальное состояние ожидания сетевого ввода-вывода (горутины спят в сокетах HTTP/gRPC).</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Block profile без фильтрации</span>
+  </div>
+  <div class="callout-body">
+    <p>В веб-сервисах львиная доля времени горутин уходит на ожидание данных из сетевых сокетов клиентских соединений (<code>netpollblock</code>). Это абсолютно штатный режим ожидания, который замусоривает отчет и скрывает реальные проблемы синхронизации.<br />
+<strong>Решение:</strong> Фильтруйте сетевой опрос при анализе профиля блокировок флагом <code>-ignore</code>:<br />
+<code>go tool pprof -ignore=netpoll block.prof</code></p>
+  </div>
+</div>
+
+<hr />
 <h2 id="execution-tracer-dlya-vizualizatsii-contention">Execution tracer для визуализации contention</h2>
 
-<p>Profiles дают агрегированную картину, но не показывают динамику. Для этого используется <strong>execution tracer</strong> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>). Он записывает события:</p>
-<ul>
-<li><code>MutexLock</code>, <code>MutexUnlock</code> — моменты захвата/освобождения.</li>
-<li><code>GoBlock</code> / <code>GoUnblock</code> — когда горутина блокируется и пробуждается.</li>
-</ul>
-<p>В визуализации трассировки можно увидеть «ступеньки» — горутины, ожидающие на одном мьютексе, и понять, как contention распределён во времени. Если в определённые моменты десятки горутин одновременно ждут один мьютекс, это чётко видно.</p>
+<p>В отличие от профилей pprof, которые показывают лишь статическую сумму миллисекунд за период, утилита <code>go tool trace</code> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>) визуализирует конфликт во времени с наносекундной точностью:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">curl -o trace.out &quot;http://localhost:6060/debug/pprof/trace?seconds=5&quot;
+go tool trace trace.out
+</code></pre>
+</div>
+
+<p>Трассировщик наглядно фиксирует системные события:<br />
+- <code>MutexLock</code> и <code>MutexUnlock</code> — временные интервалы владения замками;<br />
+- <code>GoBlock</code> и <code>GoUnblock</code> — моменты засыпания и пробуждения горутин.</p>
+<p>В визуализаторе трассировки Lock Contention выглядит как характерная «расческа» или ступенчатый каскад: несколько параллельных дорожек горутин внезапно прерываются красными сегментами блокировки, выстраиваясь в очередь к одной точке, и запускаются строго по одной цепочке.</p>
+<hr />
 <h2 id="tipichnye-patterny-contention-i-sposoby-ikh-ustraneniya">Типичные паттерны contention и способы их устранения</h2>
 
-<p>После того как профиль указал на горячую точку, нужно применить одно из структурных решений.</p>
+<p>После того как lock profiling указал на эпицентр проблемы, применяются пять проверенных архитектурных приемов снижения конфликта за замки.</p>
 <h3 id="1-shardirovanie-razdelenie-myuteksa">1. Шардирование (разделение) мьютекса</h3>
 
-<p>Вместо одного мьютекса на всю структуру — массив мьютексов с хешированием по ключу. Применимо для кэшей, счётчиков по категориям.</p>
+<p>Вместо одного глобального замка на всю структуру данных создается массив из $N$ независимых шардов (секций). Каждое обращение направляется в конкретный шард на основе быстрого хэширования ключа:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2396,23 +2555,26 @@ Showing nodes accounting for 4.5s, 90% of 5s total
     </button>
   </div>
   <pre class="language-go"><code class="language-go">type ShardedCache struct {
-    shards []*CacheShard
+    numShards int
+    shards    []*CacheShard
 }
 
 type CacheShard struct {
     mu    sync.RWMutex
     store map[string]string
 }
+
+func (c *ShardedCache) getShard(key string) *CacheShard {
+    idx := fnv32(key) % uint32(c.numShards)
+    return c.shards[idx]
+}
 </code></pre>
 </div>
 
-<p>Количество шардов подбирается экспериментально.</p>
+<p>Если число шардов равно 32 или 64, вероятность одновременного конфликта двух горутин за один и тот же замок снижается в десятки раз, восстанавливая параллелизм.</p>
 <h3 id="2-lock-free-struktury-s-atomic">2. Lock-free структуры с atomic</h3>
 
-<p>Если критическая секция сводится к простым операциям (инкремент, замена ссылки), заменяйте Mutex на атомарные операции. Например, <code>sync.Map</code> внутри построен на атомиках для типичных сценариев.</p>
-<h3 id="3-sokrashchenie-kriticheskoy-sektsii">3. Сокращение критической секции</h3>
-
-<p>Выносите из-под мьютекса всё, что не требует синхронизации: дорогие вычисления, выделение памяти, ввод-вывод.</p>
+<p>Если критическая секция сводится к обновлению указателя конфигурации или инкременту метрик, мьютекс полностью заменяется на примитивы <code>sync/atomic</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2422,78 +2584,104 @@ type CacheShard struct {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Плохо
+  <pre class="language-go"><code class="language-go">// Вместо mu.Lock(); counter++; mu.Unlock()
+atomic.AddInt64(&amp;counter, 1)
+</code></pre>
+</div>
+
+<p>Для чтения тяжелых конфигураций, обновляемых раз в час, идеален <code>atomic.Pointer[Config]</code>. Для кэшей с доминирующим чтением превосходно подходит оптимизированный тип <code>sync.Map</code>, использующий атомарную загрузку без захвата замков на быстром пути.</p>
+<h3 id="3-sokrashchenie-kriticheskoy-sektsii">3. Сокращение критической секции</h3>
+
+<p>Никогда не удерживайте мьютекс при выполнении операций, не требующих эксклюзивного доступа: сериализации JSON, форматирования строк, выделения памяти и, самое главное, сетевого ввода-вывода или походов в базу данных!</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// АНТИПАТТЕРН: катастрофический contention!
 mu.Lock()
-data := fetchFromDB()  // долго!
+data := fetchFromDB(key) // Долгий сетевой вызов (10 мс) под замком!
 cache[key] = data
 mu.Unlock()
 
-// Хорошо
-data := fetchFromDB()  // вне блокировки
+// ЭТАЛОН: критическая секция занимает 20 наносекунд
+data := fetchFromDB(key) // Выполняется свободно и параллельно
 mu.Lock()
-cache[key] = data
+cache[key] = data        // Только атомарная запись в память
 mu.Unlock()
 </code></pre>
 </div>
 
 <h3 id="4-rwmutex-vmesto-mutex">4. RWMutex вместо Mutex</h3>
 
-<p>Если чтений значительно больше записей, используйте <code>sync.RWMutex</code>. Но помните, что при частых записях оверхед RWMutex может превысить выгоду.</p>
+<p>Если структура данных читается тысячами горутин одновременно, а записи происходят редко (&lt; 5%), замена <code>sync.Mutex</code> на <code>sync.RWMutex</code> позволяет читателям использовать метод <code>RLock()</code>, исполняясь абсолютно параллельно на всех ядрах процессора.</p>
 <h3 id="5-otkaz-ot-myuteksov-v-polzu-kanalov-aktornaya-model">5. Отказ от мьютексов в пользу каналов (акторная модель)</h3>
 
-<p>Переход на передачу данных через канал единственной горутине-владельцу исключает contention на мьютексе вовсе, но добавляет оверхед канала. Применимо для сложных инвариантов состояния.</p>
+<p>Перенос управления сложным мутабельным состоянием внутрь единственной горутины-актора, принимающей команды через буферизованный канал, полностью исключает Lock Contention за память.</p>
+<hr />
 <h2 id="mechanical-sympathy-pochemu-contention-byot-po-keshu">Mechanical Sympathy: почему contention бьёт по кэшу</h2>
 
-<p>Каждый захват мьютекса меняет состояние кэш-линии, в которой находится <code>state</code> мьютекса. Когда горутины на разных ядрах часто конкурируют за один мьютекс:</p>
-<ul>
-<li>Кэш-линия постоянно мигрирует между ядрами (bouncing). Каждый переход требует инвалидации и последующей загрузки, что стоит десятки тактов.</li>
-<li>Если защищаемые данные находятся в той же кэш-линии, что и мьютекс, возникает <strong>false sharing</strong> (<a href="8-false-sharing.html" class="wikilink">8. False sharing</a>): горутина А меняет данные, горутина Б меняет мьютекс, и они мешают друг другу, даже не пересекаясь логически.</li>
-<li>Спиннинг (spinning) горутин при contention — это по сути «пустые» запросы к кэш-линии, создающие паразитный трафик и мешающие полезной работе.</li>
-</ul>
-<p>Поэтому устранение contention — это не только про уменьшение задержек, но и про повышение эффективности использования кэш-памяти и пропускной способности шины.</p>
+<p>С точки зрения кремниевой архитектуры современных многоядерных процессоров (AMD Zen, Intel Xeon, ARM Neoverse) Lock Contention наносит разрушительный удар по аппаратным кэшам:</p>
+<ol>
+<li><strong>Шторм протокола MESI (Cache Line Bouncing):</strong><br />
+   Поле <code>state</code> мьютекса <code>sync.Mutex</code> занимает 4 байта и физически лежит в одной 64-байтовой строке кэша. Чтобы выполнить атомарный <code>CAS</code>, ядро обязано захватить эксклюзивный статус <code>Modified</code>. Строка кэша начинает непрерывно метаться между ядрами через межпроцессорную шину UPI/Infinity Fabric со скоростью сотен наносекунд на каждую попытку.</li>
+<li><strong>Паразитный трафик False Sharing:</strong><br />
+   Если разработчик по ошибке расположил полезные данные структуры в той же самой кэш-линии, что и мьютекс:<br />
+<code>go
+   type BadStruct struct {
+       mu    sync.Mutex // 8 байт
+       data  int64      // 8 байт (лежит в той же кэш-линии 64B!)
+   }</code><br />
+   каждая попытка захвата мьютекса будет выбивать из кэша L1 ячейку <code>data</code>, заставляя все читающие ядра ловить постоянные Cache Misses (<a href="8-false-sharing.html" class="wikilink">8. False sharing</a>).</li>
+<li><strong>Бесполезный прогрев кремния при спиннинге:</strong><br />
+   Пока горутины крутятся в цикле спиннинга, конвейер процессора загружен выполнением инструкций <code>PAUSE</code> и непрерывным чтением общей шины памяти, попутно вытесняя из кэшей L1i/L1d полезные инструкции бизнес-логики.</li>
+</ol>
+<hr />
 <h2 id="lovushki-i-chastye-oshibki">Ловушки и частые ошибки</h2>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Включение сэмплирования rate=1 на постоянной основе в production</span>
   </div>
   <div class="callout-body">
-    <p><strong>Не включайте mutex/block профили с rate=1 на постоянной основе в production.</strong> Это может замедлить приложение в разы. Используйте высокие значения (1000–10000) или включайте только на время диагностики.</p>
+    <p>Установка <code>runtime.SetMutexProfileFraction(1)</code> или <code>runtime.SetBlockProfileRate(1)</code> на высоконагруженном сервере под 50k RPS способна замедлить сервис в 3–5 раз! Захват стектрейсов на каждом конфликте создает колоссальный оверхед по памяти и CPU.<br />
+<strong>Правило:</strong> В продакшене используйте значения <code>fraction &gt;= 100</code> и <code>rate &gt;= 10_000</code>, либо активируйте сбор профилей точечно на 30–60 секунд во время инцидента.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ложный contention из-за внешних блокировок</span>
   </div>
   <div class="callout-body">
-    <p><strong>Block profile без фильтрации.</strong> По умолчанию он записывает ожидания на мьютексах и каналах. Чтобы увидеть именно проблемы, можно отфильтровать pprof-вывод: <code>go tool pprof -ignore=netpoll block.prof</code>.</p>
+    <p>Начинающие инженеры часто смотрят на отчет <code>mutex profile</code>, видят, что функция <code>updateCache</code> удерживает замок 90% времени, и начинают судорожно шардировать мапу. Однако реальной причиной оказывается то, что разработчик оставил внутри критической секции вызов <code>fetchFromDB(key)</code>. Всегда инспектируйте полный граф вызовов: ищите, <strong>что именно исполняется под замком</strong>, а не просто факт ожидания.</p>
   </div>
 </div>
 
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Ложный contention из-за длительных критических секций.</strong> Профиль показывает, что горутины ждут <code>updateCache</code>, но причина — <code>fetchFromDB</code> внутри секции, а не сам кэш. Смотрите не только точку ожидания, но и код, который удерживает мьютекс (через граф mutex profile).</p>
-  </div>
-</div>
-
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li>Contention — главный враг масштабируемости конкурентных программ, вызывающий простои горутин, cache line bouncing и рост хвостовых задержек.</li>
-<li>Для диагностики Go предоставляет mutex profile (contention за мьютексами) и block profile (все блокировки).</li>
-<li>Профили включаются через <code>runtime.SetMutexProfileFraction</code>/<code>SetBlockProfileRate</code> и анализируются через <code>go tool pprof</code>.</li>
-<li>Mutex profile показывает двустороннюю картину: кто ждал и кто удерживал блокировку.</li>
-<li>Execution tracer дополняет профили визуализацией динамики блокировок.</li>
-<li>Методы устранения: шардирование, lock-free структуры, сокращение критических секций, RWMutex, акторная модель.</li>
-<li>На уровне «железа» contention вызывает деградацию кэша и трафик когерентности, поэтому даже «лёгкий» мьютекс может быть дорог.</li>
+<li><strong>Lock Contention</strong> — фундаментальный враг масштабируемости, превращающий многоядерный сервер в медленный однопоточный конвейер из-за очередей к разделяемой памяти.</li>
+<li>Рантайм Go предоставляет два дополняющих инструмента:</li>
+<li><strong><code>mutex profile</code></strong> — исследует конфликты за замки <code>sync.Mutex</code> и <code>sync.RWMutex</code>, формируя двусторонний граф: «кто ждал $\to$ кто держал»;</li>
+<li><strong><code>block profile</code></strong> — отслеживает суммарное время ожидания горутин на всех примитивах: каналах, семафорах, таймерах и сокетах.</li>
+<li>Для включения профилирования используются вызовы <code>runtime.SetMutexProfileFraction</code> и <code>runtime.SetBlockProfileRate</code>, а анализ проводится через <code>go tool pprof</code> и <code>go tool trace</code>.</li>
+<li>Пять канонических стратегий устранения contention:<br />
+  1. Шардирование структур данных по хэшу ключа;<br />
+  2. Замена мьютексов на атомарные операции <code>sync/atomic</code> и <code>sync.Map</code>;<br />
+  3. Максимальное сужение критических секций (вынос I/O наружу);<br />
+  4. Переход на <code>sync.RWMutex</code> при доминировании операций чтения;<br />
+  5. Переход на акторную модель через каналы.</li>
+<li>На аппаратном уровне борьба за замки вызывает разрушительное биение строк кэша (Cache Line Bouncing) и шторм протокола когерентности MESI.</li>
 </ul>
+<p>Разобравшись с явной конкуренцией за блокировки, мы готовы перейти к исследованию самого коварного, скрытого и невидимого для компилятора врага производительности — ложному разделению кэш-линий процессора: <a href="8-false-sharing.html" class="wikilink">8. False sharing</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2521,7 +2709,7 @@ mu.Unlock()
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#contention-i-lock-profiling-kak-nayti-i-ustranit-konkurentsiyu-za-blokirovki">Contention и lock profiling: как найти и устранить конкуренцию за блокировки</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-contention-i-pochemu-on-razrushaet-proizvoditelnost">Что такое contention и почему он разрушает производительность</a></li><li class="toc-item toc-h2"><a href="#dva-profilya-dlya-diagnostiki-mutex-i-block">Два профиля для диагностики: mutex и block</a></li><li class="toc-item toc-h3"><a href="#mutex-profile">Mutex profile</a></li><li class="toc-item toc-h3"><a href="#block-profile">Block profile</a></li><li class="toc-item toc-h2"><a href="#kak-rabotaet-profilirovanie-contention-iznutri">Как работает профилирование contention изнутри</a></li><li class="toc-item toc-h3"><a href="#mutex-profile">Mutex profile</a></li><li class="toc-item toc-h3"><a href="#block-profile">Block profile</a></li><li class="toc-item toc-h2"><a href="#kak-vklyuchit-i-sobrat-profil">Как включить и собрать профиль</a></li><li class="toc-item toc-h3"><a href="#dlya-production-servisa-http">Для production-сервиса (HTTP)</a></li><li class="toc-item toc-h3"><a href="#dlya-testov-i-benchmarkov">Для тестов и бенчмарков</a></li><li class="toc-item toc-h2"><a href="#analiz-mutex-profile">Анализ mutex profile</a></li><li class="toc-item toc-h2"><a href="#analiz-block-profile">Анализ block profile</a></li><li class="toc-item toc-h2"><a href="#execution-tracer-dlya-vizualizatsii-contention">Execution tracer для визуализации contention</a></li><li class="toc-item toc-h2"><a href="#tipichnye-patterny-contention-i-sposoby-ikh-ustraneniya">Типичные паттерны contention и способы их устранения</a></li><li class="toc-item toc-h3"><a href="#1-shardirovanie-razdelenie-myuteksa">1. Шардирование (разделение) мьютекса</a></li><li class="toc-item toc-h3"><a href="#2-lock-free-struktury-s-atomic">2. Lock-free структуры с atomic</a></li><li class="toc-item toc-h3"><a href="#3-sokrashchenie-kriticheskoy-sektsii">3. Сокращение критической секции</a></li><li class="toc-item toc-h3"><a href="#4-rwmutex-vmesto-mutex">4. RWMutex вместо Mutex</a></li><li class="toc-item toc-h3"><a href="#5-otkaz-ot-myuteksov-v-polzu-kanalov-aktornaya-model">5. Отказ от мьютексов в пользу каналов (акторная модель)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-contention-byot-po-keshu">Mechanical Sympathy: почему contention бьёт по кэшу</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-chastye-oshibki">Ловушки и частые ошибки</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#contention-i-lock-profiling-kak-nayti-i-ustranit-konkurentsiyu-za-blokirovki">Contention и lock profiling: как найти и устранить конкуренцию за блокировки</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-contention-i-pochemu-on-razrushaet-proizvoditelnost">Что такое contention и почему он разрушает производительность</a></li><li class="toc-item toc-h2"><a href="#dva-profilya-dlya-diagnostiki-mutex-i-block">Два профиля для диагностики: mutex и block</a></li><li class="toc-item toc-h3"><a href="#mutex-profile">Mutex profile</a></li><li class="toc-item toc-h3"><a href="#block-profile">Block profile</a></li><li class="toc-item toc-h2"><a href="#kak-rabotaet-profilirovanie-contention-iznutri">Как работает профилирование contention изнутри</a></li><li class="toc-item toc-h3"><a href="#mutex-profile">Mutex profile</a></li><li class="toc-item toc-h3"><a href="#block-profile">Block profile</a></li><li class="toc-item toc-h2"><a href="#kak-vklyuchit-i-sobrat-profil">Как включить и собрать профиль</a></li><li class="toc-item toc-h3"><a href="#dlya-production-servisa-http">Для production-сервиса (HTTP)</a></li><li class="toc-item toc-h3"><a href="#dlya-testov-i-benchmarkov">Для тестов и бенчмарков</a></li><li class="toc-item toc-h2"><a href="#analiz-mutex-profile">Анализ mutex profile</a></li><li class="toc-item toc-h3"><a href="#dvustoronniy-graf-kto-zhdal-to-kto-derzhal">Двусторонний граф: «Кто ждал $\to$ Кто держал»</a></li><li class="toc-item toc-h2"><a href="#analiz-block-profile">Анализ block profile</a></li><li class="toc-item toc-h2"><a href="#execution-tracer-dlya-vizualizatsii-contention">Execution tracer для визуализации contention</a></li><li class="toc-item toc-h2"><a href="#tipichnye-patterny-contention-i-sposoby-ikh-ustraneniya">Типичные паттерны contention и способы их устранения</a></li><li class="toc-item toc-h3"><a href="#1-shardirovanie-razdelenie-myuteksa">1. Шардирование (разделение) мьютекса</a></li><li class="toc-item toc-h3"><a href="#2-lock-free-struktury-s-atomic">2. Lock-free структуры с atomic</a></li><li class="toc-item toc-h3"><a href="#3-sokrashchenie-kriticheskoy-sektsii">3. Сокращение критической секции</a></li><li class="toc-item toc-h3"><a href="#4-rwmutex-vmesto-mutex">4. RWMutex вместо Mutex</a></li><li class="toc-item toc-h3"><a href="#5-otkaz-ot-myuteksov-v-polzu-kanalov-aktornaya-model">5. Отказ от мьютексов в пользу каналов (акторная модель)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-contention-byot-po-keshu">Mechanical Sympathy: почему contention бьёт по кэшу</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-chastye-oshibki">Ловушки и частые ошибки</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

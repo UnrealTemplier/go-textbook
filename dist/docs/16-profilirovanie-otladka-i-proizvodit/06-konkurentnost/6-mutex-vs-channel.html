@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~41 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Mutex vs channel</h1>
           </header>
@@ -2178,18 +2178,51 @@
           <div class="article-markdown">
             <h2 id="mutex-vs-channel-vybor-opredelyayushchiy-arkhitekturu">Mutex vs Channel: выбор, определяющий архитектуру</h2>
 
-<p>В <a href="5-sync-primitives-i-ikh-stoimost.html" class="wikilink">5. Sync primitives и их стоимость</a> мы количественно оценили стоимость каждого примитива синхронизации: от дешёвых атомарных операций до дорогих каналов. Но стоимость — не единственный критерий. <strong>Mutex</strong> и <strong>Channel</strong> представляют две принципиально разные философии конкурентного взаимодействия, каждая из которых глубоко вписана в дизайн Go.</p>
-<p>Одна из главных пословиц Go гласит:</p>
+<p>В лекции <a href="5-sync-primitives-i-ikh-stoimost.html" class="wikilink">5. Sync primitives и их стоимость</a> мы провели строгий количественный замер стоимости примитивов синхронизации: от субнаносекундных атомарных операций до относительно тяжелых очередей каналов. Однако чистая производительность — лишь одна сторона медали. <strong>Mutex</strong> и <strong>Channel</strong> представляют собой две принципиально разные инженерные философии конкурентного взаимодействия в языке Go.</p>
+<p>Широко известная максима создателей языка, сформулированная Робом Пайком, гласит:</p>
 <blockquote>
-<p><em>Do not communicate by sharing memory; instead, share memory by communicating.</em></p>
+<p><em>Do not communicate by sharing memory; instead, share memory by communicating.</em><br />
+(«Не общайтесь через разделяемую память; вместо этого разделяйте память через общение».)</p>
 </blockquote>
-<p>То есть: не передавайте владение данными через разделяемую память с блокировками — передавайте сами данные через каналы, и пусть владеет тот, кто их получает. Однако на практике Senior-инженер знает, что это не догма. Мьютексы часто дают лучшую производительность, а каналы могут усложнить код там, где нужен простой доступ к общему состоянию. Выбор между ними — это компромисс между семантикой, сложностью и производительностью.</p>
-<p>Цель этой статьи — дать чёткие критерии для выбора, разобрать внутренние механики, типичные паттерны и ловушки, и соотнести выбор с механической эмпатией (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>). Мы будем опираться на знание планировщика (<a href="1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>), стоимости операций (<a href="5-sync-primitives-i-ikh-stoimost.html" class="wikilink">5. Sync primitives и их стоимость</a>), контекстных переключений (<a href="4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>) и инструментов профилирования (<a href="7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>).</p>
+<p>На заре освоения языка начинающие разработчики часто возводят этот лозунг в статус непререкаемой догмы: пытаются заменить абсолютно все мьютексы каналами, строят громоздкие акторные горутины вокруг тривиальных счетчиков и получают падение пропускной способности в 5–10 раз вместе со скрытыми утечками горутин.</p>
+<p>Опытный senior-инженер понимает: эта цитата — архитектурный ориентир для проектирования потоков данных, а не запрет на использование классической синхронизации. Мьютексы зачастую обеспечивают на порядок более высокую скорость работы, в то время как каналы привносят в код стройность, устраняют гонки за владение объектами и элегантно оркеструют асинхронные события. Выбор между ними — это фундаментальный компромисс между семантикой владения, вычислительной сложностью и микроархитектурными накладными расходами процессора (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>).</p>
+<p>Цель этой лекции — дать строгие математические и практические критерии выбора, разобрать внутреннюю механику работы обоих инструментов, рассмотреть типичные производственные паттерны и антипаттерны, а также научиться диагностировать неверные решения с помощью планировщика (<a href="1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>, <a href="1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>), анализа переключений контекста (<a href="4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>) и профилирования блокировок (<a href="7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>).</p>
+<hr />
 <h2 id="dva-mira-obshchee-sostoyanie-protiv-peredachi-vladeniya">Два мира: общее состояние против передачи владения</h2>
+
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Mutex_World [&quot;Парадигма Mutex: Разделяемое состояние (Shared State)&quot;]
+Data[&quot;(Общая структура данных в RAM)&quot;]
+G1[&quot;Горутина 1&quot;] --&gt;|&quot;Lock(): монопольный доступ&quot;| Data
+G2[&quot;Горутина 2&quot;] -.-&gt;|&quot;Ждет в очереди semacquire&quot;| Data
+G3[&quot;Горутина 3&quot;] -.-&gt;|&quot;Ждет в очереди&quot;| Data
+end
+
+subgraph Channel_World [&quot;Парадигма Channel: Передача владения (Ownership Transfer)&quot;]
+Producer[&quot;Горутина-продюсер&quot;] ==&gt;|&quot;ch &lt;- Data (отдача владения)&quot;| Pipe[(&quot;Очередь канала chan&quot;)]
+Pipe ==&gt;|&quot;Data := &lt;-ch (прием владения)&quot;| Consumer[&quot;Горутина-потребитель&quot;]
+end
+  </pre>
+</div>
+
 
 <h3 id="mutex-razdelyaemaya-pamyat-s-eksklyuzivnym-dostupom">Mutex: разделяемая память с эксклюзивным доступом</h3>
 
-<p>Мьютекс (<code>sync.Mutex</code>) защищает <strong>критическую секцию</strong> — блок кода, в котором горутина временно владеет эксклюзивным доступом к разделяемым данным. Все горутины оперируют <em>одними и теми же</em> ячейками памяти, но по очереди. Модель: «Я изменяю общее состояние, пока никто не видит». После разблокировки любое изменение видно следующему владельцу.</p>
+<p>Мьютекс (<code>sync.Mutex</code>) защищает <strong>критическую секцию</strong> — замкнутый фрагмент исполняемого кода, в котором горутина временно получает монопольное право читать и модифицировать разделяемые переменные. Все параллельные горутины обращаются к <em>одним и тем же ячейкам памяти</em>, но строго по очереди.</p>
+<p>Ментальная модель мьютекса: «Мы все живем в одной квартире с общей кухней, на двери которой висит замок. Пока я готовлю у плиты, никто другой не может войти; закончив, я открываю замок и отдаю ключ следующему».</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2206,16 +2239,17 @@
 
 func Put(k, v string) {
     mu.Lock()
-    cache[k] = v
+    cache[k] = v // Эксклюзивное владение общей памятью
     mu.Unlock()
 }
 </code></pre>
 </div>
 
-<p>Главное правило: пока ты под мьютексом, данные твои и только твои. Но другие горутины могут «подсмотреть», если не блокируются, — отсюда гонки. Мьютекс не защищает от гонок; защищает ваша дисциплина.</p>
+<p>Ключевой нюанс: <strong>мьютекс не защищает сами данные — он защищает лишь критическую секцию кода</strong>. Компилятор Go не бьет разработчика по рукам, если другая горутина обратится к переменной <code>cache</code> напрямую, минуя <code>mu.Lock()</code>. Корректность разделяемой памяти целиком и полностью держится на строгой дисциплине инженера.</p>
 <h3 id="channel-peredacha-dannykh-s-peredachey-vladeniya">Channel: передача данных с передачей владения</h3>
 
-<p>Канал (<code>chan</code>) передаёт <strong>значения</strong> от одной горутины к другой. Можно думать о канале как о потоке данных, где отправитель теряет право использовать отправленное значение (если только не передаёт копию). Модель: «Я отдаю тебе данные, дальше они твои».</p>
+<p>Канал (<code>chan</code>) передает <strong>значения</strong> от одной горутины к другой по модели очередей сообщений (Message Passing). Здесь реализуется парадигма CSP (Communicating Sequential Processes) Тони Хоара: отправитель формирует данные, помещает их в канал и в этот самый момент <strong>теряет право на их изменение</strong>. Получатель извлекает данные из канала и становится их единственным законным владельцем.</p>
+<p>Ментальная модель канала: «Я упаковал посылку, запечатал коробку и опустил ее в почтовый ящик. Теперь посылка мне не принадлежит — ею будет распоряжаться адресат, который достанет ее из ящика».</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2226,89 +2260,103 @@ func Put(k, v string) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func producer(ch chan&lt;- string) {
-    ch &lt;- &quot;data&quot; // передали владение
-    // больше не используем строку
+    data := &quot;payload&quot;
+    ch &lt;- data // Владение передано!
+    // Продюсер больше не трогает переменную data
 }
 
 func consumer(ch &lt;-chan string) {
-    data := &lt;-ch // приняли владение
+    data := &lt;-ch // Получено полное эксклюзивное владение
     fmt.Println(data)
 }
 </code></pre>
 </div>
 
-<p>Канал в явном виде передаёт владение, избавляя от необходимости синхронизировать доступ к разделяемой памяти. Но если по каналу пересылаются указатели или слайсы, и отправитель продолжает их использовать, возможна неявная гонка — это грубая ошибка.</p>
+<p>Канал в явном виде устраняет необходимость в ручной синхронизации, поскольку в любой момент времени с данными работает строго одна горутина. Однако, если по каналу пересылается указатель (например, <code>*SomeStruct</code>) или слайс, и отправитель продолжает модифицировать объект после отправки, возникает неявная и крайне опасная гонка данных (Data Race).</p>
+<hr />
 <h2 id="vnutrennee-ustroystvo-mutex-i-channel-tsena-bystrogo-puti-i-blokirovki">Внутреннее устройство Mutex и Channel: цена быстрого пути и блокировки</h2>
 
-<p>Мы уже разбирали внутренности в <a href="5-sync-primitives-i-ikh-stoimost.html" class="wikilink">5. Sync primitives и их стоимость</a>, но повторим ключевые моменты для сравнения.</p>
-<p><strong>Mutex</strong> (<code>sync.Mutex</code>):<br />
-- Быстрый путь: атомарный CAS над 32-битным полем <code>state</code>. При нулевом contention — десятки наносекунд.<br />
-- Медленный путь: горутина начинает spin-цикл (spinning), затем паркуется через <code>runtime.semacquire</code> → <code>futex(FUTEX_WAIT)</code> (Linux). Это userspace → kernel → userspace, с сохранением контекста.<br />
-- Пробуждение: владелец при <code>Unlock()</code> вызывает <code>runtime.semrelease</code> → <code>futex(FUTEX_WAKE)</code>.</p>
-<p><strong>Channel</strong> (внутренняя структура <code>hchan</code> из <code>runtime/chan.go</code>):<br />
-- Имеет внутренний мьютекс <code>lock</code> (быстрый, рантаймовый, без справедливости).<br />
-- Буфер (кольцевой массив), две очереди ожидающих горутин (<code>sendq</code>, <code>recvq</code>).<br />
-- При небуферизированном рандеву копирует значение напрямую из стека отправителя в стек получателя (минуя буфер), что дёшево.<br />
-- При буферизированной операции без блокировки — копирование в/из буфера под блокировкой.<br />
-- При блокировке — горутина паркуется в очередь, мьютекс отпускается; при появлении партнёра — пробуждение.</p>
-<p><strong>Канал всегда дороже Mutex на быстром пути</strong> из-за внутреннего мьютекса, проверок буфера и копирования. Но в сценариях передачи владения он даёт лучшую композицию и понятность.</p>
+<p>В лекции <a href="5-sync-primitives-i-ikh-stoimost.html" class="wikilink">5. Sync primitives и их стоимость</a> мы исследовали их устройство под микроскопом. Сопоставим их ключевые механизмы:</p>
+<h3 id="mutex-sync-mutex">Mutex (`sync.Mutex`):</h3>
+<ul>
+<li><strong>Быстрый путь (Fast Path):</strong> Единственная инструкция процессора <code>LOCK CMPXCHG</code> (атомарный CAS над 32-битным полем <code>state</code>). При отсутствии конкуренции операция завершается за <strong>10–20 наносекунд</strong> без обращения к планировщику рантайма.</li>
+<li><strong>Медленный путь (Slow Path):</strong> Кратковременный активный спиннинг (Active Spinning) на процессоре с инструкцией <code>PAUSE</code>. Если замок не освободился — уход в глубокий сон через процедуру <code>runtime.semacquire</code> $\to$ системный вызов ядра <code>futex(FUTEX_WAIT)</code> (в Linux).</li>
+<li><strong>Пробуждение:</strong> При вызове метода <code>Unlock()</code> владелец сбрасывает флаг блокировки и вызывает процедуру <code>runtime.semrelease</code> $\to$ <code>futex(FUTEX_WAKE)</code>, возвращая спящую горутину в очередь планировщика <code>_Grunnable</code>.</li>
+</ul>
+<h3 id="channel-hchan-iz-runtimechan-go">Channel (`hchan` из `runtime/chan.go`):</h3>
+<ul>
+<li><strong>Внутренний замок:</strong> Структура <code>hchan</code> сама по себе защищена внутренним низкоуровневым мьютексом <code>lock</code> (<code>runtime.mutex</code>).</li>
+<li><strong>Сложная логика буфера:</strong> Канал управляет кольцевым массивом в куче (<code>buf</code>), индексами чтения и записи (<code>sendx</code>, <code>recvx</code>), а также двусвязными списками заблокированных горутин (<code>sendq</code> и <code>recvq</code>).</li>
+<li><strong>Прямое копирование стека:</strong> При небуферизованном рандеву рантайм Go выполняет прямое копирование байт из стека отправителя в стек получателя в обход буфера кучи.</li>
+<li><strong>Блокировка:</strong> Если буфер полон или пуст, горутина формирует дескриптор ожидания <code>sudog</code>, ставит себя в очередь <code>sendq</code>/<code>recvq</code>, отпускает внутренний замок <code>hchan.lock</code> и засыпает в <code>gopark</code>.</li>
+</ul>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Фундаментальный факт производительности</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Канал на быстром пути всегда существенно дороже обычного Mutex</strong>. Внутри каждого канала уже встроен собственный мьютекс, к стоимости которого добавляются проверки переполнения буфера, манипуляции с указателями и копирование памяти.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="sravnenie-stoimosti-kogda-tsena-imeet-znachenie">Сравнение стоимости: когда цена имеет значение</h2>
 
 <div class="table-container"><table>
 <thead>
 <tr>
-<th>Сценарий</th>
-<th>Mutex</th>
-<th>Buffered Channel</th>
-<th>Unbuffered Channel</th>
+<th>Сценарий использования</th>
+<th style="text-align: center;">sync.Mutex</th>
+<th style="text-align: center;">Буферизованный канал (Buffered)</th>
+<th style="text-align: center;">Небуферизованный канал (Unbuffered)</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Операция без ожидания</td>
-<td>10-20 нс</td>
-<td>50-150 нс</td>
-<td>100-300 нс</td>
+<td><strong>Операция без ожидания (Fast Path)</strong></td>
+<td style="text-align: center;"><strong>10–20 нс</strong></td>
+<td style="text-align: center;"><strong>50–150 нс</strong></td>
+<td style="text-align: center;"><strong>100–300 нс</strong></td>
 </tr>
 <tr>
-<td>Операция с ожиданием</td>
-<td>~1-10 мкс (futex, контекст)</td>
-<td>~1-100 мкс</td>
-<td>~1-100 мкс</td>
+<td><strong>Операция с блокировкой (Slow Path)</strong></td>
+<td style="text-align: center;"><strong>1–10 мкс</strong> (futex + gopark)</td>
+<td style="text-align: center;"><strong>1–100 мкс</strong></td>
+<td style="text-align: center;"><strong>1–100 мкс</strong></td>
+</tr>
+<tr>
+<td><strong>Накладные расходы памяти</strong></td>
+<td style="text-align: center;"><strong>8 байт</strong> (встраивается в struct)</td>
+<td style="text-align: center;"><strong>~96 байт + размер буфера в куче</strong></td>
+<td style="text-align: center;"><strong>~96 байт</strong> в куче</td>
 </tr>
 </tbody>
 </table></div>
-<p>При высоком contention на мьютексе множество горутин могут крутиться в spin-циклах, что сжигает CPU, но даёт низкую задержку, если критические секции короткие. Канал же немедленно паркует горутину, экономя CPU, но добавляя задержку на пробуждение.</p>
-<p>Таким образом, если операция очень короткая (несколько наносекунд), Mutex часто выигрывает. Если ожидание длительное (микросекунды и более), разница стирается, и канал даёт лучшие гарантии справедливости и понятность.</p>
+<p>Если критическая операция выполняется за считаные наносекунды (например, обновление счетчика или получение элемента из мапы), <code>sync.Mutex</code> опережает каналы на порядок величины.</p>
+<p>Однако при длительном ожидании (сотни микросекунд или миллисекунды) накладные расходы самого примитива нивелируются длительностью ожидания. В этом случае каналы раскрывают свою истинную мощь: они предоставляют выразительный декларативный синтаксис оркестрации и органично интегрируются с мультиплексором <code>select</code>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос с собеседования: Канал для защиты счетчика</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему использование канала для защиты простого счётчика медленнее, чем Mutex?<br />
-<strong>Ответ:</strong> Каждая операция send/recv требует захвата внутреннего мьютекса канала, проверки буфера, манипуляций с очередями ожидающих, и часто — копирования значения. Для простого инкремента это избыточно. Mutex делает лишь атомарный CAS на быстром пути.</p>
+    <p><strong>Вопрос:</strong> «Почему реализация потокобезопасного счетчика через канал (например, передача <code>int</code> по кругу) работает в разы медленнее, чем через <code>sync.Mutex</code> или <code>sync/atomic</code>?»<br />
+<strong>Ответ:</strong><br />
+Каждая отправка и прием из канала требует захвата внутреннего замка <code>hchan.lock</code>, проверки состояния очередей <code>sendq</code>/<code>recvq</code>, перемещения данных и вызова процедур рантайма <code>runtime.chansend</code>/<code>runtime.chanrecv</code>. Для тривиального инкремента 64-битного числа это чудовищный оверхед. <code>sync/atomic</code> выполняет операцию за 5–10 нс на уровне регистров CPU, а <code>sync.Mutex</code> — за 10–20 нс через 1 CAS, в то время как канал тратит от 150 до 300 нс на каждую операцию.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kogda-vybirat-mutex">Когда выбирать Mutex</h2>
 
+<p>Применяйте <code>sync.Mutex</code> (или <code>sync.RWMutex</code>), когда ваша архитектурная задача относится к следующим категориям:</p>
 <h3 id="1-zashchita-razdelyaemogo-sostoyaniya-kesh-konfiguratsiya-schyotchiki">1. Защита разделяемого состояния (кэш, конфигурация, счётчики)</h3>
-<p>Любая структура, к которой нужен конкурентный доступ на чтение/запись. Классика: map с мьютексом, слайс, дерево. Здесь данные не передаются «владением», они общие.</p>
+<p>Любые внутренние in-memory структуры данных, к которым требуется высокоскоростной параллельный доступ: хэш-таблицы (<code>map</code>), срезы, деревья, LRU-кэши, локальные метрики. Здесь данные не путешествуют между горутинами — они статично лежат в памяти, а горутины приходят к ним для быстрого чтения или обновления.</p>
 <h3 id="2-kriticheskie-sektsii-dlyashchiesya-nanosekundy">2. Критические секции, длящиеся наносекунды</h3>
-<p>Если время под блокировкой сопоставимо с накладными расходами канала, Mutex даст лучший throughput. См. бенчмарк для инкремента map.</p>
+<p>Если логика внутри замка укладывается в несколько ассемблерных инструкций (присваивание поля, чтение указателя, инкремент), мьютекс обеспечит максимальный throughput системы, не создавая мусора в куче и лишних накладных расходов.</p>
 <h3 id="3-slozhnye-invarianty-trebuyushchie-atomarnosti-neskolkikh-operatsiy">3. Сложные инварианты, требующие атомарности нескольких операций</h3>
-<p>Мьютекс гарантирует, что между проверкой условия и модификацией данных никто не вмешается. Канал для этого требует передачи всего состояния туда-обратно, что неэффективно.</p>
-<h3 id="4-vysokokonkurentnoe-chtenie-s-redkoy-zapisyu-rwmutex">4. Высококонкурентное чтение с редкой записью (RWMutex)</h3>
-<p><code>sync.RWMutex</code> позволяет множеству читателей параллельно читать. Каналы так не могут.</p>
-<h2 id="kogda-vybirat-channel">Когда выбирать Channel</h2>
-
-<h3 id="1-peredacha-dannykh-mezhdu-gorutinami-s-peredachey-vladeniya">1. Передача данных между горутинами с передачей владения</h3>
-<p>Конвейерная обработка (fan-in, fan-out), pipeline, pub-sub в пределах процесса. Канал является и синхронизацией, и контейнером.</p>
-<h3 id="2-koordinatsiya-i-signalizatsiya-done-cancel">2. Координация и сигнализация (done, cancel)</h3>
-<p>Закрытие канала (<code>close(ch)</code>) — широкая вещательная операция: все получатели мгновенно просыпаются и получают zero value. Это невозможно эмулировать одним Mutex.</p>
-<h3 id="3-ogranichenie-parallelizma-semafor">3. Ограничение параллелизма (семафор)</h3>
-<p>Буферизированный канал ёмкостью N — это готовая реализация семафора. Попытка занять слот = send, освободить = recv. Просто и идиоматично.</p>
+<p>Мьютекс незаменим при реализации паттерна <strong>Check-Then-Act</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2318,28 +2366,118 @@ func consumer(ch &lt;-chan string) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">sem := make(chan struct{}, 100)
-// Захват:
-sem &lt;- struct{}{}
-// Освобождение:
-&lt;-sem
+  <pre class="language-go"><code class="language-go">mu.Lock()
+if user.Balance &gt;= amount {
+    user.Balance -= amount
+    user.OrdersCount++
+}
+mu.Unlock()
+</code></pre>
+</div>
+
+<p>Мьютекс железно гарантирует, что между проверкой условия и списанием баланса ни одна сторонняя горутина не сможет вклиниться и нарушить бизнес-инвариант. Попытка реализовать аналогичную логику через каналы потребует громоздких схем с пересылкой структур состояния туда и обратно.</p>
+<h3 id="4-vysokokonkurentnoe-chtenie-s-redkoy-zapisyu-rwmutex">4. Высококонкурентное чтение с редкой записью (RWMutex)</h3>
+<p>Когда тысячи горутин непрерывно читают разделяемые данные (например, глобальную конфигурацию микросервиса), а обновления происходят раз в несколько минут, <code>sync.RWMutex</code> позволяет читателям исполняться абсолютно параллельно на всех ядрах без взаимных блокировок. Каналы не поддерживают паттерн параллельного чтения одних и тех же данных несколькими подписчиками без дублирования сообщений.</p>
+<hr />
+<h2 id="kogda-vybirat-channel">Когда выбирать Channel</h2>
+
+<p>Применяйте каналы (<code>chan</code>), когда решаются задачи координации, диспетчеризации и передачи ответственности:</p>
+<h3 id="1-peredacha-dannykh-mezhdu-gorutinami-s-peredachey-vladeniya">1. Передача данных между горутинами с передачей владения</h3>
+<p>Классические конвейеры обработки данных (Data Pipelines), где каждый этап выполняется отдельным пулом воркеров. Продюсер парсит сетевой поток, отправляет чанк в канал; воркер забирает его, валидирует и отправляет дальше. Канал выступает одновременно транспортной магистралью и буфером сглаживания нагрузки (Backpressure).</p>
+<h3 id="2-koordinatsiya-i-signalizatsiya-done-cancel">2. Координация и сигнализация (done, cancel)</h3>
+<p>Широковещательное оповещение о завершении работы. Закрытие канала <code>close(ch)</code> — это уникальная операция рантайма Go: все горутины, заблокированные на чтении <code>&lt;-ch</code>, мгновенно разблокируются и получают нулевое значение типа (<code>zero value</code>). Сэмулировать такой мгновенный широковещательный сигнал через один мьютекс невозможно.</p>
+<h3 id="3-ogranichenie-parallelizma-semafor">3. Ограничение параллелизма (семафор)</h3>
+<p>Буферизованный канал емкостью $N$ представляет собой каноническую реализацию семафора Дейкстры в одну строчку кода:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Семафор на 100 одновременных горутин
+sem := make(chan struct{}, 100)
+
+for req := range requests {
+    sem &lt;- struct{}{} // Захват слота (send блокируется, если в буфере уже 100 элементов)
+    go func(r Request) {
+        defer func() { &lt;-sem }() // Освобождение слота
+        handle(r)
+    }(req)
+}
 </code></pre>
 </div>
 
 <h3 id="4-taym-auty-i-neblokiruyushchie-operatsii">4. Тайм-ауты и неблокирующие операции</h3>
-<p><code>select</code> с <code>case ch &lt;- val:</code> и <code>case &lt;-time.After(t):</code> даёт гибкость, которую Mutex не предоставляет. Можно ждать несколько каналов одновременно.</p>
+<p>Конструкция <code>select</code> с ветками <code>case ch &lt;- val:</code> и <code>case &lt;-time.After(t):</code> даёт феноменальную гибкость, недостижимую для традиционных мьютексов:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">select {
+case ch &lt;- val:
+    // Успешно отправлено без блокировки
+case &lt;-time.After(t):
+    // Превышен таймаут ожидания операции
+default:
+    // Неблокирующий опрос: выполняется, если канал не готов немедленно
+}
+</code></pre>
+</div>
+
 <h3 id="5-postroenie-slozhnykh-konechnykh-avtomatov-i-orkestrovok">5. Построение сложных конечных автоматов и оркестровок</h3>
-<p>Каналы с <code>select</code> — это способ описания взаимодействия, который ближе к CSP (Communicating Sequential Processes), чем к блокировкам.</p>
+<p>Каналы с оператором <code>select</code> позволяют строить надежные машины состояний, арбитраж независимых источников данных и корректное завершение сервисов (Graceful Shutdown).</p>
+<hr />
 <h2 id="patterny-ispolzovaniya-kanalov">Паттерны использования каналов</h2>
 
 <h3 id="fan-out-fan-in">Fan-out / Fan-in</h3>
-<p>Несколько горутин читают из одного канала, обрабатывают, результат пишут в общий выходной канал. Просто реализуется, не требует внешнего Mutex.</p>
+
+<ul>
+<li><strong>Fan-out:</strong> Одна горутина-генератор читает сырые задачи и распределяет их по общему входному каналу между несколькими горутинами-воркерами, параллелизуя вычисления на всех доступных ядрах CPU.</li>
+<li><strong>Fan-in:</strong> Результаты работы всех воркеров сливаются в единый результирующий канал для финальной агрегации или сохранения в базу данных.</li>
+</ul>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Source[&quot;Генератор задач (Producer)&quot;] --&gt;|&quot;In Channel&quot;| W1[&quot;Воркер 1&quot;]
+Source --&gt;|&quot;In Channel&quot;| W2[&quot;Воркер 2&quot;]
+Source --&gt;|&quot;In Channel&quot;| W3[&quot;Воркер 3&quot;]
+W1 --&gt;|&quot;Out Channel&quot;| Sink[&quot;Агрегатор (Consumer)&quot;]
+W2 --&gt;|&quot;Out Channel&quot;| Sink
+W3 --&gt;|&quot;Out Channel&quot;| Sink
+  </pre>
+</div>
+
+
 <h3 id="pipeline">Pipeline</h3>
-<p>Последовательная цепочка обработчиков: канал → горутина → канал → … Позволяет нагрузить все ядра.</p>
+
+<p>Потоковая обработка данных, разделенная на строго изолированные фазы:<br />
+<code>Чтение из сокета</code> $\to$ <code>Расшифровка TLS</code> $\to$ <code>Бизнес-валидация</code> $\to$ <code>Сохранение в БД</code>.<br />
+Каждая фаза связана со следующей через буферизованный канал, что позволяет выдерживать пиковые всплески трафика без падения сервиса.</p>
 <h3 id="semafor-s-kanalom">Семафор с каналом</h3>
-<p>Вместо <code>sync.WaitGroup</code> можно использовать канал, но WaitGroup подходит для ожидания завершения без передачи значений.</p>
+
+<p>Управление пулом соединений или ограничение одновременных тяжелых вызовов внешних API без раздувания пула горутин.</p>
 <h3 id="kontekst-s-select">Контекст с `select`</h3>
 
+<p>Стандарт де-факто для отмены операций при межсервисном взаимодействии:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2351,91 +2489,156 @@ sem &lt;- struct{}{}
   </div>
   <pre class="language-go"><code class="language-go">select {
 case &lt;-ctx.Done():
-    return ctx.Err()
+    return ctx.Err() // Отмена по таймауту родительского контекста
 case data := &lt;-ch:
     return process(data)
 }
 </code></pre>
 </div>
 
-<p>Каналы интегрируются с <code>context.Context</code> для graceful shutdown.</p>
+<p>Интеграция с пакетом <code>context.Context</code> гарантирует, что ни одна горутина не останется висеть в памяти при досрочном обрыве клиентского HTTP-соединения.</p>
+<hr />
 <h2 id="lovushki-i-antipatterny">Ловушки и антипаттерны</h2>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Передача указателей через канал</span>
   </div>
   <div class="callout-body">
-    <p><strong>Передача указателей через канал.</strong> Если вы посылаете <code>*SomeStruct</code> в канал, и продолжаете модифицировать структуру после отправки, возникает гонка. Канал передал владение, а вы его нарушили. Решение: передавать value-копии (если не велики) или прекратить использовать объект.</p>
+    <p>Если горутина отправляет в канал указатель <code>*SomeStruct</code>, а затем продолжает читать или модифицировать поля этой же структуры:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">msg := &amp;SomeStruct{ID: 42}
+ch &lt;- msg
+msg.ID = 43 // КАТАСТРОФА: Data Race!
+</code></pre>
+</div>
+
+<p>вы создаете коварнейшую гонку данных, которую крайне сложно отловить без детектора гонок (<code>-race</code>). Передача указателя через канал должна сопровождаться <strong>полным отказом отправителя от работы с этим объектом</strong> (за исключением сценариев иммутабельных структур, открытых только на чтение).</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Использование канала для защиты общего кэша</span>
   </div>
   <div class="callout-body">
-    <p><strong>Использование канала для защиты общего кэша.</strong> Канал обязывает сериализовать все операции записи и чтения через единственную горутину (actor model). Это может стать узким местом. Mutex с конкуректным чтением (RWMutex) может быть значительно производительнее.</p>
+    <p>Попытка построить конкурентный in-memory кэш вокруг единственной горутины-актора:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// Антипаттерн: единая горутина слушает канал запросов к map
+func cacheActor(requests &lt;-chan Request) {
+    m := make(map[string]string)
+    for req := range requests { ... }
+}
+</code></pre>
+</div>
+
+<p>превращает горутину-актора в непреодолимое узкое место системы. Все ядра процессора встают в очередь к каналу <code>requests</code>, а общая пропускная способность ограничивается скоростью работы одного ядра. Замена этого антипаттерна на обычный <code>sync.RWMutex</code> увеличивает throughput в десятки раз.</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Небуферизированный канал для thread-safe стека</span>
   </div>
   <div class="callout-body">
-    <p><strong>Небуферизированный канал для thread-safe stack.</strong> Попытка реализовать стек через канал приводит к тому, что каждое push/pop блокируется в ожидании партнёра, что не совместимо со свободным доступом многих горутин. Mutex здесь естественнее.</p>
+    <p>Попытка реализовать многопоточный стек или очередь задач через небуферизованный канал приводит к тому, что каждый push и pop требует одновременного рандеву двух горутин. Если продюсер готов записать, а консьюмер еще занят, продюсер блокируется и уходит в <code>gopark</code>. Используйте нормальные структуры данных с <code>sync.Mutex</code>!</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Дедлоки и паники из-за каналов</span>
   </div>
   <div class="callout-body">
-    <p><strong>Дедлоки из-за каналов.</strong> Забыли закрыть канал, отправили в закрытый (panic), или обе горутины ждут друг друга (отправитель ждёт получателя, а получатель отправителя). Mutex тоже дедлоки, но каналы чаще ловят на этапе разработки через <code>select</code> с <code>default</code>.</p>
+    <ol>
+<li>Отправка данных в закрытый канал (<code>ch &lt;- x</code>) немедленно вызывает неустранимую панику: <code>panic: send on closed channel</code>.</li>
+<li>Повторное закрытие канала (<code>close(ch)</code>) также вызывает панику: <code>panic: close of closed channel</code>.</li>
+<li>Чтение из незакрытого пустого канала навсегда блокирует горутину, порождая утечку памяти (Goroutine Leak).<br />
+<strong>Каноническое правило Go:</strong> Закрывать канал имеет право <strong>только отправитель (продюсер)</strong>, и только тот, кто является единственным писателем в этот канал.</li>
+</ol>
   </div>
 </div>
 
+<hr />
 <h2 id="profilirovanie-kak-uvidet-chto-vybor-neveren">Профилирование: как увидеть, что выбор неверен</h2>
 
-<p>Если вы выбрали Mutex, но подозреваете проблемы:<br />
-- Снимите <strong>mutex profile</strong> (<a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>), он покажет время ожидания на каждом мьютексе. Если contention высок — возможно, стоит перейти на RWMutex, шардирование, или пересмотреть критическую секцию.<br />
-- Используйте <code>block profile</code> (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>) для поиска ожиданий на каналах.</p>
-<p>Если вы выбрали канал, и сервис тормозит:<br />
-- <code>GODEBUG=schedtrace=1000</code> покажет, не скапливаются ли горутины в ожидании на каналах (массовое <code>_Gwaiting</code>).<br />
-- Execution tracer (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>) покажет, сколько времени горутины проводят в состоянии waiting на каналах.<br />
-- CPU-профиль может показать высокое время в <code>runtime.chansend</code> или <code>runtime.chanrecv</code>, что говорит о дорогих блокировках.</p>
+<p>Если архитектурный выбор сделан с ошибкой, профилировщики Go мгновенно подсвечивают проблему:</p>
+<ul>
+<li><strong>Выбран Mutex, но система тормозит:</strong><br />
+  Снимите профиль мьютексов (<a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>):<br />
+<code>bash
+  go test -mutexprofile=mutex.out</code><br />
+  Если граф вызовов показывает, что горутины проводят в ожидании замка секунды суммарного времени — критическая секция перегружена. Решения: сократить время под замком, перейти на шардирование мап (Sharded Map) или применить <code>sync.RWMutex</code>.</li>
+<li><strong>Выбран Channel, но throughput деградирует:</strong><br />
+  Снимите профиль блокировок (<code>block profile</code>, <a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>):<br />
+<code>bash
+  go test -blockprofile=block.out</code><br />
+  Если в топе находятся функции <code>runtime.chansend</code> и <code>runtime.chanrecv</code>, горутины массово простаивают в ожидании партнеров.</li>
+<li><strong>Трассировка планировщика:</strong><br />
+  Команда <code>GODEBUG=schedtrace=1000</code> покажет скопление тысяч горутин в статусе <code>_Gwaiting</code>. Запустите <code>go tool trace</code> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>), чтобы визуализировать цепочки зависимостей между каналами.</li>
+</ul>
+<hr />
 <h2 id="mechanical-sympathy-mutex-channel-i-zhelezo">Mechanical Sympathy: Mutex, Channel и «железо»</h2>
 
-<p>На уровне процессора и кэша разница существенна:</p>
-<ul>
-<li><strong>Mutex:</strong> состояние блокировки — несколько байт в памяти. CAS вызывает cache line bouncing между ядрами: ядро-владелец держит линию в <code>Modified</code>, другие шлют запросы, заставляя линию переходить. Если защищаемые данные находятся в той же кэш-линии (false sharing, <a href="8-false-sharing.html" class="wikilink">8. False sharing</a>), накладные расходы резко возрастают. При spin-циклах горутины жгут такты и греют шину, не делая полезной работы.</li>
-<li><strong>Channel:</strong> содержит внутреннюю структуру <code>hchan</code> (около 100 байт), которая тоже имеет мьютекс и кэш-линии. При работе канала происходит копирование данных: если буферизированный — в/из кольцевого буфера; если небуферизированный — напрямую между стеками горутин. Копирование загружает кэш получателя «горячими» данными, что может быть плюсом. Но при пробуждении горутины её стек может быть холодным.</li>
-</ul>
-<p>Таким образом, для максимальной производительности важно:<br />
-- Минимизировать длительность критических секций под Mutex.<br />
-- Не использовать каналы там, где достаточно атомарных операций.<br />
-- Выравнивать защищаемые данные по кэш-линиям, чтобы не создавать false sharing.</p>
+<p>С точки зрения кремниевой архитектуры процессора разница между этими двумя инструментами фундаментальна:</p>
+<ol>
+<li><strong>Физика Mutex:</strong><br />
+   Поле <code>state</code> занимает всего 4 байта памяти. Конкуренция за мьютекс вызывает перемещение 64-байтовой строки кэша между ядрами (<strong>Cache Line Bouncing</strong>). Линия переходит в статус <code>Modified</code> по протоколу MESI на одном ядре, инвалидируя кэш на всех остальных ядрах. Если критическая секция коротка, данные остаются в кэше L1d, обеспечивая колоссальную скорость вычислений. Однако, если рядом с <code>sync.Mutex</code> в той же строке кэша лежат часто изменяемые поля структуры, возникает деструктивный эффект <strong>False Sharing</strong> (<a href="8-false-sharing.html" class="wikilink">8. False sharing</a>).</li>
+<li><strong>Физика Channel:</strong><br />
+   Канал <code>hchan</code> занимает около 96 байт в куче (плюс буфер). Это сразу несколько кэш-линий. При отправке данных ядро процессора неизбежно выполняет копирование памяти: сначала в кольцевой буфер канала, затем из буфера в стек получателя. Это создает дополнительный трафик на шине памяти, но имеет скрытое достоинство: данные принудительно доставляются в локальный стек получателя, прогревая его кэш перед стартом обработки.</li>
+</ol>
+<hr />
 <h2 id="itog-prakticheskoe-rukovodstvo">Итог: практическое руководство</h2>
 
-<p><strong>Выбирайте Mutex, когда:</strong><br />
-- У вас общее мутабельное состояние (кэш, map, срез, настройки).<br />
-- Критические секции очень короткие (десятки наносекунд), и contention может быть высоким.<br />
-- Требуется сложная атомарная логика (проверил-изменил) над несколькими полями.<br />
-- Чтений значительно больше записей — используйте RWMutex.</p>
-<p><strong>Выбирайте Channel, когда:</strong><br />
-- Вы передаёте владение данными между горутинами.<br />
-- Нужна координация, сигнализация, ограничение параллелизма.<br />
-- Код должен быть наглядно организован в виде пайплайнов или акторов.<br />
-- Требуются тайм-ауты и мультиплексирование (<code>select</code>).</p>
-<p><strong>Используйте атомики</strong> (<code>sync/atomic</code>), когда достаточно простого счётчика, флага или ссылки.</p>
-<p>В сложных системах часто комбинируют: внутри компонента — Mutex, между компонентами — каналы.</p>
-<p>Далее мы углубимся в диагностику проблем с мьютексами и каналами: <a href="7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>.</p>
+<p>Сведем архитектурные принципы выбора к четким инженерным правилам:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">┌─────────────────────────────────────────────────────────────────────────────┐
+│                            ЧЕКЛИСТ ВЫБОРА ИНЖЕНЕРА                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 1. Нужно просто изменить число/счетчик?       ──&gt; sync/atomic               │
+│ 2. Общее мутабельное состояние (кэш, map)?   ──&gt; sync.Mutex                │
+│ 3. Преобладает чтение (&gt;95%), записей мало?   ──&gt; sync.RWMutex              │
+│ 4. Передаете данные от продюсера к воркеру?   ──&gt; Channel (Pipeline/Queue)  │
+│ 5. Нужна отмена, таймаут, семафор, select?    ──&gt; Channel                   │
+│ 6. Ожидание группы параллельных задач?        ──&gt; sync.WaitGroup            │
+│ 7. Однократная ленивая инициализация?         ──&gt; sync.Once                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+</div>
+
+<ul>
+<li><strong>Внутри компонента (локальное состояние структуры):</strong> практически всегда предпочтителен <code>sync.Mutex</code> или <code>sync/atomic</code>. Он проще, быстрее и не раздувает стек вызовов.</li>
+<li><strong>Между компонентами (взаимодействие подсистем, воркеры):</strong> предпочтительны каналы <code>chan</code>. Они задают прозрачные границы ответственности, исключают скрытые гонки за память и легко масштабируются.</li>
+</ul>
+<p>Освоив правила выбора между мьютексами и каналами, мы переходим к самому драматичному вопросу конкурентности — борьбе за замки и методологии расследования Lock Contention: <a href="7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2463,7 +2666,7 @@ case data := &lt;-ch:
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mutex-vs-channel-vybor-opredelyayushchiy-arkhitekturu">Mutex vs Channel: выбор, определяющий архитектуру</a></li><li class="toc-item toc-h2"><a href="#dva-mira-obshchee-sostoyanie-protiv-peredachi-vladeniya">Два мира: общее состояние против передачи владения</a></li><li class="toc-item toc-h3"><a href="#mutex-razdelyaemaya-pamyat-s-eksklyuzivnym-dostupom">Mutex: разделяемая память с эксклюзивным доступом</a></li><li class="toc-item toc-h3"><a href="#channel-peredacha-dannykh-s-peredachey-vladeniya">Channel: передача данных с передачей владения</a></li><li class="toc-item toc-h2"><a href="#vnutrennee-ustroystvo-mutex-i-channel-tsena-bystrogo-puti-i-blokirovki">Внутреннее устройство Mutex и Channel: цена быстрого пути и блокировки</a></li><li class="toc-item toc-h2"><a href="#sravnenie-stoimosti-kogda-tsena-imeet-znachenie">Сравнение стоимости: когда цена имеет значение</a></li><li class="toc-item toc-h2"><a href="#kogda-vybirat-mutex">Когда выбирать Mutex</a></li><li class="toc-item toc-h3"><a href="#1-zashchita-razdelyaemogo-sostoyaniya-kesh-konfiguratsiya-schyotchiki">1. Защита разделяемого состояния (кэш, конфигурация, счётчики)</a></li><li class="toc-item toc-h3"><a href="#2-kriticheskie-sektsii-dlyashchiesya-nanosekundy">2. Критические секции, длящиеся наносекунды</a></li><li class="toc-item toc-h3"><a href="#3-slozhnye-invarianty-trebuyushchie-atomarnosti-neskolkikh-operatsiy">3. Сложные инварианты, требующие атомарности нескольких операций</a></li><li class="toc-item toc-h3"><a href="#4-vysokokonkurentnoe-chtenie-s-redkoy-zapisyu-rwmutex">4. Высококонкурентное чтение с редкой записью (RWMutex)</a></li><li class="toc-item toc-h2"><a href="#kogda-vybirat-channel">Когда выбирать Channel</a></li><li class="toc-item toc-h3"><a href="#1-peredacha-dannykh-mezhdu-gorutinami-s-peredachey-vladeniya">1. Передача данных между горутинами с передачей владения</a></li><li class="toc-item toc-h3"><a href="#2-koordinatsiya-i-signalizatsiya-done-cancel">2. Координация и сигнализация (done, cancel)</a></li><li class="toc-item toc-h3"><a href="#3-ogranichenie-parallelizma-semafor">3. Ограничение параллелизма (семафор)</a></li><li class="toc-item toc-h3"><a href="#4-taym-auty-i-neblokiruyushchie-operatsii">4. Тайм-ауты и неблокирующие операции</a></li><li class="toc-item toc-h3"><a href="#5-postroenie-slozhnykh-konechnykh-avtomatov-i-orkestrovok">5. Построение сложных конечных автоматов и оркестровок</a></li><li class="toc-item toc-h2"><a href="#patterny-ispolzovaniya-kanalov">Паттерны использования каналов</a></li><li class="toc-item toc-h3"><a href="#fan-out-fan-in">Fan-out / Fan-in</a></li><li class="toc-item toc-h3"><a href="#pipeline">Pipeline</a></li><li class="toc-item toc-h3"><a href="#semafor-s-kanalom">Семафор с каналом</a></li><li class="toc-item toc-h3"><a href="#kontekst-s-select">Контекст с select</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-antipatterny">Ловушки и антипаттерны</a></li><li class="toc-item toc-h2"><a href="#profilirovanie-kak-uvidet-chto-vybor-neveren">Профилирование: как увидеть, что выбор неверен</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-mutex-channel-i-zhelezo">Mechanical Sympathy: Mutex, Channel и «железо»</a></li><li class="toc-item toc-h2"><a href="#itog-prakticheskoe-rukovodstvo">Итог: практическое руководство</a></li>
+    <li class="toc-item toc-h2"><a href="#mutex-vs-channel-vybor-opredelyayushchiy-arkhitekturu">Mutex vs Channel: выбор, определяющий архитектуру</a></li><li class="toc-item toc-h2"><a href="#dva-mira-obshchee-sostoyanie-protiv-peredachi-vladeniya">Два мира: общее состояние против передачи владения</a></li><li class="toc-item toc-h3"><a href="#mutex-razdelyaemaya-pamyat-s-eksklyuzivnym-dostupom">Mutex: разделяемая память с эксклюзивным доступом</a></li><li class="toc-item toc-h3"><a href="#channel-peredacha-dannykh-s-peredachey-vladeniya">Channel: передача данных с передачей владения</a></li><li class="toc-item toc-h2"><a href="#vnutrennee-ustroystvo-mutex-i-channel-tsena-bystrogo-puti-i-blokirovki">Внутреннее устройство Mutex и Channel: цена быстрого пути и блокировки</a></li><li class="toc-item toc-h3"><a href="#mutex-sync-mutex">Mutex (sync.Mutex):</a></li><li class="toc-item toc-h3"><a href="#channel-hchan-iz-runtimechan-go">Channel (hchan из runtime/chan.go):</a></li><li class="toc-item toc-h2"><a href="#sravnenie-stoimosti-kogda-tsena-imeet-znachenie">Сравнение стоимости: когда цена имеет значение</a></li><li class="toc-item toc-h2"><a href="#kogda-vybirat-mutex">Когда выбирать Mutex</a></li><li class="toc-item toc-h3"><a href="#1-zashchita-razdelyaemogo-sostoyaniya-kesh-konfiguratsiya-schyotchiki">1. Защита разделяемого состояния (кэш, конфигурация, счётчики)</a></li><li class="toc-item toc-h3"><a href="#2-kriticheskie-sektsii-dlyashchiesya-nanosekundy">2. Критические секции, длящиеся наносекунды</a></li><li class="toc-item toc-h3"><a href="#3-slozhnye-invarianty-trebuyushchie-atomarnosti-neskolkikh-operatsiy">3. Сложные инварианты, требующие атомарности нескольких операций</a></li><li class="toc-item toc-h3"><a href="#4-vysokokonkurentnoe-chtenie-s-redkoy-zapisyu-rwmutex">4. Высококонкурентное чтение с редкой записью (RWMutex)</a></li><li class="toc-item toc-h2"><a href="#kogda-vybirat-channel">Когда выбирать Channel</a></li><li class="toc-item toc-h3"><a href="#1-peredacha-dannykh-mezhdu-gorutinami-s-peredachey-vladeniya">1. Передача данных между горутинами с передачей владения</a></li><li class="toc-item toc-h3"><a href="#2-koordinatsiya-i-signalizatsiya-done-cancel">2. Координация и сигнализация (done, cancel)</a></li><li class="toc-item toc-h3"><a href="#3-ogranichenie-parallelizma-semafor">3. Ограничение параллелизма (семафор)</a></li><li class="toc-item toc-h3"><a href="#4-taym-auty-i-neblokiruyushchie-operatsii">4. Тайм-ауты и неблокирующие операции</a></li><li class="toc-item toc-h3"><a href="#5-postroenie-slozhnykh-konechnykh-avtomatov-i-orkestrovok">5. Построение сложных конечных автоматов и оркестровок</a></li><li class="toc-item toc-h2"><a href="#patterny-ispolzovaniya-kanalov">Паттерны использования каналов</a></li><li class="toc-item toc-h3"><a href="#fan-out-fan-in">Fan-out / Fan-in</a></li><li class="toc-item toc-h3"><a href="#pipeline">Pipeline</a></li><li class="toc-item toc-h3"><a href="#semafor-s-kanalom">Семафор с каналом</a></li><li class="toc-item toc-h3"><a href="#kontekst-s-select">Контекст с select</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-antipatterny">Ловушки и антипаттерны</a></li><li class="toc-item toc-h2"><a href="#profilirovanie-kak-uvidet-chto-vybor-neveren">Профилирование: как увидеть, что выбор неверен</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-mutex-channel-i-zhelezo">Mechanical Sympathy: Mutex, Channel и «железо»</a></li><li class="toc-item toc-h2"><a href="#itog-prakticheskoe-rukovodstvo">Итог: практическое руководство</a></li>
   </ul>
 </aside>
 
