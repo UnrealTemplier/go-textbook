@@ -2169,27 +2169,56 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 18</span>
-              <span class="meta-tag read-time">⏱ ~12 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Типы метрик. Counter, Gauge, Histogram</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="osnovnye-tipy-dannykh-v-tsdb">Основные типы данных в TSDB</h2>
+            <h1>1. Типы метрик: Counter, Gauge, Histogram и Summary</h1>
+<blockquote>
+<p><em>"If you can't measure it, you can't improve it."</em><br />
+— Питер Друкер</p>
+</blockquote>
+<p>В предыдущей статье мы рассмотрели кардинальность и убедились, что бездумное умножение меток способно мгновенно положить любую TSDB. Теперь перейдем к фундаменту, на котором строится вся телеметрия: <strong>базовым типам данных</strong>.</p>
+<p>В мире телеметрии и экосистеме Prometheus (де-факто промышленного стандарта для бэкенда на Go) существует всего четыре фундаментальных примитива: <strong>Counter</strong>, <strong>Gauge</strong>, <strong>Histogram</strong> и <strong>Summary</strong>. Каждый из них решает строго свою физическую задачу, опирается на конкретные машинные инструкции процессора и требует своего математического аппарата при составлении запросов. </p>
+<p>Понимание их внутреннего устройства убережет вас от двух классических бед продакшена: бесполезных графиков «средней температуры по больнице» и тяжелых алертов, генерирующих ложные срабатывания.</p>
+<hr />
+<h2 id="osnovnye-tipy-dannykh-v-tsdb">Основные типы данных в TSDB</h2>
 
-<p>В предыдущей статье мы обсудили кардинальность и предупредили об опасности разрастания временных рядов. Теперь настало время понять, какие именно типы данных мы можем безопасно и эффективно использовать для измерения поведения нашей системы.</p>
-<p>В экосистеме Prometheus (который стал стандартом де-факто для Go-бэкенда) существует четыре основных типа метрик. Понимание разницы между ними — это база для построения адекватных алертов и дашбордов.</p>
+<p>База данных временных рядов (TSDB) оперирует потоками пар <code>(timestamp, float64)</code>. На уровне физического хранения TSDB абсолютно все равно, что означает это число <code>float64</code> — количество байт, загрузку процессора или перцентиль задержки. </p>
+<p>Смысловую нагрузку и семантическую модель задает клиентская библиотека в коде приложения. Если вы выберете неверный тип примитива, вы либо потеряете способность агрегировать данные между репликами сервиса, либо получите математически бессмысленный результат в PromQL.</p>
+<p>Рассмотрим каждый тип детально — от ассемблерных инструкций инкремента до агрегации в распределенном кластере.</p>
+<hr />
 <h2 id="1-counter-schetchik">1. Counter (Счетчик)</h2>
 
-<p><strong>Counter</strong> — это метрика, значение которой может только расти (или сбрасываться в ноль при рестарте). Она представляет собой кумулятивную сумму.</p>
+<p><strong>Counter</strong> — это кумулятивный монотонный счетчик. Его значение может <strong>только увеличиваться</strong> либо сбрасываться до нуля при перезапуске процесса (или переполнении разрядной сетки).</p>
 <ul>
-<li><strong>Примеры:</strong> Количество обработанных запросов, количество ошибок, количество отправленных байт.</li>
-<li><strong>Операции:</strong> <code>Inc()</code> (увеличить на 1), <code>Add(float64)</code> (увеличить на значение).</li>
+<li><strong>Назначение:</strong> Измерение дискретных событий и объемов за все время жизни процесса.</li>
+<li><strong>Примеры:</strong> Количество обработанных HTTP-запросов (<code>http_requests_total</code>), число ошибок базы данных (<code>db_errors_total</code>), отправленные байты (<code>net_bytes_sent_total</code>).</li>
+<li><strong>Операции:</strong> <code>Inc()</code> (увеличить на 1), <code>Add(float64)</code> (увеличить на неотрицательное число).</li>
 </ul>
+<p>Физическая аналогия Counter — <strong>одометр в автомобиле</strong>. Одометр не показывает вашу текущую скорость. Он просто непрерывно наматывает километры. Если вы хотите узнать скорость за последний час, вы вычитаете значение одометра час назад из текущего значения и делите на время.</p>
 <h3 id="under-the-hood">Under the Hood</h3>
-<p>Counter — это, по сути, атомарный инкремент. В Go (<code>sync/atomic</code>) это одна из самых дешевых операций с точки зрения CPU. Однако, сам по себе Counter как число бесполезен. Если вы увидите на графике <code>requests_total = 1,000,000</code>, это ни о чем не скажет — сервис работает час или год?</p>
-<p>Вся мощь Counter раскрывается в функциях запросов (PromQL), например, <code>rate()</code>.</p>
+
+<p>На уровне процессора и рантайма Go вызов <code>Inc()</code> или <code>Add()</code> для Counter — это операция атомарного сложения:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">CPU Core 0 ────► [ LOCK XADD / atomic.AddUint64 ] ────► Cache Line (L1D)
+</code></pre>
+</div>
+
+<p>В пакете <code>client_golang</code> счетчик хранит значение как <code>uint64</code> (битовое представление <code>float64</code>), обновление которого выполняется без блокировки мьютексами через атомарные инструкции процессора (<code>sync/atomic</code>). Это делает инкремент чрезвычайно быстрым — считанные единицы наносекунд.</p>
+<p>Однако сам по себе Counter как абсолютное число практически бесполезен. Если вы увидите на графике <code>requests_total = 1,000,000</code> (или <code>http_requests_total = 4_500_000</code>), эта цифра не говорит дежурному инженеру ровным счетом ничего: это миллион запросов за пять минут под атакой, или сервис мирно переваривал их в течение трех месяцев?</p>
+<p>Вся мощь Counter раскрывается только в PromQL через функции вычисления производной по времени: <code>rate()</code> и <code>irate()</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2199,27 +2228,41 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Идиоматичное использование Counter
+  <pre class="language-go"><code class="language-go">// Идиоматичное использование Counter в Go HTTP-сервере
+package main
+
+import (
+    &quot;net/http&quot;
+
+    &quot;github.com/prometheus/client_golang/prometheus&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/promauto&quot;
+)
+
 var (
     httpRequestsTotal = promauto.NewCounterVec(
         prometheus.CounterOpts{
             Name: &quot;http_requests_total&quot;,
-            Help: &quot;Total number of HTTP requests.&quot;,
+            Help: &quot;Total number of HTTP requests processed by handler.&quot;,
         },
         []string{&quot;path&quot;, &quot;method&quot;},
     )
 )
 
 func handler(w http.ResponseWriter, r *http.Request) {
-    // Инкремент происходит в конце обработки
+    // Инкремент регистрируется при завершении обработки
     defer func() {
         httpRequestsTotal.WithLabelValues(r.URL.Path, r.Method).Inc()
     }()
-    // ... logic
+
+    // Основная бизнес-логика...
+    w.WriteHeader(http.StatusOK)
+    _, _ = w.Write([]byte(&quot;OK&quot;))
 }
 </code></pre>
 </div>
 
+<p>Когда Prometheus вычисляет <code>rate(http_requests_total[5m])</code>, он берет разницу между значениями счетчика на 5-минутном окне и делит ее на 300 секунд, получая истинный <strong>RPS (Requests Per Second)</strong>.</p>
+<p>Более того, функция <code>rate()</code> обладает встроенным механизмом <strong>детектирования сброса (reset detection)</strong>. Если ваш сервис упал и перезапустился, счетчик сбросился с 10 000 до нуля. Алгоритм <code>rate()</code> видит падение значения, понимает, что произошел рестарт пода, и корректно компенсирует скачок, предотвращая отрицательные всплески на графиках.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2231,15 +2274,19 @@ func handler(w http.ResponseWriter, r *http.Request) {
   </div>
 </div>
 
+<hr />
 <h2 id="2-gauge-izmeritel">2. Gauge (Измеритель)</h2>
 
-<p><strong>Gauge</strong> — это метрика, значение которой может произвольно расти и падать. Это «моментальный снимок» состояния.</p>
+<p><strong>Gauge</strong> — это моментальный снимок (snapshot) некоторой числовой величины в данный конкретный момент времени. Значение Gauge может произвольно увеличиваться, уменьшаться или оставаться неизменным.</p>
 <ul>
-<li><strong>Примеры:</strong> Текущая температура CPU, использование памяти (RAM), количество активных горутин, размер очереди.</li>
-<li><strong>Операции:</strong> <code>Inc()</code>, <code>Dec()</code>, <code>Set(float64)</code>.</li>
+<li><strong>Назначение:</strong> Мониторинг текущего состояния и емкости ресурсов.</li>
+<li><strong>Примеры:</strong> Загрузка оперативной памяти (RAM), температура процессора, текущее количество активных горутин в рантайме, размер очереди сообщений в брокере, количество открытых TCP-соединений.</li>
+<li><strong>Операции:</strong> <code>Inc()</code>, <code>Dec()</code>, <code>Set(float64)</code>, <code>Add(float64)</code>, <code>Sub(float64)</code>.</li>
 </ul>
+<p>Физическая аналогия Gauge — <strong>спидометр или стрелочный указатель уровня топлива в бензобаке</strong>. Стрелка поднимается и опускается в реальном времени, отражая текущий уровень.</p>
 <h3 id="under-the-hood">Under the Hood</h3>
-<p>Gauge сложнее в реализации, чем Counter, так как требует операций <code>Load</code> и <code>Store</code> (или мьютексов), чтобы установить произвольное значение.</p>
+
+<p>В отличие от строго монотонного Counter, внутреннее состояние Gauge требует произвольной перезаписи. Под капотом <code>prometheus.Gauge</code> использует атомарные инструкции <code>atomic.StoreUint64</code> и <code>atomic.LoadUint64</code> для сохранения чисел с плавающей точкой:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2249,7 +2296,17 @@ func handler(w http.ResponseWriter, r *http.Request) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Пример мониторинга горутин (Gauge)
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;runtime&quot;
+    &quot;time&quot;
+
+    &quot;github.com/prometheus/client_golang/prometheus&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/promauto&quot;
+)
+
+// Пример мониторинга горутин (Gauge)
 var (
     goroutinesGauge = promauto.NewGauge(prometheus.GaugeOpts{
         Name: &quot;current_goroutines&quot;,
@@ -2258,11 +2315,11 @@ var (
 )
 
 func recordMetrics() {
-    // Periodically update the gauge
+    // Периодическое обновление Gauge в фоновой горутине
     ticker := time.NewTicker(5 * time.Second)
     for range ticker.C {
-        // runtime.NumGoroutine() - системный вызов, дорого делать на каждый запрос
-        // поэтому обновляем периодически
+        // runtime.NumGoroutine() - системный вызов рантайма, дорого вызывать на каждый HTTP-запрос,
+        // поэтому опрашиваем состояние периодически раз в несколько секунд
         goroutinesGauge.Set(float64(runtime.NumGoroutine()))
     }
 }
@@ -2278,19 +2335,28 @@ func recordMetrics() {
     <p><strong>Gauge и <code>rate()</code></strong>.<br />
 Главная ошибка новичков — пытаться применить функцию <code>rate()</code> к Gauge. <code>rate()</code> вычисляет скорость роста. Для Gauge это бессмысленно (если только вы не измеряете скорость изменения уровня воды в баке, но это редкий кейс).<br />
 Для Gauge обычно используют функции <code>min()</code>, <code>max()</code>, <code>avg()</code> или просто смотрят текущее значение.</p>
+<p>Если применить <code>rate()</code> к Gauge, при каждом падении значения алгоритм решит, что произошел «сброс счетчика» из-за рестарта сервера, и попытается экстраполировать дельту, выдав на график колоссальные фантомные скачки.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="3-histogram-gistogramma">3. Histogram (Гистограмма)</h2>
 
-<p><strong>Histogram</strong> — это тип метрик для измерения распределения значений (обычно длительности запросов или размеров ответов). Это самый мощный, но и самый дорогой инструмент.</p>
-<p>Вместо того чтобы хранить каждое значение (как в логах), гистограмма «раскладывает» значения по заранее определенным корзинам (buckets).</p>
+<p><strong>Histogram</strong> — самый мощный, статистически надежный и одновременно ресурсоемкий инструмент мониторинга. Она предназначена для измерения <strong>распределения непрерывных величин</strong> (задержек запросов, размеров передаваемых пакетов, времени удержания блокировок мьютекса).</p>
 <h3 id="problema-srednikh-znacheniy">Проблема средних значений</h3>
-<p>Допустим, у вас 99 запросов выполняются за 10мс, и 1 запрос за 10 секунд.<br />
-*   <strong>Average (Среднее):</strong> 190мс. Выглядит нормально? Но 1 пользователь реально пострадал.<br />
-*   <strong>P99 (99-й перцентиль):</strong> 10 секунд. Это показывает реальную проблему.</p>
+
+<p>Полагаться на среднее арифметическое (Average / Mean) в распределенных бэкенд-системах — смертный грех системной инженерии.</p>
+<p>Представьте веб-сервис, обработавший 100 запросов:<br />
+*   99 запросов выполнились молниеносно: ровно за <strong>10 мс</strong>.<br />
+*   1 запрос намертво завис на таймауте базы данных: <strong>10 000 мс</strong> (10 секунд).</p>
+<p>Посчитаем метрики:<br />
+*   <strong>Average (Среднее):</strong> $(99 \times 10 + 10000) / 100 \approx 109.9 \text{ мс}$. На графике дашборда 110 мс выглядит вполне комфортно и зелено. Руководство довольно.<br />
+*   <strong>P99 (99-й перцентиль):</strong> <strong>10 000 мс</strong>. В реальности каждый сотый покупатель в интернет-магазине уперся в 10-секундный экран загрузки и ушел к конкурентам.</p>
+<p>Среднее значение начисто маскирует катастрофические выбросы (outliers). Чтобы видеть реальный пользовательский опыт, инженеры используют <strong>квантили и перцентили</strong> (P50, P90, P99, P99.9). А чтобы вычислять перцентили в распределенной системе, необходима гистограмма.</p>
+<p>Гистограмма разбивает весь диапазон значений на фиксированные корзины (<strong>buckets</strong>) и подсчитывает, сколько измерений попало в каждую корзину.</p>
 <h3 id="kak-eto-rabotaet-v-go">Как это работает в Go?</h3>
-<p>Когда вы объявляете Histogram, вы должны задать границы корзин (buckets).</p>
+
+<p>При объявлении гистограммы разработчик обязан заранее задать верхние границы корзин (<code>Buckets</code>).</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2300,7 +2366,17 @@ func recordMetrics() {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">var (
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;net/http&quot;
+    &quot;time&quot;
+
+    &quot;github.com/prometheus/client_golang/prometheus&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/promauto&quot;
+)
+
+var (
     requestDuration = promauto.NewHistogramVec(
         prometheus.HistogramOpts{
             Name:    &quot;http_request_duration_seconds&quot;,
@@ -2313,18 +2389,27 @@ func recordMetrics() {
 
 func handler(w http.ResponseWriter, r *http.Request) {
     start := time.Now()
-    // ... logic
-    duration := time.Since(start).Seconds()
-    // Метод Observe кладет значение в подходящий бакет
-    requestDuration.WithLabelValues(r.URL.Path).Observe(duration)
+    defer func() {
+        duration := time.Since(start).Seconds()
+        // Метод Observe распределяет замер по подходящим бакетам
+        requestDuration.WithLabelValues(r.URL.Path).Observe(duration)
+    }()
+
+    // Имитация полезной нагрузки
+    w.WriteHeader(http.StatusOK)
 }
 </code></pre>
 </div>
 
 <h3 id="under-the-hood-cost-of-observation">Under the Hood: Cost of Observation</h3>
-<p>Каждый вызов <code>Observe()</code> заставляет Histogram инкрементировать счетчики во всех бакетах, граница которых превышает наблюдаемое значение.</p>
-<p>Если у вас запрос выполняется 0.3 секунды, и бакеты <code>[0.1, 0.5, 1.0]</code>, то будут инкрементированы счетчики для бакетов <code>0.5</code> и <code>1.0</code> (и <code>+Inf</code>).<br />
-Это означает, что <strong>Histogram пишет в несколько временных рядов за одну операцию</strong>. Если у вас 10 бакетов и 1 метрика, вы создаете 10+ временных рядов (bucket, sum, count). Если добавите лейбл с 100 значениями, вы получите 100 * 13 = 1300 рядов.</p>
+
+<p>В Prometheus бакеты гистограммы являются <strong>кумулятивными (cumulative)</strong>. Это означает, что бакет с границей <code>le="0.5"</code> содержит счетчик всех событий, длительность которых была $\le 0.5$ секунды.<br />
+Каждый вызов <code>Observe()</code> заставляет Histogram инкрементировать счетчики во всех бакетах, граница которых превышает наблюдаемое значение.</p>
+<p>Если у вас запрос выполняется 0.3 секунды, и бакеты <code>[0.1, 0.5, 1.0]</code>, то будут инкрементированы счетчики для бакетов <code>0.5</code> и <code>1.0</code> (и <code>+Inf</code>).</p>
+<p>При каждом вызове <code>Observe()</code> клиентская библиотека выполняет следующую работу:<br />
+1. Инкрементирует общий счетчик наблюдений <code>_count</code>.<br />
+2. Добавляет наблюдаемое значение к общей сумме <code>_sum</code>.<br />
+3. Пробегает по массиву бакетов и инкрементирует счетчик <strong>каждого бакета, граница которого <code>le &gt;= v</code></strong>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2339,26 +2424,58 @@ func handler(w http.ResponseWriter, r *http.Request) {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Observe 0.3s&quot;] --&gt; B{&quot;Check Buckets&quot;}
-B --&gt;|le=0.1| C[&quot;NO &lt;br&gt; 0.3 &gt; 0.1&quot;]
-B --&gt;|le=0.5| D[&quot;YES &lt;br&gt; Increment bucket 0.5&quot;]
-B --&gt;|le=1.0| E[&quot;YES &lt;br&gt; Increment bucket 1.0&quot;]
-B --&gt;|le=+Inf| F[&quot;YES &lt;br&gt; Increment bucket +Inf&quot;]
+A[&quot;Observe(0.3s)&quot;] --&gt; B{&quot;Check Buckets&quot;}
+B --&gt;|&quot;le=0.1&quot;| C[&quot;NO: 0.3 &gt; 0.1 &lt;br&gt; (Не инкрементируем)&quot;]
+B --&gt;|&quot;le=0.5&quot;| D[&quot;YES: 0.3 &lt;= 0.5 &lt;br&gt; Increment bucket 0.5&quot;]
+B --&gt;|&quot;le=1.0&quot;| E[&quot;YES: 0.3 &lt;= 1.0 &lt;br&gt; Increment bucket 1.0&quot;]
+B --&gt;|&quot;le=+Inf&quot;| F[&quot;YES: 0.3 &lt;= +Inf &lt;br&gt; Increment bucket +Inf&quot;]
 
 D --&gt; G[&quot;_sum += 0.3&quot;]
 E --&gt; G
 F --&gt; G
+G --&gt; H[&quot;_count += 1&quot;]
 
-style A fill:#f9f,stroke:#333
+style A fill:#4338ca,stroke:#6366f1,stroke-width:2px,color:#fff
+style D fill:#065f46,stroke:#10b981,color:#fff
+style E fill:#065f46,stroke:#10b981,color:#fff
+style F fill:#065f46,stroke:#10b981,color:#fff
   </pre>
 </div>
 
 
+<p>В результате одна метрика <code>http_request_duration_seconds</code> экспортирует наружу:<br />
+*   <code>http_request_duration_seconds_bucket{le="0.005"}</code><br />
+*   <code>...</code><br />
+*   <code>http_request_duration_seconds_bucket{le="+Inf"}</code><br />
+*   <code>http_request_duration_seconds_sum</code><br />
+*   <code>http_request_duration_seconds_count</code></p>
+<p>Если у вас 11 бакетов, гистограмма порождает <strong>13 независимых временных рядов</strong>. Если добавить метку с 100 значениями, это даст $13 \times 100 = 1300$ рядов.</p>
+<p>Для вычисления P99 на стороне Prometheus используется функция <code>histogram_quantile()</code>:</p>
+
+<div class="code-block" data-lang="promql">
+  <div class="code-header">
+    <span class="code-lang-tag">PROMQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-promql"><code class="language-promql">histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))
+</code></pre>
+</div>
+
+<p>Сервер Prometheus берет скорость роста каждого бакета, складывает их по всем инстансам сервиса и выполняет линейную интерполяцию внутри бакета, где лежит 99-й процентиль.</p>
+<hr />
 <h2 id="4-summary-rezyume-kratkoe-upominanie">4. Summary (Резюме) — краткое упоминание</h2>
 
-<p>Существует еще тип <strong>Summary</strong>. Он похож на Histogram, но вычисляет перцентили (квантили) на стороне клиента (в вашем Go-приложении).<br />
-*   <strong>Плюс:</strong> Точные перцентили без необходимости выбирать бакеты.<br />
-*   <strong>Минус:</strong> Вы не можете агрегировать Summary данные (нельзя сложить p99 с двух серверов и получить общий p99). Поэтому в современных распределенных системах <strong>Histogram</strong> предпочтительнее.</p>
+<p>Существует еще тип <strong>Summary</strong>. Он похож на Histogram, но вычисляет перцентили (квантили) на стороне клиента (в вашем Go-приложении).</p>
+<ul>
+<li><strong>Как устроен:</strong> Клиентская библиотека хранит скользящее окно недавних замеров (обычно за последние 10 минут) и использует алгоритмы вычисления перцентилей (такие как CKMS или T-Digest).</li>
+<li><strong>Плюс:</strong> Дает математически точные перцентили без необходимости вручную подбирать границы бакетов.</li>
+<li><strong>Минус (фатальный для микросервисов):</strong> <strong>Summary нельзя агрегировать между репликами!</strong> Невозможно взять 99-й перцентиль с Сервера 1 и 99-й перцентиль с Сервера 2 и усреднить их. Математически это приведет к грубой ошибке.</li>
+</ul>
+<p>Именно поэтому в современных облачных и распределенных системах <strong>Histogram</strong> является безоговорочным выбором: бакеты гистограмм — это обычные счетчики Counter, которые можно безопасно складывать оператором <code>sum()</code> по любому количеству реплик, подов и дата-центров.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Выбор типа метрики диктует способ её сбора и анализа:</p>
@@ -2369,26 +2486,37 @@ style A fill:#f9f,stroke:#333
 <th style="text-align: left;">Смысл</th>
 <th style="text-align: left;">Использование</th>
 <th style="text-align: left;">Aggregation</th>
+<th style="text-align: left;">Поведение в PromQL</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td style="text-align: left;"><strong>Counter</strong></td>
-<td style="text-align: left;">Сколько всего?</td>
-<td style="text-align: left;"><code>rate()</code> для RPS, error rate</td>
-<td style="text-align: left;">Суммируется</td>
+<td style="text-align: left;">Сколько всего произошло?</td>
+<td style="text-align: left;"><code>rate()</code> для RPS, error rate, пропускной способности</td>
+<td style="text-align: left;">Суммируется (<code>sum</code>)</td>
+<td style="text-align: left;">Монотонный рост, автосброс при рестарте</td>
 </tr>
 <tr>
 <td style="text-align: left;"><strong>Gauge</strong></td>
-<td style="text-align: left;">Сколько сейчас?</td>
-<td style="text-align: left;">Текущее состояние, тренды</td>
-<td style="text-align: left;">Avg, Max, Min (не Sum)</td>
+<td style="text-align: left;">Сколько сейчас в наличии?</td>
+<td style="text-align: left;">Текущее состояние, емкость, использование памяти</td>
+<td style="text-align: left;">Нельзя суммировать слепо; <code>avg</code>, <code>max</code>, <code>min</code></td>
+<td style="text-align: left;">Свободные колебания вверх и вниз</td>
 </tr>
 <tr>
 <td style="text-align: left;"><strong>Histogram</strong></td>
-<td style="text-align: left;">Как распределено?</td>
-<td style="text-align: left;">Latency (P99), Payload sizes</td>
-<td style="text-align: left;">Суммируется (бакеты)</td>
+<td style="text-align: left;">Каково распределение величин?</td>
+<td style="text-align: left;">Задержки (Latency P95/P99), размеры тел запросов</td>
+<td style="text-align: left;">Суммируется по бакетам (<code>sum by (le)</code>)</td>
+<td style="text-align: left;"><code>histogram_quantile()</code> для перцентилей</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Summary</strong></td>
+<td style="text-align: left;">Точный квантиль на одном хосте</td>
+<td style="text-align: left;">Локальный детальный профиль процесса</td>
+<td style="text-align: left;"><strong>Не агрегируется</strong> между узлами</td>
+<td style="text-align: left;">Готовые квантили <code>{quantile="0.99"}</code></td>
 </tr>
 </tbody>
 </table></div>

@@ -2169,18 +2169,21 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Load balancing</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Когда ваш Go-бэкенд перестает справляться с потоком запросов на одном сервере, вы масштабируете его горизонтально — запускаете несколько инстансов (реплик). Но кто будет решать, какому именно инстансу отдать конкретный HTTP-запрос? Это задача <strong>Load Balancer'а</strong> (балансировщика нагрузки).</p>
-<p>В связке Nginx + Go, Nginx выступает L7 (уровень приложений) балансировщиком. Он понимает протокол HTTP, может читать заголовки, куки и URI, принимая интеллектуальные решения о маршрутизации, чего не могут сделать балансировщики L4 (уровень TCP, например, чистый HAProxy или AWS NLB).</p>
-<h2 id="blok-upstream-pul-bekendov">Блок `upstream`: Пул бэкендов</h2>
+            <h1>Балансировка нагрузки в Nginx: От Round Robin до Power of Two Choices и gRPC</h1>
+<p>Когда один сервер с Go-бэкендом исчерпывает физические лимиты масштабирования (CPU, память, пропускную способность сетевой карты), естественным шагом становится горизонтальное масштабирование — запуск нескольких независимых реплик приложения на разных узлах кластера или виртуальных машинах.</p>
+<p>Но кто будет распределять лавину входящих запросов между этими репликами? Кто вовремя заметит, что один из инстансов Go рухнул из-за паники или нехватки памяти (OOM), и мгновенно перенаправит трафик на живые узлы? Эту фундаментальную задачу берет на себя <strong>балансировщик нагрузки (Load Balancer)</strong>.</p>
+<p>В классической связке Nginx выступает в роли балансировщика седьмого уровня модели OSI (<strong>L7 Application Load Balancer</strong>). В отличие от L4-балансировщиков (таких как чистый HAProxy в режиме TCP, Linux IPVS или AWS Network Load Balancer), оперирующих только голыми TCP-пакетами и портами, Nginx глубоко анализирует протокол HTTP: заголовки, куки, URI путей, методы и тело запроса. Это позволяет принимать гибкие и интеллектуальные решения о маршрутизации трафика к пулам Go-микросервисов.</p>
+<hr />
+<h2 id="1-blok-upstream-deklarativnyy-pul-bekendov">1. Блок upstream: Декларативный пул бэкендов</h2>
 
-<p>В Nginx список серверов, между которыми распределяется трафик, описывается в директиве <code>upstream</code>. </p>
+<p>В конфигурации Nginx целевая группа серверов объединяется в директиву <code>upstream</code>. Это виртуальный кластер бэкендов, к которому затем обращаются директивы <code>proxy_pass</code> или <code>grpc_pass</code>:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2191,63 +2194,80 @@
     </button>
   </div>
   <pre class="language-nginx"><code class="language-nginx">upstream go_backends {
+    # Основные рабочие узлы с параметрами пассивных проверок
     server 10.0.1.10:8080 max_fails=3 fail_timeout=30s;
     server 10.0.1.11:8080 max_fails=3 fail_timeout=30s;
-    server 10.0.1.12:8080 backup; # Вступит в работу только если упадут основные
+
+    # Резервный сервер: вступает в работу только если упадут все основные
+    server 10.0.1.12:8080 backup;
 }
 
 server {
     listen 80;
+    server_name api.example.com;
+
     location / {
         proxy_pass http://go_backends;
+        proxy_next_upstream error timeout http_500 http_502 http_503 http_504;
     }
 }
 </code></pre>
 </div>
 
-<h2 id="algoritmy-balansirovki">Алгоритмы балансировки</h2>
+<hr />
+<h2 id="2-algoritmy-balansirovki-trafika">2. Алгоритмы балансировки трафика</h2>
 
-<p>Выбор алгоритма — это не просто "круговая очередь". От него напрямую зависит задержка (латентность) и утилизация ресурсов вашего Go-кластера.</p>
-<h3 id="1-round-robin-po-umolchaniyu">1. Round Robin (По умолчанию)</h3>
-<p>Запросы раздаются инстансам по очереди: 1-й → Сервер А, 2-й → Сервер B, 3-й → Сервер C, 4-й → Сервер А.<br />
-Подходит только для идеального мира: когда все серверы одинаково мощные, а все запросы требуют одинакового количества CPU/RAM. В реальности такого не бывает.</p>
+<p>Выбор алгоритма балансировки — это ключевой фактор, определяющий хвостовую задержку (<strong>tail latency</strong>, p99) и равномерность утилизации ресурсов вашего Go-кластера.</p>
+<h3 id="1-round-robin-krugovoe-raspredelenie-po-umolchaniyu">1. Round Robin (Круговое распределение по умолчанию)</h3>
+<p>Запросы поочередно распределяются между серверами по кругу: 1-й → Сервер А, 2-й → Сервер B, 3-й → Сервер C, 4-й → Сервер А.</p>
+<p>Round Robin справедлив только в идеальном сферическом вакууме: когда все инстансы развернуты на абсолютно идентичном железе, а каждый входящий HTTP-запрос требует одинакового времени CPU и памяти. В реальном бэкенде такого равенства не существует в принципе.</p>
 <h3 id="2-least-connections-leastconn">2. Least Connections (`least_conn`)</h3>
-<p>Директива <code>least_conn</code> отправляет запрос на сервер, у которого сейчас меньше всего активных соединений. </p>
+<p>Директива <code>least_conn</code> указывает Nginx направлять очередной входящий запрос на тот сервер, у которого в текущий момент зафиксировано <strong>наименьшее количество активных TCP-соединений</strong>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Почему least_conn превосходит Round Robin в Go-системах?</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему <code>least_conn</code> почти всегда лучше Round Robin для Go-бэкенда?<br />
-<strong>Ответ:</strong> Время обработки HTTP-запросов варьируется в сотни раз. Запрос <code>GET /users</code> может отработать за 2мс, а <code>GET /reports/generate</code> — за 2000мс. При Round Robin оба сервера получат поровну запросов, но первый быстро освободится, а второй будет держать горутины в активном состоянии. В итоге один сервер будет простаивать, а другой — перегружен (Hot Spot). <code>least_conn</code> учитывает реальную нагрузку, отправляя новые запросы на тот инстанс Go, который быстрее справляется с работой.</p>
+    <p><strong>Вопрос:</strong> Почему для пула микросервисов на Go алгоритм <code>least_conn</code> почти всегда оказывается предпочтительнее Round Robin?</p>
+<p><strong>Ответ:</strong> <br />
+Время обработки HTTP-запросов варьируется в сотни раз:<br />
+* Запрос <code>GET /users</code> читает данные из in-memory кэша и отрабатывает за 2 мс.<br />
+* Запрос <code>GET /reports/generate</code> выполняет тяжелую агрегацию данных в PostgreSQL и длится 2000 мс.</p>
+<p>При использовании Round Robin оба бэкенда получат строго по 50% запросов. Но первый сервер мгновенно завершит быстрые запросы и будет простаивать, а второй накопит пачку тяжелых запросов, удерживая горутины в активном состоянии и раздувая память. Возникает эффект горячей точки (<strong>Hot Spot</strong>).</p>
+<p>Алгоритм <code>least_conn</code> динамически отслеживает текущую нагрузку: как только инстанс начинает захлебываться медленными запросами, число его активных соединений возрастает, и Nginx автоматически перестает слать на него новый трафик, перенаправляя его свободным воркерам.</p>
   </div>
 </div>
 
 <h3 id="3-ip-hash-iphash">3. IP Hash (`ip_hash`)</h3>
-<p>Алгоритм хеширует IP-адрес клиента и привязывает его к конкретному серверу (Sticky Sessions). </p>
+<p>Алгоритм вычисляет хэш от первых трех октетов IPv4-адреса клиента (или полного IPv6) и жестко привязывает пользователя к конкретному серверу бэкенда (<strong>Sticky Sessions</strong>).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Опасность ip_hash в современной архитектуре Go</span>
   </div>
   <div class="callout-body">
-    <p>В эпоху монолитных PHP-приложений, где сессии хранились в файлах на диске сервера, <code>ip_hash</code> был спасением. В Go это <strong>антипаттерн</strong>. <br />
-Во-первых, если вы сидите в корпоративной сети через NAT, тысяча пользователей будет иметь один IP, что создаст колоссальный дисбаланс (Hot Spot).<br />
-Во-вторых, Go-бэкенды должны быть <strong>Stateless</strong> (без состояния). Сессии должны храниться во внешнем хранилище (Redis, Memcached, БД). Если инстанс Go упадет, Nginx перехеширует IP на другой сервер, и пользователи ничего не заметят, если сессия в Redis. Используйте <code>ip_hash</code> только для кэширования статики или в крайних случаях.</p>
+    <p>В эпоху монолитных PHP-приложений, где пользовательские сессии сохранялись в локальные файлы на диске сервера (<code>/var/lib/php/sessions</code>), <code>ip_hash</code> был неизбежным спасением.</p>
+<p>В микросервисной архитектуре Go использование <code>ip_hash</code> считается серьезным <strong>антипаттерном</strong>:<br />
+1. <strong>Проблема корпоративных NAT и мобильных операторов:</strong> Если тысячи сотрудников крупного офиса или пользователи мобильного провайдера выходят в интернет через один общий NAT-шлюз, они имеют одинаковый публичный IP-адрес. В результате вся многотысячная толпа клиентов попадет на один-единственный инстанс Go, создав катастрофический перекос нагрузки (Hot Spot) и уронив узел в OOM.<br />
+2. <strong>Принцип Stateless:</strong> Go-бэкенды обязаны проектироваться без состояния (Stateless). Пользовательские сессии, токены и промежуточные состояния должны храниться во внешних распределенных хранилищах (Redis, Memcached, СУБД). Если один инстанс Go упадет, балансировщик перенаправит пользователя на любой соседний узел, и клиент даже не заметит сбоя, прочитав сессию из Redis. Применяйте <code>ip_hash</code> исключительно для локализованного кэширования статики или в редких legacy-системах.</p>
   </div>
 </div>
 
-<h3 id="4-random-power-of-two-choices">4. Random (Power of Two Choices)</h3>
-<p>Директива <code>random two least_conn;</code> — это современный алгоритм, который использует математический феномен "Сила двух выборов" (Power of Two Choices).</p>
+<h3 id="4-random-i-kontseptsiya-sila-dvukh-vyborov-power-of-two-choices">4. Random и концепция «Сила двух выборов» (Power of Two Choices)</h3>
+<p>Современная директива <code>random two least_conn;</code> реализует фундаментальный алгоритм распределенных систем — <strong>Power of Two Random Choices</strong>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Математическое изящество Power of Two Choices</span>
   </div>
   <div class="callout-body">
-    <p>Чтобы выбрать <em>абсолютно</em> наименее загруженный сервер, Nginx пришлось бы опросить все инстансы в <code>upstream</code> (O(N) операций). В высоконагруженных системах с десятками бэкендов это само по себе создает задержку.<br />
-Алгоритм Random Two делает иначе: он выбирает <strong>два случайных сервера</strong>, сравнивает их загрузку и отправляет запрос на тот, который менее загружен. Математически доказано, что этот подход (O(1) операций) снижает задержку (tail latency) почти так же эффективно, как полный опрос всех серверов, но требует в разы меньше вычислительных ресурсов балансировщика.</p>
+    <p>Чтобы выбрать <em>абсолютно</em> наименее загруженный узел в пуле из сотен серверов, балансировщику пришлось бы обойти весь список и проверить счетчик каждого узла — это алгоритмическая сложность $O(N)$. При обработке сотен тысяч запросов в секунду такой глобальный перебор сам по себе создает задержки и блокировки в разделяемой памяти Nginx.</p>
+<p>Алгоритм <strong>Random Two Choices</strong> действует гениально просто:<br />
+1. Балансировщик случайно выбирает <strong>всего два сервера</strong> из пула upstream ($O(1)$ операций).<br />
+2. Сравнивает число активных соединений только между этой парой.<br />
+3. Отправляет запрос тому из двух, кто менее загружен.</p>
+<p>Теория вероятностей строго доказывает (теорема Митценмахера), что выбор из двух случайных альтернатив экспоненциально устраняет очереди и срезает хвостовую задержку (tail latency) практически так же эффективно, как полный опрос всех $N$ узлов, требуя при этом ничтожное количество процессорных тактов.</p>
   </div>
 </div>
 
@@ -2273,31 +2293,24 @@ C --&gt;|&quot;Сравнение: 10 меньше 45&quot;| E[&quot;Запро�
 </div>
 
 
-<h2 id="health-checks-passivnyy-i-aktivnyy">Health Checks: Пассивный и Активный</h2>
+<hr />
+<h2 id="3-health-checks-passivnye-proverki-i-zashchita-ot-502-bad-gateway">3. Health Checks: Пассивные проверки и защита от 502 Bad Gateway</h2>
 
-<p>Если один из ваших Go-инстансов упал (например, OOM Kill), Nginx должен перестать отправлять ему трафик. В open-source версии Nginx доступны только <strong>Пассивные проверки (Passive Health Checks)</strong>.</p>
-<p>Они настраиваются параметрами в <code>upstream</code>:<br />
-*   <code>max_fails=3</code>: Количество неудачных попыток соединения/чтения с бэкендом, прежде чем он считается недоступным.<br />
-*   <code>fail_timeout=30s</code>: Время, в течение которого сервер считается недоступным, прежде чем Nginx снова попробует отправить ему запрос.</p>
-<p><strong>Как это работает:</strong> Nginx не опрашивает бэкенды фоном. Он узнает о падении бэкенда только тогда, когда реальный клиент попытается зайти на сайт. Если Nginx получает ошибку от Go-сервера или таймаут, он считает это <code>fail</code>. После 3 фейлов Nginx на 30 секунд перестает пускать туда трафик. </p>
+<p>Когда один из инстансов Go внезапно падает (например, аварийно завершается из-за OOM Killer ядра Linux или неперехваченной паники), балансировщик обязан незамедлительно исключить его из маршрутизации.</p>
+<p>В базовой Open-Source версии Nginx поддерживаются <strong>Пассивные проверки здоровья (Passive Health Checks)</strong>. Они настраиваются директивами внутри блока <code>upstream</code>:</p>
+<ul>
+<li><code>max_fails=3</code>: Число последовательных неудачных попыток соединения или чтения ответа от бэкенда, после которого сервер признается временно недоступным.</li>
+<li><code>fail_timeout=30s</code>: Временной интервал, в течение которого Nginx выдерживает сервер в карантине (не шлет на него запросы), прежде чем предпримет новую попытку отправить проверочный запрос.</li>
+</ul>
+<p><strong>Механика работы:</strong> Nginx не генерирует фоновый проверочный трафик самостоятельно. Он узнает о недоступности бэкенда исключительно в момент обслуживания реального клиентского запроса. Если системный вызов <code>connect()</code> завершается по таймауту или сервер обрывает соединение, Nginx инкрементирует счетчик сбоев (<code>fails</code>).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ошибка 502 первому неудачливому клиенту</span>
   </div>
   <div class="callout-body">
-    <p>При пассивных проверках первый пользователь, чей запрос попадет на упавший инстанс, получит ошибку 502 Bad Gateway. Чтобы этого избежать, используют директиву <code>proxy_next_upstream</code>. Она заставляет Nginx при ошибке (например, таймаут или 500 от бэкенда) автоматически повторить запрос на следующем сервере из пула. Клиент получит нормальный ответ, albeit с небольшой задержкой.</p>
-  </div>
-</div>
-
-<h2 id="spetsifika-balansirovki-grpc">Специфика балансировки gRPC</h2>
-
-<p>Если ваш Go-бэкенд общается с другими сервисами по gRPC (HTTP/2), балансировка через обычный HTTP-прокси превращается в ад. </p>
-<p>HTTP/2 мультиплексирует сотни RPC-вызовов внутри <em>одного</em> TCP-соединения. При обычном <code>proxy_pass</code> Nginx установит с каждым бэкендом по одному TCP-соединению, и все RPC-вызовы от миллионов клиентов полетят через эти несколько соединений. Round Robin будет балансировать <em>соединения</em>, а не <em>запросы</em>, и балансировка полностью сломается.</p>
-<p>Для gRPC в Nginx обязательно использовать:<br />
-1. Директиву <code>grpc_pass</code> вместо <code>proxy_pass</code>.<br />
-2. Алгоритм <code>least_conn</code> или <code>random two</code>, так как они балансируют по количеству активных запросов внутри соединения.<br />
-3. <code>keepalive</code> в upstream, чтобы не пересоздавать HTTP/2 сессии.</p>
+    <p>Главный изъян пассивных проверок: клиент, чей запрос первым натолкнулся на упавший бэкенд, рискует получить сухую ошибку <code>502 Bad Gateway</code>.</p>
+<p>Чтобы исключить потерю клиентских запросов, обязательно настраивайте директиву <strong><code>proxy_next_upstream</code></strong>:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2307,107 +2320,30 @@ C --&gt;|&quot;Сравнение: 10 меньше 45&quot;| E[&quot;Запро�
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-nginx"><code class="language-nginx">upstream grpc_backends {
-    least_conn;
-    server 10.0.1.10:4443;
-    server 10.0.1.11:4443;
-    keepalive 16; # Важно для HTTP/2 мультиплексирования
-}
-
-server {
-    listen 443 http2;
-    location / {
-        grpc_pass grpc://grpc_backends;
-    }
+  <pre class="language-nginx"><code class="language-nginx">location / {
+    proxy_pass http://go_backends;
+    # При сетевых сбоях и кодах 500-504 немедленно повторяем запрос на другом узле
+    proxy_next_upstream error timeout http_500 http_502 http_503 http_504 non_idempotent;
+    proxy_next_upstream_tries 3;
+    proxy_next_upstream_timeout 5s;
 }
 </code></pre>
 </div>
 
-<h2 id="itog">Итог</h2>
-
-<ol>
-<li><strong>Least Connections</strong> — алгоритм по умолчанию для Go-бэкендов, так как время обработки запросов варьируется, и он предотвращает Hot Spots.</li>
-<li><strong>Stateless архитектура</strong> в Go делает <code>ip_hash</code> ненужным и опасным; храните сессии в Redis.</li>
-<li><strong>Random Two Choices</strong> — математический трюк, который позволяет балансировать эффективно, не сканируя все серверы.</li>
-<li><strong>Пассивные Health Checks</strong> и <code>proxy_next_upstream</code> спасают клиентов от 502 ошибок при падении инстанса, но добавляют задержку "первого" запроса к упавшему узлу.</li>
-<li><strong>gRPC балансировка</strong> требует <code>least_conn</code> и понимания мультиплексирования HTTP/2, иначе трафик распределится катастрофически неравномерно.</li>
-</ol>
-<p>Балансировщик работает с открытым текстом, но выпускать его в таком виде в интернет — преступление. В следующей статье мы разберем, как Nginx снимает с Go-приложений тяжелую криптографическую нагрузку: <a href="4-tls-termination.html" class="wikilink">4. TLS termination</a>.<br />
-Когда ваш Go-бэкенд перестает справляться с потоком запросов на одном сервере, вы масштабируете его горизонтально — запускаете несколько инстансов (реплик). Но кто будет решать, какому именно инстансу отдать конкретный HTTP-запрос? Это задача <strong>Load Balancer'а</strong> (балансировщика нагрузки).</p>
-<p>В связке Nginx + Go, Nginx выступает L7 (уровень приложений) балансировщиком. Он понимает протокол HTTP, может читать заголовки, куки и URI, принимая интеллектуальные решения о маршрутизации, чего не могут сделать балансировщики L4 (уровень TCP, например, чистый HAProxy или AWS NLB).</p>
-<h2 id="blok-upstream-pul-bekendov">Блок `upstream`: Пул бэкендов</h2>
-
-<p>В Nginx список серверов, между которыми распределяется трафик, описывается в директиве <code>upstream</code>. </p>
-
-<div class="code-block" data-lang="nginx">
-  <div class="code-header">
-    <span class="code-lang-tag">NGINX</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-nginx"><code class="language-nginx">upstream go_backends {
-    server 10.0.1.10:8080 max_fails=3 fail_timeout=30s;
-    server 10.0.1.11:8080 max_fails=3 fail_timeout=30s;
-    server 10.0.1.12:8080 backup; # Вступит в работу только если упадут основные
-}
-
-server {
-    listen 80;
-    location / {
-        proxy_pass http://go_backends;
-    }
-}
-</code></pre>
-</div>
-
-<h2 id="algoritmy-balansirovki">Алгоритмы балансировки</h2>
-
-<p>Выбор алгоритма — это не просто "круговая очередь". От него напрямую зависит задержка (латентность) и утилизация ресурсов вашего Go-кластера.</p>
-<h3 id="1-round-robin-po-umolchaniyu">1. Round Robin (По умолчанию)</h3>
-<p>Запросы раздаются инстансам по очереди: 1-й → Сервер А, 2-й → Сервер B, 3-й → Сервер C, 4-й → Сервер А.<br />
-Подходит только для идеального мира: когда все серверы одинаково мощные, а все запросы требуют одинакового количества CPU/RAM. В реальности такого не бывает.</p>
-<h3 id="2-least-connections-leastconn">2. Least Connections (`least_conn`)</h3>
-<p>Директива <code>least_conn</code> отправляет запрос на сервер, у которого сейчас меньше всего активных соединений. </p>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему <code>least_conn</code> почти всегда лучше Round Robin для Go-бэкенда?<br />
-<strong>Ответ:</strong> Время обработки HTTP-запросов варьируется в сотни раз. Запрос <code>GET /users</code> может отработать за 2мс, а <code>GET /reports/generate</code> — за 2000мс. При Round Robin оба сервера получат поровну запросов, но первый быстро освободится, а второй будет держать горутины в активном состоянии. В итоге один сервер будет простаивать, а другой — перегружен (Hot Spot). <code>least_conn</code> учитывает реальную нагрузку, отправляя новые запросы на тот инстанс Go, который быстрее справляется с работой.</p>
+<p>Благодаря этому правилу Nginx при ошибке первого сервера мгновенно перехватит сбой и прозрачно перенаправит исходный запрос на соседний живой инстанс. Клиент получит успешный ответ <code>200 OK</code>, заметив лишь незначительное увеличение времени ответа на несколько миллисекунд.</p>
   </div>
 </div>
 
-<h3 id="3-ip-hash-iphash">3. IP Hash (`ip_hash`)</h3>
-<p>Алгоритм хеширует IP-адрес клиента и привязывает его к конкретному серверу (Sticky Sessions). </p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p>В эпоху монолитных PHP-приложений, где сессии хранились в файлах на диске сервера, <code>ip_hash</code> был спасением. В Go это <strong>антипаттерн</strong>. <br />
-Во-первых, если вы сидите в корпоративной сети через NAT, тысяча пользователей будет иметь один IP, что создаст колоссальный дисбаланс (Hot Spot).<br />
-Во-вторых, Go-бэкенды должны быть <strong>Stateless</strong> (без состояния). Сессии должны храниться во внешнем хранилище (Redis, Memcached, БД). Если инстанс Go упадет, Nginx перехеширует IP на другой сервер, и пользователи ничего не заметят, если сессия в Redis. Используйте <code>ip_hash</code> только для кэширования статики или в крайних случаях.</p>
-  </div>
-</div>
+<hr />
+<h2 id="4-spetsifika-balansirovki-grpc-i-http2">4. Специфика балансировки gRPC и HTTP/2</h2>
 
-<h3 id="4-random-power-of-two-choices">4. Random (Power of Two Choices)</h3>
-<p>Директива <code>random two least_conn;</code> — это современный алгоритм, который использует математический феномен "Сила двух выборов" (Power of Two Choices).</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Чтобы выбрать <em>абсолютно</em> наименее загруженный сервер, Nginx пришлось бы опросить все инстансы в <code>upstream</code> (O(N) операций). В высоконагруженных системах с десятками бэкендов это само по себе создает задержку.<br />
-Алгоритм Random Two делает иначе: он выбирает <strong>два случайных сервера</strong>, сравнивает их загрузку и отправляет запрос на тот, который менее загружен. Математически доказано, что этот подход (O(1) операций) снижает задержку (tail latency) почти так же эффективно, как полный опрос всех серверов, но требует в разы меньше вычислительных ресурсов балансировщика.</p>
-  </div>
-</div>
-
+<p>С бурным развитием микросервисов в Go стандартом межсервисного общения стал фреймворк <strong>gRPC</strong>, работающий поверх транспортного протокола <strong>HTTP/2</strong>.</p>
+<p>И здесь традиционная балансировка через обычный <code>proxy_pass</code> терпит полный крах!</p>
+<p>Причина в архитектуре HTTP/2: протокол выполняет <strong>мультиплексирование потоков (Streams)</strong> внутри одного постоянного TCP-соединения. Тысячи RPC-запросов передаются параллельно в рамках единой TCP-сессии.</p>
+<p>Если настроить обычный <code>proxy_pass http://grpc_backends;</code>:<br />
+1. Nginx установит ровно одно TCP-соединение с каждым бэкендом.<br />
+2. Все миллионы gRPC-запросов от сотен клиентов полетят через эти зафиксированные соединения.<br />
+3. Алгоритм Round Robin распределит <em>TCP-соединения</em>, а не сами RPC-вызовы! В результате один сервер может оказаться забит тысячами одновременных вызовов, а второй будет полностью простаивать.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2421,40 +2357,25 @@ server {
     </button>
   </div>
   <pre class="mermaid">
-flowchart LR
-A[&quot;Входящий запрос&quot;] --&gt; B{&quot;Nginx random two&quot;}
-B --&gt;|&quot;Случайный выбор 2&quot;| C[&quot;Go Server 1 - 10 активных коннектов&quot;]
-B --&gt;|&quot;Случайный выбор 2&quot;| D[&quot;Go Server 2 - 45 активных коннектов&quot;]
-C --&gt;|&quot;Сравнение: 10 меньше 45&quot;| E[&quot;Запрос отправлен на Server 1&quot;]
+flowchart TD
+subgraph Bad [&quot;Обычный proxy_pass (Дисбаланс по TCP-соединениям)&quot;]
+C1[&quot;Клиент 1 (100 RPC)&quot;] --&gt; TCP1[&quot;Единый TCP/HTTP2 канал&quot;]
+C2[&quot;Клиент 2 (500 RPC)&quot;] --&gt; TCP2[&quot;Единый TCP/HTTP2 канал&quot;]
+TCP1 --&gt; S1[&quot;Go Server 1 (Перегружен: 600 RPC)&quot;]
+TCP2 --&gt; S1
+S2[&quot;Go Server 2 (Простаивает: 0 RPC)&quot;]
+end
+
+subgraph Good [&quot;Nginx grpc_pass (Балансировка по потокам)&quot;]
+Client[&quot;Клиенты gRPC&quot;] --&gt; Ingress[&quot;Nginx (grpc_pass + least_conn)&quot;]
+Ingress --&gt;|&quot;RPC Streams 1..300&quot;| G1[&quot;Go Server 1 (300 RPC)&quot;]
+Ingress --&gt;|&quot;RPC Streams 301..600&quot;| G2[&quot;Go Server 2 (300 RPC)&quot;]
+end
   </pre>
 </div>
 
 
-<h2 id="health-checks-passivnyy-i-aktivnyy">Health Checks: Пассивный и Активный</h2>
-
-<p>Если один из ваших Go-инстансов упал (например, OOM Kill), Nginx должен перестать отправлять ему трафик. В open-source версии Nginx доступны только <strong>Пассивные проверки (Passive Health Checks)</strong>.</p>
-<p>Они настраиваются параметрами в <code>upstream</code>:<br />
-*   <code>max_fails=3</code>: Количество неудачных попыток соединения/чтения с бэкендом, прежде чем он считается недоступным.<br />
-*   <code>fail_timeout=30s</code>: Время, в течение которого сервер считается недоступным, прежде чем Nginx снова попробует отправить ему запрос.</p>
-<p><strong>Как это работает:</strong> Nginx не опрашивает бэкенды фоном. Он узнает о падении бэкенда только тогда, когда реальный клиент попытается зайти на сайт. Если Nginx получает ошибку от Go-сервера или таймаут, он считает это <code>fail</code>. После 3 фейлов Nginx на 30 секунд перестает пускать туда трафик. </p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p>При пассивных проверках первый пользователь, чей запрос попадет на упавший инстанс, получит ошибку 502 Bad Gateway. Чтобы этого избежать, используют директиву <code>proxy_next_upstream</code>. Она заставляет Nginx при ошибке (например, таймаут или 500 от бэкенда) автоматически повторить запрос на следующем сервере из пула. Клиент получит нормальный ответ, albeit с небольшой задержкой.</p>
-  </div>
-</div>
-
-<h2 id="spetsifika-balansirovki-grpc">Специфика балансировки gRPC</h2>
-
-<p>Если ваш Go-бэкенд общается с другими сервисами по gRPC (HTTP/2), балансировка через обычный HTTP-прокси превращается в ад. </p>
-<p>HTTP/2 мультиплексирует сотни RPC-вызовов внутри <em>одного</em> TCP-соединения. При обычном <code>proxy_pass</code> Nginx установит с каждым бэкендом по одному TCP-соединению, и все RPC-вызовы от миллионов клиентов полетят через эти несколько соединений. Round Robin будет балансировать <em>соединения</em>, а не <em>запросы</em>, и балансировка полностью сломается.</p>
-<p>Для gRPC в Nginx обязательно использовать:<br />
-1. Директиву <code>grpc_pass</code> вместо <code>proxy_pass</code>.<br />
-2. Алгоритм <code>least_conn</code> или <code>random two</code>, так как они балансируют по количеству активных запросов внутри соединения.<br />
-3. <code>keepalive</code> в upstream, чтобы не пересоздавать HTTP/2 сессии.</p>
+<p>Для корректной балансировки gRPC в Nginx используется специальный модуль:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2465,31 +2386,51 @@ C --&gt;|&quot;Сравнение: 10 меньше 45&quot;| E[&quot;Запро�
     </button>
   </div>
   <pre class="language-nginx"><code class="language-nginx">upstream grpc_backends {
+    # Для gRPC критически важен least_conn по числу активных стримов
     least_conn;
+
     server 10.0.1.10:4443;
     server 10.0.1.11:4443;
-    keepalive 16; # Важно для HTTP/2 мультиплексирования
+
+    # Пул открытых соединений HTTP/2 для минимизации задержек
+    keepalive 16;
 }
 
 server {
-    listen 443 http2;
+    # Включаем поддержку HTTP/2 (или gRPC over cleartext h2c)
+    listen 443 ssl;
+    http2 on; # Современный синтаксис Nginx 1.25+
+
+    ssl_certificate     /etc/ssl/certs/service.crt;
+    ssl_certificate_key /etc/ssl/private/service.key;
+
     location / {
+        # Специализированное проксирование gRPC
         grpc_pass grpc://grpc_backends;
+
+        # Настройка таймаутов для длительных Streaming RPC
+        grpc_read_timeout 300s;
+        grpc_send_timeout 300s;
     }
 }
 </code></pre>
 </div>
 
+<p>Ключевые требования для gRPC:<br />
+1. Использование директивы <code>grpc_pass</code> вместо <code>proxy_pass</code>.<br />
+2. Применение алгоритмов <code>least_conn</code> или <code>random two</code>, которые отслеживают количество активных потоков (активных запросов) внутри соединения.<br />
+3. Обязательный <code>keepalive</code> в блоке <code>upstream</code>, предотвращающий постоянный пересчет параметров сжатия HPACK и пересоздание TLS-сессий.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Least Connections</strong> — алгоритм по умолчанию для Go-бэкендов, так как время обработки запросов варьируется, и он предотвращает Hot Spots.</li>
-<li><strong>Stateless архитектура</strong> в Go делает <code>ip_hash</code> ненужным и опасным; храните сессии в Redis.</li>
-<li><strong>Random Two Choices</strong> — математический трюк, который позволяет балансировать эффективно, не сканируя все серверы.</li>
-<li><strong>Пассивные Health Checks</strong> и <code>proxy_next_upstream</code> спасают клиентов от 502 ошибок при падении инстанса, но добавляют задержку "первого" запроса к упавшему узлу.</li>
-<li><strong>gRPC балансировка</strong> требует <code>least_conn</code> и понимания мультиплексирования HTTP/2, иначе трафик распределится катастрофически неравномерно.</li>
+<li><strong>Least Connections — стандарт для Go:</strong> Алгоритм <code>least_conn</code> нивелирует естественный разброс во времени выполнения тяжелых и легких HTTP-хендлеров, исключая появление Hot Spots.</li>
+<li><strong>Опасность ip_hash:</strong> Привязка клиентов по IP нарушает принципы Stateless-архитектуры и приводит к перегрузке узлов из-за агрегации трафика под корпоративными NAT.</li>
+<li><strong>Power of Two Choices:</strong> Математически выверенный выбор между двумя случайными узлами (<code>random two least_conn</code>) обеспечивает эффективную балансировку с алгоритмической сложностью $O(1)$.</li>
+<li><strong>Пассивные проверки и отказоустойчивость:</strong> Связка директив <code>max_fails</code>, <code>fail_timeout</code> и <code>proxy_next_upstream</code> предотвращает появление ошибок 502 у пользователей при сбоях бэкендов.</li>
+<li><strong>Мультиплексирование gRPC:</strong> Балансировка gRPC требует специализированной директивы <code>grpc_pass</code> и поддержки HTTP/2, чтобы балансировать отдельные RPC-вызовы, а не монолитные TCP-трубы.</li>
 </ol>
-<p>Балансировщик работает с открытым текстом, но выпускать его в таком виде в интернет — преступление. В следующей статье мы разберем, как Nginx снимает с Go-приложений тяжелую криптографическую нагрузку: <a href="4-tls-termination.html" class="wikilink">4. TLS termination</a>.</p>
+<p>Балансировщик эффективно распределяет открытый HTTP-трафик, но передача незашифрованных данных через публичный интернет недопустима. В следующей лекции мы детально изучим криптографическую защиту соединений и разгрузку бэкенда: <a href="4-tls-termination.html" class="wikilink">4. TLS termination</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2517,7 +2458,7 @@ server {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#blok-upstream-pul-bekendov">Блок upstream: Пул бэкендов</a></li><li class="toc-item toc-h2"><a href="#algoritmy-balansirovki">Алгоритмы балансировки</a></li><li class="toc-item toc-h3"><a href="#1-round-robin-po-umolchaniyu">1. Round Robin (По умолчанию)</a></li><li class="toc-item toc-h3"><a href="#2-least-connections-leastconn">2. Least Connections (leastconn)</a></li><li class="toc-item toc-h3"><a href="#3-ip-hash-iphash">3. IP Hash (iphash)</a></li><li class="toc-item toc-h3"><a href="#4-random-power-of-two-choices">4. Random (Power of Two Choices)</a></li><li class="toc-item toc-h2"><a href="#health-checks-passivnyy-i-aktivnyy">Health Checks: Пассивный и Активный</a></li><li class="toc-item toc-h2"><a href="#spetsifika-balansirovki-grpc">Специфика балансировки gRPC</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li><li class="toc-item toc-h2"><a href="#blok-upstream-pul-bekendov">Блок upstream: Пул бэкендов</a></li><li class="toc-item toc-h2"><a href="#algoritmy-balansirovki">Алгоритмы балансировки</a></li><li class="toc-item toc-h3"><a href="#1-round-robin-po-umolchaniyu">1. Round Robin (По умолчанию)</a></li><li class="toc-item toc-h3"><a href="#2-least-connections-leastconn">2. Least Connections (leastconn)</a></li><li class="toc-item toc-h3"><a href="#3-ip-hash-iphash">3. IP Hash (iphash)</a></li><li class="toc-item toc-h3"><a href="#4-random-power-of-two-choices">4. Random (Power of Two Choices)</a></li><li class="toc-item toc-h2"><a href="#health-checks-passivnyy-i-aktivnyy">Health Checks: Пассивный и Активный</a></li><li class="toc-item toc-h2"><a href="#spetsifika-balansirovki-grpc">Специфика балансировки gRPC</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-blok-upstream-deklarativnyy-pul-bekendov">1. Блок upstream: Декларативный пул бэкендов</a></li><li class="toc-item toc-h2"><a href="#2-algoritmy-balansirovki-trafika">2. Алгоритмы балансировки трафика</a></li><li class="toc-item toc-h3"><a href="#1-round-robin-krugovoe-raspredelenie-po-umolchaniyu">1. Round Robin (Круговое распределение по умолчанию)</a></li><li class="toc-item toc-h3"><a href="#2-least-connections-leastconn">2. Least Connections (leastconn)</a></li><li class="toc-item toc-h3"><a href="#3-ip-hash-iphash">3. IP Hash (iphash)</a></li><li class="toc-item toc-h3"><a href="#4-random-i-kontseptsiya-sila-dvukh-vyborov-power-of-two-choices">4. Random и концепция «Сила двух выборов» (Power of Two Choices)</a></li><li class="toc-item toc-h2"><a href="#3-health-checks-passivnye-proverki-i-zashchita-ot-502-bad-gateway">3. Health Checks: Пассивные проверки и защита от 502 Bad Gateway</a></li><li class="toc-item toc-h2"><a href="#4-spetsifika-balansirovki-grpc-i-http2">4. Специфика балансировки gRPC и HTTP/2</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

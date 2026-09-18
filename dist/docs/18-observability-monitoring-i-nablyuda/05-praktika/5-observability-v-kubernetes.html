@@ -2169,17 +2169,29 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 18</span>
-              <span class="meta-tag read-time">⏱ ~10 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~13 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Observability в Kubernetes</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="dinamicheskiy-mir-kubernetes">Динамический мир Kubernetes</h2>
+            <h1>5. Observability в Kubernetes: Эксплуатация телеметрии в динамических средах</h1>
+<blockquote>
+<p><em>"The purpose of computing is insight, not numbers."</em><br />
+— Ричард Хэмминг</p>
+</blockquote>
+<p>В предыдущих статьях мы рассматривали Observability абстрактно: библиотеки Go, локальные сокеты и сетевые вызовы. Но в реальности подавляющее большинство современных Go-бэкендов развертывается и масштабируется в среде <strong>Kubernetes (K8s)</strong>.</p>
+<p>Kubernetes переворачивает привычные правила игры с ног на голову. Здесь больше нет постоянных серверов с фиксированными IP-адресами, настроенных раз и навсегда. Поды рождаются, перемещаются планировщиком между физическими нодами, деградируют и уничтожаются за считанные секунды. В таком эфемерном океане контейнеров любая статическая конфигурация обречена на провал.</p>
+<p>Разберем, как выстроить надежный контур наблюдаемости в Kubernetes, не разорившись на ресурсах и не потеряв контроль над поведением сервисов.</p>
+<hr />
+<h2 id="dinamicheskiy-mir-kubernetes">Динамический мир Kubernetes</h2>
 
-<p>В предыдущих статьях мы рассматривали Observability абстрактно. Но в реальности большинство современных Go-бэкендов развертываются в Kubernetes (K8s). Это меняет правила игры: статические конфигурации IP-адресов больше не работают, а масштабирование происходит мгновенно.</p>
-<p>Kubernetes создает новые вызовы: эфемерность подов (они часто создаются и удаляются), динамическая сервисная сетка и сложная маршрутизация.</p>
+<p>Kubernetes создает принципиально новые вызовы для системной инженерии:<br />
+1. <strong>Эфемерность:</strong> Жизненный цикл пода измеряется часами или днями. Попытка мониторить под как отдельный «хост» приводит к взрывному раздуванию временных рядов (Series Churn).<br />
+2. <strong>Многоуровневость (Multi-Tenancy):</strong> В одном физическом кластере соседствуют десятки изолированных неймспейсов (Namespaces), делящие общий пул процессоров и памяти.<br />
+3. <strong>Виртуализация ресурсов (Cgroups):</strong> Рантайм приложения изолирован механизмом Linux cgroups, что напрямую влияет на поведение сборщика мусора Go и планировщика операционной системы.</p>
+<hr />
 <h2 id="arkhitektura-observability-v-k8s">Архитектура Observability в K8s</h2>
 
 <p>Классический подход «Push» (агент внутри приложения отправляет метрики) в K8s менее популярен, чем подход <strong>Pull</strong> с использованием <strong>Prometheus Operator</strong>.</p>
@@ -2212,25 +2224,35 @@ end
 
 A4 --&gt;|&quot;Remote Write&quot;| B1
 A6 --&gt;|&quot;Push Logs&quot;| B1
+
+style A fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#fff
+style A1 fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#fff
+style A6 fill:#78350f,stroke:#f59e0b,stroke-width:2px,color:#fff
+style B fill:#0f172a,stroke:#475569,stroke-width:1px,color:#fff
   </pre>
 </div>
 
 
 <h3 id="prometheus-operator">Prometheus Operator</h3>
+
 <p>Это стандарт де-факто для мониторинга в K8s. Вместо того чтобы вручную править конфиг <code>prometheus.yml</code> и перезагружать контейнер при каждом добавлении нового сервиса, Operator делает это автоматически.</p>
 <ul>
 <li><strong>CRD (Custom Resource Definition):</strong> Вы создаете ресурс <code>ServiceMonitor</code>, который говорит: «Следи за всеми сервисами, у которых есть лейбл <code>app=backend</code>».</li>
 <li><strong>Service Discovery:</strong> Prometheus сам находит все поды, попадающие под критерий, и начинает их скрейпить.</li>
 </ul>
+<p>Prometheus Operator непрерывно отслеживает Kubernetes API и автоматически генерирует конфиг скрейпинга для ядра Prometheus при любом изменении подов или сервисов.</p>
+<hr />
 <h2 id="logirovanie-sidecar-vs-daemonset">Логирование: Sidecar vs DaemonSet</h2>
 
 <p>В статье <a href="../03-logirovanie/4-tsentralizovannye-logi.html" class="wikilink">4. Централизованные логи</a> мы определили, что приложения должны писать в <code>stdout</code>. В K8s вопрос в том, <em>кто</em> эти логи забирает.</p>
 <h3 id="1-daemonset-agent-on-node">1. DaemonSet (Agent on Node)</h3>
-<p>На каждой ноде кластера запускается один под-агент (например, Promtail).<br />
+
+<p>На каждой ноде кластера запускается один под-агент (например, Promtail или Fluent Bit).<br />
 *   <strong>Принцип:</strong> Агент монтирует директорию <code>/var/log</code> с хоста, читает файлы контейнеров и отправляет в Loki.<br />
 *   <strong>Плюсы:</strong> Эффективно. Не потребляет ресурсы приложения. Один процесс на ноду.<br />
 *   <strong>Минусы:</strong> Нельзя парсить логи приложений по-разному на уровне приложения (конфиг общий).</p>
 <h3 id="2-sidecar-agent-in-pod">2. Sidecar (Agent in Pod)</h3>
+
 <p>В каждый под вашего приложения добавляется второй контейнер — логгер.<br />
 *   <strong>Принцип:</strong> Оба контейнера монтируют общий <code>emptyDir</code> volume. Приложение пишет в файл, sidecar читает и отправляет.<br />
 *   <strong>Плюсы:</strong> Максимальная гибкость (каждый микросервис может иметь свой формат/токен).<br />
@@ -2246,6 +2268,7 @@ A6 --&gt;|&quot;Push Logs&quot;| B1
   </div>
 </div>
 
+<hr />
 <h2 id="under-the-hood-container-metrics-cadvisor">Under the Hood: Container Metrics (cAdvisor)</h2>
 
 <p>Kubernetes сам по себе предоставляет метрики через Metrics Server, но для детального Observability мы используем <code>cAdvisor</code> (встроен в Kubelet).</p>
@@ -2262,17 +2285,20 @@ A6 --&gt;|&quot;Push Logs&quot;| B1
   <div class="callout-body">
     <p><strong>Go Runtime и Limits.</strong><br />
 Go GC не знает о лимитах контейнера (cgroups) до версий Go 1.19 (автоматическое определение <code>GOMEMLIMIT</code>). В старых версиях Go видел память всей ноды (например, 64GB) и мог установить цель GC слишком высоко, пока контейнер не убили по лимиту 512MB.<br />
-<strong>Решение:</strong> В Go 1.21+ runtime автоматически определяет cgroup limits и настраивает GC. Убедитесь, что вы используете свежую версию Go.</p>
+<strong>Решение:</strong> В Go 1.21+ runtime автоматически определяет cgroup limits и настраивает GC. Убедитесь, что вы используете свежую версию Go и задаете переменную окружения <code>GOMEMLIMIT</code> (например, 90% от лимита памяти пода), чтобы сборщик мусора успевал очистить кучу до срабатывания OOM Killer.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="cost-and-scale-cardinality-v-k8s">Cost and Scale: Cardinality в K8s</h2>
 
-<p>В Kubernetes проблема кардинальности (обсуждавшаяся в статье <a href="../01-osnovy/4-cardinality-i-stoimost-metrik.html" class="wikilink">4. Cardinality и стоимость метрик</a>) обостряется.<br />
-Если вы добавите лейбл <code>pod_name</code> в метрику, а потом сделаете <code>RollingUpdate</code> деплоя, K8s создаст новые поды с новыми именами.<br />
+<p>В Kubernetes проблема кардинальности (обсуждавшаяся в статье <a href="../01-osnovy/4-cardinality-i-stoimost-metrik.html" class="wikilink">4. Cardinality и стоимость метрик</a>) обостряется.</p>
+<p>Если вы добавите лейбл <code>pod_name</code> в метрику, а потом сделаете <code>RollingUpdate</code> деплоя, K8s создаст новые поды с новыми именами.<br />
 Prometheus будет создавать новые временные ряды для каждого нового пода. Старые ряды будут «гнить» (stale), но занимать место.</p>
+<p>Каждый деплой создает тысячи устаревших серий в памяти TSDB.</p>
 <p><strong>Best Practice:</strong><br />
 Никогда не используйте лейблы, которые меняются при редеплое (<code>pod_name</code>, <code>container_id</code>, <code>instance_ip</code>) в метриках высокого кардинальности. Используйте статические лейблы (<code>deployment</code>, <code>service</code>, <code>namespace</code>).</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>

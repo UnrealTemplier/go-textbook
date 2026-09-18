@@ -2169,20 +2169,26 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Ingress</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статьях <a href="2-pod-deployment-service.html" class="wikilink">2. Pod, Deployment, Service</a> мы разобрали, как Service (типа ClusterIP) обеспечивает стабильный IP-адрес для общения <em>внутри</em> кластера. Но как впустить внешних пользователей из интернета в ваши Go-сервисы, работающие в K8s?</p>
-<p>Если вы используете Service типа <code>LoadBalancer</code>, облачный провайдер создаст отдельный облачный балансировщик (AWS ELB, Yandex NLB) для <em>каждого</em> сервиса. Если у вас 30 микросервисов, вы получите 30 балансировщиков и астрономический счет от облака. Кроме того, L4-балансировщики не умеют маршрутизировать трафик по HTTP-путям (например, <code>/api/v1</code> -&gt; Go-сервис, <code>/admin</code> -&gt; другой сервис).</p>
-<p>Для решения этой проблемы в Kubernetes существует <strong>Ingress</strong>.</p>
-<h2 id="ingress-pravila-vs-kontroller">Ingress: Правила vs Контроллер</h2>
+            <h1>4. Ingress: Шлюз в мир и L7-маршрутизация</h1>
+<p>В предыдущих главах (в частности, в <a href="2-pod-deployment-service.html" class="wikilink">2. Pod, Deployment, Service</a>) мы детально исследовали, как абстракция <code>Service</code> (в режиме <code>ClusterIP</code>) организует надежное внутреннее сетевое взаимодействие и балансировку нагрузки между подами. Однако внешний мир пока отрезан от нашего кластера. Как впустить миллионы пользователей из открытого интернета в работающие Go-микросервисы?</p>
+<p>Первая наивная мысль — назначить каждому сервису тип <code>LoadBalancer</code>. Но в публичных облаках (AWS, GCP, Azure, Yandex Cloud) эта директива заставляет облачного провайдера выделить реальный аппаратный или виртуальный балансировщик (AWS NLB/ALB, Yandex Network Load Balancer). Если в вашей архитектуре 30 или 50 микросервисов, вы получите 50 отдельных балансировщиков, 50 публичных белых IP-адресов и астрономический счет в конце месяца. Кроме того, классические L4-балансировщики ничего не знают об HTTP-заголовках, куках и путях: они не способны отправить запрос по пути <code>/api/v1</code> или <code>/api/users</code> в Go-сервис, а <code>/admin</code> — в административный сервис.</p>
+<p>В реальном мире для бизнес-центра не строят отдельную уличную дверь и турникет к каждому офисному кабинету. Вместо этого возводят просторный центральный вестибюль с консьерж-службой, турникетами и указателями: «На 3-й этаж — бухгалтерия, на 5-й — разработка». В Kubernetes роль такого умного парадного вестибюля выполняет <strong>Ingress</strong>.</p>
+<hr />
+<h2 id="1-ingress-deklarativnye-pravila-protiv-realnogo-kontrollera">1. Ingress: Декларативные правила против реального контроллера</h2>
 
-<p>Главная концепция, которую нужно усвоить: <strong>Ingress — это не работающий сервис</strong>. Это просто набор правил (YAML-манифест) в etcd, декларативно описывающий, как маршрутизировать внешний HTTP/HTTPS трафик.</p>
-<p>Чтобы эти правила заработали, в кластере должен работать <strong>Ingress Controller</strong> (например, Nginx Ingress Controller, Traefik, Istio Ingress Gateway). Контроллер — это обычный Pod, который читает эти правила через API Server и настраивает свой внутренний прокси-сервер.</p>
+<p>Главный концептуальный барьер, о который спотыкаются многие инженеры: <strong>Ingress сам по себе ничего не проксирует и не слушает порты</strong>.</p>
+<ul>
+<li><strong>Ingress (Ресурс)</strong> — это просто декларативная запись (Custom Spec) в базе данных <code>etcd</code>. Это архитектурный чертеж, закон, свод правил маршрутизации.</li>
+<li><strong>Ingress Controller (Исполнитель)</strong> — это реально работающий в кластере софт (демон или Deployment), специализированный обратный прокси (Nginx, Envoy, Traefik, HAProxy, Istio Ingress Gateway), который читает эти чертежи и воплощает их в жизнь.</li>
+</ul>
+<p>Если вы создадите манифест <code>kind: Ingress</code> в «голом» кластере без установленного Ingress Controller, Kubernetes покорно сохранит объект в <code>etcd</code>, но снаружи к кластеру никто не сможет подключиться: чертеж есть, а строителей нет.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2196,47 +2202,96 @@
     </button>
   </div>
   <pre class="mermaid">
-flowchart LR
-A[&quot;Клиент из интернета&quot;] --&gt;|&quot;HTTPS - api.myapp.com&quot;| B[&quot;Cloud Load Balancer - L4&quot;]
-B --&gt;|&quot;TCP 443&quot;| C[&quot;Ingress Controller Pod - Nginx&quot;]
-C --&gt;|&quot;Смотрит Ingress правила&quot;| D[&quot;K8s API Server - etcd&quot;]
-C --&gt;|&quot;HTTP - /users&quot;| E[&quot;Service A - ClusterIP&quot;]
-C --&gt;|&quot;HTTP - /products&quot;| F[&quot;Service B - ClusterIP&quot;]
-E --&gt; G[&quot;Go Pods&quot;]
-F --&gt; H[&quot;Go Pods&quot;]
+flowchart TD
+Client[&quot;Клиент из интернета\n(HTTPS: api.myapp.com)&quot;] --&gt;|&quot;Внешний трафик L4 (TCP 443)&quot;| LB[&quot;Cloud Load Balancer\n(Единый внешний IP-адрес)&quot;]
+
+subgraph K8s[&quot;Кластер Kubernetes&quot;]
+LB --&gt;|&quot;Проброс TCP&quot;| IC[&quot;Ingress Controller Pod\n(Nginx / Envoy / Traefik)&quot;]
+
+APIServer[&quot;K8s API Server\n(etcd)&quot;] -.-&gt;|&quot;Watch Ingress Rules\n&amp; Endpoints&quot;| IC
+
+IC --&gt;|&quot;L7 HTTP: /api/users&quot;| SvcA[&quot;Service A (ClusterIP)\nuser-service&quot;]
+IC --&gt;|&quot;L7 HTTP: /api/products&quot;| SvcB[&quot;Service B (ClusterIP)\nproduct-service&quot;]
+
+SvcA --&gt; Pod1[&quot;Go Pod 1&quot;]
+SvcA --&gt; Pod2[&quot;Go Pod 2&quot;]
+SvcB --&gt; Pod3[&quot;Go Pod 3&quot;]
+SvcB --&gt; Pod4[&quot;Go Pod 4&quot;]
+end
   </pre>
 </div>
 
 
-<h2 id="kak-rabotaet-nginx-ingress-controller-pod-kapotom">Как работает Nginx Ingress Controller под капотом</h2>
+<p>Один-единственный внешний <code>LoadBalancer</code> принимает весь трафик и передает его пулу подов Ingress Controller. А уже контроллер разбирает HTTP-заголовки, TLS SNI, пути URL и отправляет запросы к целевым Go-приложениям.</p>
+<hr />
+<h2 id="2-anatomiya-nginx-ingress-controller-chto-skryto-pod-kapotom">2. Анатомия Nginx Ingress Controller: Что скрыто под капотом</h2>
 
-<p>Самый популярный контроллер в мире K8s базируется на Nginx. Как именно он переводит ваши YAML в конфигурацию Nginx?</p>
-<ol>
-<li>В Pod'е Ingress Controller работает процесс Nginx и дополнительный Go-процесс (контроллер).</li>
-<li>Go-процесс использует <code>client-go</code> (Informer), чтобы следить (Watch) за изменениями объектов Ingress, Service и Secrets в API Server.</li>
-<li>Как только вы применяете <code>kubectl apply -f ingress.yaml</code>, Go-процесс замечает изменение.</li>
-<li>Он генерирует новый <code>nginx.conf</code> на основе Go-шаблонов (templates).</li>
-<li>Он выполняет <code>nginx -s reload</code> для применения новой конфигурации.</li>
-</ol>
+<p>Исторически и практически самым распространенным контроллером остается <strong>Nginx Ingress Controller</strong> (разрабатываемый сообществом Kubernetes). Давайте заглянем внутрь его пода.</p>
+<p>Внутри пода Ingress Controller работают два ключевых компонента:<br />
+1. <strong>Go-контроллер (Управляющий контур):</strong> Бинарный процесс, написанный на Go. Он использует библиотеку <code>client-go</code> и механизм <code>Informer</code> с долгоживущим HTTP-соединением <code>Watch</code> к K8s API Server. Он непрерывно слушает создание, изменение и удаление объектов <code>Ingress</code>, <code>Service</code>, <code>Endpoints</code> и <code>Secret</code>.<br />
+2. <strong>Прокси-сервер Nginx (Контур данных):</strong> Классический мастер-процесс Nginx и пул воркеров на базе <code>epoll</code>.</p>
+<p>Когда администратор применяет новый маршрут:<br />
+1. Вы выполняете <code>kubectl apply -f ingress.yaml</code>.<br />
+2. Go-процесс ловит событие через <code>Informer</code>.<br />
+3. Контроллер подставляет данные в Go-шаблон <code>text/template</code> и генерирует гигантский файл конфигурации <code>/etc/nginx/nginx.conf</code>.<br />
+4. Для применения новой конфигурации Go-процесс выполняет команду <code>nginx -s reload</code> (отправляет сигнал <code>SIGHUP</code> мастер-процессу Nginx).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Подводный камень: Дороговизна `nginx -s reload`</span>
   </div>
   <div class="callout-body">
-    <p>Команда <code>nginx -s reload</code> — это дорогостоящая операция. Она форкает новый воркер и плавно завершает старый. Если вы активно обновляете Ingress-правила (например, при динамическом создании маршрутов для клиентов), частые <code>reload</code> вызовут всплеск потребления CPU и кратковременные обрывы долгих соединений (WebSockets, gRPC). Для таких сценариев используют контроллеры на базе OpenResty (с Lua-скриптами) или Envoy, которые обновляют конфигурацию в памяти без рестарта воркеров.</p>
+    <p>Команда <code>nginx -s reload</code> — тяжелая операция для операционной системы. При перезагрузке мастер-процесс Nginx парсит конфигурацию, создает новые рабочие процессы (воркеры) и переводит старые в режим graceful shutdown (ожидание завершения текущих соединений).</p>
+<p>Если в высоконагруженном кластере настроен агрессивный автоскейлинг подов или инженеры часто деплоят сервисы, <code>reload</code> может происходить каждые несколько секунд. Это приводит к:<br />
+* Всплескам потребления CPU ядром Linux на контекстных переключениях.<br />
+* Обрывам долгоживущих соединений (WebSockets, Server-Sent Events, gRPC-стримы), если старые воркеры принудительно завершаются по таймауту.<br />
+* Накоплению сотен «умирающих» процессов Nginx в памяти.</p>
   </div>
 </div>
 
-<h2 id="dynamic-configuration-i-lua">Dynamic Configuration и Lua</h2>
+<hr />
+<h2 id="3-dynamic-configuration-izbavlenie-ot-reload-s-pomoshchyu-lua">3. Dynamic Configuration: Избавление от reload с помощью Lua</h2>
 
-<p>Стандартный Nginx Ingress Controller (от community) частично решает проблему рестартов с помощью модуля <strong>Lua</strong>. <br />
-Когда вы изменяете количество реплик вашего Go-деплоймента, Endpoints (IP-адреса Подов) меняются. Если бы Nginx обновлял апстримы через <code>reload</code>, это было бы катастрофой при автоскейлинге. </p>
-<p>Вместо этого, Go-процесс контроллера обновляет общую память (shared memory dict) Nginx через Lua API. Воркеры Nginx читают список IP-адресов прямо из памяти в режиме реального времени (balancer_by_lua_block), не требуя перезагрузки конфига.</p>
-<h2 id="spetsifika-go-problema-dvoynogo-routinga">Специфика Go: Проблема двойного роутинга</h2>
+<p>Чтобы решить проблему с частыми перезагрузками при обычном масштабировании подов (когда правила маршрутов не меняются, а лишь добавляются или удаляются IP-адреса бэкендов), сообщество внедрило в Nginx модуль <strong>OpenResty Lua</strong>.</p>
+<p>В памяти Nginx выделяется разделяемый кольцевой сегмент (<code>lua_shared_dict</code>). Когда Go-контроллер видит изменение сетевых адресов (<code>Endpoints</code>) подов вашего Go-сервиса, он больше не переписывает <code>nginx.conf</code> и не дергает <code>nginx -s reload</code>!</p>
 
-<p>Классическая ошибка при переходе на K8s — дублирование логики маршрутизации в Nginx и в Go-коде.</p>
-<p>Допустим, у вас есть Ingress:</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor Dev as Go Pod (Scale Up)
+participant API as K8s API Server
+participant GoCtrl as Controller (Go Binary)
+participant Lua as Nginx Shared Memory (Lua)
+participant Worker as Nginx Workers (epoll)
+
+Dev-&gt;&gt;API: Новый Pod перешел в статус Ready
+API--&gt;&gt;GoCtrl: Watch Event (Endpoints updated)
+Note over GoCtrl,Lua: Без перезагрузки nginx.conf!
+GoCtrl-&gt;&gt;Lua: HTTP POST в локальный сокет (Lua API)
+Lua-&gt;&gt;Lua: Обновление IP-адресов в shared dict
+Worker-&gt;&gt;Lua: balancer_by_lua_block читает свежие IP
+Worker-&gt;&gt;Dev: Проксирование клиентского запроса
+  </pre>
+</div>
+
+
+<p>Воркеры Nginx на стадии балансировки исполняют директиву <code>balancer_by_lua_block</code>. Они на лету считывают свежие IP-адреса подов напрямую из разделяемой памяти за наносекунды. Перезагрузка <code>nginx -s reload</code> требуется исключительно при изменении топологии: добавлении новых доменов, TLS-сертификатов, изменении путей или глобальных аннотаций.</p>
+<hr />
+<h2 id="4-spetsifika-go-lovushka-dvoynogo-routinga">4. Специфика Go: Ловушка двойного роутинга</h2>
+
+<p>Одна из самых коварных архитектурных ошибок при переезде Go-сервиса в Kubernetes — попытка дублировать маршрутизацию между L7-балансировщиком и кодом приложения.</p>
+<p>Представьте манифест Ingress:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2247,8 +2302,16 @@ F --&gt; H[&quot;Go Pods&quot;]
     </button>
   </div>
   <pre class="language-yaml"><code class="language-yaml"># Ingress маршрутизирует /api/ на Go-сервис
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop-ingress
+  annotations:
+    # Опасная магия!
+    nginx.ingress.kubernetes.io/rewrite-target: /
 spec:
   rules:
+  - host: api.myshop.com
     http:
       paths:
       - path: /api
@@ -2256,10 +2319,12 @@ spec:
         backend:
           service:
             name: go-api
+            port:
+              number: 8080
 </code></pre>
 </div>
 
-<p>А в вашем Go-приложении (например, на Chi или Gin) роутер ожидает:</p>
+<p>А внутри Go-сервиса (написанного с использованием популярного роутера Chi или Gin) разработчик наивно регистрирует обработчик:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2269,28 +2334,50 @@ spec:
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">r.Get(&quot;/api/users&quot;, getUsers) // Ожидает полный путь
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;net/http&quot;
+    &quot;github.com/go-chi/chi/v5&quot;
+)
+
+func main() {
+    r := chi.NewRouter()
+
+    // Go-роутер ожидает полный URL-путь
+    r.Get(&quot;/api/users&quot;, getUsers)
+    r.Get(&quot;/api/products&quot;, getProducts)
+
+    http.ListenAndServe(&quot;:8080&quot;, r)
+}
 </code></pre>
 </div>
 
-<p>Когда приходит запрос <code>GET /api/users</code>, Ingress передает его в Go-сервис как есть. Если вы решите использовать аннотацию <code>nginx.ingress.kubernetes.io/rewrite-target: /</code>, Nginx срежет префикс <code>/api</code> и отправит в Go запрос <code>GET /users</code>. Внезапно все ваши роуты в Go упадут с 404.</p>
+<p>Что произойдет?<br />
+1. Клиент посылает запрос: <code>GET /api/users</code>.<br />
+2. Ingress матчит префикс <code>/api</code>.<br />
+3. Директива <code>nginx.ingress.kubernetes.io/rewrite-target: /</code> безжалостно срезает префикс <code>/api</code> и отправляет в Go запрос <code>GET /users</code>.<br />
+4. Запрос прилетает в Go-приложение, роутер Chi ищет путь <code>/users</code>, но он ожидал <code>r.Get("/api/users", getUsers)</code>, не находит его и возвращает клиенту позорную ошибку <code>404 Not Found</code>.</p>
+<p>Попытка «исправить» это, изменив роут в Go на <code>r.Get("/", ...)</code> приводит к тому, что сервис теряет контекст пути, путает вложенные эндпоинты, а локальное тестирование и запуск в Docker Compose превращаются в ад.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Архитектурное правило для собеседования: Принцип Single Responsibility в маршрутизации</span>
   </div>
   <div class="callout-body">
     <p><strong>Вопрос:</strong> Как правильно организовать роутинг между Ingress и Go-приложением?<br />
-<strong>Ответ:</strong> Следуйте принципу Single Responsibility. Nginx Ingress должен маршрутизировать трафик по доменам (Host) и базовым путям (Path) к разным <em>сервисам</em>. А внутренний роутинг (например, <code>/api/users</code> vs <code>/api/products</code>) должен полностью принадлежать Go-приложению. Не используйте <code>rewrite-target</code> без крайней необходимости. Ваш Go-сервис должен быть самодостаточным и независимым от инфраструктурных трансформаций URL.</p>
+<strong>Ответ:</strong> Следуйте принципу Single Responsibility. Nginx Ingress должен маршрутизировать трафик по доменам (<code>Host</code>) и базовым путям к разным <em>сервисам</em>. А внутренний роутинг (например, <code>/api/users</code> vs <code>/api/products</code>) должен полностью принадлежать Go-приложению. Не используйте <code>rewrite-target</code> без крайней необходимости. Ваш Go-сервис должен быть самодостаточным и независимым от инфраструктурных трансформаций URL.</p>
   </div>
 </div>
 
-<h2 id="websockets-i-grpc-nyuansy-konfiguratsii">WebSockets и gRPC: Нюансы конфигурации</h2>
+<hr />
+<h2 id="5-protokoly-realnogo-vremeni-websockets-i-grpc">5. Протоколы реального времени: WebSockets и gRPC</h2>
 
-<p>Так как Ingress работает на L7 уровне, протоколы, отличные от стандартного HTTP/1.1, требуют явной поддержки.</p>
-<h3 id="websockets">WebSockets</h3>
-<p>Для WebSockets Nginx должен выполнить HTTP Upgrade. В Nginx Ingress Controller это работает из коробки, но есть проблема <strong>таймаутов</strong>. По умолчанию Nginx закроет простаивающее WebSocket-соединение через 60 секунд (<code>proxy_read_timeout</code>).</p>
-<p>Если у вас чат на Go с долгими простоями, вы обязаны увеличить таймаут через аннотации:</p>
+<p>Стандартный HTTP/1.1 с парадигмой «запрос-ответ» работает через Ingress без дополнительных усилий. Однако в Go повсеместно используются двунаправленные протоколы: WebSockets (для real-time нотификаций и чатов) и gRPC (для высокоскоростного RPC-обмена).</p>
+<h3 id="5-1-tonkosti-s-websockets">5.1. Тонкости с WebSockets</h3>
+<p>WebSockets требуют от прокси-сервера процедуры апгрейда соединения (<code>Connection: Upgrade</code>, <code>Upgrade: websocket</code>). В Nginx Ingress это поддержано по умолчанию, но здесь вас подстерегает ловушка <strong>таймаутов неактивности</strong>.</p>
+<p>По умолчанию Nginx обрывает любое проксируемое соединение, если в течение 60 секунд (<code>proxy_read_timeout</code>) по нему не передавались байты данных. Если ваши клиенты подключились к Go-серверу чата через WebSocket и просто читают сообщения (нет активного трафика), ровно через минуту Nginx принудительно разорвет TCP-соединение.</p>
+<p>Решение: явная настройка таймаутов через аннотации Ingress:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2300,15 +2387,32 @@ spec:
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">annotations:
-  nginx.ingress.kubernetes.io/proxy-read-timeout: &quot;3600&quot;
-  nginx.ingress.kubernetes.io/proxy-send-timeout: &quot;3600&quot;
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: chat-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: &quot;3600&quot;
+    nginx.ingress.kubernetes.io/proxy-send-timeout: &quot;3600&quot;
+spec:
+  rules:
+  - host: chat.myshop.com
+    http:
+      paths:
+      - path: /ws
+        pathType: Prefix
+        backend:
+          service:
+            name: chat-service
+            port:
+              number: 8080
 </code></pre>
 </div>
 
-<h3 id="grpc">gRPC</h3>
-<p>gRPC работает поверх HTTP/2. Если Ingress не настроен на HTTP/2, ваши Go-микросервисы не смогут общаться.<br />
-В Nginx Ingress Controller нужно включить бэкенд по gRPC:</p>
+<p>Параллельно в коде Go-клиента и сервера необходимо реализовать периодический обмен ping/pong фреймами (Heartbeat) каждые 15–30 секунд.</p>
+<h3 id="5-2-spetsifika-grpc-poverkh-http2">5.2. Специфика gRPC поверх HTTP/2</h3>
+<p>gRPC спроектирован поверх мультиплексированного транспорта HTTP/2. Если Nginx не предупредить заранее, он примет внешний запрос по HTTP/2, но к вашему Go-бэкенду обратится по устаревшему HTTP/1.1. В результате бинарный поток protobuf будет сломан, а клиент получит ошибку <code>transport: received the unexpected content-type "text/html"</code>.</p>
+<p>Чтобы Nginx общался с Go-подом по HTTP/2, требуется обязательная аннотация:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2318,35 +2422,114 @@ spec:
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">annotations:
-  nginx.ingress.kubernetes.io/backend-protocol: &quot;GRPC&quot;
+  <pre class="language-yaml"><code class="language-yaml">metadata:
+  annotations:
+    # Приказывает Nginx проксировать gRPC по протоколу HTTP/2
+    nginx.ingress.kubernetes.io/backend-protocol: &quot;GRPC&quot;
 </code></pre>
 </div>
 
-<p>Это заставит Nginx проксировать трафик как HTTP/2, не преобразуя его в HTTP/1.1, что критически важно для сохранения мультиплексирования gRPC.</p>
-<h2 id="tls-termination-v-ingress">TLS Termination в Ingress</h2>
+<p>При включении этой опции Nginx активирует модуль <code>grpc_pass</code>, сохраняя потоковую передачу данных и мультиплексирование каналов.</p>
+<hr />
+<h2 id="6-tls-termination-sni-i-sekrety">6. TLS Termination: SNI и Секреты</h2>
 
-<p>Обычно именно Ingress занимается расшифровкой HTTPS (TLS Termination, как мы разбирали в <a href="../02-nginx/4-tls-termination.html" class="wikilink">4. TLS termination</a>). K8s хранит сертификаты в объектах Secret, а Ingress на них ссылается.</p>
-<p>Но как Ingress понимает, какой сертификат отдать клиенту, если на одном IP-адресе хостятся десятки доменов? Используется механизм <strong>SNI (Server Name Indication)</strong>. </p>
-<p>Когда клиент делает TLS Handshake, он отправляет имя домена в открытом виде (в расширении SNI). Ingress Controller читает это поле, находит в памяти подходящий сертификат из нужного Secret и использует его для установления соединения.</p>
-<h2 id="budushchee-gateway-api">Будущее: Gateway API</h2>
+<p>В подавляющем большинстве промышленных инсталляций именно Ingress берет на себя тяжелую математическую работу по шифрованию и расшифровке трафика (TLS Termination, подробно разобранный в <a href="../02-nginx/4-tls-termination.html" class="wikilink">4. TLS termination</a>).</p>
+<p>Сертификаты и приватные ключи хранятся в объектах K8s <code>Secret</code> (тип <code>kubernetes.io/tls</code>). Манифест Ingress декларативно связывает доменные имена и секреты:</p>
 
-<p>Ingress имеет фундаментальные ограничения: он плохо справляется с маршрутизацией TCP/UDP трафика, не поддерживает взвешенную балансировку (Canary deployments без хаков с аннотациями) и расширяется только через нестандартные аннотации.</p>
-<p>В K8s появился преемник — <strong>Gateway API</strong>. Это новая CRD-модель (Custom Resource Definitions), которая разделяет роли:<br />
-*   <strong>GatewayClass</strong> (для администратора кластера — выбор типа контроллера).<br />
-*   <strong>Gateway</strong> (для сетевой команды — выдача IP и портов).<br />
-*   <strong>HTTPRoute</strong> (для разработчика Go-сервиса — правила роутинга).</p>
-<p>Gateway API позволяет Go-разработчикам декларировать сложную маршрутизацию (хедеры, query-параметры, канареечные релизы) нативными объектами K8s, не требуя от админов писать кастомные Nginx-конфиги.</p>
-<h2 id="itog">Итог</h2>
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secure-ingress
+spec:
+  tls:
+  - hosts:
+    - api.myshop.com
+    secretName: myshop-tls-secret
+  - hosts:
+    - admin.myshop.com
+    secretName: admin-tls-secret
+  rules:
+  - host: api.myshop.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: api-service
+            port:
+              number: 80
+</code></pre>
+</div>
+
+<p>Как Nginx Ingress понимает, какой именно сертификат отдать браузеру, если на один и тот же публичный IP-адрес приходят клиенты и для <code>api.myshop.com</code>, и для <code>admin.myshop.com</code>?</p>
+<p>На помощь приходит механизм <strong>SNI (Server Name Indication)</strong>. В самом начале рукопожатия TLS клиент отправляет имя целевого домена в открытом виде внутри пакета <code>ClientHello</code>. Контроллер Nginx считывает SNI до начала криптографических операций, находит в памяти сертификат из соответствующего K8s Secret и завершает рукопожатие с правильным ключом. Трафик между Ingress и внутренними Go-подами внутри кластерной сети передается уже в расшифрованном виде (чистый HTTP), избавляя процессорные ядра Go-сервисов от лишней нагрузки на шифрование.</p>
+<hr />
+<h2 id="7-budushchee-ot-ogranicheniy-ingress-k-kubernetes-gateway-api">7. Будущее: От ограничений Ingress к Kubernetes Gateway API</h2>
+
+<p>Несмотря на популярность, классический объект <code>Ingress</code> страдает от врожденных архитектурных дефектов, заложенных еще в ранние годы Kubernetes:<br />
+1. <strong>Монолитность и смешение прав:</strong> В одном YAML-файле смешиваются инфраструктурные настройки (порты, TLS-сертификаты, IP-адреса) и правила разработчиков (какой путь ведет на какой микросервис). В больших командах это приводит к конфликтам доступа.<br />
+2. <strong>Засилье кастомных аннотаций:</strong> Так как стандартная спецификация <code>Ingress</code> невероятно бедна (в ней нет даже нормального описания перенаправлений или канареечного деплоя), каждый контроллер оброс сотнями несогласованных аннотаций (<code>nginx.ingress.kubernetes.io/...</code>, <code>traefik.ingress.kubernetes.io/...</code>). Кочуя между облаками, инженер вынужден переписывать манифесты заново.<br />
+3. <strong>Отсутствие поддержки не-HTTP протоколов:</strong> Ingress не умеет нормально маршрутизировать чистый TCP, UDP или TLS passthrough.</p>
+<p>Для преодоления этих проблем сообщество разработало официальный преемник — <strong>Gateway API</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph InfraTeam[&quot;Инфраструктурная команда / Cloud Admin&quot;]
+GC[&quot;GatewayClass\n(Выбор контроллера: Envoy / Cilium)&quot;]
+GW[&quot;Gateway\n(IP-адрес, Порт 443, TLS Secret)&quot;]
+GC --&gt; GW
+end
+
+subgraph DevTeam[&quot;Go-разработчики сервисов&quot;]
+R1[&quot;HTTPRoute: /api/v1/users\n(Canary: 90% v1, 10% v2)&quot;]
+R2[&quot;HTTPRoute: /api/v1/orders\n(Header-based routing)&quot;]
+GW --&gt; R1
+GW --&gt; R2
+
+R1 --&gt; SvcUserV1[&quot;user-service-v1&quot;]
+R1 --&gt; SvcUserV2[&quot;user-service-v2&quot;]
+R2 --&gt; SvcOrders[&quot;order-service&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Gateway API разделяет ответственность на независимые декларативные уровни:<br />
+* <strong>GatewayClass:</strong> Создается инфраструктурной командой (определяет тип балансировщика, например, Envoy Gateway или Cilium).<br />
+* <strong>Gateway:</strong> Описывает физическую точку входа (порты 80/443, привязка публичного IP, TLS-сертификаты).<br />
+* <strong>HTTPRoute / GRPCRoute / TCPRoute:</strong> Создаются разработчиками конкретных Go-сервисов. Здесь прямо из коробки поддерживаются взвешенная балансировка для канареечных релизов (Canary), маршрутизация по HTTP-заголовкам и cookie, фильтрация и модификация запросов без хаков с аннотациями.</p>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Ingress — это декларация</strong>, а не сервис. Ingress Controller (Nginx/Traefik) читает правила и настраивает прокси.</li>
-<li><strong>Механика обновления</strong>: Изменение правил вызывает <code>nginx -s reload</code>, а изменение IP-адресов Подов обновляется через Lua в памяти (без даунтайма).</li>
-<li><strong>Избегайте двойного роутинга</strong>: Ingress маршрутизирует к Сервисам, а Go-роутер — внутри приложения. Не ломайте URL через <code>rewrite-target</code>.</li>
-<li><strong>WebSockets и gRPC</strong>: Требуют явных аннотаций (увеличение таймаутов, включение backend-protocol).</li>
-<li><strong>Gateway API</strong> — современная замена Ingress, решающая его архитектурные ограничения через ролевую модель и расширенную маршрутизацию.</li>
+<li><strong>Ingress — это спецификация, а не процесс.</strong> Для его работы необходим Ingress Controller (Nginx, Envoy, Traefik), работающий как обратный прокси.</li>
+<li><strong>Механизм работы Nginx Ingress Controller:</strong> Процесс на Go слушает события API Server через <code>client-go</code> и генерирует <code>nginx.conf</code>.</li>
+<li><strong>Lua для нулевого даунтайма:</strong> При изменении IP-адресов подов контроллер не делает <code>nginx -s reload</code>, а обновляет список бэкендов в разделяемой памяти Nginx через директиву <code>balancer_by_lua_block</code>.</li>
+<li><strong>Разделение роутинга:</strong> Ingress маршрутизирует трафик к сервисам. Go-роутер (<code>chi</code>, <code>gin</code>) разбирает внутренние пути приложения. Избегайте бездумного срезания путей через <code>rewrite-target</code>.</li>
+<li><strong>Поддержка WebSocket и gRPC:</strong> Для WebSockets необходимо увеличивать таймауты (<code>proxy-read-timeout</code>), а для gRPC — явно указывать аннотацию <code>backend-protocol: "GRPC"</code>.</li>
+<li><strong>Эволюция в Gateway API:</strong> Переход на модель <code>GatewayClass -&gt; Gateway -&gt; HTTPRoute</code> устраняет хаос аннотаций и позволяет разработчикам нативно управлять канареечными релизами и L7-правилами.</li>
 </ol>
-<p>Наши сервисы теперь доступны из интернета, но что делать, если нагрузка резко возрастет во время Черной Пятницы? В следующей статье мы разберем механизмы масштабирования: <a href="5-scaling-i-autoscaling.html" class="wikilink">5. Scaling и autoscaling</a>.</p>
+<p>После того как внешний мир получил доступ к нашим сервисам, перед нами встает задача защиты от перегрузок и адаптации к скачкам трафика. В следующей лекции мы разберем горизонтальное и вертикальное масштабирование: <a href="5-scaling-i-autoscaling.html" class="wikilink">5. Scaling и autoscaling</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2374,7 +2557,7 @@ spec:
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#ingress-pravila-vs-kontroller">Ingress: Правила vs Контроллер</a></li><li class="toc-item toc-h2"><a href="#kak-rabotaet-nginx-ingress-controller-pod-kapotom">Как работает Nginx Ingress Controller под капотом</a></li><li class="toc-item toc-h2"><a href="#dynamic-configuration-i-lua">Dynamic Configuration и Lua</a></li><li class="toc-item toc-h2"><a href="#spetsifika-go-problema-dvoynogo-routinga">Специфика Go: Проблема двойного роутинга</a></li><li class="toc-item toc-h2"><a href="#websockets-i-grpc-nyuansy-konfiguratsii">WebSockets и gRPC: Нюансы конфигурации</a></li><li class="toc-item toc-h3"><a href="#websockets">WebSockets</a></li><li class="toc-item toc-h3"><a href="#grpc">gRPC</a></li><li class="toc-item toc-h2"><a href="#tls-termination-v-ingress">TLS Termination в Ingress</a></li><li class="toc-item toc-h2"><a href="#budushchee-gateway-api">Будущее: Gateway API</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-ingress-deklarativnye-pravila-protiv-realnogo-kontrollera">1. Ingress: Декларативные правила против реального контроллера</a></li><li class="toc-item toc-h2"><a href="#2-anatomiya-nginx-ingress-controller-chto-skryto-pod-kapotom">2. Анатомия Nginx Ingress Controller: Что скрыто под капотом</a></li><li class="toc-item toc-h2"><a href="#3-dynamic-configuration-izbavlenie-ot-reload-s-pomoshchyu-lua">3. Dynamic Configuration: Избавление от reload с помощью Lua</a></li><li class="toc-item toc-h2"><a href="#4-spetsifika-go-lovushka-dvoynogo-routinga">4. Специфика Go: Ловушка двойного роутинга</a></li><li class="toc-item toc-h2"><a href="#5-protokoly-realnogo-vremeni-websockets-i-grpc">5. Протоколы реального времени: WebSockets и gRPC</a></li><li class="toc-item toc-h3"><a href="#5-1-tonkosti-s-websockets">5.1. Тонкости с WebSockets</a></li><li class="toc-item toc-h3"><a href="#5-2-spetsifika-grpc-poverkh-http2">5.2. Специфика gRPC поверх HTTP/2</a></li><li class="toc-item toc-h2"><a href="#6-tls-termination-sni-i-sekrety">6. TLS Termination: SNI и Секреты</a></li><li class="toc-item toc-h2"><a href="#7-budushchee-ot-ogranicheniy-ingress-k-kubernetes-gateway-api">7. Будущее: От ограничений Ingress к Kubernetes Gateway API</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

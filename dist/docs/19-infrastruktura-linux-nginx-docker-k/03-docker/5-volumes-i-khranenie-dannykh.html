@@ -2169,52 +2169,56 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Volumes и хранение данных</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Главный принцип контейнеризации: <strong>Контейнеры эфемерны (ephemeral)</strong>. Они создаются, уничтожаются, масштабируются и обновляются в любой момент. Если ваше Go-приложение пишет данные внутри контейнера (в его файловую систему), эти данные исчезнут навсегда, как только контейнер будет удален или пересоздан при обновлении (Rolling Update).</p>
-<p>Для хранения состояния (State) за пределами жизненного цикла контейнера Docker предоставляет механизмы монтирования хранилищ с хост-машине. От того, как вы их используете, зависит не только сохранность данных, но и производительность IO.</p>
-<h2 id="problema-writable-layer-overlayfs">Проблема Writable Layer (OverlayFS)</h2>
+            <h1>Volumes и хранение данных в Docker: От деградации OverlayFS к нативному I/O и SQLite</h1>
+<p>Фундаментальный постулат контейнерной парадигмы гласит: <strong>Контейнеры строго эфемерны (ephemeral)</strong>. Они создаются за доли секунды, масштабируются горизонтально, уничтожаются планировщиком и пересоздаются при каждом деплое новой версии сервиса (Rolling Update).</p>
+<p>Если ваше Go-приложение сохраняет состояние (записывает загруженные пользователем аватарки, ведет локальную встраиваемую базу данных или сбрасывает файлы отчетов) непосредственно во внутреннюю файловую систему контейнера, эти данные будут <strong>безвозвратно уничтожены</strong> в момент перезапуска процесса.</p>
+<p>Для долговременного сохранения состояния (<strong>Stateful Data</strong>) и достижения нативной скорости дискового ввода-вывода Docker предоставляет специализированные механизмы монтирования хранилищ. Выбор конкретного механизма напрямую определяет не только сохранность ваших данных при сбоях, но и показатели дисковой латентности (IOPS и Write Latency).</p>
+<hr />
+<h2 id="1-problema-writable-layer-v-overlayfs-pochemu-konteynery-tormozyat-pri-zapisi">1. Проблема Writable Layer в OverlayFS: Почему контейнеры «тормозят» при записи</h2>
 
-<p>Как мы разбирали в статье <a href="1-konteynerizatsiya-osnovy.html" class="wikilink">1. Контейнеризация. Основы</a>, контейнерная файловая система построена на OverlayFS. Верхний слой (Upper Layer) доступен для записи. </p>
-<p>Когда ваш Go-код выполняет <code>os.Create("app.log")</code> и пишет туда данные, OverlayFS делает следующее:<br />
-1. Ищет файл в нижних слоях (Read-Only).<br />
-2. Если файл не найден, создает его в Upper Layer.<br />
-3. Если файл найден и вы пытаетесь его изменить, срабатывает механизм <strong>Copy-on-Write (CoW)</strong>: файл копируется из Read-Only слоя в Upper Layer, и изменения вносятся туда.</p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p>OverlayFS и CoW убивают производительность дискового IO. Если ваше Go-приложение активно пишет логи, обновляет локальную базу данных (например, SQLite) или делает аппенд в файл, каждый новый блок данных может триггерить аллокацию и копирование на уровне файловой системы хоста. Скорость записи упадет в разы по сравнению с записью на обычный диск. Никогда не храните важные данные или базы данных в Writable Layer контейнера.</p>
-  </div>
-</div>
+<p>Как мы детально разбирали в статье <a href="1-konteynerizatsiya-osnovy.html" class="wikilink">1. Контейнеризация. Основы</a>, файловая система контейнера представляет собой многослойный пирог <strong>OverlayFS</strong>. Все базовые слои образа неизменяемы (Read-Only), а поверх них монтируется единственный тонкий рабочий слой контейнера — <strong>Upper Layer (Writable Layer)</strong>, доступный для записи.</p>
+<p>Когда в Go-коде выполняется операция создания или изменения файла, например:</p>
 
-<h2 id="tipy-khranilishch-v-docker">Типы хранилищ в Docker</h2>
-
-<p>Чтобы решить проблему производительности и персистентности, Docker позволяет "пробросить" директорию с хоста прямо в контейнер, минуя OverlayFS.</p>
-<h3 id="1-volumes-imenovannye-toma">1. Volumes (Именованные тома)</h3>
-
-<p><strong>Volume</strong> — это полностью управляемый Dockerом механизм хранения. Docker сам создает директорию на хосте (обычно <code>/var/lib/docker/volumes/&lt;volume_name&gt;/_data</code>) и монтирует её напрямую в контейнер.</p>
-
-<div class="code-block" data-lang="bash">
+<div class="code-block" data-lang="go">
   <div class="code-header">
-    <span class="code-lang-tag">Bash</span>
+    <span class="code-lang-tag">Go</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">docker volume create my-go-data
-docker run -d -v my-go-data:/app/data my-go-image
+  <pre class="language-go"><code class="language-go">f, err := os.Create(&quot;app.log&quot;)
 </code></pre>
 </div>
 
+<p>под капотом файловой системы ядра Linux разворачивается многоступенчатый сценарий:<br />
+1. Ядро сканирует стопку слоев сверху вниз, проверяя наличие файла <code>app.log</code>.<br />
+2. Если файл отсутствует, он создается с нуля в рабочем слое Upper Layer.<br />
+3. Если же файл уже присутствовал в одном из слоев образа (например, конфиг по умолчанию) и приложение пытается выполнить дозапись, активируется механизм <strong>Copy-on-Write (CoW)</strong>: ядро Linux полностью копирует весь файл из неизменяемого нижнего слоя в верхний рабочий слой, и только затем применяет модификацию.</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Деградация IOPS и фрагментация диска на OverlayFS</span>
+  </div>
+  <div class="callout-body">
+    <p>Механизм Copy-on-Write в OverlayFS создает колоссальные накладные расходы на дисковый ввод-вывод.</p>
+<p>Если ваше Go-приложение интенсивно пишет в файл (например, выполняет аппенд сотен тысяч строк логов, ведет встроенную БД SQLite или обрабатывает временные файлы загрузок), каждый вызов <code>write()</code> инициирует сложную цепочку обновления метаданных и фрагментирует запись на хостовом диске.</p>
+<p>Скорость дисковых операций в Writable Layer контейнера может <strong>падать в 3–5 раз</strong> по сравнению с прямой записью на диск хоста! </p>
+<p><strong>Золотое правило:</strong> Никогда не храните базы данных, очереди сообщений или интенсивные логи в слое контейнера. Любой реальный I/O обязан выноситься в специально смонтированные тома.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="2-arkhitektura-khranilishch-docker-volumes-bind-mounts-i-tmpfs">2. Архитектура хранилищ Docker: Volumes, Bind Mounts и tmpfs</h2>
+
+<p>Чтобы обеспечить персистентность данных и нативную скорость дисковой подсистемы, Docker позволяет пробросить хранилище хоста напрямую в пространство имен контейнера (<strong>Mount Namespace</strong>), полностью обходя накладные расходы OverlayFS:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2236,20 +2240,38 @@ C --&gt; D[&quot;Физический диск хоста&quot;]
 </div>
 
 
+<h3 id="1-imenovannye-toma-docker-volumes">1. Именованные тома (Docker Volumes)</h3>
+<p><strong>Volume</strong> — это официально рекомендуемый и полностью управляемый Docker механизм персистентного хранения.</p>
+<p>При создании тома:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">docker volume create my-go-data
+docker run -d -v my-go-data:/app/data my-go-image
+</code></pre>
+</div>
+
+<p>Docker выделяет на хосте выделенный каталог (по умолчанию <code>/var/lib/docker/volumes/&lt;volume_name&gt;/_data</code>) и монтирует его непосредственно в контейнер.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Нативная скорость через bind mount</span>
   </div>
   <div class="callout-body">
-    <p>Когда вы используете Volume, ядро Linux создает привязку (bind mount) между директорией на хосте и директорией внутри Network/Mount Namespace контейнера. Данные идут в обход Copy-on-Write механики OverlayFS напрямую на файловую систему хоста (ext4, xfs). Это обеспечивает <strong>нативную скорость IO хоста</strong>.</p>
+    <p>Когда Docker монтирует Volume, ядро Linux создает прямую системную привязку (<strong>bind mount</strong>) между каталогом хоста и целевой точкой в Mount Namespace контейнера.</p>
+<p>Все операции записи из Go минуют логику Copy-on-Write и драйвер OverlayFS, направляясь напрямую в хостовую файловую систему (ext4 или XFS). Это обеспечивает <strong>нативную аппаратную скорость дискового I/O</strong>, идентичную работе обычного системного процесса на хосте.</p>
+<p>В оркестраторах (Kubernetes) концептуальным аналогом томов являются абстракции <strong>PersistentVolume (PV)</strong> и <strong>PersistentVolumeClaim (PVC)</strong>.</p>
   </div>
 </div>
 
-<p>Volumes — единственный механизм, который работает в кластерах Docker Swarm или Kubernetes, где ноды могут переключаться. В K8s аналогом являются PersistentVolumeClaims (PVC).</p>
-<h3 id="2-bind-mounts-privyazka-k-direktorii-khosta">2. Bind Mounts (Привязка к директории хоста)</h3>
-
-<p><strong>Bind Mount</strong> позволяет вам явно указать любую директорию или файл на хост-системе и примонтировать их в контейнер.</p>
+<h3 id="2-pryamoe-montirovanie-katalogov-bind-mounts">2. Прямое монтирование каталогов (Bind Mounts)</h3>
+<p><strong>Bind Mount</strong> позволяет примонтировать абсолютно любой существующий файл или директорию с хоста в произвольную точку файловой системы контейнера:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2264,12 +2286,11 @@ C --&gt; D[&quot;Физический диск хоста&quot;]
 </div>
 
 <ul>
-<li><strong>Плюсы:</strong> Удобно для разработки (например, пробросить исходный код с хоста в контейнер, чтобы использовать hot-reload утилиты вроде <code>air</code>).</li>
-<li><strong>Минусы:</strong> Жесткая привязка к структуре файловой системы конкретного хоста. Если вы перенесете контейнер на другой сервер, где нет <code>/home/user/myapp/config.yaml</code>, контейнер не запустится.</li>
+<li><strong>Преимущества:</strong> Незаменимый инструмент для локальной разработки. Вы можете пробросить папку с исходным Go-кодом внутрь сборочного контейнера и использовать утилиты горячей перезагрузки (такие как <code>air</code>), чтобы код автоматически перекомпилировался при сохранении файла в IDE без пересборки Docker-образа.</li>
+<li><strong>Недостатки:</strong> Жесткая привязка к конкретной структуре директорий хостовой машины. Если на продакшен-сервере путь <code>/home/user/myapp/config.yaml</code> отсутствует, контейнер аварийно завершится при старте. В production-средах использование Bind Mounts считается антипаттерном.</li>
 </ul>
-<h3 id="3-tmpfs-mounts-v-operativnoy-pamyati">3. tmpfs Mounts (В оперативной памяти)</h3>
-
-<p><strong>tmpfs</strong> монтирует временную файловую систему прямо в RAM хоста. Данные не пишутся на диск вообще.</p>
+<h3 id="3-khranenie-v-operativnoy-pamyati-tmpfs-mounts">3. Хранение в оперативной памяти (tmpfs Mounts)</h3>
+<p>Файловая система <strong>tmpfs</strong> монтирует изолированный виртуальный каталог непосредственно в оперативную память (RAM) хоста, минуя постоянные накопители (SSD/NVMe):</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2283,53 +2304,69 @@ C --&gt; D[&quot;Физический диск хоста&quot;]
 </code></pre>
 </div>
 
-<p>Используется для хранения чувствительных данных (ключи, которые не должны попадать на диск) или как сверхбыстрый кэш, который не жалко потерять при перезапуске. Лимитируется размером (в примере 100 МБ); если превысить лимит, процесс получит ошибку <code>ENOSPC</code> (No space left on device).</p>
-<h2 id="spetsifika-go-sqlite-i-faylovye-blokirovki">Специфика Go: SQLite и Файловые блокировки</h2>
+<ul>
+<li><strong>Сферы применения:</strong><br />
+  1. Сверхбыстрый временный кэш, для которого задержка записи в RAM на порядки ниже любых NVMe-дисков.<br />
+  2. Хранение чувствительных данных (секретные криптографические ключи, токены сессий, временные расшифрованные сертификаты), которые категорически запрещено сбрасывать на физический диск.</li>
+<li><strong>Подводный камень:</strong> Размер <code>tmpfs</code> жестко квотируется (в примере: 100 МБ). При переполнении памяти системный вызов записи в Go немедленно вернет ошибку ядра <strong><code>ENOSPC</code> (No space left on device)</strong>.</li>
+</ul>
+<hr />
+<h2 id="3-spetsifika-go-vstraivaemye-bazy-dannykh-sqlite-i-faylovye-blokirovki-flock">3. Специфика Go: Встраиваемые базы данных (SQLite) и файловые блокировки flock</h2>
 
-<p>Для Go-разработчиков очень популярно использование встроенных баз данных (Embedded DB), таких как SQLite (через CGO или чистый Go-порт), BadgerDB или BoltDB. Они не требуют отдельного сервера и идеально подходят для микрофронтендов или edge-вычислений.</p>
-<p>Но при запуске в Docker они часто ломаются с ошибкой <code>database is locked</code> или <code>SIGBUS: bus error</code>.</p>
+<p>В экосистеме Go огромной популярностью пользуются встраиваемые бессерверные базы данных (<strong>Embedded Databases</strong>): SQLite (как в CGO-версии, так и в современных чистых Go-портах вроде <code>modernc.org/sqlite</code>), BadgerDB и BoltDB. Они не требуют развертывания отдельного сервера баз данных и хранят все структуры прямо в единственном файле.</p>
+<p>Однако при их запуске внутри контейнеров инженеры регулярно сталкиваются с фатальными ошибками: <code>database is locked</code>, паникой повреждения страниц или сбоем ядра <code>SIGBUS: bus error</code>.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Логика flock() поверх OverlayFS и NFS</span>
   </div>
   <div class="callout-body">
-    <p>SQLite использует механизм <code>flock()</code> (file locking) на уровне ОС для контроля конкурентного доступа к файлу БД. <br />
-1. Если вы запускаете SQLite поверх OverlayFS (без Volume), файловые блокировки могут не работать корректно, так как OverlayFS имеет ограниченную поддержку POSIX ACL и locking.<br />
-2. Если вы используете сетевую файловую систему (NFS/EFS) для Volume, <code>flock()</code> также может не работать между разными нодами, приводя к повреждению БД.<br />
-<strong>Решение:</strong> SQLite и другие embedded-базы <em>всегда</em> должны работать на локальных Volumes (блочные устройства хоста). Если контейнер размазан по нескольким нодам K8s, вы обязаны использовать ReadWriteOnce (RWO) режим для PVC, чтобы диск был примонтирован только к одной ноде.</p>
+    <p>SQLite для обеспечения транзакционной целостности (ACID) использует системный вызов ядра <strong><code>flock()</code></strong> (или <code>fcntl</code> file locking), блокирующий байтовые диапазоны файла БД при операциях записи.</p>
+<ol>
+<li><strong>Крах на OverlayFS:</strong> Если файл SQLite лежит в Writable Layer контейнера (без смонтированного Volume), драйвер OverlayFS из-за своей слоистой природы не гарантирует корректную семантику POSIX-блокировок. При одновременной записи из нескольких горутин файл базы данных гарантированно разрушается (<strong>Data Corruption</strong>).</li>
+<li><strong>Крах на сетевых хранилищах (NFS/AWS EFS):</strong> Если вы смонтируете Volume через сетевую распределенную файловую систему, сетевой протокол не сможет синхронизировать быстрые блокировки <code>flock()</code> между разными хостами. Вы получите регулярные таймауты <code>database is locked</code>.</li>
+</ol>
+<p><strong>Решение:</strong> Встраиваемые базы данных SQLite обязаны работать <strong>исключительно на локальных Docker Volumes (блочных устройствах хоста)</strong>. В Kubernetes том для SQLite обязан монтироваться в монопольном режиме <strong>ReadWriteOnce (RWO)</strong>, гарантируя, что только одна реплика пода имеет доступ к файлу.</p>
   </div>
 </div>
 
-<h2 id="problema-prav-dostupa-uidgid-mapping">Проблема прав доступа (UID/GID маппинг)</h2>
+<hr />
+<h2 id="4-problema-prav-dostupa-mapping-uidgid-i-oshibka-permission-denied">4. Проблема прав доступа: Маппинг UID/GID и ошибка Permission Denied</h2>
 
-<p>Классическая боль при работе с Volumes в Docker — ошибка <code>Permission Denied</code>.</p>
-<p>Когда Docker создает Volume, директория на хосте (<code>/var/lib/docker/volumes/.../_data</code>) создается с правами <code>root:root</code>. Если внутри контейнера ваше Go-приложение работает от <code>appuser</code> (UID 10001), оно не сможет писать в эту директорию.</p>
-<p>С другой стороны, при использовании Bind Mount (<code>-v /host/dir:/app/dir</code>), файлы внутри контейнера будут принадлежать тому же UID, что и на хосте. Если на хосте файл принадлежит UID 1000, а в контейнере <code>appuser</code> имеет UID 2000, приложение не сможет прочитать конфиг.</p>
+<p>Пожалуй, самая частая и раздражающая ошибка при подключении томов в production — внезапный отказ в доступе: <code>open /app/data/app.db: permission denied</code>.</p>
+<h3 id="v-chem-priroda-konflikta-prav">В чем природа конфликта прав?</h3>
+<ol>
+<li>Когда Docker впервые создает Volume на хосте (<code>/var/lib/docker/volumes/.../_data</code>), владельцем каталога на уровне операционной системы хоста становится пользователь <strong><code>root:root</code> (UID 0, GID 0)</strong>.</li>
+<li>В то же время наш Go-контейнер собран по стандартам безопасности и работает от непривилегированного пользователя <code>appuser</code> (например, с UID 10001), как мы настраивали в лекции <a href="2-dockerfile-best-practices.html" class="wikilink">2. Dockerfile best practices</a>.</li>
+<li>При попытке Go-процесса создать файл в точке монтирования <code>/app/data</code> ядро Linux сверяет права: процесс с EUID 10001 пытается писать в каталог владельца UID 0 с правами <code>drwxr-xr-x</code>. Ядро мгновенно блокирует операцию с ошибкой <code>EACCES</code> (Permission Denied).</li>
+</ol>
+<p>Аналогично при использовании Bind Mount (<code>-v /host/dir:/app/dir</code>): если файлы на хосте принадлежат локальному пользователю разработчика с UID 1000, а процесс внутри контейнера работает под UID 2000, Go-сервис даже не сможет прочитать собственный конфигурационный файл.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Способы разрешения конфликтов UID/GID при работе с томами</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как заставить Go-приложение в контейнере корректно читать и писать в Docker Volume, учитывая различие UID между хостом и контейнером?<br />
-<strong>Ответ:</strong> Существует несколько паттернов:<br />
-1. <strong>Фиксированный UID</strong>: В Dockerfile создаем пользователя с конкретным UID (например, <code>adduser -u 10001 appuser</code>), а системным администраторам гарантируем, что директория Volume на хосте/в K8s принадлежит этому же UID.<br />
-2. <strong>Entrypoint скрипт от root</strong>: Контейнер запускается от root, entrypoint-скрипт (на bash/sh) делает <code>chown -R appuser:appgroup /app/data</code>, а затем выполняет <code>su-exec</code> или <code>gosu</code> для дропа привилегий и запуска Go-бинарника. (Используется в официальных образах Postgres/Nginx).<br />
-3. <strong>User Namespaces</strong>: Настройка Docker демона на использование <code>userns-remap</code>, которая маппит root внутри контейнера на непривилегированного пользователя на хосте. Сложно в настройке в K8s.</p>
+    <p><strong>Вопрос:</strong> Как организовать работу непривилегированного Go-приложения в контейнере с внешними томами (Docker Volumes / Bind Mounts) без ошибок прав доступа?</p>
+<p><strong>Ответ:</strong> В современной инфраструктуре применяется несколько проверенных паттернов:<br />
+1. <strong>Стандартизация фиксированного UID:</strong> В Dockerfile создаем пользователя с конкретным UID (например, <code>adduser -u 10001 appuser</code>), а системным администраторам гарантируем, что целевая директория Volume на хосте/в K8s принадлежит этому же UID. В Kubernetes это настраивается декларативно в манифесте пода через <code>securityContext.fsGroup: 10001</code>.<br />
+2. <strong>Паттерн Root Entrypoint + gosu/su-exec:</strong> Контейнер стартует от пользователя <code>root</code>. Легковесный стартовый скрипт (<code>entrypoint.sh</code>) перед запуском приложения проверяет права на точку монтирования, при необходимости выполняет быстрый <code>chown -R appuser:appgroup /app/data</code>, после чего вызывает утилиту <strong><code>gosu</code></strong> или <code>su-exec</code>. Утилита сбрасывает привилегии до <code>appuser</code> и через системный вызов <code>exec</code> запускает скомпилированный Go-бинарник. (Именно так устроены официальные production-образы PostgreSQL и Redis).<br />
+3. <strong>Активация User Namespaces (<code>userns-remap</code>):</strong> Настройка демона Docker, при которой пользователь <code>root</code> внутри контейнера автоматически транслируется ядром в непривилегированного пользователя на хосте, устраняя конфликты владельцев.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Writable Layer (OverlayFS)</strong> — только для эфемерных данных. Запись туда медленная из-за Copy-on-Write.</li>
-<li><strong>Volumes</strong> — единственный правильный способ персистентного хранения данных в Docker/K8s. Обеспечивают прямую запись на диск хоста.</li>
-<li><strong>Bind Mounts</strong> — отличный инструмент для локальной разработки (hot-reload), но антипаттерн для production из-за привязки к ФС хоста.</li>
-<li><strong>tmpfs</strong> — для сверхбыстрого кэширования в RAM и чувствительных данных, которые не должны оставаться на диске.</li>
-<li><strong>Файловые блокировки (flock)</strong>: Embedded БД (SQLite) требуют реальных блочных устройств (Volumes), а не сетевых или эфемерных ФС.</li>
+<li><strong>Writable Layer (OverlayFS) — зона риска:</strong> Он предназначен только для эфемерных временных файлов; операции записи туда деградируют по скорости из-за оверхеда Copy-on-Write.</li>
+<li><strong>Docker Volumes:</strong> Основной и рекомендуемый способ хранения данных; обеспечивает прямое обращение к блочным устройствам хоста с нативной скоростью файловой системы.</li>
+<li><strong>Bind Mounts:</strong> Идеальны для быстрой локальной разработки и горячей перезагрузки (<code>air</code>), но опасны в production из-за привязки к путям файловой системы хоста.</li>
+<li><strong>tmpfs Mounts:</strong> Гарантируют молниеносный кэш и абсолютную безопасность конфиденциальных данных за счет хранения исключительно в оперативной памяти.</li>
+<li><strong>Тонкости SQLite и flock():</strong> Встраиваемые базы данных требуют монопольного доступа к локальным томам с честной поддержкой POSIX-блокировок.</li>
+<li><strong>Синхронизация UID/GID:</strong> Требует обязательной координации между непривилегированным пользователем контейнера и правами на смонтированные каталоги.</li>
 </ol>
-<p>Хранение данных — лишь один аспект инфраструктуры. Если злоумышленник получит доступ к вашему контейнеру, он не должен иметь возможности выбраться на хост или соседние контейнеры. В следующей статье мы углубимся в безопасность контейнеризации: <a href="6-bezopasnost-konteynerov.html" class="wikilink">6. Безопасность контейнеров</a>.</p>
+<p>Мы научились собирать, связывать по сети и обеспечивать надежное хранение данных наших Go-контейнеров. Однако открытым остается ключевой вопрос: как защитить контейнеризированную среду от взлома и изощренных атак на ядро? В следующей статье мы разберем боевую безопасность контейнеров: <a href="6-bezopasnost-konteynerov.html" class="wikilink">6. Безопасность контейнеров</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2357,7 +2394,7 @@ C --&gt; D[&quot;Физический диск хоста&quot;]
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#problema-writable-layer-overlayfs">Проблема Writable Layer (OverlayFS)</a></li><li class="toc-item toc-h2"><a href="#tipy-khranilishch-v-docker">Типы хранилищ в Docker</a></li><li class="toc-item toc-h3"><a href="#1-volumes-imenovannye-toma">1. Volumes (Именованные тома)</a></li><li class="toc-item toc-h3"><a href="#2-bind-mounts-privyazka-k-direktorii-khosta">2. Bind Mounts (Привязка к директории хоста)</a></li><li class="toc-item toc-h3"><a href="#3-tmpfs-mounts-v-operativnoy-pamyati">3. tmpfs Mounts (В оперативной памяти)</a></li><li class="toc-item toc-h2"><a href="#spetsifika-go-sqlite-i-faylovye-blokirovki">Специфика Go: SQLite и Файловые блокировки</a></li><li class="toc-item toc-h2"><a href="#problema-prav-dostupa-uidgid-mapping">Проблема прав доступа (UID/GID маппинг)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-problema-writable-layer-v-overlayfs-pochemu-konteynery-tormozyat-pri-zapisi">1. Проблема Writable Layer в OverlayFS: Почему контейнеры «тормозят» при записи</a></li><li class="toc-item toc-h2"><a href="#2-arkhitektura-khranilishch-docker-volumes-bind-mounts-i-tmpfs">2. Архитектура хранилищ Docker: Volumes, Bind Mounts и tmpfs</a></li><li class="toc-item toc-h3"><a href="#1-imenovannye-toma-docker-volumes">1. Именованные тома (Docker Volumes)</a></li><li class="toc-item toc-h3"><a href="#2-pryamoe-montirovanie-katalogov-bind-mounts">2. Прямое монтирование каталогов (Bind Mounts)</a></li><li class="toc-item toc-h3"><a href="#3-khranenie-v-operativnoy-pamyati-tmpfs-mounts">3. Хранение в оперативной памяти (tmpfs Mounts)</a></li><li class="toc-item toc-h2"><a href="#3-spetsifika-go-vstraivaemye-bazy-dannykh-sqlite-i-faylovye-blokirovki-flock">3. Специфика Go: Встраиваемые базы данных (SQLite) и файловые блокировки flock</a></li><li class="toc-item toc-h2"><a href="#4-problema-prav-dostupa-mapping-uidgid-i-oshibka-permission-denied">4. Проблема прав доступа: Маппинг UID/GID и ошибка Permission Denied</a></li><li class="toc-item toc-h3"><a href="#v-chem-priroda-konflikta-prav">В чем природа конфликта прав?</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

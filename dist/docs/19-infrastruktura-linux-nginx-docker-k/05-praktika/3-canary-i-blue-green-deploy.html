@@ -2169,25 +2169,29 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Canary и blue green deploy</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статье <a href="2-rolling-updates.html" class="wikilink">2. Rolling updates</a> мы разобрали стандартный механизм обновления K8s. Rolling Update работает великолепно, но у него есть фундаментальное ограничение: он предполагает, что новая версия приложения на 100% совместима со старой (backward compatible). </p>
-<p>Но что делать, если вы меняете схему базы данных? Или переписываете критически важный эндпоинт, и не уверены, что новый код не ляжет под продакшен-нагрузкой? В таких случаях Rolling Update — это прыжок с парашютом, который вы не проверили. Для минимизации рисков применяют стратегии <strong>Blue-Green Deployment</strong> и <strong>Canary Release</strong>.</p>
-<h2 id="blue-green-deployment-mgnovennoe-pereklyuchenie">Blue-Green Deployment: Мгновенное переключение</h2>
+            <h1>3. Продвинутые стратегии деплоя: Blue-Green, Canary и управление рисками в Go</h1>
+<p>В предыдущей статье (<a href="2-rolling-updates.html" class="wikilink">2. Rolling updates</a>) мы детально исследовали механику скользящего обновления <code>RollingUpdate</code>. Это прекрасный рабочий инструмент для 80% повседневных релизов, однако у него есть фундаментальная предпосылка: он исходит из того, что новая версия приложения на 100% обратно совместима (backward compatible) со старой версией и с существующей схемой базы данных.</p>
+<p>В реальной жизни бэкенд-разработчика наступают моменты радикальных тектонических сдвигов:<br />
+* Полная переработка архитектуры критического финансового модуля.<br />
+* Изменение структуры реляционной базы данных (миграции сотен миллионов строк).<br />
+* Переход на новый протокол сериализации или замена сетевых библиотек.</p>
+<p>Выкатывать такие изменения «вслепую» через Rolling Update — все равно что прыгать с парашютом, который укладывал незнакомец. Если в новом коде кроется незаметная утечка памяти, ломающая сервис под нагрузкой через 20 минут, или деструктивный баг в обработке транзакций, вы рискуете уронить 100% клиентского трафика.</p>
+<p>Для безопасного управления рисками в индустрии выработаны две ключевые стратегии: <strong>Blue-Green Deployment</strong> (мгновенная замена окружений) и <strong>Canary Release</strong> (канареечный запуск на малой доле реальных пользователей).</p>
+<hr />
+<h2 id="1-blue-green-deployment-mgnovennaya-rokirovka-okruzheniy">1. Blue-Green Deployment: Мгновенная рокировка окружений</h2>
 
-<p>Суть Blue-Green заключается в том, что у вас работают <strong>два идентичных окружения</strong> (синее и зеленое), каждое из которых включает полную версию вашего приложения.</p>
-<p>В контексте Kubernetes это означает, что у вас есть два Deployment'а (например, <code>app-v1</code> и <code>app-v2</code>), но Service направляет трафик только на один из них.</p>
-<ol>
-<li><strong>Blue (Текущий прод)</strong>: Весь трафик идет на <code>app-v1</code>.</li>
-<li><strong>Деплой Green</strong>: Вы разворачиваете <code>app-v2</code> без отключения <code>app-v1</code>. Приложение стартует, прогревает кэши, проходит Readiness Probe, но не принимает пользовательский трафик.</li>
-<li><strong>Переключение (Cutover)</strong>: Вы меняете селектор у Service (или вес в Ingress), и трафик мгновенно перенаправляется на <code>app-v2</code>.</li>
-<li><strong>Откат</strong>: Если что-то пошло не так, вы переключаете Service обратно на <code>app-v1</code>. Это занимает миллисекунды.</li>
-</ol>
+<p>Идея Blue-Green (сине-зеленого) развертывания предельно наглядна и элегантна: в кластере одновременно сосуществуют <strong>два независимых, абсолютно идентичных производственных окружения</strong>.</p>
+<ul>
+<li><strong>Blue (Синее):</strong> Текущий работающий продакшен (версия V1), принимающий 100% пользовательских запросов.</li>
+<li><strong>Green (Зеленое):</strong> Новая версия (V2), полностью развернутая рядом в том же кластере, но пока изолированная от внешнего трафика.</li>
+</ul>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2202,63 +2206,39 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Ingress - Трафик&quot;] --&gt; B[&quot;Service&quot;]
-B --&gt; C[&quot;Blue - Deployment v1&lt;br&gt;4 Поды&quot;]
-D[&quot;Green - Deployment v2&lt;br&gt;4 Поды без трафика&quot;]
-B -.-&gt;|&quot;Селектор на v2&quot;| D
+Ingress[&quot;Внешний Ingress / Балансировщик&quot;] --&gt; Svc[&quot;K8s Service\n(selector: version=v1)&quot;]
+
+subgraph BlueEnv[&quot;Blue Окружение (Stable V1)&quot;]
+Svc --&gt;|&quot;100% трафика&quot;| P1[&quot;Pod v1&quot;]
+Svc --&gt;|&quot;100% трафика&quot;| P2[&quot;Pod v1&quot;]
+end
+
+subgraph GreenEnv[&quot;Green Окружение (New V2)&quot;]
+P3[&quot;Pod v2 (Ready)&quot;]
+P4[&quot;Pod v2 (Ready)&quot;]
+end
+
+Svc -.-&gt;|&quot;Мгновенное переключение&lt;br&gt;селектора на version=v2&quot;| P3
+Svc -.-&gt;|&quot;Мгновенное переключение&lt;br&gt;селектора на version=v2&quot;| P4
   </pre>
 </div>
 
 
+<h3 id="poshagovyy-protokol-pereklyucheniya-cutover">Пошаговый протокол переключения (Cutover):</h3>
+<ol>
+<li>Вы разворачиваете деплоймент <code>app-v2</code> рядом с <code>app-v1</code>. Поды версии V2 стартуют, выделяют память, подключаются к базе данных, прогревают локальные кэши и успешно отвечают на <code>Readiness Probe</code>.</li>
+<li>Инженеры QA или синтетические тесты могут проверить работоспособность Green-окружения через специальный внутренний тестовый сервис.</li>
+<li><strong>Момент Cutover (Переключение):</strong> Администратор или CI/CD обновляет поле <code>selector</code> в манифесте Service с <code>version: v1</code> на <code>version: v2</code>.</li>
+<li>Kubernetes мгновенно обновляет IP-адреса в объекте <code>Endpoints</code>. Весь входящий трафик за миллисекунды перенаправляется на Green-поды.</li>
+<li><strong>Откат (Rollback):</strong> Если в продакшене внезапно взлетает график 500-х ошибок, селектор Service меняется обратно на <code>version: v1</code>. Откат занимает доли секунды, ведь старое Blue-окружение не уничтожалось и продолжает мирно работать в памяти.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Механика селекторов в K8s</span>
   </div>
   <div class="callout-body">
-    <p>В K8s переключение Service между Blue и Green — это просто обновление поля <code>selector</code> в YAML-манифесте. API Server обновляет Endpoints, Kube-proxy на нодах обновляет правила iptables/IPVS. Это происходит быстрее, чем создание новых Pod'ов при Rolling Update. <br />
-Важно: чтобы Service мог переключаться между Deployment'ами, Поды в обоих Deployment'ах должны иметь общий лейбл (например, <code>app: my-api</code>) и уникальный лейбл версии (<code>version: v1</code> / <code>version: v2</code>).</p>
-  </div>
-</div>
-
-<h3 id="akhillesova-pyata-blue-green-migratsii-bd">Ахиллесова пята Blue-Green: Миграции БД</h3>
-
-<p>Главная проблема Blue-Green развертывания — работа с состоянием (State). Если ваш Go-код при старте выполняет <code>ALTER TABLE ADD COLUMN</code>, база данных изменится. Но старая версия (<code>v1</code>) ничего не знает про новую колонку и может упасть при <code>SELECT *</code>. Вы больше не можете откатиться на <code>v1</code>.</p>
-<p><strong>Решение (Паттерн Expand/Contract):</strong><br />
-1. <strong>Expand</strong>: Сначала деплоите версию, которая <em>добавляет</em> новую колонку, но не использует её. Старый код работает стабильно.<br />
-2. <strong>Переключение</strong>: Переключаетесь на версию, которая <em>читает и пишет</em> в новую колонку.<br />
-3. <strong>Contract</strong>: Убедившись, что отката не будет, деплоите версию, которая <em>удаляет</em> старую колонку.</p>
-<h2 id="canary-deployment-testirovanie-na-realnykh-lyudyakh">Canary Deployment: Тестирование на реальных людях</h2>
-
-<p>Canary (Канареечный релиз) — это более плавная стратегия. Название отсылает к канарейкам, которых шахтеры брали с собой в шахту для обнаружения газа. Если канарейка выживала, шахтеры шли дальше.</p>
-<p>В K8s Canary означает, что вы направляете лишь небольшую часть трафика (например, 1%, 5% или 10%) на новую версию, оставляя 90-99% на старой. Вы внимательно следите за метриками (ошибки, латентность). Если "канарейка" падает, вы автоматически откатываете этот 1%. Если всё хорошо — постепенно увеличиваете долю новой версии до 100%.</p>
-
-<div class="mermaid-wrapper">
-  <div class="mermaid-header">
-    <div class="mermaid-title">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
-      <span>Архитектурная схема</span>
-    </div>
-    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
-      <span>На весь экран</span>
-    </button>
-  </div>
-  <pre class="mermaid">
-flowchart LR
-A[&quot;Ingress&quot;] --&gt; B[&quot;Nginx Canary&quot;]
-B --&gt;|&quot;99% трафика&quot;| C[&quot;Stable - v1&quot;]
-B -.-&gt;|&quot;1% трафика&quot;| D[&quot;Canary - v2&quot;]
-C --&gt; E[&quot;Поды v1&quot;]
-D --&gt; F[&quot;Поды v2&quot;]
-  </pre>
-</div>
-
-
-<h3 id="realizatsiya-canary-v-nginx-ingress">Реализация Canary в Nginx Ingress</h3>
-
-<p>Самый популярный способ реализации Canary в K8s без Service Mesh — использование аннотаций Nginx Ingress Controller.</p>
-<p>Вы создаете <em>отдельный</em> Ingress-ресурс для новой версии с аннотацией <code>canary: "true"</code>.</p>
+    <p>Чтобы архитектура Blue-Green работала в Kubernetes, оба Deployment (<code>app-v1</code> и <code>app-v2</code>) обязаны иметь общий группирующий лейбл приложения и уникальный лейбл версии:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2268,53 +2248,188 @@ D --&gt; F[&quot;Поды v2&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml"># Stable Ingress (99% трафика)
-apiVersion: networking.k8s.io/v1
+  <pre class="language-yaml"><code class="language-yaml"># В Pod Template обоих деплойментов:
+metadata:
+  labels:
+    app: my-api       # Общий идентификатор
+    version: v1       # (или v2 для Green)
+</code></pre>
+</div>
+
+<p>Переключение сервиса — это патч одной строчки: <code>kubectl set selector service/my-api version=v2</code>. Никаких рестартов подов, никаких долгих пересчетов: Kube-proxy обновляет правила iptables/IPVS за миллисекунды.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="2-akhillesova-pyata-blue-green-bazy-dannykh-i-pattern-expandcontract">2. Ахиллесова пята Blue-Green: Базы данных и паттерн Expand/Contract</h2>
+
+<p>Казалось бы, Blue-Green идеален. В чем подвох? <br />
+Подвох кроется в состоянии (<strong>State</strong>) — в общей базе данных.</p>
+<p>Представьте: версия V2 требует нового поля в таблице пользователей. Если ваш Go-код при старте выполняет <code>ALTER TABLE ADD COLUMN</code>, база данных изменится:</p>
+
+<div class="code-block" data-lang="sql">
+  <div class="code-header">
+    <span class="code-lang-tag">SQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-sql"><code class="language-sql">ALTER TABLE users ADD COLUMN phone_number VARCHAR(20) NOT NULL;
+</code></pre>
+</div>
+
+<p>И здесь наступает катастрофа:<br />
+1. Синее окружение (версия <code>app-v1</code>) еще активно работает и принимает реальные запросы.<br />
+2. Go-код версии V1 выполняет привычный запрос: <code>SELECT * FROM users;</code>.<br />
+3. Драйвер базы данных натыкается на неожиданную новую колонку, не может смапить ее в существующую Go-структуру и выдает фатальную ошибку.<br />
+4. Вы не можете безопасно откатиться назад: откат приложения на <code>app-v1</code> уже не спасет, так как схема базы данных безвозвратно изменена!</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph ExpandContract[&quot;Паттерн Expand / Contract&quot;]
+Step1[&quot;1. EXPAND (Расширение)\nДобавляем новую колонку phone_number (NULLable).\nКод V1 ее игнорирует, база совместима с обеими версиями.&quot;]
+Step2[&quot;2. ПЕРЕКЛЮЧЕНИЕ (Cutover)\nПереводим трафик на V2.\nКод V2 пишет и читает новую колонку phone_number.&quot;]
+Step3[&quot;3. CONTRACT (Сжатие)\nУбеждаемся в стабильности V2.\nСтавим NOT NULL и удаляем старые неиспользуемые поля.&quot;]
+Step1 --&gt; Step2 --&gt; Step3
+end
+  </pre>
+</div>
+
+
+<h3 id="spasenie-pattern-expandcontract-parallel-run">Спасение: Паттерн Expand/Contract (Parallel Run)</h3>
+<p>Для поддержки бесшовного Blue-Green деплоя все изменения баз данных разбиваются на три фазы:<br />
+1. <strong>Expand (Расширение схемы):</strong> В БД добавляются новые таблицы или колонки со статусом <code>NULLable</code> или дефолтными значениями. Старая версия <code>v1</code> продолжает работать, не замечая изменений.<br />
+2. <strong>Переключение (Cutover):</strong> Трафик переводится на <code>v2</code>. Приложение начинает заполнять новые поля.<br />
+3. <strong>Contract (Сжатие схемы):</strong> Только после того, как версия <code>v2</code> отработала в проде несколько дней, и риск отката сведен к нулю, отдельной миграцией накладываются строгие ограничения (<code>NOT NULL</code>) и удаляются устаревшие рудименты.</p>
+<hr />
+<h2 id="3-canary-deployment-proverka-boem-na-zhivykh-polzovatelyakh">3. Canary Deployment: Проверка боем на живых пользователях</h2>
+
+<p>Название «Канареечный релиз» отсылает к исторической традиции шахтеров: спускаясь в забой, они брали с собой клетку с канарейкой. Птицы исключительно чувствительны к метану и угарному газу. Если канарейка начинала проявлять беспокойство или засыпала, шахтеры немедленно эвакуировались на поверхность до того, как газ достигнет смертельной для человека концентрации.</p>
+<p>В программной инженерии <strong>Canary Release</strong> — это техника, при которой новая версия бинарника (v2) раскатывается не на всех, а лишь на крошечный срез пользователей (например, 1%, 5% или 10%), в то время как 90–99% аудитории продолжают обслуживаться проверенной стабильной версией v1.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Client[&quot;Входящий поток пользователей&quot;] --&gt; Ingress[&quot;Nginx Ingress (L7 Split)&quot;]
+
+Ingress --&gt;|&quot;99% стабильного трафика&quot;| SvcStable[&quot;Service: my-api-v1&quot;]
+Ingress -.-&gt;|&quot;1% канареечного трафика&quot;| SvcCanary[&quot;Service: my-api-v2&quot;]
+
+SvcStable --&gt; P1[&quot;Поды v1 (Stable)&quot;]
+SvcStable --&gt; P2[&quot;Поды v1 (Stable)&quot;]
+SvcCanary --&gt; PC[&quot;Pod v2 (Canary)&quot;]
+  </pre>
+</div>
+
+
+<p>Инженеры непрерывно анализируют телеметрию канарейки: если 1% пользователей не сталкивается с ростом 5xx-ошибок и задержек, доля трафика плавно повышается: 5% -&gt; 25% -&gt; 50% -&gt; 100%.</p>
+<hr />
+<h2 id="4-realizatsiya-canary-cherez-nginx-ingress-magiya-annotatsiy">4. Реализация Canary через Nginx Ingress: Магия аннотаций</h2>
+
+<p>Если в вашей инфраструктуре еще не развернут тяжелый Service Mesh (Istio или Linkerd), проще и эффективнее всего реализовать канареечную маршрутизацию средствами стандартного <strong>Nginx Ingress Controller</strong>.</p>
+<p>Для этого создаются два независимых манифеста <code>Ingress</code>, указывающие на один и тот же домен и путь, но имеющие разные бэкенды:</p>
+<h3 id="1-stabilnyy-ingress-osnovnoy-trafik">1. Стабильный Ingress (Основной трафик):</h3>
+
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: my-api-stable
 spec:
   rules:
-  - http:
+  - host: api.example.com
+    http:
       paths:
       - path: /api
+        pathType: Prefix
         backend:
           service:
             name: my-api-v1
+            port:
+              number: 8080
+</code></pre>
+</div>
 
----
-# Canary Ingress (1% трафика)
-apiVersion: networking.k8s.io/v1
+<h3 id="2-kanareechnyy-ingress-1-trafika">2. Канареечный Ingress (1% трафика):</h3>
+
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: my-api-canary
   annotations:
+    # Включаем канареечный режим
     nginx.ingress.kubernetes.io/canary: &quot;true&quot;
+    # Задаем ровно 1% входящего трафика
     nginx.ingress.kubernetes.io/canary-weight: &quot;1&quot;
 spec:
   rules:
-  - http:
+  - host: api.example.com
+    http:
       paths:
       - path: /api
+        pathType: Prefix
         backend:
           service:
             name: my-api-v2
+            port:
+              number: 8080
 </code></pre>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Семантика соединений против запросов в gRPC</span>
   </div>
   <div class="callout-body">
-    <p>Canary-маршрутизация в Nginx Ingress работает на уровне <strong>L7</strong>. Это значит, что Nginx использует <code>split_clients</code> модуль (на основе IP-адреса или случайного числа) для распределения запросов. если вы используете WebSockets или gRPC с мультиплексированием, один TCP-коннект может содержать сотни стримов. Nginx балансирует <em>соединения</em>, а не отдельные стримы внутри gRPC. Для корректного Canary-деплоя gRPC-микросервисов на Go нужен Service Mesh (Istio/Linkerd), который умеет балансировать на уровне L7 фреймов.</p>
+    <p>Nginx Ingress Controller распределяет трафик с помощью модуля ядра Nginx <code>split_clients</code> (опираясь на IP-адрес клиента или случайное распределение сокетов).</p>
+<p>В мире чистого REST/HTTP/1.1 это работает идеально: каждый запрос открывает новое соединение или переиспользует сокет в пул. <br />
+Но если ваши Go-сервисы общаются по <strong>gRPC поверх HTTP/2</strong>, клиент создает <strong>одно-единственное долгоживущее TCP-соединение</strong>, внутри которого мультиплексирует миллионы RPC-вызовов!</p>
+<p>В итоге Nginx применит вес 1% к <em>TCP-соединению</em>. Если клиент попадет в этот 1%, он направит абсолютно <strong>все 100% своих gRPC-запросов</strong> в канарейку! Для честной L7-балансировки потоков gRPC требуется Envoy Gateway или полноценный Service Mesh.</p>
   </div>
 </div>
 
-<h3 id="tochnyy-targeting-ab-testing">Точный таргетинг (A/B Testing)</h3>
-
-<p>Вместо случайного процента, Canary Ingress может направлять трафик по заголовкам или куки. Это идеально для тестирования фич на внутренних пользователях (dogfooding):</p>
+<h3 id="tochnyy-targeting-ab-testing-i-vnutrenniy-dogfooding">Точный таргетинг (A/B Testing и внутренний Dogfooding)</h3>
+<p>Вместо случайного процентного разделения трафика вы можете направить на канарейку конкретную когорту пользователей — например, сотрудников вашей компании (практика <em>dogfooding</em>):</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2324,25 +2439,31 @@ spec:
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">annotations:
-  nginx.ingress.kubernetes.io/canary: &quot;true&quot;
-  nginx.ingress.kubernetes.io/canary-by-header: &quot;X-Canary&quot;
-  nginx.ingress.kubernetes.io/canary-by-header-value: &quot;true&quot;
+  <pre class="language-yaml"><code class="language-yaml">metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/canary: &quot;true&quot;
+    nginx.ingress.kubernetes.io/canary-by-header: &quot;X-Canary&quot;
+    nginx.ingress.kubernetes.io/canary-by-header-value: &quot;true&quot;
 </code></pre>
 </div>
 
-<p>Если ваш Go-код (или фронтенд) отправляет заголовок <code>X-Canary: true</code>, пользователь попадет на версию v2. Остальные — на v1.</p>
-<h2 id="mechanical-sympathy-spetsifika-go-pri-canary">Mechanical Sympathy: Специфика Go при Canary</h2>
+<p>Если Go-клиент или мобильное приложение передаст HTTP-заголовок <code>X-Canary: true</code>, запрос гарантированно попадет на новую версию <code>v2</code>. Все обычные пользователи пойдут на стабильную <code>v1</code>.</p>
+<hr />
+<h2 id="5-mechanical-sympathy-podvodnye-kamni-canary-v-rantayme-go">5. Mechanical Sympathy: Подводные камни Canary в рантайме Go</h2>
 
+<p>Параллельная работа двух разных версий одного и того же Go-сервиса порождает специфические эффекты в распределенной памяти.</p>
 <h3 id="1-problema-keshey-cache-incoherence">1. Проблема кэшей (Cache Incoherence)</h3>
-<p>Если ваш Go-сервис использует распределенный кэш (Redis), Canary-деплой может вызвать "мерцание" данных. <br />
-Представьте, что v1 кладет в кэш структуру <code>User{Name: "Ivan"}</code>, а v2 добавила поле <code>IsAdmin: false</code>. <br />
+<p>Если ваш Go-сервис использует распределенный кэш (Redis), Canary-деплой может вызвать «мерцание» данных.<br />
+Представьте, что v1 кладет в кэш структуру <code>User{Name: "Ivan"}</code>, а v2 добавила поле <code>IsAdmin: false</code>.<br />
 1. Запрос идет в v2, она кладет в кэш новую структуру.<br />
-2. Следующий запрос того же пользователя балансером уходит в v1.<br />
-3. v1 десериализует кэш и паникует (или ломает бизнес-логику), так как не ожидает нового поля.</p>
-<p><strong>Решение:</strong> В Go при использовании <code>encoding/json</code> неизвестные поля по умолчанию игнорируются (это спасает от паник). Но логика может сломаться. Используйте версионирование ключей кэша (например, <code>user:123:v2</code>) или строгую обратную совместимость (никогда не удалять поля в JSON, только добавлять).</p>
+2. Следующий запрос того же пользователя балансировщиком уходит в v1.<br />
+3. v1 десериализует кэш.</p>
+<p>В Go стандартный пакет <code>encoding/json</code> по умолчанию просто игнорирует неизвестные поля JSON при десериализации, что спасает приложение от паники. Однако если вы используете строгие валидаторы (<code>DisallowUnknownFields()</code>) или бинарные протоколы (Protobuf/MessagePack без обратной совместимости номеров тегов), сервис V1 упадет с ошибкой парсинга.</p>
+<p><strong>Золотое правило для распределенного кэша:</strong><br />
+Всегда версионируйте префиксы ключей в Redis при несовместимых изменениях: <code>user:123:v2</code> вместо <code>user:123</code>.</p>
 <h3 id="2-observability-vy-ne-mozhete-uluchshit-to-chto-ne-vidite">2. Observability: Вы не можете улучшить то, что не видите</h3>
-<p>Запуск 1% Canary бессмысленен, если вы не отличаете метрики старой версии от новой. В Prometheus метрики вашего Go-приложения (например, <code>http_request_duration_seconds</code>) обязаны иметь лейбл <code>version</code> или <code>image_tag</code>.</p>
+<p>Выкатить 1% канарейку и смотреть на общий дашборд сервиса — бесполезно: всплеск ошибок на 1% потока просто утонет в шуме общих 99% трафика.</p>
+<p>В Prometheus метрики вашего Go-приложения (например, <code>http_request_duration_seconds</code>) обязаны иметь лейбл <code>version</code> или <code>image_tag</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2352,39 +2473,48 @@ spec:
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// В Go обязательно добавляйте версию в метрики
-var httpRequestDur = prometheus.NewHistogramVec(
+  <pre class="language-go"><code class="language-go">package metrics
+
+import &quot;github.com/prometheus/client_golang/prometheus&quot;
+
+var HttpRequestDuration = prometheus.NewHistogramVec(
     prometheus.HistogramOpts{
-        Name: &quot;http_request_duration_seconds&quot;,
+        Name:    &quot;http_request_duration_seconds&quot;,
+        Help:    &quot;Время обработки HTTP запросов&quot;,
+        Buckets: prometheus.DefBuckets,
     },
-    []string{&quot;method&quot;, &quot;path&quot;, &quot;version&quot;}, // Лейбл version критически важен!
+    // Метка version или image_tag критически важна для отделения Canary от Stable!
+    []string{&quot;method&quot;, &quot;path&quot;, &quot;status&quot;, &quot;version&quot;},
 )
 </code></pre>
 </div>
 
-<p>Только имея дашборд Grafana, где наложены графики p99 latency версии <code>v1</code> и <code>v2</code>, вы можете принять решение о масштабировании Canary.</p>
+<p>Только построив в Grafana два независимых графика: <code>p99 latency (version="v1")</code> против <code>p99 latency (version="v2")</code>, вы сможете объективно подтвердить успех релиза.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос для собеседования: Canary vs Feature Flags</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между Canary Release и Feature Flags (Флаги функций)?<br />
-<strong>Ответ:</strong> Feature Flags — это изменение логики <em>внутри</em> одного бинарника. Вы деплоите один и тот же Go-код всем, но для части пользователей (по куки/БД) включаете новый <code>if</code>. Canary — это запуск <em>отдельного бинарника</em> (изолированного процесса) для части трафика.<br />
-Feature Flags проще в инфраструктурном плане, но имеют риск "загрязнения" кода (if-else) и не защищают от утечек памяти (OOM) в новом коде — он работает на тех же процессах, что и старый. Canary изолирует риски на уровне процессов/нод, но требует сложной инфраструктуры (Ingress/Mesh).</p>
+    <p><strong>Вопрос:</strong> В чем архитектурное отличие между Canary Release и Feature Flags (Флагами функций)?<br />
+<strong>Ответ:</strong> <br />
+* <strong>Feature Flags (Переключатели функций):</strong> Управляют поведением <em>внутри единого исполняемого файла</em>. Вы деплоите один и тот же бинарник на все 100% серверов, а логику переключаете динамически через внешнюю конфигурацию (LaunchDarkly, Unleash или etcd). Плюс: мгновенное включение без перезапуска. Минус: код обрастает ветвлениями <code>if/else</code>, а фатальный баг (паника или утечка памяти) положит весь под целиком.<br />
+* <strong>Canary Release:</strong> Изоляция на уровне <em>процессов и контейнеров</em>. Вы запускаете физически разные бинарники в независимых подах. Если канарейка падает в OOM Kill или пожирает 100% CPU, она изолирована в своих cgroups и не затронет стабильный кластер.</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Blue-Green</strong> дает мгновенное переключение и откат, но требует двойных ресурсов (2x Pods) и сложной стратегии миграции БД (Expand/Contract).</li>
-<li><strong>Canary</strong> — золотой стандарт безопасного деплоя. Трафик переводится на новую версию постепенно (1% -&gt; 100%).</li>
-<li><strong>Nginx Ingress Canary</strong> — простой способ реализовать Canary без Service Mesh через аннотации и веса.</li>
-<li><strong>Кэши и сериализация</strong>: В Go используйте совместимую сериализацию JSON и версионирование ключей в Redis при сосуществовании старой и новой версий.</li>
-<li><strong>Observability</strong>: Canary слеп без метрик. Выделение трафика на <code>v2</code> требует лейбла <code>version</code> в Prometheus.</li>
+<li><strong>Blue-Green:</strong> Обеспечивает мгновенное переключение трафика на уровне Service Selector и мгновенный откат, но требует двойного запаса вычислительных мощностей.</li>
+<li><strong>Expand/Contract:</strong> Обязательный паттерн миграции баз данных при Blue-Green релизах, исключающий поломку старых реплик из-за изменений DDL.</li>
+<li><strong>Canary Release:</strong> Минимизирует бизнес-риски, направляя 1–5% пользователей на новую версию с непрерывным контролем метрик.</li>
+<li><strong>Nginx Ingress Canary:</strong> Реализует канареечное разделение через аннотации <code>canary: "true"</code> и <code>canary-weight</code>, а также поддерживает A/B-тестирование по заголовку <code>X-Canary</code>.</li>
+<li><strong>gRPC Caveat:</strong> Из-за мультиплексирования HTTP/2 Nginx Ingress балансирует TCP-соединения, а не отдельные gRPC-вызовы. Для стримов gRPC необходим Envoy / Service Mesh.</li>
+<li><strong>Метрики и кэш в Go:</strong> Обязательно добавляйте лейбл <code>version</code> во все векторы метрик Prometheus и версионируйте ключи Redis (<code>user:123:v2</code>).</li>
 </ol>
-<p>Развертывание новых версий — это только половина дела. Чтобы понимать, не "умерла ли канарейка", вам нужна глубокая наблюдаемость за инфраструктурой. В следующей статье мы разберем мониторинг железа и подов: <a href="4-monitoring-infrastruktury.html" class="wikilink">4. Мониторинг инфраструктуры</a>.</p>
+<p>Чтобы канареечный релиз приносил пользу, инженеры должны непрерывно видеть состояние здоровья серверов, контейнеров и рантайма. В следующей статье мы погрузимся в телеметрию низкого уровня: <a href="4-monitoring-infrastruktury.html" class="wikilink">4. Мониторинг инфраструктуры</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2412,7 +2542,7 @@ Feature Flags проще в инфраструктурном плане, но и
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#blue-green-deployment-mgnovennoe-pereklyuchenie">Blue-Green Deployment: Мгновенное переключение</a></li><li class="toc-item toc-h3"><a href="#akhillesova-pyata-blue-green-migratsii-bd">Ахиллесова пята Blue-Green: Миграции БД</a></li><li class="toc-item toc-h2"><a href="#canary-deployment-testirovanie-na-realnykh-lyudyakh">Canary Deployment: Тестирование на реальных людях</a></li><li class="toc-item toc-h3"><a href="#realizatsiya-canary-v-nginx-ingress">Реализация Canary в Nginx Ingress</a></li><li class="toc-item toc-h3"><a href="#tochnyy-targeting-ab-testing">Точный таргетинг (A/B Testing)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-spetsifika-go-pri-canary">Mechanical Sympathy: Специфика Go при Canary</a></li><li class="toc-item toc-h3"><a href="#1-problema-keshey-cache-incoherence">1. Проблема кэшей (Cache Incoherence)</a></li><li class="toc-item toc-h3"><a href="#2-observability-vy-ne-mozhete-uluchshit-to-chto-ne-vidite">2. Observability: Вы не можете улучшить то, что не видите</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-blue-green-deployment-mgnovennaya-rokirovka-okruzheniy">1. Blue-Green Deployment: Мгновенная рокировка окружений</a></li><li class="toc-item toc-h3"><a href="#poshagovyy-protokol-pereklyucheniya-cutover">Пошаговый протокол переключения (Cutover):</a></li><li class="toc-item toc-h2"><a href="#2-akhillesova-pyata-blue-green-bazy-dannykh-i-pattern-expandcontract">2. Ахиллесова пята Blue-Green: Базы данных и паттерн Expand/Contract</a></li><li class="toc-item toc-h3"><a href="#spasenie-pattern-expandcontract-parallel-run">Спасение: Паттерн Expand/Contract (Parallel Run)</a></li><li class="toc-item toc-h2"><a href="#3-canary-deployment-proverka-boem-na-zhivykh-polzovatelyakh">3. Canary Deployment: Проверка боем на живых пользователях</a></li><li class="toc-item toc-h2"><a href="#4-realizatsiya-canary-cherez-nginx-ingress-magiya-annotatsiy">4. Реализация Canary через Nginx Ingress: Магия аннотаций</a></li><li class="toc-item toc-h3"><a href="#1-stabilnyy-ingress-osnovnoy-trafik">1. Стабильный Ingress (Основной трафик):</a></li><li class="toc-item toc-h3"><a href="#2-kanareechnyy-ingress-1-trafika">2. Канареечный Ingress (1% трафика):</a></li><li class="toc-item toc-h3"><a href="#tochnyy-targeting-ab-testing-i-vnutrenniy-dogfooding">Точный таргетинг (A/B Testing и внутренний Dogfooding)</a></li><li class="toc-item toc-h2"><a href="#5-mechanical-sympathy-podvodnye-kamni-canary-v-rantayme-go">5. Mechanical Sympathy: Подводные камни Canary в рантайме Go</a></li><li class="toc-item toc-h3"><a href="#1-problema-keshey-cache-incoherence">1. Проблема кэшей (Cache Incoherence)</a></li><li class="toc-item toc-h3"><a href="#2-observability-vy-ne-mozhete-uluchshit-to-chto-ne-vidite">2. Observability: Вы не можете улучшить то, что не видите</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

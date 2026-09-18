@@ -2169,31 +2169,45 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Кэширование в nginx</h1>
           </header>
 
           <div class="article-markdown">
-            <p>После того как Nginx расшифровал TLS и отбалансировал трафик, на его плечах остается еще одна критически важная задача — защита ваших Go-инстансов от ненужной работы. Кэширование ответов на уровне прокси-сервера — это мощнейший инструмент масштабирования.</p>
-<p>Когда мы говорим о кэшировании в бэкенде, часто вспоминают Redis или in-memory кэши внутри Go (например, BigCache, FreeCache). Но кэширование в Nginx имеет принципиальное отличие: оно происходит <strong>до того, как запрос вообще коснется вашего приложения</strong>.</p>
-<h2 id="mechanical-sympathy-pochemu-nginx-kesh-luchshe-go-kesha-dlya-statiki-i-tyazhelyk">Mechanical Sympathy: Почему Nginx-кэш лучше Go-кэша для статики и тяжелых GET</h2>
+            <h1>Кэширование в Nginx: Разгрузка Go-бэкенда, борьба с Thundering Herd и Page Cache</h1>
+<p>После того как Nginx расшифровал входящий TLS-трафик и отбалансировал потоки между инстансами, перед ним открывается еще одна мощнейшая оптимизационная возможность — <strong>кэширование ответов на пограничном уровне (Edge Caching)</strong>.</p>
+<p>В бэкенд-разработке под кэшированием обычно понимают in-memory структуры данных внутри процесса Go (такие как <code>sync.Map</code>, локальные кэши без сборщика мусора вроде <code>BigCache</code> или <code>FreeCache</code>), либо внешние распределенные хранилища (Redis, Memcached, KeyDB).</p>
+<p>Однако кэширование на уровне обратного прокси Nginx обладает фундаментальным преимуществом: <strong>оно отрабатывает до того, как сетевой пакет вообще коснется вашего приложения</strong>.</p>
+<hr />
+<h2 id="1-mechanical-sympathy-pochemu-nginx-kesh-effektivnee-go-kesha-dlya-tyazhelykh-ge">1. Mechanical Sympathy: Почему Nginx-кэш эффективнее Go-кэша для тяжелых GET-запросов</h2>
 
-<p>Представьте, что у вас есть тяжелый аналитический GET-эндпоинт в Go, который делает 3 запроса в PostgreSQL и собирает JSON-ответ на 500 КБ за 300 мс. <br />
-Если вы кэшируете это в Redis, запрос всё равно дойдет до Go-приложения, рантайм выделит память под HTTP-структуры, горутина сделает сетевой запрос в Redis, получит данные, распарсит их, запишет в сокет и только потом Garbage Collector уберет этот мусор.</p>
-<p>Если этот ответ закэширован в Nginx, происходит следующее:<br />
-1. Запрос попадает в Worker Nginx.<br />
-2. Nginx находит ключ в кэше.<br />
-3. Nginx использует системный вызов <code>sendfile()</code> (о котором мы говорили в статье <a href="1-nginx-arkhitektura.html" class="wikilink">1. nginx. Архитектура</a>), чтобы перекинуть данные прямо из Page Cache операционной системы в сокет клиента.<br />
-4. <strong>Go-приложение вообще не знает, что этот запрос был.</strong> Ноль аллокаций в куче, ноль работы GC, ноль нагрузки на CPU.</p>
-<h2 id="arkhitektura-kesha-nginx-disk-i-pamyat">Архитектура кэша Nginx: Диск и Память</h2>
-
-<p>Nginx использует двухуровневую архитектуру для кэширования:</p>
+<p>Представьте типичный аналитический сценарий: клиент запрашивает сложный дашборд через HTTP GET. Чтобы сформировать JSON-ответ размером 500 КБ, сервис на Go выполняет 3 запроса в PostgreSQL, агрегирует данные и сериализует результат в течение 300 мс.</p>
+<h3 id="esli-keshirovat-dannye-v-redis">Если кэшировать данные в Redis:</h3>
 <ol>
-<li><strong>Диск (Disk)</strong>: Само тело HTTP-ответа и заголовки пишутся в файлы на диске. Nginx не боится дискового IO, так как операционная система кэширует эти файлы в Page Cache (RAM).</li>
-<li><strong>Разделяемая память (Shared Memory - Keys Zone)</strong>: Чтобы не искать файлы на диске по имени (что медленно), Nginx хранит в оперативной памяти красно-черное дерево (Red-Black Tree) с ключами кэша (MD5-хеш URL) и метаданными (флаги актуальности, время истечения).</li>
+<li>Запрос приходит в сокет Go-сервера.</li>
+<li>Сетевой поллер Go будит горутину, рантайм аллоцирует структуры <code>http.Request</code> и контекст.</li>
+<li>Горутина по TCP обращается в Redis, вычитывает 500 КБ JSON, парсит их или передает в <code>w.Write()</code>.</li>
+<li>Рантайм Go удерживает сотни килобайт в куче (Heap), нагружая Garbage Collector сканированием объектов.</li>
+<li>При 5 000 RPS даже при стопроцентном попадании в Redis Go-сервер сжигает процессорные ядра только на сетевой маршалинг и сборку мусора.</li>
 </ol>
+<h3 id="esli-otvet-zakeshirovan-v-nginx">Если ответ закэширован в Nginx:</h3>
+<ol>
+<li>Запрос попадает в однопоточный Worker Nginx.</li>
+<li>Воркер находит ключ в разделяемой памяти и определяет файл с телом ответа.</li>
+<li>Nginx вызывает системный вызов ядра <strong><code>sendfile()</code></strong> (о котором мы говорили в статье <a href="1-nginx-arkhitektura.html" class="wikilink">1. nginx. Архитектура</a>), передавая закэшированные байты <strong>напрямую из Page Cache операционной системы в сетевой сокет</strong>.</li>
+<li><strong>Go-бэкенд вообще не узнает о существовании этого запроса!</strong> Нулевое потребление CPU в Go, ноль аллокаций в куче, ноль пауз сборщика мусора. Сервер способен отдавать десятки тысяч ответов в секунду на скорости сетевого интерфейса.</li>
+</ol>
+<hr />
+<h2 id="2-arkhitektura-kesha-nginx-disk-i-razdelyaemaya-pamyat">2. Архитектура кэша Nginx: Диск и Разделяемая память</h2>
+
+<p>Nginx реализует элегантную гибридную архитектуру кэша:</p>
+<ol>
+<li><strong>Дисковая подсистема (Disk Storage):</strong> Тела HTTP-ответов и оригинальные заголовки бэкенда записываются в обычные файлы на диске. Это решение исключительно надежно и быстро, поскольку операционная система Linux автоматически удерживает часто запрашиваемые дисковые блоки в оперативной памяти — в системном кэше страниц (<strong>Page Cache</strong>).</li>
+<li><strong>Разделяемая память (Shared Memory Keys Zone):</strong> Поиск файла на диске по строковому имени при каждом запросе создавал бы недопустимые задержки ввода-вывода (Disk I/O). Поэтому Nginx хранит все метаданные кэша в оперативной памяти, в структуре данных <strong>Красно-черное дерево (Red-Black Tree)</strong>. Узел дерева содержит MD5-хэш ключа кэша, размер файла, временные метки валидности и счетчик обращений.</li>
+</ol>
+<p>Базовая конфигурация в <code>nginx.conf</code>:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2203,7 +2217,7 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-nginx"><code class="language-nginx"># Определяем зону кэша
+  <pre class="language-nginx"><code class="language-nginx"># Задаем параметры глобальной зоны кэширования
 proxy_cache_path /var/cache/nginx/api 
                  levels=1:2 
                  keys_zone=api_cache:10m 
@@ -2216,17 +2230,20 @@ proxy_cache_path /var/cache/nginx/api
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Роль параметров levels и use_temp_path</span>
   </div>
   <div class="callout-body">
-    <p>Параметр <code>levels=1:2</code> критически важен для производительности файловой системы Linux. Если его не указать, Nginx создаст одну директорию и положит туда миллионы файлов (например, по одному на каждый ID товара). Файловые системы (ext4, xfs) начинают катастрофически тормозить при поиске в директориях с &gt;10 000 файлов (линейный поиск). Параметр <code>levels</code> создает двухуровневую иерархию директорий на основе хеша, распределяя файлы равномерно, как в шардировании БД.<br />
-<code>use_temp_path=off</code> заставляет Nginx писать временные файлы прямо в конечную папку кэша, избегая дорогостоящего перемещения файлов (rename) между разными дисковыми разделами.</p>
+    <p>Директива <code>levels=1:2</code> критически важна для производительности файловых систем Linux (ext4, XFS).</p>
+<p>Если опустить этот параметр, Nginx сохранит все кэш-файлы в единый плоский каталог. Когда число записей превысит 10 000–50 000 файлов, системные вызовы <code>open()</code> и <code>stat()</code> начнут фатально деградировать из-за коллизий в B-Tree каталогов файловой системы.</p>
+<p>Конфигурация <code>levels=1:2</code> создает двухуровневую иерархию поддиректорий на основе последних символов MD5-хэша (например, <code>/var/cache/nginx/api/f/4a/b6...4af</code>), распределяя миллионы файлов равномерно по тысячам подпапок.</p>
+<p>Параметр <code>use_temp_path=off</code> приказывает Nginx записывать входящие ответы бэкенда непосредственно во временные файлы целевой файловой системы кэша. Это исключает дорогостоящую операцию копирования между разными разделами диска при финализации файла (<code>rename()</code>).</p>
   </div>
 </div>
 
-<h2 id="zhiznennyy-tsikl-zaprosa-v-keshe">Жизненный цикл запроса в кэше</h2>
+<hr />
+<h2 id="3-zhiznennyy-tsikl-zaprosa-v-keshe">3. Жизненный цикл запроса в кэше</h2>
 
-<p>Как Nginx принимает решение — отдать из кэша или пойти в Go?</p>
+<p>При получении HTTP-запроса Nginx выполняет строгий алгоритм:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2257,11 +2274,16 @@ K --&gt; L[&quot;Отдача ответа клиенту&quot;]
 </div>
 
 
-<h2 id="thundering-herd-stadnyy-effekt-i-cache-lock">Thundering Herd (Стадный эффект) и Cache Lock</h2>
+<hr />
+<h2 id="4-thundering-herd-stadnyy-effekt-i-direktiva-proxycachelock">4. Thundering Herd (Стадный эффект) и директива proxy_cache_lock</h2>
 
-<p>Самая опасная ситуация для кэширующего прокси — <strong>Cache Stampede</strong> (или Thundering Herd). Представьте, что кэш тяжелого ответа протух ровно в 12:00:00. В 12:00:01 на ваш сервер приходит 1000 запросов на этот URL.</p>
-<p>Если Nginx просто проверит кэш, увидит, что он просрочен, и отправит все 1000 запросей в Go-бэкенд, ваш сервис ляжет от CPU-спайка или исчерпания пула коннектов к БД.</p>
-<p>Для решения этой проблемы существует директива <code>proxy_cache_lock</code>. Когда она включена, Nginx разрешает только <em>одному</em> запросу идти в бэкенд за свежими данными. Остальные 999 запросов ждут (обслуживаясь из просроченного кэша, если включен <code>proxy_cache_use_stale updating</code>), пока первый запрос не обновит кэш.</p>
+<p>Самая опасная аварийная ситуация для кэширующей системы — явление <strong>Cache Stampede</strong> (или <strong>Thundering Herd</strong> — эффект стадного наплыва).</p>
+<p>Представьте высоконагруженный эндпоинт каталога с трафиком 2 000 RPS. Время жизни кэша (TTL) составляет 10 минут. В <code>12:00:00</code> срок жизни кэша истекает. </p>
+<p>Если Nginx не защищен, в <code>12:00:01</code> все 2 000 одновременных запросов обнаружат <code>Cache MISS</code> и синхронно ринутся в Go-бэкенд! В этот момент:<br />
+* Go мгновенно порождает 2 000 параллельных горутин.<br />
+* База данных получает 6 000 тяжелых SQL-запросов одновременно.<br />
+* Пул соединений PostgreSQL исчерпывается, процессор уходит в полку, и сервер падает по таймауту.</p>
+<p>Для предотвращения этой катастрофы Nginx предоставляет спасительную связку директив:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2276,21 +2298,27 @@ K --&gt; L[&quot;Отдача ответа клиенту&quot;]
     proxy_cache_valid 200 10m;  // Кэшируем успешные ответы на 10 минут
     proxy_cache_key $uri$is_args$args;
 
-    # Включаем защиту от Thundering Herd
+    # Включаем блокировку Thundering Herd: только один запрос идет в Go!
     proxy_cache_lock on;
     proxy_cache_lock_timeout 5s;
 
-    # Отдаем просроченный кэш, пока обновляем его в фоне
+    # Отдаем просроченный кэш, пока один запрос обновляет его в фоне
     proxy_cache_use_stale updating error timeout;
 }
 </code></pre>
 </div>
 
-<h2 id="vzaimodeystvie-go-i-nginx-kontrakt-zagolovkov">Взаимодействие Go и Nginx: Контракт заголовков</h2>
+<h3 id="kak-rabotaet-proxycachelock">Как работает `proxy_cache_lock`:</h3>
+<ol>
+<li>При протухании кэша Nginx пропускает к Go-бэкенду <strong>ровно один запрос</strong>, который захватывает внутренний мьютекс блокировки.</li>
+<li>Остальные 1 999 запросов либо ждут освобождения блокировки, либо — если указана директива <code>proxy_cache_use_stale updating</code> — <strong>мгновенно получают слегка устаревший ответ из старого кэша</strong>.</li>
+<li>Клиенты не видят задержек, база данных не замечает скачка нагрузки, а кэш бесшовно обновляется в фоне.</li>
+</ol>
+<hr />
+<h2 id="5-kontrakt-zagolovkov-mezhdu-go-i-nginx">5. Контракт заголовков между Go и Nginx</h2>
 
-<p>Важно понимать, кто управляет временем жизни кэша. Nginx может жестко задать его в конфиге (<code>proxy_cache_valid 200 10m</code>), но в микросервисной архитектуре это негибко. Разные эндпоинты могут требовать разное время жизни (TTL).</p>
-<p>Идиоматичный подход — делегировать управление кэшем Go-приложению с помощью стандартных HTTP-заголовков <code>Cache-Control</code> и <code>Expires</code>.</p>
-<p>Чтобы Nginx уважал заголовки от бэкенда, нужно включить:</p>
+<p>Жестко прописывать TTL в конфигурации Nginx (<code>proxy_cache_valid 200 10m</code>) неудобно при микросервисной разработке: изменение логики кэширования требует передеплоя инфраструктуры.</p>
+<p>Идиоматичный подход — <strong>делегировать управление временем жизни кэша самому Go-сервису</strong> через стандартные HTTP-заголовки <code>Cache-Control</code> и <code>Expires</code>:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2300,16 +2328,21 @@ K --&gt; L[&quot;Отдача ответа клиенту&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-nginx"><code class="language-nginx">proxy_cache_valid 200 302 10m; # Дефолтный TTL
-proxy_cache_valid 404 1m;      # Кэшируем 404 на 1 минуту
+  <pre class="language-nginx"><code class="language-nginx">location /api/ {
+    proxy_cache api_cache;
 
-# Заставляем Nginx слушать заголовки Go-приложения
-proxy_ignore_headers Set-Cookie; # Куки не должны мешать кэшированию
-proxy_hide_header Set-Cookie;    # Убираем куки из ответа клиенту, чтобы они не кэшировались в браузере
+    # Запасные дефолтные значения TTL
+    proxy_cache_valid 200 302 10m; # Дефолтный TTL
+    proxy_cache_valid 404 1m;      # Кэшируем 404 на 1 минуту
+
+    # Разрешаем кэширование, игнорируя мешающие служебные заголовки
+    proxy_ignore_headers Set-Cookie; # Куки не должны мешать кэшированию
+    proxy_hide_header Set-Cookie;    # Убираем куки из ответа клиенту, чтобы они не кэшировались в браузере
+}
 </code></pre>
 </div>
 
-<p>В Go-коде вы управляете кэшем так:</p>
+<p>В Go-коде программист явно управляет поведением Nginx:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2319,14 +2352,25 @@ proxy_hide_header Set-Cookie;    # Убираем куки из ответа к�
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func heavyHandler(w http.ResponseWriter, r *http.Request) {
-    // ... тяжелая логика ...
+  <pre class="language-go"><code class="language-go">package main
 
+import (
+    &quot;net/http&quot;
+)
+
+func heavyHandler(w http.ResponseWriter, r *http.Request) {
+    // 1. Вычисление тяжелого ответа...
+    jsonData := []byte(`{&quot;status&quot;:&quot;ok&quot;,&quot;data&quot;:&quot;complex analytics&quot;}`)
+
+    // 2. Управляем кэшем Nginx через стандартные заголовки:
     // Говорим Nginx кэшировать на 5 минут
     w.Header().Set(&quot;Cache-Control&quot;, &quot;public, max-age=300&quot;)
-    // Или явно запрещаем кэшировать этот конкретный ответ
+
+    // Если бы потребовалось запретить кэширование этого конкретного ответа:
     // w.Header().Set(&quot;Cache-Control&quot;, &quot;no-cache, no-store, must-revalidate&quot;)
 
+    w.Header().Set(&quot;Content-Type&quot;, &quot;application/json&quot;)
+    w.WriteHeader(http.StatusOK)
     w.Write(jsonData)
 }
 </code></pre>
@@ -2335,30 +2379,41 @@ proxy_hide_header Set-Cookie;    # Убираем куки из ответа к�
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Куки убивают кэширование</span>
   </div>
   <div class="callout-body">
-    <p>Если ваше Go-приложение возвращает заголовок <code>Set-Cookie</code> (например, устанавливает сессию), Nginx <strong>по умолчанию отказывается кэшировать такой ответ</strong>. Это логично: иначе один пользователь получил бы куки другого. Но если вы кэшируете публичный API, и где-то в мидлваре globally ставится <code>Set-Cookie</code> (даже пустой), ваш кэш перестанет работать. Решение — <code>proxy_ignore_headers Set-Cookie;</code> с последующим сокрытием его от клиента <code>proxy_hide_header Set-Cookie;</code>.</p>
+    <p>По спецификации RFC и дефолтной логике Nginx: если бэкенд возвращает заголовок <code>Set-Cookie</code>, Nginx <strong>категорически отказывается кэшировать такой ответ</strong>. Это разумная мера предосторожности: иначе сессионная кука пользователя А закэшировалась бы и отправилась пользователю B.</p>
+<p>Однако в Go-сервисах глобальные middleware (например, логирование сессий или CSRF) часто проставляют <code>Set-Cookie</code> даже на публичные GET-эндпоинты. В результате кэш тихо перестает работать, а инженеры недоумевают, почему нагрузка на Go не падает. </p>
+<p><strong>Решение:</strong> На публичных API-маршрутах обязательно указывайте <code>proxy_ignore_headers Set-Cookie;</code> и <code>proxy_hide_header Set-Cookie;</code>.</p>
   </div>
 </div>
 
-<h2 id="invalidatsiya-kesha-purge">Инвалидация кэша: Purge</h2>
+<hr />
+<h2 id="6-invalidatsiya-kesha-purge-i-cache-busting">6. Инвалидация кэша: Purge и Cache Busting</h2>
 
-<p>Рано или поздно данные в БД обновятся, и вам нужно сбросить кэш до истечения TTL. Самый топорный способ — перезапустить Nginx или удалить файлы с диска. Правильный путь — использовать коммерческий модуль Nginx Plus или модуль <code>ngx_cache_purge</code> (собранный из исходников).</p>
-<p>Он позволяет сбросить кэш по ключу HTTP-запросом:<br />
-<code>PURGE /api/v1/data/123 HTTP/1.1</code></p>
-<p>Если у вас нет возможности использовать эти модули, в Go-бэкенде применяют паттерн <strong>Cache Busting через URL</strong>. Вместо <code>/api/data</code> запрашивают <code>/api/data?v=2</code>. Nginx посчитает новый MD5-хеш и пойдет в Go за свежими данными.</p>
+<p>Рано или поздно данные в базе данных обновляются, и закэшированный ответ становится неактуальным до истечения TTL.</p>
+<p>Существует несколько стратегий инвалидации:</p>
+<ol>
+<li><strong>Модуль <code>ngx_cache_purge</code> (или Nginx Plus):</strong> Позволяет удалять записи из кэша точечным HTTP-запросом специального метода:<br />
+<code>http
+   PURGE /api/v1/data/123 HTTP/1.1
+   Host: api.example.com</code></li>
+<li><strong>Паттерн Cache Busting через URL:</strong> Если сторонние модули недоступны, в Go-архитектуре используют версионирование ключей: клиент обращается к URL вида <code>/api/data?v=2</code>. Nginx вычисляет новый MD5-хэш от ключа <code>$uri$is_args$args</code> и идет в Go за свежей копией.</li>
+</ol>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Очистка кэша Nginx без сторонних модулей</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как очистить кэш Nginx без модуля <code>ngx_cache_purge</code> и перезапуска сервера?<br />
-<strong>Ответ:</strong> Использовать "трюк" с заголовком из бэкенда. Go-приложение при обновлении данных может вернуть ответ с заголовком <code>Cache-Control: no-cache</code> или специальным <code>X-Accel-Expires: 0</code> (собственный заголовок Nginx). Nginx увидит его, удалит закэшированный файл, и следующий запрос заставит его сделать новый запрос в бэкенд. Альтернатива — менять версию в <code>proxy_cache_key</code> (например, добавлять <code>$http_x_app_version</code>), что делает старый кэш автоматически невалидным.</p>
+    <p><strong>Вопрос:</strong> Как очистить кэш Nginx без модуля <code>ngx_cache_purge</code> и перезапуска сервера?</p>
+<p><strong>Ответ:</strong><br />
+1. <strong>Специальный заголовок от Go-бэкенда:</strong> Go-приложение при обнаружении обновлений может вернуть ответ с директивой <code>Cache-Control: no-cache</code> или специализированным заголовком Nginx <strong><code>X-Accel-Expires: 0</code></strong>. Nginx немедленно признает локальный файл кэша устаревшим и перезапишет его свежими данными.<br />
+2. <strong>Динамическая версия в ключе кэширования:</strong> Добавить в <code>proxy_cache_key</code> кастомный заголовок версии приложения (например, <code>$http_x_app_version</code>). При деплое новой версии достаточно инкрементировать версию на клиенте — старый кэш автоматически вымоется по <code>inactive=60m</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
@@ -2396,7 +2451,7 @@ proxy_hide_header Set-Cookie;    # Убираем куки из ответа к�
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-nginx-kesh-luchshe-go-kesha-dlya-statiki-i-tyazhelyk">Mechanical Sympathy: Почему Nginx-кэш лучше Go-кэша для статики и тяжелых GET</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-kesha-nginx-disk-i-pamyat">Архитектура кэша Nginx: Диск и Память</a></li><li class="toc-item toc-h2"><a href="#zhiznennyy-tsikl-zaprosa-v-keshe">Жизненный цикл запроса в кэше</a></li><li class="toc-item toc-h2"><a href="#thundering-herd-stadnyy-effekt-i-cache-lock">Thundering Herd (Стадный эффект) и Cache Lock</a></li><li class="toc-item toc-h2"><a href="#vzaimodeystvie-go-i-nginx-kontrakt-zagolovkov">Взаимодействие Go и Nginx: Контракт заголовков</a></li><li class="toc-item toc-h2"><a href="#invalidatsiya-kesha-purge">Инвалидация кэша: Purge</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-mechanical-sympathy-pochemu-nginx-kesh-effektivnee-go-kesha-dlya-tyazhelykh-ge">1. Mechanical Sympathy: Почему Nginx-кэш эффективнее Go-кэша для тяжелых GET-запросов</a></li><li class="toc-item toc-h3"><a href="#esli-keshirovat-dannye-v-redis">Если кэшировать данные в Redis:</a></li><li class="toc-item toc-h3"><a href="#esli-otvet-zakeshirovan-v-nginx">Если ответ закэширован в Nginx:</a></li><li class="toc-item toc-h2"><a href="#2-arkhitektura-kesha-nginx-disk-i-razdelyaemaya-pamyat">2. Архитектура кэша Nginx: Диск и Разделяемая память</a></li><li class="toc-item toc-h2"><a href="#3-zhiznennyy-tsikl-zaprosa-v-keshe">3. Жизненный цикл запроса в кэше</a></li><li class="toc-item toc-h2"><a href="#4-thundering-herd-stadnyy-effekt-i-direktiva-proxycachelock">4. Thundering Herd (Стадный эффект) и директива proxycachelock</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-proxycachelock">Как работает proxycachelock:</a></li><li class="toc-item toc-h2"><a href="#5-kontrakt-zagolovkov-mezhdu-go-i-nginx">5. Контракт заголовков между Go и Nginx</a></li><li class="toc-item toc-h2"><a href="#6-invalidatsiya-kesha-purge-i-cache-busting">6. Инвалидация кэша: Purge и Cache Busting</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

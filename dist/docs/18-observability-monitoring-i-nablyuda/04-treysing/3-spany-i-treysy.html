@@ -2169,26 +2169,35 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 18</span>
-              <span class="meta-tag read-time">⏱ ~12 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Спаны и трейсы</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="anatomiya-zaprosa">Анатомия запроса</h2>
+            <h1>3. Спаны и трейсы: Анатомия и жизненный цикл единицы распределенной работы</h1>
+<blockquote>
+<p><em>"A distributed system is one in which the failure of a computer you didn't even know existed can render your own computer unusable."</em><br />
+— Лесли Лэмпорт</p>
+</blockquote>
+<p>В предыдущей статье мы рассмотрели OpenTelemetry как глобальный индустриальный стандарт и архитектурный мост между кодом приложения и коллекторами данных. Теперь спустимся на уровень рантайма языка Go и препарируем фундаментальные кирпичики, из которых складывается вся картина наблюдаемости: <strong>Спаны (Spans)</strong> и <strong>Трейсы (Traces)</strong>.</p>
+<p>Понимание внутреннего устройства спана, цены его создания в памяти и семантики передачи контекста через функции — это обязательный навык Senior Go-инженера. Без этого легко превратить высокопроизводительный сервис в генератор лишних аллокаций и взаимных блокировок.</p>
+<hr />
+<h2 id="anatomiya-zaprosa">Анатомия запроса</h2>
 
-<p>В предыдущей статье мы обсудили OpenTelemetry как стандарт. Теперь спустимся на уровень ниже и разберем, из чего состоит трейс в рантайме Go. Понимание структуры Спанов (Span) и их жизненного цикла критически важно для написания эффективного инструментария.</p>
-<p>Трейс — это не монолитная сущность. Это дерево, состоящее из узлов — <strong>Спанов</strong>.</p>
+<p>Трейс — это не монолитный непрерывный лог. Это направленный ациклический граф (DAG), узлами которого являются отдельные дискретные операции — <strong>Спаны</strong>.</p>
+<p>Если трейс представляет собой всю пьесу целиком (жизненный путь запроса от клика в браузере до фиксации транзакции в реплике СУБД), то спан — это отдельная реплика или действие конкретного актера на сцене.</p>
+<hr />
 <h2 id="struktura-spana">Структура Спана</h2>
 
 <p>Спан представляет собой атомарную единицу работы. В Go (через OpenTelemetry SDK) спан создается, живет в рамках функции и завершается.</p>
 <h3 id="klyuchevye-polya-spana">Ключевые поля Спана:</h3>
 
 <ol>
-<li><strong>Trace ID:</strong> Глобальный идентификатор всего запроса. Одинаков для всех спанов в рамках одного трейса (128 бит).</li>
-<li><strong>Span ID:</strong> Уникальный идентификатор конкретной операции (64 бит).</li>
-<li><strong>Parent Span ID:</strong> ID родительского спана. Именно это поле строит иерархию.</li>
+<li><strong>Trace ID:</strong> Глобальный идентификатор всего запроса. Одинаков для всех спанов в рамках одного трейса (128 бит / 16 байт).</li>
+<li><strong>Span ID:</strong> Уникальный идентификатор конкретной операции (64 бит / 8 байт).</li>
+<li><strong>Parent Span ID:</strong> ID родительского спана. Именно это поле строит иерархию (ссылка на родительский узел дерева).</li>
 <li><strong>Start/End Timestamp:</strong> Время начала и окончания работы.</li>
 <li><strong>Attributes:</strong> Метаданные (Key-Value), описывающие операцию (например, <code>http.method="GET"</code>).</li>
 <li><strong>Events:</strong> Лог-подобные события, произошедшие <em>внутри</em> спана (например, "получено сообщение из очереди").</li>
@@ -2218,10 +2227,16 @@ D1[&quot;Attribute: db.system=postgres&quot;]
 D2[&quot;Event: Acquired connection&quot;]
 D3[&quot;Status: Ok&quot;]
 end
+
+style A fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#fff
+style B fill:#312e81,stroke:#818cf8,color:#fff
+style C fill:#312e81,stroke:#818cf8,color:#fff
+style D fill:#0f172a,stroke:#10b981,color:#fff
   </pre>
 </div>
 
 
+<hr />
 <h2 id="under-the-hood-sozdanie-spana-v-go">Under the Hood: Создание Спана в Go</h2>
 
 <p>В Go создание спана происходит через объект <code>Tracer</code>. метод <code>tracer.Start</code> возвращает два значения: сам спан и новый контекст.</p>
@@ -2234,7 +2249,15 @@ end
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func myHandler(ctx context.Context) {
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+
+    &quot;go.opentelemetry.io/otel&quot;
+)
+
+func myHandler(ctx context.Context) {
     // Создаем дочерний спан от контекста, который пришел извне
     tr := otel.Tracer(&quot;my-service&quot;)
     ctx, span := tr.Start(ctx, &quot;myHandler-operation&quot;)
@@ -2248,15 +2271,20 @@ end
     // Если вызываем другую функцию, передаем обновленный ctx
     processPayment(ctx)
 }
+
+func processPayment(ctx context.Context) {
+    // Вложенная операция...
+}
 </code></pre>
 </div>
 
+<p>Контекст в Go иммутабелен (immutable). Вызов <code>tr.Start</code> не мутирует переданный <code>ctx</code>, а создает новую обертку <code>context.WithValue</code>, помещая туда указатель на созданный спан. Если вы передадите в дочернюю функцию старый <code>ctx</code>, новый спан не станет родителем для последующих операций!</p>
 <h3 id="mechanical-sympathy-tsena-sozdaniya-spana">Mechanical Sympathy: Цена создания спана</h3>
 
 <p>Многие боятся добавлять спаны, думая, что это «убьет» производительность. Давайте разберем, что происходит при вызове <code>tr.Start</code>:</p>
 <ol>
-<li><strong>Генерация ID:</strong> Требует криптографически стойкого (или псевдослучайного) генератора. Это не просто инкремент счетчика, это вычислительная работа.</li>
-<li><strong>Time Now:</strong> Вызов <code>time.Now()</code> — это системный вызов или чтение VDSO (в зависимости от ОС и версии Go). Это быстро, но не бесплатно.</li>
+<li><strong>Генерация ID:</strong> Требует криптографически стойкого (или псевдослучайного) генератора. Это не просто инкремент счетчика, это вычислительная работа. OpenTelemetry использует оптимизированные быстрые генераторы псевдослучайных чисел без блокировок глобального мьютекса.</li>
+<li><strong>Time Now:</strong> Вызов <code>time.Now()</code> — это системный вызов или чтение VDSO (в зависимости от ОС и версии Go). Это быстро, но не бесплатно. В современном Linux на x86-64/arm64 это чтение счетчика тактов процессора <code>RDTSC</code> через память VDSO без переключения контекста в ядро.</li>
 <li><strong>Сэмплирование (Sampling):</strong> Самое важное!<ul>
 <li>Если Sampler решает <strong>не записывать</strong> этот спан (например, <code>ProbabilitySampler</code> с вероятностью 1%), SDK возвращает <strong>NoopSpan</strong> (заглушку).</li>
 <li>Заглушка не записывает атрибуты, не отправляет данные. Она почти бесплатна (пара аллокаций на интерфейс).</li>
@@ -2264,14 +2292,17 @@ end
 </ul>
 </li>
 </ol>
+<hr />
 <h2 id="tipy-spanov">Типы Спанов</h2>
 
 <p>В OpenTelemetry есть два типа спанов, и их путают чаще всего.</p>
 <h3 id="1-internal-span-vnutrenniy">1. Internal Span (Внутренний)</h3>
+
 <p>Это спан, который описывает операцию <em>внутри</em> вашего сервиса.<br />
 *   <em>Семантика:</em> "Я делаю работу".<br />
 *   <em>Пример:</em> Функция валидации заказа, выполнение SQL-запроса через драйвер.</p>
 <h3 id="2-remote-span-client-server-spans-vneshniy">2. Remote Span / Client & Server Spans (Внешний)</h3>
+
 <p>Это спаны, описывающие взаимодействие с внешним миром (RPC).</p>
 <ul>
 <li><strong>Client Span:</strong> Создается отправителем <em>перед</em> вызовом внешнего сервиса. Время спана включает в себя сетевые задержки и ожидание ответа.<ul>
@@ -2280,6 +2311,34 @@ end
 </li>
 <li><strong>Server Span:</strong> Создается получателем <em>при входе</em> запроса. Он становится дочерним по отношению к Client Span'у отправителя (благодаря propagation).</li>
 </ul>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+participant S1 as Service 1 (Caller)
+participant S2 as Service 2 (Callee)
+
+Note over S1: Client Span Starts
+S1-&gt;&gt;S2: HTTP/gRPC Request (traceparent header)
+Note over S2: Server Span Starts (Child of Client Span)
+Note over S2: Business Logic Execution
+Note over S2: Server Span Ends
+S2--&gt;&gt;S1: HTTP/gRPC Response
+Note over S1: Client Span Ends
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2292,25 +2351,23 @@ end
   </div>
 </div>
 
+<hr />
 <h2 id="atributy-vs-sobytiya-events">Атрибуты vs События (Events)</h2>
 
 <p>Когда что использовать?</p>
 <ul>
-<li>
-<p><strong>Attributes (Атрибуты):</strong> Используйте для статических или квазистатических данных, по которым вы будете искать трейсы.</p>
-<ul>
+<li><strong>Attributes (Атрибуты):</strong> Используйте для статических или квазистатических данных, по которым вы будете искать трейсы.<ul>
 <li><em>Пример:</em> <code>user_id</code>, <code>order_id</code>, <code>http.status_code</code>.</li>
 <li><em>Осторожно:</em> Атрибуты с высокой кардинальностью (ID) могут раздуть индексы в бэкенде (Jaeger/Tempo).</li>
 </ul>
 </li>
-<li>
-<p><strong>Events (События):</strong> Используйте для точечных логов внутри спана.</p>
-<ul>
+<li><strong>Events (События):</strong> Используйте для точечных логов внутри спана.<ul>
 <li><em>Пример:</em> "Retry attempt 1", "Cache miss".</li>
 <li>События имеют timestamp и позволяют увидеть хронологию внутри одной операции без создания новых спанов.</li>
 </ul>
 </li>
 </ul>
+<hr />
 <h2 id="svyaz-s-oshibkami">Связь с ошибками</h2>
 
 <p>Обработка ошибок в трейсинге специфична.<br />
@@ -2324,19 +2381,30 @@ end
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">if err != nil {
-    // 1. Записываем событие об ошибке (StackTrace добавится автоматически в events)
-    span.RecordError(err)
+  <pre class="language-go"><code class="language-go">package main
 
-    // 2. Устанавливаем статус спана как Error
-    span.SetStatus(codes.Error, err.Error())
+import (
+    &quot;go.opentelemetry.io/otel/attribute&quot;
+    &quot;go.opentelemetry.io/otel/codes&quot;
+    &quot;go.opentelemetry.io/otel/trace&quot;
+)
 
-    // 3. Можно добавить атрибут, если нужно фильтровать по типу ошибки
-    span.SetAttributes(attribute.String(&quot;error.type&quot;, &quot;db_connection_failed&quot;))
+func handleOperation(span trace.Span, err error) {
+    if err != nil {
+        // 1. Записываем событие об ошибке (StackTrace добавится автоматически в events)
+        span.RecordError(err)
+
+        // 2. Устанавливаем статус спана как Error
+        span.SetStatus(codes.Error, err.Error())
+
+        // 3. Можно добавить атрибут, если нужно фильтровать по типу ошибки
+        span.SetAttributes(attribute.String(&quot;error.type&quot;, &quot;db_connection_failed&quot;))
+    }
 }
 </code></pre>
 </div>
 
+<p>Почему это так устроено? В Go ошибка — это значение. Функция может вернуть ошибку, которую вызывающий код успешно обработает (например, возьмет данные из кэша при ошибке БД). Если бы SDK красило спан в красный цвет при любом <code>err != nil</code>, графики трейсинга пестрели бы ложными паниками. Поэтому программист явно решает, является ли ошибка фатальным статусом (<code>codes.Error</code>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2349,6 +2417,7 @@ end
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>

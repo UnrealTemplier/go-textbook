@@ -2169,23 +2169,31 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. TLS termination</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В современном вебе передача данных в открытом виде (HTTP) — это преступление. Протокол HTTPS (HTTP поверх TLS) шифрует трафик, гарантируя его конфиденциальность и целостность. Но криптография — это тяжелая математика. </p>
-<p><strong>TLS Termination (Терминирование TLS)</strong> — это процесс расшифровки входящего HTTPS-трафика на граничном сервере (Nginx) и передача дальнейшего трафика к бэкенду уже в открытом виде (по протоколу HTTP). Nginx берет на себя всю криптографическую нагрузку, "терминируя" (завершая) защищенную сессию.</p>
-<h2 id="mechanical-sympathy-tsena-rukopozhatiya">Mechanical Sympathy: Цена рукопожатия</h2>
+            <h1>Терминация TLS в Nginx: Разгрузка CPU, ускорение TLS 1.3 и mTLS</h1>
+<p>В современном вебе передача сетевых данных в открытом виде (по протоколу HTTP) — непростительная ошибка с точки зрения безопасности. Протокол HTTPS (HTTP поверх защищенного транспортного уровня TLS) шифрует трафик, обеспечивая строгую конфиденциальность, аутентификацию сервера и целостность передаваемых пакетов.</p>
+<p>Однако криптография — это чрезвычайно тяжелая вычислительная математика. Операции асимметричного шифрования при установке защищенного соединения сжигают колоссальное количество процессорных тактов.</p>
+<p><strong>TLS Termination (Терминирование TLS)</strong> — это архитектурный паттерн, при котором входящие зашифрованные клиентские HTTPS-сессии расшифровываются на граничном шлюзе (<strong>Nginx</strong>). Дальше внутрь защищенного периметра инфраструктуры (к микросервисам на Go) очищенный трафик передается по легковесному и быстрому протоколу HTTP (или специализированному gRPC h2c). Nginx берет на себя всю криптографическую работу, терминируя защищенный канал на входе.</p>
+<hr />
+<h2 id="1-mechanical-sympathy-apparatnaya-tsena-rukopozhatiya-tls-handshake">1. Mechanical Sympathy: Аппаратная цена рукопожатия TLS Handshake</h2>
 
-<p>Чтобы понять, почему Nginx необходим перед Go-бэкендом для работы с TLS, нужно взглянуть на то, что происходит на уровне CPU при установке HTTPS-соединения.</p>
-<p>Процесс TLS Handshake (рукопожатие), особенно при использовании алгоритмов с асимметричным шифрованием (например, RSA или ECDHE), требует выполнения операций с гигантскими простыми числами. Это занимает тысячи тактов CPU. </p>
-<p>Если Go-приложение будет принимать HTTPS напрямую, каждый новый клиент будет заставлять рантайм Go выполнять тяжелые математические вычисления. Но хуже всего — <strong>медленные клиенты</strong>. Клиент с плохим интернетом будет медленно слать пакеты рукопожатия. Если это происходит в Go, горутина, отвечающая за соединение, будет долго висеть в памяти, удерживая выделенные буферы и заставляя Garbage Collector работать с растущим Heap. </p>
-<p>Nginx спасает Go от этого ада:<br />
-1. <strong>Асинхронность на C</strong>: Nginx работает на уровне событий ОС (epoll). Он легко пережидает медленные рукопожатия, не плодя тяжелые сущности в памяти.<br />
-2. <strong>Оптимизации ядра и OpenSSL</strong>: Nginx (скомпилированный с OpenSSL или BoringSSL) использует аппаратные инструкции процессора (например, AES-NI для симметричного шифрования), что недоступно "из коробки" для высокоуровневого Go-кода без ручного написания ассемблера.</p>
+<p>Чтобы осознать, почему выставление Go-сервера напрямую в публичный интернет с TLS — не всегда оптимальное инженерное решение, посмотрим на происходящее глазами процессора.</p>
+<p>Процесс установки защищенной сессии (<strong>TLS Handshake</strong>) опирается на ресурсоемкую асимметричную криптографию (алгоритмы RSA или кривые Диффи-Хеллмана ECDHE). Вычисление модульной экспоненты над 2048/4096-битными числами или скалярное умножение точек на эллиптических кривых требует сотен тысяч тактов CPU на каждое входящее соединение.</p>
+<p>Если Go-приложение принимает HTTPS напрямую, его планировщик вынужден постоянно выделять потоки ОС (<code>M</code>) под криптографические операции. Но главная угроза — <strong>медленные и нестабильные клиенты</strong>:<br />
+* Клиент на слабом мобильном канале передает сертификаты и ключевые пакеты с задержками в сотни миллисекунд.<br />
+* В рантайме Go горутина, обслуживающая такой сокет, висит в памяти, удерживая криптографический контекст, сессионные буферы кучи и блокируя системные ресурсы.<br />
+* При наплыве тысяч таких клиентов куча (Heap) раздувается, заставляя сборщик мусора (<strong>Garbage Collector</strong>) непрерывно сканировать долгоживущие структуры и просаживать throughput полезного бэкенда.</p>
+<h3 id="pochemu-nginx-effektivnee-spravlyaetsya-s-tls">Почему Nginx эффективнее справляется с TLS:</h3>
+<ol>
+<li><strong>Асинхронное событийно-ориентированное ядро на Си:</strong> Nginx использует системный вызов <code>epoll</code>. Он удерживает десятки тысяч медленных TLS-рукопожатий в компактных C-структурах, не аллоцируя динамические стеки горутин и не создавая работы для сборщика мусора.</li>
+<li><strong>Аппаратные векторные инструкции и OpenSSL:</strong> Nginx собирается с высокооптимизированными криптографическими библиотеками (OpenSSL, BoringSSL или wolfSSL). Они на уровне ассемблера используют специализированные векторные инструкции CPU — <strong>AES-NI</strong> (аппаратное шифрование AES на кремнии), CLMUL и AVX-512, выжимая предельный гигабитный трафик при минимальном нагреве кристаллов CPU.</li>
+</ol>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2200,19 +2208,21 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Клиент из интернета&quot;] --&gt;|&quot;1\. HTTPS - Тяжелый TLS Handshake&quot;| B[&quot;Nginx - Терминация&quot;]
-B --&gt;|&quot;2\. HTTP - Быстрый, без шифрования&quot;| C[&quot;Go Backend&quot;]
-C --&gt;|&quot;3\. HTTP Response&quot;| B
-B --&gt;|&quot;4\. HTTPS - Шифрование ответа&quot;| A
+A[&quot;Клиент из интернета&quot;] --&gt;|&quot;1. HTTPS - Тяжелый TLS Handshake&quot;| B[&quot;Nginx - Терминация&quot;]
+B --&gt;|&quot;2. HTTP - Быстрый, без шифрования&quot;| C[&quot;Go Backend&quot;]
+C --&gt;|&quot;3. HTTP Response&quot;| B
+B --&gt;|&quot;4. HTTPS - Шифрование ответа&quot;| A
   </pre>
 </div>
 
 
-<h2 id="sessii-tls-izbavlyaemsya-ot-handshake">Сессии TLS: Избавляемся от Handshake</h2>
+<hr />
+<h2 id="2-vozobnovlenie-sessiy-tls-izbavlyaemsya-ot-povtornogo-handshake">2. Возобновление сессий TLS: Избавляемся от повторного Handshake</h2>
 
-<p>Самый быстрый TLS Handshake — тот, который не произошел. Чтобы не делать тяжелые асимметричные вычисления при каждом новом соединении, в TLS существуют механизмы возобновления сессий. Nginx поддерживает их "из коробки".</p>
-<h3 id="1-session-ids">1. Session IDs</h3>
-<p>Клиент и сервер договариваются о коротком идентификаторе сессии. При повторном соединении клиент передает этот ID, и если Nginx помнит его (в кэше shared memory), рукопожатие сокращается: сервер пропускает этап асимметричной криптографии и сразу переходит к симметричному шифрованию.</p>
+<p>Самое быстрое криптографическое рукопожатие — то, которого удалось полностью избежать. Если клиент совершает серию запросов, повторный полный TLS Handshake (с асимметричным обменом ключами) создает неоправданную задержку в 1–2 сетевых round-trip'а (RTT).</p>
+<p>В протоколах TLS предусмотрены механизмы быстрого возобновления сессий (Session Resumption), которые Nginx поддерживает на уровне конфигурации:</p>
+<h3 id="1-session-ids-keshirovanie-na-storone-servera">1. Session IDs (Кэширование на стороне сервера)</h3>
+<p>Сервер и клиент сохраняют уникальный 32-байтный идентификатор сессии (<code>Session ID</code>). При повторном подключении клиент передает этот ID. Если Nginx находит его в кэше разделяемой памяти, этап асимметричных вычислений пропускается: стороны мгновенно восстанавливают симметричный ключ шифрования и начинают передачу данных.</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2222,43 +2232,66 @@ B --&gt;|&quot;4\. HTTPS - Шифрование ответа&quot;| A
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-nginx"><code class="language-nginx"># Выделяем 10 МБ в разделяемой памяти между воркерами для кэша сессий
+  <pre class="language-nginx"><code class="language-nginx"># Выделяем 10 МБ в разделяемой памяти между воркерами для кэша сессий (~40 000 сессий)
 ssl_session_cache shared:SSL:10m; 
 ssl_session_timeout 1d;
 </code></pre>
 </div>
 
-<h3 id="2-session-tickets-stateless">2. Session Tickets (Stateless)</h3>
-<p>Вместо того чтобы хранить состояние сессии на сервере (что проблемно при балансировке между множеством серверов Nginx), сервер шифрует данные сессии ключом, известным только ему, и отправляет клиенту в виде "билета". При следующем соединении клиент возвращает билет, Nginx расшифровывает его своим ключом и возобновляет сессию.</p>
+<h3 id="2-session-tickets-stateless-mekhanizm">2. Session Tickets (Stateless-механизм)</h3>
+<p>Хранение сессий в памяти Nginx плохо масштабируется при балансировке между несколькими серверами (клиент может прийти на другой хост, где нет нужного ID). В механизме <strong>Session Tickets</strong> (RFC 5077) сервер шифрует состояние сессии секретным симметричным мастер-ключом и отдает его клиенту в виде зашифрованного билета (Ticket). При следующем запросе клиент возвращает билет, Nginx расшифровывает его своим ключом и продолжает диалог.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Синхронизация Session Ticket Keys в кластере</span>
   </div>
   <div class="callout-body">
-    <p>Проблема Session Tickets в инфраструктуре с множеством инстансов Nginx: если ключи для шифрования билетов (ticket keys) на серверах разные, клиент, попавший после балансировки на другой Nginx-узел, не сможет возобновить сессию и пройдет полный Handshake. В Production необходимо синхронизировать <code>ssl_session_ticket_key</code> между всеми узлами Nginx (например, раздавая их через распределенный конфиг типа Consul или ротируя скриптом).</p>
+    <p>Если в вашей инфраструктуре работает несколько независимых серверов Nginx за внешним балансировщиком L4 (или DNS Round Robin), возникает проблема: при генерации случайных ticket-ключей на каждом узле клиент, переключившийся на соседний узел, получит отказ расшифровки билета и будет вынужден проходить тяжелый полный Handshake.</p>
+<p>В production-инфраструктуре секретный ключ <code>ssl_session_ticket_key</code> обязан быть идентичным на всех нодах кластера Nginx. Ключи генерируются криптографически стойким генератором (48 байт псевдослучайных данных), синхронизируются через секреты (HashiCorp Vault, Kubernetes Secrets) и регулярно ротируются без перезапуска демона Nginx.</p>
   </div>
 </div>
 
-<h2 id="tls-1-3-i-0-rtt">TLS 1.3 и 0-RTT</h2>
+<hr />
+<h2 id="3-tls-1-3-i-rezhim-0-rtt-ekstremalnaya-skorost-protiv-riskov-bezopasnosti">3. TLS 1.3 и режим 0-RTT: Экстремальная скорость против рисков безопасности</h2>
 
-<p>С приходом TLS 1.3 жизнь бэкендеров стала проще. Протокол стал быстрее за счет уменьшения количества round-trip (путешествий пакета туда-обратно) при рукопожатии.</p>
-<p>Особенно интересна фича <strong>0-RTT (Zero Round Trip Time)</strong>. Если клиент уже подключался к серверу ранее, он может отправить свои HTTP-данные (например, GET-запрос) <em>вместе</em> с первым пакетом рукопожатия, не дожидаясь его завершения. Nginx поддерживает 0-RTT через директиву <code>ssl_early_data on;</code>.</p>
+<p>Современный стандарт <strong>TLS 1.3</strong> кардинально упростил криптографию в вебе:<br />
+1. Удалены все небезопасные и устаревшие шифры (RC4, 3DES, CBC-режимы AES, MD5, SHA-1).<br />
+2. Полное рукопожатие сокращено с 2-х RTT до <strong>ровно 1 RTT</strong> — клиент отправляет свои криптографические параметры одновременно с пакетом Client Hello.</p>
+<p>Вершиной оптимизации стал режим <strong>0-RTT (Zero Round Trip Time)</strong>, или <code>Early Data</code>. Если клиент ранее уже устанавливал защищенное соединение с сервером, он может передать первый HTTP-запрос (например, <code>GET /api/v1/profile</code>) <strong>внутри первого же криптографического пакета</strong>, еще до завершения нового рукопожатия!</p>
+<p>Для включения 0-RTT в Nginx используется директива:</p>
+
+<div class="code-block" data-lang="nginx">
+  <div class="code-header">
+    <span class="code-lang-tag">NGINX</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-nginx"><code class="language-nginx">ssl_early_data on;
+</code></pre>
+</div>
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Уязвимость 0-RTT перед атаками повтора (Replay Attacks)</span>
   </div>
   <div class="callout-body">
-    <p>0-RTT уязвим для <strong>Replay Attack (атака повтором)</strong>. Злоумышленник может перехватить пакет 0-RTT (содержащий, например, запрос на перевод денег) и отправить его повторно на сервер. Nginx не может отличить оригинал от повтора на уровне TLS. <br />
-<strong>Правило:</strong> Никогда не разрешайте 0-RTT для мутабельных запросов (POST, PUT). Если вы включили <code>ssl_early_data</code>, ваше Go-приложение должно проверять заголовок <code>Early-Data: 1</code>, и если он присутствует, принудительно отклонять любые запросы, меняющие состояние (или обеспечивать идемпотентность на уровне БД).</p>
+    <p>Пакеты 0-RTT принципиально не защищены от повторного воспроизведения (<strong>Replay Attack</strong>).</p>
+<p>Злоумышленник, перехватывающий Wi-Fi трафик в публичном месте, может скопировать зашифрованный пакет 0-RTT (содержащий, например, запрос <code>POST /api/pay?amount=1000</code>) и отправить его на сервер 100 раз подряд. Поскольку пакет зашифрован валидным ключом, Nginx успешно расшифрует его и передаст в Go-бэкенд.</p>
+<p><strong>Правила защиты при использовании 0-RTT:</strong><br />
+1. <strong>Запрет для мутаций:</strong> Никогда не используйте 0-RTT для небезопасных и немутабельных HTTP-методов (<code>POST</code>, <code>PUT</code>, <code>DELETE</code>, <code>PATCH</code>).<br />
+2. <strong>Проверка заголовка Early-Data в Go:</strong> Nginx автоматически проставляет HTTP-заголовок <code>Early-Data: 1</code> при трансляции ранних запросов. В Go-сервисе подключите middleware, проверяющий этот заголовок: если пришел изменяющий состояние метод с <code>Early-Data: 1</code>, немедленно отвечайте кодом <code>425 Too Early</code>, заставляя браузер повторить запрос после штатного завершения рукопожатия!</p>
   </div>
 </div>
 
-<h2 id="peredacha-konteksta-v-go">Передача контекста в Go</h2>
+<hr />
+<h2 id="4-peredacha-kriptograficheskogo-konteksta-v-rantaym-go">4. Передача криптографического контекста в рантайм Go</h2>
 
-<p>Когда Nginx терминирует TLS, ваш Go-бэкенд перестает понимать, что оригинальный запрос был по защищенному каналу. Если вы попытаетесь сгенерировать URL для редиректа в Go, вы получите <code>http://</code> вместо <code>https://</code>.</p>
-<p>Nginx должен передать информацию о схеме:</p>
+<p>Поскольку Nginx снимает шифрование, соединение между Nginx и Go происходит по голому протоколу HTTP. Для приложения поле <code>r.TLS</code> в объекте <code>http.Request</code> равно <code>nil</code>.</p>
+<p>Если Go-бэкенду необходимо сгенерировать абсолютный редирект, ссылку для подтверждения почты или проверить безопасность куки (<code>Secure</code>), он сформирует префикс <code>http://</code> вместо <code>https://</code>, что приведет к блокировке браузером или ошибкам авторизации.</p>
+<p>Для передачи контекста Nginx настраивается следующим образом:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2270,18 +2303,49 @@ ssl_session_timeout 1d;
   </div>
   <pre class="language-nginx"><code class="language-nginx">location / {
     proxy_pass http://go_backend:8080;
-    proxy_set_header X-Forwarded-Proto $scheme; # Будет 'https'
+
+    # Сообщаем, что клиент пришел по защищенному HTTPS
+    proxy_set_header X-Forwarded-Proto $scheme; # Примет значение 'https'
+
+    # Передаем оригинальный внешний порт
     proxy_set_header X-Forwarded-Port $server_port;
+
+    # Транслируем доменное имя
     proxy_set_header Host $host;
 }
 </code></pre>
 </div>
 
-<p>В Go вы обязаны использовать мидлварь, которая читает эти заголовки и подменяет <code>r.URL.Scheme</code> и <code>r.URL.Host</code> до того, как запрос попадет в бизнес-логику. В популярных фреймворках (или в стандартном <code>net/http</code> через обертки) это делается автоматически, если настроить <code>TrustForwardHeader</code>.</p>
-<h2 id="mutual-tls-mtls-i-nginx">Mutual TLS (mTLS) и Nginx</h2>
+<p>В Go вы обязаны использовать мидлварь, которая читает эти заголовки и подменяет <code>r.URL.Scheme</code> и <code>r.URL.Host</code> до того, как запрос попадет в бизнес-логику. В популярных фреймворках или в стандартном пакете <code>net/http</code> через обертки это настраивается с указанием <code>TrustForwardHeader</code>:</p>
 
-<p>В микросервисной архитектуре (Service Mesh) часто используется mTLS — взаимная аутентификация, где не только клиент проверяет сертификат сервера, но и сервер требует сертификат у клиента.</p>
-<p>Если Nginx — это граничный прокси, он может проверять клиентские сертификаты:</p>
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func HTTPSRedirectOrContextMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        proto := r.Header.Get(&quot;X-Forwarded-Proto&quot;)
+        if proto == &quot;https&quot; {
+            r.URL.Scheme = &quot;https&quot;
+        }
+        if host := r.Header.Get(&quot;Host&quot;); host != &quot;&quot; {
+            r.URL.Host = host
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+</code></pre>
+</div>
+
+<hr />
+<h2 id="5-vzaimnaya-autentifikatsiya-mutual-tls-mtls">5. Взаимная аутентификация: Mutual TLS (mTLS)</h2>
+
+<p>В корпоративных средах и архитектуре Zero Trust все чаще применяется <strong>Mutual TLS (mTLS)</strong>. В отличие от стандартного HTTPS, где только клиент валидирует подлинность сертификата сервера, при mTLS сервер требует от клиента предъявить его персональный сертификат X.509 и проверяет его по локальному центру сертификации (CA).</p>
+<p>Nginx может выступать централизованной точкой проверки mTLS-сертификатов на входе:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2291,24 +2355,49 @@ ssl_session_timeout 1d;
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-nginx"><code class="language-nginx">ssl_client_certificate /etc/ssl/ca.pem;
-ssl_verify_client on; # Обязать клиента присылать сертификат
+  <pre class="language-nginx"><code class="language-nginx">server {
+    listen 443 ssl;
+    server_name m2m.example.com;
+
+    ssl_certificate        /etc/ssl/server.crt;
+    ssl_certificate_key    /etc/ssl/server.key;
+
+    # Доверенный корневой сертификат для валидации клиентов
+    ssl_client_certificate /etc/ssl/ca.pem;
+
+    # Требовать обязательный клиентский сертификат (on) или опционально (optional)
+    ssl_verify_client on;
+
+    location / {
+        proxy_pass http://go_backend:8080;
+
+        # Передаем статус верификации и метаданные субъекта
+        proxy_set_header X-Client-Verify $ssl_client_verify;
+        proxy_set_header X-Client-Cert-Dn $ssl_client_s_dn;
+
+        # Передаем весь сертификат в формате PEM для глубокого анализа в Go
+        proxy_set_header X-Client-Cert $ssl_client_escaped_cert;
+    }
+}
 </code></pre>
 </div>
 
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Безопасная передача сертификата из Nginx в Go</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Ваша архитектура требует mTLS. Если Nginx терминирует TLS и проверяет клиентский сертификат, как внутренний Go-сервис узнает, кто именно (какой клиент) к нему обратился, ведь шифрование снято?<br />
-<strong>Ответ:</strong> Nginx должен передать данные из сертификата в HTTP-заголовках. Существуют стандартные заголовки (определенные RFC), такие как <code>X-Client-Cert-Dn</code> (Distinguished Name), или Nginx может передавать сертификат в формате PEM через заголовок:<br />
-<code>proxy_set_header X-Client-Cert $ssl_client_escaped_cert;</code><br />
-Важно использовать <code>$ssl_client_escaped_cert</code>, а не просто <code>$ssl_client_cert</code>, чтобы не сломать HTTP-заголовки переносами строк. Go-бэкенд читает этот заголовок, парсит PEM и извлекает Subject для авторизации.</p>
+    <p><strong>Вопрос:</strong> Ваша архитектура требует mTLS. Если Nginx терминирует TLS и проверяет клиентский сертификат, как внутренний Go-сервис узнает, кто именно (какой клиент) к нему обратился, ведь шифрование снято?</p>
+<p><strong>Ответ:</strong> <br />
+Nginx должен передать данные из сертификата в HTTP-заголовках. Существуют стандартные заголовки (определенные RFC), такие как <code>X-Client-Cert-Dn</code> (Distinguished Name), или Nginx может передавать сертификат в формате PEM через заголовок:<br />
+<code>proxy_set_header X-Client-Cert $ssl_client_escaped_cert;</code></p>
+<p><strong>Критический нюанс:</strong> Обязательно использовать переменную <code>$ssl_client_escaped_cert</code>, а не <code>$ssl_client_cert</code>! Сертификат X.509 в формате PEM содержит символы переноса строк (<code>\n</code>). Если вставить их в HTTP-заголовок напрямую, заголовок будет поврежден или сломает парсер HTTP в Go (уязвимость HTTP Response Splitting). Переменная <code>$ssl_client_escaped_cert</code> кодирует сертификат в безопасный URL-encoded формат. </p>
+<p>Go-бэкенд читает этот заголовок, декодирует через <code>url.QueryUnescape</code>, парсит PEM через <code>pem.Decode</code> и извлекает Subject для авторизации.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
@@ -2346,7 +2435,7 @@ ssl_verify_client on; # Обязать клиента присылать сер�
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-rukopozhatiya">Mechanical Sympathy: Цена рукопожатия</a></li><li class="toc-item toc-h2"><a href="#sessii-tls-izbavlyaemsya-ot-handshake">Сессии TLS: Избавляемся от Handshake</a></li><li class="toc-item toc-h3"><a href="#1-session-ids">1. Session IDs</a></li><li class="toc-item toc-h3"><a href="#2-session-tickets-stateless">2. Session Tickets (Stateless)</a></li><li class="toc-item toc-h2"><a href="#tls-1-3-i-0-rtt">TLS 1.3 и 0-RTT</a></li><li class="toc-item toc-h2"><a href="#peredacha-konteksta-v-go">Передача контекста в Go</a></li><li class="toc-item toc-h2"><a href="#mutual-tls-mtls-i-nginx">Mutual TLS (mTLS) и Nginx</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-mechanical-sympathy-apparatnaya-tsena-rukopozhatiya-tls-handshake">1. Mechanical Sympathy: Аппаратная цена рукопожатия TLS Handshake</a></li><li class="toc-item toc-h3"><a href="#pochemu-nginx-effektivnee-spravlyaetsya-s-tls">Почему Nginx эффективнее справляется с TLS:</a></li><li class="toc-item toc-h2"><a href="#2-vozobnovlenie-sessiy-tls-izbavlyaemsya-ot-povtornogo-handshake">2. Возобновление сессий TLS: Избавляемся от повторного Handshake</a></li><li class="toc-item toc-h3"><a href="#1-session-ids-keshirovanie-na-storone-servera">1. Session IDs (Кэширование на стороне сервера)</a></li><li class="toc-item toc-h3"><a href="#2-session-tickets-stateless-mekhanizm">2. Session Tickets (Stateless-механизм)</a></li><li class="toc-item toc-h2"><a href="#3-tls-1-3-i-rezhim-0-rtt-ekstremalnaya-skorost-protiv-riskov-bezopasnosti">3. TLS 1.3 и режим 0-RTT: Экстремальная скорость против рисков безопасности</a></li><li class="toc-item toc-h2"><a href="#4-peredacha-kriptograficheskogo-konteksta-v-rantaym-go">4. Передача криптографического контекста в рантайм Go</a></li><li class="toc-item toc-h2"><a href="#5-vzaimnaya-autentifikatsiya-mutual-tls-mtls">5. Взаимная аутентификация: Mutual TLS (mTLS)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

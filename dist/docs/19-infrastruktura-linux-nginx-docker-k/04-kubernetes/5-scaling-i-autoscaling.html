@@ -2169,24 +2169,25 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Scaling и autoscaling</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы настраивали Deploys, Сервисы и Ingress, предполагая, что нагрузка статична. Но в реальном мире трафик волнообразен. Ночью сервисы простаивают, а во время маркетинговых акций нагрузка может вырасти в 100 раз за минуты. </p>
-<p>Масштабирование (Scaling) в Kubernetes бывает ручным (<code>kubectl scale --replicas=10</code>) и автоматическим. Для Go-бэкенда автоматическое масштабирование — это не просто удобство, это способ уложить бизнес-требования в бюджет облака, не потеряв при этом в доступности.</p>
-<h2 id="horizontal-pod-autoscaler-hpa-bazovyy-mekhanizm">Horizontal Pod Autoscaler (HPA): Базовый механизм</h2>
+            <h1>5. Масштабирование в Kubernetes: HPA, VPA, Cluster Autoscaler и Mechanical Sympathy в Go</h1>
+<p>В распределенных системах статическая нагрузка существует только в синтетических тестах. В реальном мире трафик подчиняется законам природы и социума: ночью сервисы погружаются в полудрему, а в «Черную пятницу» или во время утреннего всплеска поток заказов вырастает в сотни раз за считанные секунды. </p>
+<p>Держать серверный парк постоянно развернутым под пиковую нагрузку — финансовое самоубийство для бизнеса. Масштабировать сервисы вручную командой <code>kubectl scale --replicas=10</code> — медленно и ненадежно: дежурный инженер никогда не среагирует быстрее микросекундного всплеска трафика.</p>
+<p>Kubernetes предлагает развитую трехуровневую систему автоматического масштабирования:<br />
+1. <strong>Горизонтальное масштабирование подов (HPA — Horizontal Pod Autoscaler):</strong> изменение количества реплик сервиса.<br />
+2. <strong>Вертикальное масштабирование подов (VPA — Vertical Pod Autoscaler):</strong> динамическое изменение вычислительных ресурсов (CPU/RAM) одного пода.<br />
+3. <strong>Масштабирование физических узлов (Cluster Autoscaler / Karpenter):</strong> заказ и выключение реальных серверов у облачного провайдера.</p>
+<p>Однако без понимания рантайма Go автоматика способна не спасти сервис, а окончательно добить его. Давайте разберем математику, физику и скрытые ловушки масштабирования с точки зрения механического сочувствия к машине.</p>
+<hr />
+<h2 id="1-horizontal-pod-autoscaler-hpa-mekhanika-i-matematika">1. Horizontal Pod Autoscaler (HPA): Механика и математика</h2>
 
-<p><strong>HPA</strong> — это контроллер K8s, который периодически запрашивает метрики (CPU, RAM или кастомные) у API Server и увеличивает/уменьшает количество реплик (Pods) в Deployment, чтобы привести текущие метрики к целевым.</p>
-<h3 id="matematika-hpa">Математика HPA</h3>
-
-<p>HPA использует простую, но важную формулу:<br />
-<code>desiredReplicas = ceil[ currentReplicas * ( currentMetricValue / desiredMetricValue ) ]</code></p>
-<p>Пример: У вас 4 реплики Go-сервиса. Target CPU = 50%. Текущий CPU = 85%.<br />
-<code>desiredReplicas = ceil[ 4 * (85 / 50) ] = ceil[ 6.8 ] = 7</code>.</p>
+<p>Контроллер <strong>HPA</strong> встроен в <code>kube-controller-manager</code>. Он функционирует как непрерывный управляющий контур с отрицательной обратной связью (период опроса по умолчанию — каждые 15 секунд):</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2201,8 +2202,8 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Metrics Server - Сбор данных с нод&quot;] --&gt;|&quot;Текущее потребление CPU/RAM&quot;| B[&quot;K8s API Server&quot;]
-C[&quot;HPA Controller - Цикл опроса каждые 15 сек&quot;] --&gt;|&quot;Запрос метрик&quot;| B
+A[&quot;Metrics Server\n(Сбор метрик с kubelet cAdvisor)&quot;] --&gt;|&quot;CPU/RAM использование&quot;| B[&quot;K8s API Server&quot;]
+C[&quot;HPA Controller\n(Цикл опроса каждые 15 сек)&quot;] --&gt;|&quot;Запрос текущих метрик&quot;| B
 C --&gt;|&quot;Текущие реплики: 4, CPU 85%&quot;| D{&quot;Вычисление desiredReplicas&quot;}
 D --&gt;|&quot;Целевое CPU 50%&quot;| E[&quot;Новое значение: 7&quot;]
 E --&gt;|&quot;Обновление Deployment.replicas&quot;| B
@@ -2211,48 +2212,167 @@ B --&gt; F[&quot;Deployment Controller создает 3 новых Пода&quot
 </div>
 
 
+<h3 id="matematicheskaya-formula-hpa">Математическая формула HPA</h3>
+
+<p>Алгоритм вычисления целевого числа реплик в исходном коде Kubernetes поразительно прост и элегантен:</p>
+<p>$$\text{desiredReplicas} = \left\lceil \text{currentReplicas} \times \left( \frac{\text{currentMetricValue}}{\text{desiredMetricValue}} \right) \right\rceil$$</p>
+<p>В кодовой базе K8s эта формула записывается как:<br />
+<code>desiredReplicas = ceil[ currentReplicas * ( currentMetricValue / desiredMetricValue ) ]</code></p>
+<p><strong>Наглядный расчет:</strong><br />
+Предположим, у нас развернуты 4 реплики Go-сервиса (<code>currentReplicas = 4</code>). Мы задали целевой уровень утилизации процессора в 50% (<code>desiredMetricValue = 50%</code>). Внезапно пошел наплыв пользователей, и текущее потребление достигло 85% (<code>currentMetricValue = 85%</code>).<br />
+Контроллер вычисляет:<br />
+<code>desiredReplicas = ceil[ 4 * (85 / 50) ] = ceil[ 6.8 ] = 7</code>.<br />
+Контроллер немедленно отправляет патч в спецификацию деплоймента, увеличивая число реплик с 4 до 7.</p>
+<hr />
+<h2 id="2-lovushka-cfs-throttling-pochemu-dushat-go-protsessy">2. Ловушка CFS Throttling: Почему «душат» Go-процессы</h2>
+
+<p>Многие инженеры интуитивно настраивают HPA на метрику CPU и выставляют жесткие лимиты в манифесте:</p>
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">resources:
+  requests:
+    cpu: &quot;200m&quot;
+    memory: &quot;256Mi&quot;
+  limits:
+    cpu: &quot;500m&quot;
+    memory: &quot;512Mi&quot;
+</code></pre>
+</div>
+
+<p>Здесь кроется фундаментальная архитектурная ловушка ядра Linux и Kubernetes.</p>
+<p>Kubernetes реализует <code>limits.cpu</code> через механизм <strong>CFS (Completely Fair Scheduler)</strong> и подсистему <code>cpu.cfs_quota_us</code> в cgroups.<br />
+Лимит <code>limits: cpu: "500m"</code> означает, что процессу положено 0.5 процессорного ядра. Но ядро Linux не замедляет тактовую частоту процессора. Оно делит время на фиксированные окна (по умолчанию <code>cfs_period_us = 100ms</code>). <br />
+Квота в 500m означает: за каждые 100 мс процессам пода разрешено суммарно работать на ядрах CPU не более 50 мс.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+gantt
+title CFS Quota Throttling (Период 100 мс)
+dateFormat X
+axisFormat %s
+section Выполнение Go
+Работа горутин (4 потока M) :active, 0, 50
+CFS THROTTLING (Ядро замораживает процесс!) :crit, 50, 100
+Возобновление работы в новом окне :active, 100, 150
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Подводный камень: CFS Throttling (Удушение процессора)</span>
   </div>
   <div class="callout-body">
-    <p><strong>Проблема Throttling (Удушения) в K8s.</strong> <br />
-По умолчанию K8s использует CFS (Completely Fair Scheduler) для ограничения CPU. Лимит CPU задается в "милликорах" (millicores), например, <code>limits: cpu: "500m"</code> — это 0.5 ядра. CFS выделяет процессу квоты времени (period = 100ms). Если ваш Go-процесс сожмет свою квоту за 50мс (используя все 100% CPU), на оставшиеся 50мс ядро Linux <strong>заморозит</strong> процесс (throttle). <br />
-Метрика, которую видит HPA, — это <em>использование от запроса (requests)</em>, а не от лимита. Из-за этого приложение может тормозить (throttle), но HPA не будет скейлиться, так как метрика <code>requests</code> ниже целевой. В высоконагруженных Go-сервисах часто полностью <strong>убирают CPU limits</strong>, оставляя только <code>requests</code>, чтобы избежать CFS throttling.</p>
+    <p>Рантайм Go — высокопараллельный. Если у вас 4 потока ОС (<code>GOMAXPROCS=4</code>), и они одновременно начали обрабатывать пачку входящих JSON-запросов, они выжгут суммарную квоту в 50 мс всего за 12.5 мс физического времени!</p>
+<p>На оставшиеся 87.5 мс текущего периода ядро Linux <strong>принудительно усыпляет (freeze / throttle)</strong> все потоки Go-приложения. Для клиента задержка (latency) мгновенно подскакивает до небес, соединение отваливается по таймауту. </p>
+<p>Самое ужасное: метрика, которую видит стандартный HPA, — это <em>процент утилизации от <code>requests</code></em>, а не факт троттлинга! HPA «думает», что нагрузка умеренная, и поды не добавляет, пока сервис захлебывается в искусственном сне.</p>
+<p><strong>Инженерный консенсус для Go:</strong> В современных высоконагруженных Go-сервисах часто полностью <strong>убирают CPU limits</strong>, выставляя только адекватные <code>requests</code>, чтобы избежать искусственного CFS throttling и деградации p99 latency.</p>
   </div>
 </div>
 
-<h2 id="mechanical-sympathy-pochemu-cpu-i-ram-plokhie-metriki-dlya-go">Mechanical Sympathy: Почему CPU и RAM — плохие метрики для Go</h2>
+<hr />
+<h2 id="3-mechanical-sympathy-pochemu-cpu-i-ram-obmanyvayut-hpa-v-go">3. Mechanical Sympathy: Почему CPU и RAM обманывают HPA в Go</h2>
 
-<p>Стандартный HPA опирается на ресурсы. Для Java или Python это работает неплохо, но для Go — это антипаттерн.</p>
+<p>Стандартные шаблоны мониторинга предлагают масштабировать сервисы по CPU и RAM. Для стеков с синхронным вводом-выводом (Python WSGI, Ruby) это имеет смысл. Но для архитектуры Go это прямой путь к сбоям.</p>
 <h3 id="1-problema-s-cpu">1. Проблема с CPU</h3>
-<p>Go-рантайм очень эффективно использует CPU. Горутины легковесны, и даже при 10 000 активных горутинах CPU может простаивать, ожидая сети. С другой стороны, Garbage Collector или тяжелые математические вычисления могут кратковременно загрузить CPU до 100%, заставляя HPA панически скейлиться, хотя приложение отрабатывает в пределах таймаутов.</p>
+<p>Модель многозадачности Go основана на неблокирующем сетевом полинге (<code>netpoller</code>). Десятки тысяч горутин могут обслуживать клиентов, проводя 95% времени в ожидании ответа от базы данных или сокета. В этот момент загрузка CPU стремится к нулю. Сервис может находиться на грани исчерпания системных файловых дескрипторов или соединений к БД, а HPA не пошевелится. </p>
+<p>И наоборот: фоновый проход Garbage Collector или парсинг тяжелого XML кратковременно нагрузит ядра на 100% в течение 200 мс, провоцируя HPA на паническое и ненужное выделение новых подов.</p>
 <h3 id="2-problema-s-memory-ram">2. Проблема с Memory (RAM)</h3>
-<p>Go управляет памятью через GC. По умолчанию (<code>GOGC=100</code>), GC запускается, когда размер кучи удваивается. Это означает, что потребление памяти Go-приложением <strong>всегда осциллирует</strong> (то растет, когда аллоцируются объекты, то резко падает при сборке мусора).</p>
-<p>Если вы настроите HPA на RAM (например, target 70%), HPA будет сходить с ума от "пилы" графика памяти:<br />
-1. Приложение аллоцирует память до 72% -&gt; HPA скейлит вверх.<br />
-2. Срабатывает GC, память падает до 40% -&gt; HPA скейлит вниз (через 5 минут).<br />
-3. Цикл повторяется. Это называется <strong>Flapping (Хлопанье)</strong>.</p>
+<p>Управление памятью в Go — дискретное. Рантайм не возвращает освобожденную память операционной системе мгновенно. <br />
+По умолчанию сборщик мусора ориентируется на переменную <code>GOGC=100</code>: следующий цикл GC инициируется, когда размер рабочей кучи (heap) удваивается по сравнению с размером живых данных после предыдущей сборки.</p>
+<p>В результате потребление памяти Go-сервисом выглядит как классическая <strong>пила</strong>:<br />
+1. Сервис работает, куча растет. Память доходит до 75% от лимита контейнера.<br />
+2. HPA, настроенный на порог в 70% RAM, видит превышение и немедленно отдает команду: «Скейлимся вверх, запускаем еще 5 реплик!».<br />
+3. В следующую секунду рантайм Go запускает GC: память очищается и падает до 35%.<br />
+4. HPA видит, что кластер недогружен, выжидает cooldown-интервал и начинает удалять поды (scale down).<br />
+5. Цикл повторяется по кругу.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Alloc[&quot;Выделение памяти (куча растет до 75%)&quot;] --&gt;|&quot;HPA видит порог &gt; 70%&quot;| ScaleUp[&quot;HPA добавляет поды (Scale Up)&quot;]
+ScaleUp --&gt; GC[&quot;Срабатывает Go GC (память падает до 35%)&quot;]
+GC --&gt;|&quot;HPA видит недогруз &lt; 70%&quot;| ScaleDown[&quot;HPA удаляет поды (Scale Down)&quot;]
+ScaleDown --&gt; Alloc
+  </pre>
+</div>
+
+
+<p>Это деструктивное поведение называется <strong>Flapping (Хлопанье)</strong> — кластер непрерывно вводит и выводит реплики из эксплуатации, нагружая планировщик K8s и попутно сбрасывая кэши приложений.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Архитектурная деталь: Стабилизация памяти через GOMEMLIMIT</span>
   </div>
   <div class="callout-body">
-    <p>Чтобы стабилизировать потребление памяти в Go под HPA, всегда используйте <code>GOMEMLIMIT</code> (появился в Go 1.19). Установите его на уровне 80-90% от K8s <code>limits</code> памяти. Это заставит GC работать более проактивно, сглаживая "пилу" потребления RAM и защищая от OOM Kill.</p>
+    <p>Начиная с версии Go 1.19, рантайм получил спасительную переменную окружения <code>GOMEMLIMIT</code>. Она задает мягкий лимит памяти для Go GC.</p>
+<p>Установив <code>GOMEMLIMIT</code> на уровне 80–90% от Kubernetes <code>limits</code> памяти контейнера, вы приказываете GC запускаться чаще по мере приближения к опасной границе. Это сглаживает зубцы «пилы», защищает от внезапного OOM Kill (Out of Memory) и предотвращает ложные срабатывания HPA.</p>
   </div>
 </div>
 
-<h2 id="kastomnye-metriki-istinnyy-scaling-dlya-go">Кастомные метрики: Истинный Scaling для Go</h2>
+<hr />
+<h2 id="4-kastomnye-metriki-istinnyy-scaling-dlya-go-bekenda">4. Кастомные метрики: Истинный Scaling для Go-бэкенда</h2>
 
-<p>Идеальный сигнал для масштабирования бэкенда — это не CPU, а <strong>длина очереди или время обработки (Latency)</strong>.</p>
-<p>K8s поддерживает кастомные метрики через <strong>Prometheus Adapter</strong>. Он берет метрики из Prometheus и транслирует их в API Server, чтобы HPA мог их читать.</p>
-<p>Какие метрики использовать для Go?<br />
-1. <strong>RPS (Requests Per Second)</strong>: Скейлимся, если количество входящих запросов на под превышает комфортный порог (например, &gt; 1000 RPS).<br />
-2. <strong>Goroutine Count</strong>: Количество активных горутин в рантайме (экспортируется из <code>runtime.NumGoroutine()</code>).<br />
-3. <strong>Latency (p99)</strong>: Если 99-й перцентиль времени ответа превышает 200мс — добавляем поды.</p>
-<p>Пример HPA на основе RPS (через кастомную метрику <code>http_requests_per_second</code>):</p>
+<p>Если аппаратные ресурсы — плохой индикатор здоровья Go-приложения, на что же должен опираться настоящий SRE-инженер? Ответ прост: на <strong>бизнес-метрики и задержки (Latency/Queue Depth)</strong>.</p>
+<p>Для проброса прикладных метрик в управляющий контур K8s используется <strong>Prometheus Adapter</strong> (или KEDA — Kubernetes Event-driven Autoscaling). Адаптер опрашивает TSDB Prometheus по PromQL-запросам и регистрирует виртуальное API <code>custom.metrics.k8s.io</code>, доступное для HPA.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+GoApp[&quot;Go Application\n(/metrics endpoint)&quot;] --&gt;|&quot;Scrape metrics&quot;| Prom[&quot;Prometheus TSDB&quot;]
+Prom --&gt;|&quot;PromQL query&quot;| Adapter[&quot;Prometheus Adapter\n(custom.metrics.k8s.io)&quot;]
+Adapter --&gt;|&quot;API Custom Metrics&quot;| APIServer[&quot;K8s API Server&quot;]
+HPA[&quot;HPA Controller&quot;] --&gt;|&quot;Запрос RPS / Goroutines&quot;| APIServer
+HPA --&gt;|&quot;Scale Deployment&quot;| Deploy[&quot;Deployment&quot;]
+  </pre>
+</div>
+
+
+<h3 id="zolotye-metriki-dlya-avtomasshtabirovaniya-go">Золотые метрики для автомасштабирования Go:</h3>
+<ol>
+<li><strong>RPS (Requests Per Second):</strong> Количество запросов в секунду на один под. Зная из нагрузочного тестирования, что один pod гарантированно держит 1 000 RPS с идеальным SLA, мы выставляем целевое среднее значение в 800–1000 RPS.</li>
+<li><strong>Goroutine Count (<code>runtime.NumGoroutine()</code>):</strong> Количество параллельно исполняемых легковесных потоков. Если число горутин аномально растет (например, превысило 5 000 на инстанс), это прямой сигнал зависания на внешних вызовах или приближения к лимитам планировщика.</li>
+<li><strong>Latency (p95 / p99):</strong> Задержка обработки запросов. Если 99-й перцентиль времени отклика переваливает за 200 мс — кластер обязан расширяться до того, как клиенты начнут получать ошибки.</li>
+</ol>
+<p>Манифест HPA на базе кастомной метрики <code>http_requests_per_second</code>:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2280,46 +2400,89 @@ spec:
         name: http_requests_per_second
       target:
         type: AverageValue
-        averageValue: &quot;1000&quot; # Скейлимся, если на 1 под больше 1000 RPS
+        averageValue: &quot;1000&quot; # Скейлимся, если на 1 под приходится более 1000 RPS
 </code></pre>
 </div>
 
-<h2 id="cold-start-i-readiness-proby">Cold Start и Readiness Пробы</h2>
+<hr />
+<h2 id="5-cold-start-i-readiness-proby-spasenie-starykh-podov-ot-kaskadnogo-sboya">5. Cold Start и Readiness Пробы: Спасение старых подов от каскадного сбоя</h2>
 
-<p>Когда HPA решает добавить поды, они не появляются мгновенно. Вашему Go-приложению нужно время на:<br />
-1. Скачивание образа (если нода новая).<br />
-2. Инициализацию соединений с БД (пул коннектов).<br />
-3. Прогрев кэшей.</p>
-<p>Если HPA скейлится из-за пиковой нагрузки, новые поды будут находиться в состоянии <code>ContainerCreating</code>, а затем <code>NotReady</code>. K8s не пустит на них трафик, пока не пройдет Readiness Probe. В этот момент старые поды могут начать падать от перегруза (Timeout/502).</p>
+<p>Когда HPA принимает решение о масштабировании, новые поды не материализуются со скоростью света. Им требуется время:<br />
+1. Выгрузка Docker-образа с реестра на новую ноду (если образ не закэширован).<br />
+2. Выделение сетевого пространства (<code>ContainerCreating</code>).<br />
+3. Инициализация Go-рантайма, выделение пулов соединений к PostgreSQL/Redis (<code>sql.Open</code>, <code>pgxpool.New</code>).<br />
+4. Прогрев локальных кэшей данных.</p>
+<p>Пока новый под находится в статусе <code>NotReady</code>, входящий шквал трафика продолжают принимать старые, уже задыхающиеся поды. Они начинают падать по тайм-аутам, провоцируя лавинообразный отказ (Cascading Failure).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Архитектурный паттерн для собеседования: Защита при холодном старте</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как защититься от каскадного сбоя во время резкого скейлинга (Cold Start), когда трафик убивает старые поды, пока новые еще не готовы?<br />
-<strong>Ответ:</strong> Использовать <strong>PodDisruptionBudget (PDB)</strong> для контроля деградации и правильно настроить <code>initialDelaySeconds</code> / Startup Probe, чтобы K8с не убивал поды слишком рано. Также на уровне Ingress/Service можно реализовать <strong>Circuit Breaker</strong> или <strong>Rate Limiting</strong>, чтобы начать отбрасывать лишний трафик (быстро возвращать 429 Too Many Requests), спасая старые поды от перегруза, пока кластер масштабируется.</p>
+    <p><strong>Вопрос:</strong> Как защитить кластер от каскадного сбоя во время резкого скейлинга (Cold Start), когда трафик убивает старые поды, пока новые еще не готовы?<br />
+<strong>Ответ:</strong> Защита строится на комплексном эшелонировании:<br />
+1. <strong>Корректные зонды (Probes):</strong> Настройка <code>initialDelaySeconds</code> и использование <code>startupProbe</code> для тяжелых сервисов, чтобы Kubernetes не убивал медленно стартующий Go-бинарник раньше времени.<br />
+2. <strong>Бюджет доступности (PodDisruptionBudget — PDB):</strong> Защищает от деградации при одновременном обновлении и выселении подов.<br />
+3. <strong>Превентивное отбрасывание нагрузки (Load Shedding / Rate Limiting):</strong> На уровне Ingress/Envoy или с помощью middleware в Go настраивается лимитер запросов (Token Bucket). При запредельном всплеске сервис мгновенно возвращает код <code>429 Too Many Requests</code> (или перенаправляет в очередь отложенной обработки), не доводя инфраструктуру до падения.<br />
+4. <strong>Предохранитель (Circuit Breaker):</strong> Размыкание цепи при сбоях бэкендов спасает от напрасного расхода ресурсов на обреченные запросы.</p>
   </div>
 </div>
 
-<h2 id="vertical-pod-autoscaler-vpa">Vertical Pod Autoscaler (VPA)</h2>
+<hr />
+<h2 id="6-vpa-vertical-pod-autoscaler-i-cluster-autoscaler-ca">6. VPA (Vertical Pod Autoscaler) и Cluster Autoscaler (CA)</h2>
 
-<p>В отличие от HPA, который меняет количество подов, <strong>VPA</strong> меняет их размер (requests и limits для CPU/RAM). Он анализирует историческое потребление и рекомендует (или автоматически перезапускает поды с новыми лимитами).</p>
-<p>Для Go-бэкендов VPA обычно используется в режиме <code>Off</code> (только для сбора рекомендаций). Автоматический режим VPA требует рестарта Пода при изменении лимитов, что означает даунтайм. Кроме того, одновременное использование HPA и VPA на основе одинаковых метрик (например, CPU) приводит к бесконечному циклу: VPA увеличивает CPU limit -&gt; утилизация CPU падает -&gt; HPA скейлится вниз -&gt; утилизация растет -&gt; VPA снова меняет лимит.</p>
-<h2 id="cluster-autoscaler-ca">Cluster Autoscaler (CA)</h2>
+<p>Помимо HPA, инфраструктурный арсенал Kubernetes включает еще два типа автомасштабирования:</p>
 
-<p>HPA увеличивает количество Подов, но что, если на текущих нодах (серверах) нет места (недостаточно CPU/RAM для назначения)? Поды зависнут в статусе <code>Pending</code>.</p>
-<p>Здесь вступает в игру <strong>Cluster Autoscaler</strong>. Он следит за Pending Pod'ами и дает команду облачному провайдеру (AWS ASG, GCP MIG) добавить новые сервера в кластер. Когда нагрузка спадает и поды удаляются, CA аккуратно дренирует (Drain) пустые сервера и удаляет их, экономя деньги.</p>
-<h2 id="itog">Итог</h2>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TB
+subgraph AppLevel[&quot;Уровень приложения (Pods)&quot;]
+HPA_Node[&quot;HPA\n(Количество подов: 3 -&gt; 10)&quot;]
+VPA_Node[&quot;VPA\n(Размер пода: 0.5 CPU -&gt; 2 CPU)&quot;]
+end
+
+subgraph InfraLevel[&quot;Уровень серверов (Nodes)&quot;]
+CA_Node[&quot;Cluster Autoscaler / Karpenter\n(Количество VM в AWS/GCP: 5 -&gt; 12)&quot;]
+end
+
+HPA_Node -.-&gt;|&quot;Поды в статусе Pending&quot;| CA_Node
+  </pre>
+</div>
+
+
+<h3 id="6-1-vpa-vertical-pod-autoscaler">6.1. VPA (Vertical Pod Autoscaler)</h3>
+<p>VPA не трогает количество подов — он анализирует профиль потребления ресурсов и подбирает оптимальные значения <code>requests</code> и <code>limits</code>.<br />
+* <strong>Режим <code>Off</code> (Рекомендательный):</strong> Идеален для Go. VPA только выдает рекомендации дашбордам, позволяя инженерам точно калибровать манифесты без неожиданностей в проде.<br />
+* <strong>Режим <code>Auto</code>:</strong> Крайне опасен для stateless веб-сервисов! Чтобы изменить лимиты CPU/памяти контейнера, Kubernetes обязан <strong>перезапустить Pod</strong>. Это неизбежно вызывает микро-даунтаймы и разрыв сетевых сессий.<br />
+* <strong>Конфликт HPA и VPA:</strong> Никогда не используйте HPA и VPA на базе одной и той же метрики (например, CPU)! Возникнет паразитный резонанс: VPA увеличит лимит -&gt; процент утилизации упадет -&gt; HPA удалит «лишние» поды -&gt; оставшиеся поды перегрузятся -&gt; VPA снова поднимет лимит.</p>
+<h3 id="6-2-cluster-autoscaler-ca">6.2. Cluster Autoscaler (CA)</h3>
+<p>Когда HPA создает новые поды, на существующих рабочих нодах может физически закончиться процессорная мощность или память. Планировщик <code>kube-scheduler</code> переводит поды в статус <code>Pending</code>.</p>
+<p>Здесь подключается <strong>Cluster Autoscaler</strong> (или современный бессерверный планировщик узлов Karpenter):<br />
+1. Контроллер видит <code>Pending</code> поды, которым не хватает ресурсов.<br />
+2. Он обращается к API облачного провайдера (AWS ASG — Auto Scaling Groups, GCP MIG — Managed Instance Groups, Yandex Cloud Compute Groups) и запускает новые виртуальные машины.<br />
+3. Когда пик спадает, и поды удаляются, Cluster Autoscaler находит недозагруженные ноды, аккуратно выселяет оставшиеся поды (процедура <strong>Drain</strong>) и удаляет пустые серверы, снижая расходы на облако до нуля.</p>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>HPA на CPU/RAM</strong> часто некорректно работает с Go из-за модели работы GC (осцилляция памяти) и Go-планировщика (CPU не отражает реальную утилизацию).</li>
-<li><strong>CFS Throttling</strong> — скрытый убийца производительности в K8s. Избегайте жестких <code>cpu limits</code> для Go.</li>
-<li><strong>GOMEMLIMIT</strong> — обязательный флаг для сглаживания потребления памяти и защиты от OOM/HPA flapping.</li>
-<li><strong>Кастомные метрики (RPS, Latency, Goroutines)</strong> — единственно верный путь для умного автоскейлинга Go-бэкендов через Prometheus Adapter.</li>
-<li><strong>VPA и CA</strong>: VPA подбирает размер подов, CA добавляет железо в кластер. Не используйте HPA и VPA на одних и тех же метриках.</li>
+<li><strong>Математика HPA:</strong> Вычисляет реплики по формуле <code>desiredReplicas = ceil[ currentReplicas * ( currentMetricValue / desiredMetricValue ) ]</code>.</li>
+<li><strong>CFS Throttling:</strong> Жесткие <code>limits: cpu</code> в Linux приводят к усыплению параллельных горутин Go на десятки миллисекунд. В Go-сервисах отдавайте предпочтение честным <code>requests</code>.</li>
+<li><strong>Память и Flapping:</strong> Из-за циклов <code>GOGC=100</code> масштабирование по RAM приводит к паразитному хлопанью подами. Для контроля используйте <code>GOMEMLIMIT</code> на уровне 80–90% от лимита.</li>
+<li><strong>Кастомные метрики (Prometheus Adapter):</strong> Настоящее масштабирование бэкенда строится на RPS (<code>http_requests_per_second</code>), времени отклика (Latency p99) и числе горутин (<code>runtime.NumGoroutine()</code>).</li>
+<li><strong>Cold Start:</strong> Для защиты подов во время старта используйте <code>startupProbe</code>, PDB и техники Rate Limiting / Load Shedding (<code>429 Too Many Requests</code>).</li>
+<li><strong>VPA и CA:</strong> VPA в Go безопасен преимущественно в режиме <code>Off</code>, а Cluster Autoscaler решает проблему нехватки нод для <code>Pending</code> подов.</li>
 </ol>
-<p>Масштабирование Stateless-приложений (REST API, gRPC) решается добавлением реплик. Но что делать с базами данных, очередями и кэшами, которым нужна строгая идентичность и постоянство данных? В следующей статье мы разберем вызовы Stateful-нагрузок: <a href="6-stateful-prilozheniya.html" class="wikilink">6. Stateful приложения</a>.</p>
+<p>Горизонтальное масштабирование без состояния (Stateless) просто и прозрачно: поды можно уничтожать и плодить сотнями. Но что делать, если нашему сервису требуется хранить петабайты данных на диске, сохранять постоянные сетевые имена и соблюдать строгий кворум? В следующей лекции мы погрузимся в мир постоянства данных: <a href="6-stateful-prilozheniya.html" class="wikilink">6. Stateful приложения</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2347,7 +2510,7 @@ spec:
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#horizontal-pod-autoscaler-hpa-bazovyy-mekhanizm">Horizontal Pod Autoscaler (HPA): Базовый механизм</a></li><li class="toc-item toc-h3"><a href="#matematika-hpa">Математика HPA</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-cpu-i-ram-plokhie-metriki-dlya-go">Mechanical Sympathy: Почему CPU и RAM — плохие метрики для Go</a></li><li class="toc-item toc-h3"><a href="#1-problema-s-cpu">1. Проблема с CPU</a></li><li class="toc-item toc-h3"><a href="#2-problema-s-memory-ram">2. Проблема с Memory (RAM)</a></li><li class="toc-item toc-h2"><a href="#kastomnye-metriki-istinnyy-scaling-dlya-go">Кастомные метрики: Истинный Scaling для Go</a></li><li class="toc-item toc-h2"><a href="#cold-start-i-readiness-proby">Cold Start и Readiness Пробы</a></li><li class="toc-item toc-h2"><a href="#vertical-pod-autoscaler-vpa">Vertical Pod Autoscaler (VPA)</a></li><li class="toc-item toc-h2"><a href="#cluster-autoscaler-ca">Cluster Autoscaler (CA)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-horizontal-pod-autoscaler-hpa-mekhanika-i-matematika">1. Horizontal Pod Autoscaler (HPA): Механика и математика</a></li><li class="toc-item toc-h3"><a href="#matematicheskaya-formula-hpa">Математическая формула HPA</a></li><li class="toc-item toc-h2"><a href="#2-lovushka-cfs-throttling-pochemu-dushat-go-protsessy">2. Ловушка CFS Throttling: Почему «душат» Go-процессы</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-pochemu-cpu-i-ram-obmanyvayut-hpa-v-go">3. Mechanical Sympathy: Почему CPU и RAM обманывают HPA в Go</a></li><li class="toc-item toc-h3"><a href="#1-problema-s-cpu">1. Проблема с CPU</a></li><li class="toc-item toc-h3"><a href="#2-problema-s-memory-ram">2. Проблема с Memory (RAM)</a></li><li class="toc-item toc-h2"><a href="#4-kastomnye-metriki-istinnyy-scaling-dlya-go-bekenda">4. Кастомные метрики: Истинный Scaling для Go-бэкенда</a></li><li class="toc-item toc-h3"><a href="#zolotye-metriki-dlya-avtomasshtabirovaniya-go">Золотые метрики для автомасштабирования Go:</a></li><li class="toc-item toc-h2"><a href="#5-cold-start-i-readiness-proby-spasenie-starykh-podov-ot-kaskadnogo-sboya">5. Cold Start и Readiness Пробы: Спасение старых подов от каскадного сбоя</a></li><li class="toc-item toc-h2"><a href="#6-vpa-vertical-pod-autoscaler-i-cluster-autoscaler-ca">6. VPA (Vertical Pod Autoscaler) и Cluster Autoscaler (CA)</a></li><li class="toc-item toc-h3"><a href="#6-1-vpa-vertical-pod-autoscaler">6.1. VPA (Vertical Pod Autoscaler)</a></li><li class="toc-item toc-h3"><a href="#6-2-cluster-autoscaler-ca">6.2. Cluster Autoscaler (CA)</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

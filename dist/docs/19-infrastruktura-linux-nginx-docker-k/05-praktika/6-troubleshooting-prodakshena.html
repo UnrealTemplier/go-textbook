@@ -2169,18 +2169,22 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Troubleshooting продакшена</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Как бы тщательно мы ни проектировали систему, масштабировали её и не настраивали мониторинг, в продакшене рано или поздно что-то сломается. Трафик превысит лимиты, сеть моргнет, а в Go-коде затаится гонка, которую не поймал <code>-race</code> в CI.</p>
-<p>Troubleshooting (поиск и устранение неисправностей) в распределенных системах — это не искусство, а строгая методология, основанная на понимании того, как слои инфраструктуры взаимодействуют друг с другом. Вы должны уметь быстро локализовать проблему: это баг в вашем Go-коде, ошибка конфигурации K8s или проблема на уровне ядра Linux?</p>
-<h2 id="metod-voronki-ot-simptoma-k-kornyu">Метод воронки: От симптома к корню</h2>
+            <h1>6. Траблшутинг продакшена: Методология воронки, OOM Killer, CPU Throttling, Ephemeral Containers и bpftrace в Go</h1>
+<p>Как бы тщательно мы ни тестировали сервисы в CI/CD, какие бы строгие линтеры ни настраивали и сколько бы канареечных релизов ни проводили, в реальном продакшене рано или поздно наступает кризис. Внезапный всплеск трафика пробивает лимиты, сеть кратковременно теряет пакеты, а в параллельном коде на Go срабатывает редчайшая гонка данных, которую не поймал <code>-race</code> на синтетических тестах.</p>
+<p>В критический момент аварии (когда дашборды полыхают красным, а в чате инцидентов требуют немедленного ответа) худшее, что может сделать инженер — это поддаться панике и начать лихорадочно менять строчки в коде или случайным образом перезагружать серверы.</p>
+<p>Поиск и устранение неисправностей (<strong>Troubleshooting</strong>) в распределенных системах — это не мистическое искусство и не шаманство. Это строгая, хладнокровная научная методология, опирающаяся на глубокое понимание слоев абстракции: от прикладных горутин в Go до сетевого стека ядра Linux и аппаратных контроллеров.</p>
+<hr />
+<h2 id="1-metod-voronki-ot-simptoma-k-pervoprichine">1. Метод воронки: От симптома к первопричине</h2>
 
-<p>Главная ошибка при дебаге — сразу лезть в код. Система огромна, и без сужения круга поиска вы потратите часы. Используйте подход "Воронка": начинайте с широких инфраструктурных метрик и спускайтесь до уровня системных вызовов.</p>
+<p>Главная ловушка начинающего инженера при возникновении 500-х ошибок — сразу бросаться в IDE и перечитывать код бизнес-логики. В современных облачных системах код — лишь верхушка айсберга. Если под упал из-за переполнения диска на ноде или нехватки файловых дескрипторов, ковыряние в коде отнимет драгоценные часы.</p>
+<p>Промышленный стандарт расследования инцидентов — <strong>Метод Воронки (Funnel Triage)</strong>: мы начинаем с самого широкого инфраструктурного уровня и последовательно сужаем область поиска до конкретного системного вызова или строки кода.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2195,61 +2199,128 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Симптом: 502 ошибки или рост Latency&quot;] --&gt; B{&quot;Шаг 1. Инфраструктура&lt;br&gt;Нода жива? Пода жив?&quot;}
-B --&gt;|&quot;Нода NotReady&quot;| C[&quot;Проблема железа или ОС - Disk Pressure, Memory Pressure&quot;]
-B --&gt;|&quot;Поды CrashLoopBackOff&quot;| D[&quot;Шаг 2. Логи Пода&lt;br&gt;kubectl logs --previous&quot;]
-B --&gt;|&quot;Поды Running, но ошибки&quot;| E{&quot;Шаг 3. Сеть и Ресурсы&quot;}
-E --&gt;|&quot;CPU Throttle / OOM&quot;| F[&quot;Проблема лимитов Cgroups&quot;]
-E --&gt;|&quot;Таймауты&quot;| G[&quot;Шаг 4. DNS / iptables&lt;br&gt;Проблема K8s Networking&quot;]
-E --&gt;|&quot;Ресурсы ок, сеть ок&quot;| H[&quot;Шаг 5. Go Runtime&lt;br&gt;pprof, trace, goroutine dump&quot;]
+Symptom[&quot;Симптом: Всплеск 502/504 ошибок или рост p99 Latency&quot;] --&gt; Step1{&quot;Шаг 1. Инфраструктура&lt;br&gt;Жив ли сервер? Живы ли поды?&quot;}
+
+Step1 --&gt;|&quot;Нода NotReady&quot;| NodeFail[&quot;Проблема сервера/ядра: Disk Pressure, Memory Pressure, kubelet crash&quot;]
+Step1 --&gt;|&quot;Поды CrashLoopBackOff&quot;| PodCrash[&quot;Шаг 2. Анализ логов падения:&lt;br&gt;kubectl logs --previous&quot;]
+Step1 --&gt;|&quot;Поды Running, но ошибки&quot;| Step3{&quot;Шаг 3. Ресурсы и Cgroups&quot;}
+
+Step3 --&gt;|&quot;CPU Throttle / OOM&quot;| ResourceIssue[&quot;Удушение CFS Quota или нехватка RAM в Cgroups&quot;]
+Step3 --&gt;|&quot;Таймауты сети&quot;| Step4[&quot;Шаг 4. Сеть и DNS:&lt;br&gt;CoreDNS, iptables/conntrack, CNI drops&quot;]
+Step3 --&gt;|&quot;Ресурсы и сеть в норме&quot;| Step5[&quot;Шаг 5. Рантайм Go:&lt;br&gt;pprof, goroutine leak, блокировки мьютексов&quot;]
   </pre>
 </div>
 
 
-<h2 id="keys-1-ubiytsa-oom-out-of-memory">Кейс 1: Убийца OOM (Out of Memory)</h2>
+<p>Давайте разберем четыре самых коварных инцидента, с которыми сталкивается каждый Go-разработчик в продакшене.</p>
+<hr />
+<h2 id="2-keys-1-ubiytsa-oom-out-of-memory-i-yarost-sigkill">2. Кейс 1: Убийца OOM (Out of Memory) и ярость SIGKILL</h2>
 
-<p>Ситуация: Поды вашего Go-сервиса постоянно перезапускаются. В метриках K8s виден рост памяти, а затем смерть.</p>
+<p><strong>Симптомы:</strong> Поды вашего Go-сервиса неожиданно исчезают и перезапускаются. На графиках памяти виден плавный рост, резкий обрыв в ноль и новый подъем.</p>
 <h3 id="diagnostika">Диагностика</h3>
 <ol>
-<li>Выполняем <code>kubectl describe pod &lt;name&gt;</code>. В событиях (Events) внизу ищем <code>OOMKilled</code>. В K8s это означает, что процесс превысил лимит памяти, заданный в <code>resources.limits.memory</code>.</li>
+<li>Выполняем команду детального осмотра пода: <code>kubectl describe pod &lt;name&gt;</code>. В событиях (Events) внизу ищем <code>OOMKilled</code>. В K8s это означает, что процесс превысил лимит памяти, заданный в <code>resources.limits.memory</code>.</li>
 <li>Смотрим логи <code>kubectl logs --previous</code>. При OOM Kill процесс умирает от <code>SIGKILL</code> (сигнал 9), который нельзя перехватить. Логов от самого приложения не будет — оно убито ядром.</li>
 </ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Механика OOM Killer в ядре Linux</span>
   </div>
   <div class="callout-body">
-    <p>Когда вы задаете <code>limits.memory: 512Mi</code>, K8s настраивает Cgroup для этого Пода. Если процесс пытается аллоцировать память сверх лимита Cgroup, ядро Linux вызывает OOM Killer. OOM Killer оценивает "вину" процессов (oom_score) и отправляет <code>SIGKILL</code> самому пожирающему память процессу. Ваш Go-рантайм даже не успеет запустить <code>defer</code> функции.</p>
+    <p>Когда вы задаете <code>limits.memory: 512Mi</code>, Kubernetes настраивает Cgroup для этого Пода. <br />
+Если аллокатор памяти Go пытается запросить у ядра хотя бы один дополнительный байт сверх этого лимита, ядро Linux отказывает в выделении и немедленно активирует <strong>OOM Killer</strong>. </p>
+<p>OOM Killer оценивает «вину» процессов (<code>oom_score</code>) и отправляет процессу-нарушителю безапелляционный сигнал <strong><code>SIGKILL</code> (сигнал 9)</strong>. Сигнал <code>SIGKILL</code> обрабатывается исключительно ядром: его невозможно перехватить, заблокировать или обработать в коде. Рантайм Go уничтожается мгновенно, не успевая выполнить ни один <code>defer</code>, ни одну функцию <code>slog.Error()</code>.</p>
   </div>
 </div>
 
 <h3 id="reshenie-go-spetsifika">Решение (Go-специфика)</h3>
-<p>Если приложение действительно требует больше памяти, не спешите просто увеличивать лимит! Возможно, проблема в Garbage Collector.<br />
-Убедитесь, что вы используете <code>GOMEMLIMIT</code> (с Go 1.19). Без него GC видит память всей ноды (или Cgroup, но работает не оптимально) и ленится собирать мусор, пока не упрется в потолок. Установите <code>GOMEMLIMIT=450MiB</code> (чуть меньше лимита K8s), чтобы GC начал работать проактивнее.</p>
-<h2 id="keys-2-prizrachnaya-zaderzhka-cpu-throttling">Кейс 2: Призрачная задержка (CPU Throttling)</h2>
+<p>Если приложение действительно требует больше памяти, не спешите просто увеличивать лимит! Возможно, проблема в Garbage Collector.</p>
+<p>Исторически сборщик мусора Go (GC) ориентировался на удвоение кучи (<code>GOGC=100</code>) и ничего не знал об искусственных ограничениях Cgroups. Он ленился запускать сборку мусора, пока размер кучи не удваивался, и с размаху врезался в потолок лимита контейнера.</p>
+<p>Начиная с версии Go 1.19, обязательно задавайте переменную окружения <code>GOMEMLIMIT</code>. Установите <code>GOMEMLIMIT=450MiB</code> (чуть меньше лимита K8s в 512Mi):</p>
 
-<p>Ситуация: P99 Latency периодически взлетает до небес, хотя средний CPU (Average) выглядит нормально.</p>
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">env:
+- name: GOMEMLIMIT
+  value: &quot;450MiB&quot; # Задаем мягкий лимит на 10-15% ниже K8s limits.memory (512Mi)
+</code></pre>
+</div>
+
+<p>Увидев, что использование кучи приближается к 450 МиБ, рантайм Go проактивно инициирует интенсивные циклы сборки мусора, очищая память и гарантированно удерживая контейнер в безопасной зоне.</p>
+<hr />
+<h2 id="3-keys-2-prizrachnaya-zaderzhka-cfs-cpu-throttling">3. Кейс 2: Призрачная задержка (CFS CPU Throttling)</h2>
+
+<p><strong>Симптомы:</strong> Графики среднего потребления процессора (Average CPU) показывают скромные 30–40%. Серверы не перегружены. Но 99-й перцентиль времени отклика (p99 Latency) у клиентов периодически взлетает с нормальных 5 мс до чудовищных 150–200 мс.</p>
 <h3 id="diagnostika">Диагностика</h3>
-<p>Смотрим метрики Prometheus: <code>container_cpu_cfs_throttled_periods_total / container_cpu_cfs_periods_total</code>. Если этот процент больше 0, ваш Go-код "душится" (throttled) планировщиком Completely Fair Scheduler (CFS).</p>
+<p>Открываем Prometheus и вычисляем процент троттлинга подов:</p>
+
+<div class="code-block" data-lang="promql">
+  <div class="code-header">
+    <span class="code-lang-tag">PROMQL</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-promql"><code class="language-promql">sum(rate(container_cpu_cfs_throttled_periods_total[5m])) by (pod) 
+/ 
+sum(rate(container_cpu_cfs_periods_total[5m])) by (pod) * 100
+</code></pre>
+</div>
+
+<p>Если это значение превышает 0% (а порой достигает 30–50%), ваш сервис пал жертвой планировщика CFS (Completely Fair Scheduler).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+gantt
+title Иллюзия низкой нагрузки: Как 40% среднего CPU убивают latency
+dateFormat X
+axisFormat %s
+section Квант 100 мс
+Параллельная работа 4 горутин (выжигание квоты) :active, 0, 40
+ЯДРО УСЫПЛЯЕТ GO-ПРОЦЕСС (CFS THROTTLE) :crit, 40, 100
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Математика CFS Quota</span>
   </div>
   <div class="callout-body">
-    <p>Вы установили <code>limits.cpu: "1"</code> (1000 millicores). В K8s это реализовано через квоты CFS: период 100мс, квота 100мс. Ваш Go-сервис может отработать свою квоту за 60мс, а оставшиеся 40мс ядро Linux <strong>полностью заморозит</strong> процесс (Throttle), даже если физические ядра CPU простаивают. В этот момент все горутины Go, ожидающие выполнения, встанут в очередь, и Latency взорвется.</p>
+    <p>Вы указали в манифесте <code>limits.cpu: "1"</code> (1000 millicores). Kubernetes настраивает квоту ядра: период 100 мс, разрешенное время работы — 100 мс.</p>
+<p>Но в многопоточном рантайме Go работают 4 ядра (<code>GOMAXPROCS=4</code>). Если все 4 потока одновременно бросились парсить тяжелый JSON-документ, они потратят разрешенные 100 мс процессорного времени всего за <strong>25 мс физического времени</strong> (25 мс $\times$ 4 потока = 100 мс квоты)!</p>
+<p>На оставшиеся 75 миллисекунд текущего окна ядро Linux <strong>принудительно усыпляет все потоки процесса</strong>. Все горутины замирают, а клиенты ждут ответов. Средний CPU за секунду при этом покажет всего 25% утилизации!</p>
   </div>
 </div>
 
 <h3 id="reshenie">Решение</h3>
-<p>Для Go-бэкендов, чувствительных к Latency, <strong>лучше вообще убрать <code>cpu limits</code></strong>, оставив только <code>requests</code>. Планировщик K8s (на основе <code>requests</code>) гарантирует процессу минимум CPU, а без <code>limits</code> он сможет потреблять свободные такты на ноде (burst) без штрафов. Это стандартная практика для Google и многих крупных компаний.</p>
-<h2 id="keys-3-setevye-taymauty-i-dns">Кейс 3: Сетевые таймауты и ДНС</h2>
+<p>Для высоконагруженных бэкендов на Go, чувствительных к Latency, <strong>лучше вообще убрать <code>cpu limits</code></strong>, оставив только <code>requests</code>. Планировщик K8s (на основе <code>requests</code>) гарантирует процессу минимум CPU, а без <code>limits</code> он сможет потреблять свободные такты на ноде (burst) без штрафов. Это стандартная практика для Google и многих крупных компаний.</p>
+<hr />
+<h2 id="4-keys-3-setevye-taymauty-i-dns">4. Кейс 3: Сетевые таймауты и ДНС</h2>
 
-<p>Ситуация: Go-сервис при запросе к другому микросервису или БД получает <code>context deadline exceeded</code>.</p>
+<p><strong>Симптомы:</strong> Go-сервис при межсервисных вызовах периодически выплевывает в логи ошибки <code>context deadline exceeded</code> или сетевые сбои <code>i/o timeout</code>.</p>
 <h3 id="diagnostika-uroven-os">Диагностика (Уровень ОС)</h3>
-<p>Если вы подозреваете сеть, <code>kubectl exec</code> вам не поможет (особенно в <code>distroless</code> образах, где нет <code>curl</code> или <code>ping</code>).</p>
-<p>Используйте <strong>Ephemeral Containers</strong> (введены в K8s 1.25):</p>
+<p>В соответствии с лучшими практиками безопасности наши Go-образы собираются на базе <code>distroless</code> или <code>scratch</code> (в них нет ни командного процессора bash, ни утилит <code>curl</code>, <code>ping</code>, <code>netstat</code>). Команда <code>kubectl exec</code> беспомощна: внутри контейнера нечего запускать.</p>
+<p>Начиная с Kubernetes 1.25, спасением стали <strong>Ephemeral Containers (Эфемерные контейнеры отладки)</strong>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2259,30 +2330,73 @@ E --&gt;|&quot;Ресурсы ок, сеть ок&quot;| H[&quot;Шаг 5. Go Ru
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">kubectl debug -it &lt;failing-pod&gt; --image=busybox --target=&lt;container-name&gt; 
+  <pre class="language-bash"><code class="language-bash">kubectl debug -it &lt;failing-pod&gt; --image=busybox --target=&lt;container-name&gt;
 </code></pre>
 </div>
 
-<p>Эта команда добавит временный контейнер с инструментами (busybox) в тот же Pod, разделив с ним Network Namespace. Теперь вы можете делать <code>wget</code>, <code>nslookup</code> или <code>traceroute</code> от лица вашего Go-приложения.</p>
+<p>Эта команда на лету внедряет в работающий под временный отладочный контейнер с утилитами <code>busybox</code>. Он разделяет с вашим Go-приложением единое сетевое пространство имен (<code>Network Namespace</code>) и таблицу процессов!</p>
+<p>Теперь вы можете проверить сетевую доступность от лица самого Go-сервиса:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># Проверка DNS-резолвинга через CoreDNS
+nslookup billing-service
+
+# Проверка TCP-связности
+wget -qO- --timeout=2 http://billing-service:8080/healthz
+
+# Трассировка маршрута
+traceroute billing-service
+</code></pre>
+</div>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос для собеседования: i/o timeout против Dial timeout</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Ваш Go-сервис логирует <code>i/o timeout</code> при подключении к БД. Как понять, проблема в сети (пакеты дропаются) или в БД (она перегружена и не принимает TCP SYN)?<br />
-<strong>Ответ:</strong> По времени ошибки. Если БД перегружена, ядро всё равно ответит на SYN пакетом SYN-ACK (через backlog), и соединение установится, но затем Go получит таймаут на чтение/запись.<br />
-Если вы получаете таймаут <em>на стадии установки соединения</em> (Dial timeout), значит, SYN-пакет не дошел или SYN-ACK не вернулся. Это сетевая проблема (iptables дропают пакеты, проблемы с CNI или физической сетью). Для глубокой диагностики используйте <code>tcpdump</code> на ноде (через <code>kubectl debug</code> для ноды).</p>
+    <p><strong>Вопрос:</strong> Ваш Go-сервис логирует ошибку <code>i/o timeout</code> при подключении к базе данных PostgreSQL. Как определить, упала ли сеть между подами или сама база данных перегружена?<br />
+<strong>Ответ:</strong> Обращайте внимание на фазу, в которой возник таймаут:<br />
+1. <strong>Таймаут на стадии Dial (Handshake timeout):</strong> Ошибка происходит при попытке открыть TCP-сокет. Если пакет <code>SYN</code> отправлен, но ответный <code>SYN-ACK</code> не возвращается в течение 2–5 секунд, это однозначно сетевая проблема (пакеты отбрасываются из-за переполнения таблицы <code>conntrack</code>, сетевые фильтры NetworkPolicy блокируют порт или сбоит оверлейная сеть CNI).<br />
+2. <strong>Таймаут после установления соединения (Read/Write timeout):</strong> TCP-рукопожатие завершилось успешно (сеть в порядке, ядро ноды БД приняло соединение в системный backlog), но Go-сервис не получает байты ответа на SQL-запрос. Это симптом перегрузки самой СУБД: нехватка соединений в пуле, долгие блокировки таблиц (deadlocks) или тяжелый seq scan.</p>
+<p>Для глубокого анализа сетевых пакетов на ноде запускают утилиту <code>tcpdump</code> через привилегированный отладочный контейнер ноды: <code>kubectl debug node/&lt;node-name&gt; -it --image=nicolaka/netshoot</code>.</p>
   </div>
 </div>
 
-<h2 id="keys-4-utechka-gorutin-goroutine-leak">Кейс 4: Утечка горутин (Goroutine Leak)</h2>
+<hr />
+<h2 id="5-keys-4-utechka-gorutin-goroutine-leak-i-spasitelnyy-sigquit">5. Кейс 4: Утечка горутин (Goroutine Leak) и спасительный SIGQUIT</h2>
 
-<p>Ситуация: Потребление памяти плавно растет, OOM не наступает, но сервис становится вялым. Метрика <code>go_goroutines</code> ползет вверх.</p>
+<p><strong>Симптомы:</strong> Потребление оперативной памяти сервисом монотонно и непрерывно ползет вверх. Сервис не падает по OOM, но через несколько дней непрерывной работы начинает потреблять гигабайты памяти. Метрика <code>go_goroutines</code> демонстрирует непрерывную восходящую прямую.</p>
 <h3 id="diagnostika-uroven-go">Диагностика (Уровень Go)</h3>
-<p>Вам нужен дамп стеков горутин. В Go он доступен через <code>pprof</code>.<br />
-Если вы не expose <code>pprof</code> на внешний интерфейс (что в проде часто запрещено политиками безопасности), вы можете получить дамп через сигнал <code>SIGQUIT</code>.</p>
-<p>Отправьте сигнал процессу (PID 1 в контейнере):</p>
+<p>В коде образовалась утечка горутин — потоки запустились, но зависли в ожидании ответа из небуферизованного канала, в который никто никогда ничего не запишет, или на HTTP-вызове без настроенного контекста <code>context.WithTimeout</code>.</p>
+<p>Для спасения системы нам необходим полный дамп стеков горутин.</p>
+<h4 id="variant-a-standartnyy-pprof">Вариант А: Стандартный pprof</h4>
+<p>Если внутри пода открыт порт профайлера:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">kubectl port-forward &lt;pod-name&gt; 6060:6060
+curl http://localhost:6060/debug/pprof/goroutine?debug=2 &gt; goroutines.txt
+</code></pre>
+</div>
+
+<p>В файле <code>goroutines.txt</code> вы увидите список всех горутин, сгруппированных по строке кода, на которой они заблокированы.</p>
+<h4 id="variant-b-ekstrennyy-damp-cherez-sigquit-v-boevom-prode">Вариант Б: Экстренный дамп через SIGQUIT в боевом проде</h4>
+<p>В жестких корпоративных средах порт 6060 закрыт политиками сетевой безопасности, а pprof вырезан из бинарника. Как заглянуть в память процесса?</p>
+<p>На помощь приходит системный сигнал ядра <strong><code>SIGQUIT</code> (сигнал 3)</strong>!</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2296,22 +2410,75 @@ E --&gt;|&quot;Ресурсы ок, сеть ок&quot;| H[&quot;Шаг 5. Go Ru
 </code></pre>
 </div>
 
-<p>По умолчанию Go-рантайм при получении <code>SIGQUIT</code> дампит стеки всех горутин в <code>stderr</code>. Вы увидите это в логах (<code>kubectl logs</code>).</p>
+<p>По умолчанию среда исполнения Go перехватывает сигнал <code>SIGQUIT</code> и выполняет экстренное аварийное действие: <strong>выводит полные стектрейсы абсолютно всех активных горутин в поток <code>stderr</code></strong>!</p>
+<p>Открываем логи:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">kubectl logs &lt;pod-name&gt;
+</code></pre>
+</div>
+
+<p>И перед нами раскрывается исчерпывающая анатомия утечки:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">goroutine 4512 [chan receive, 48 hours]:
+main.worker(0xc0000a4000)
+    /app/worker.go:42 +0x3a
+</code></pre>
+</div>
+
+<p>Вы сразу видите: 4 500 горутин уже двое суток ждут чтения из канала в файле <code>worker.go</code> на строке 42!</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Побочный эффект SIGQUIT</span>
   </div>
   <div class="callout-body">
-    <p>Будьте осторожны с <code>SIGQUIT</code>! В старых версиях Go (до 1.21) дамп тысяч горутин мог заблокировать рантайм на секунды. Также <code>SIGQUIT</code> по умолчанию завершает процесс. Убедитесь, что ваша система автоматически перезапустит Под (RestartPolicy: Always). Более безопасный способ — прочитать дампы через механизм <code>runtime/pprof</code> и записать в файл, или использовать <code>curl http://localhost:6060/debug/pprof/goroutine?debug=2</code>, если pprof открыт внутри Пода.</p>
+    <p>Помните: по стандарту POSIX сигнал <code>SIGQUIT</code> после генерации дампа аварийно <strong>завершает процесс</strong>! Используйте этот метод только тогда, когда вы готовы к мгновенному перезапуску пода (убедитесь, что в манифесте задан параметр <code>restartPolicy: Always</code>). Для безопасного съема профилей на лету без падения процесса подключайте пакет <code>runtime/pprof</code> к служебным эндпоинтам приложения.</p>
   </div>
 </div>
 
-<h2 id="ebpf-i-bpftrace-khirurgiya-yadra">eBPF и bpftrace: Хирургия ядра</h2>
+<hr />
+<h2 id="6-ebpf-i-bpftrace-khirurgicheskaya-tochnost-na-urovne-yadra">6. eBPF и bpftrace: Хирургическая точность на уровне ядра</h2>
 
-<p>Иногда проблема кроется на стыке Go и Linux (например, медленные системные вызовы, которые не видны в CPU профайлере Go). </p>
-<p>Современный подход — использование <strong>eBPF</strong> (Extended Berkeley Packet Filter). Инструменты вроде <code>bpftrace</code> позволяют писать скрипты, которые выполняются безопасно в ядре Linux, перехватывая системные вызовы без изменения вашего Go-кода и без оверхеда <code>strace</code>.</p>
-<p>Пример bpftrace скрипта для мониторинга времени системного вызова <code>openat</code> (открытие файлов):</p>
+<p>Иногда случаются аномалии, перед которыми пасуют и логи, и внутренние профилировщики Go. Например: прикладной код отрабатывает мгновенно, но периодически системный вызов открытия файла или сокета <code>openat</code> зависает на 50 миллисекунд. Традиционный <code>strace</code> в продакшене использовать смертельно опасно: он перехватывает контекст каждого вызова через <code>ptrace</code>, замедляя приложение в 10–50 раз.</p>
+<p>Современный золотой стандарт низкоуровневого траблшутинга — технология <strong>eBPF</strong> и консольный трассировщик <strong><code>bpftrace</code></strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+BPF[&quot;bpftrace Script\n(Kernel Space)&quot;] --&gt;|&quot;Attach probe&quot;| Trace[&quot;tracepoint:syscalls:sys_enter_openat&quot;]
+Trace --&gt;|&quot;Безопасное измерение времени в ядре (наносекунды)&quot;| Map[(&quot;eBPF BPF-Map\n(Гистограмма latency)&quot;)]
+Map --&gt; Output[&quot;Вывод гистограммы задержек в консоль инженера&quot;]
+  </pre>
+</div>
+
+
+<p>Скрипт <code>bpftrace</code> компилируется в безопасный байткод eBPF, загружается в ядро Linux и с наносекундной точностью замеряет задержки дискового ввода-вывода конкретного Go-процесса:</p>
 
 <div class="code-block" data-lang="c">
   <div class="code-header">
@@ -2329,17 +2496,20 @@ tracepoint:syscalls:sys_exit_openat /@start[tid]/ {
 </code></pre>
 </div>
 
-<p>Это позволит вам увидеть, не блокирует ли ваше Go-приложение медленные дисковые операции на ноде (например, из-за проблем с EBS в AWS).</p>
-<h2 id="itog">Итог</h2>
+<p>Вы мгновенно увидите гистограмму распределения времени: если основная масса файлов открывается за 2 микросекунды, но 1% операций виснет на 80 мс — проблема локализована: аппаратный сбой или деградация дискового массива EBS в облаке AWS, а не ошибка в Go-коде.</p>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Метод воронки</strong>: Не лезьте в код сразу. Проверьте ноду -&gt; Под -&gt; Сеть -&gt; Рантайм Go -&gt; Код.</li>
-<li><strong>OOM Kill</strong>: <code>SIGKILL</code> от ядра не оставляет логов. Проверяйте Events Пода и настраивайте <code>GOMEMLIMIT</code>.</li>
-<li><strong>CPU Throttling</strong>: CFS квоты — главный враг Latency. Убирайте <code>cpu limits</code> для сервисов, требующих низкой задержки.</li>
-<li><strong>Ephemeral Containers</strong>: Единственный безопасный способ дебажить сеть в <code>distroless</code>/<code>scratch</code> контейнерах.</li>
-<li><strong>SIGQUIT и pprof</strong>: Инструменты для поиска утечек горутин и deadlocks прямо в продакшене.</li>
+<li><strong>Метод воронки:</strong> Расследуйте инциденты поэтапно: Физический сервер -&gt; Поды (<code>CrashLoopBackOff</code>) -&gt; Ресурсы Cgroups -&gt; Сеть и DNS -&gt; Рантайм Go.</li>
+<li><strong>OOM Killer (<code>SIGKILL</code>):</strong> Убивает процесс без логов и без выполнения <code>defer</code>. Для предотвращения задавайте мягкий лимит кучи <code>GOMEMLIMIT</code> на 10–15% ниже лимита контейнера.</li>
+<li><strong>CFS CPU Throttling:</strong> Жесткие квоты CPU усыпляют многопоточные сервисы на десятки миллисекунд, взвинчивая p99 Latency. Избегайте директивы <code>limits.cpu</code> в критических Go-бэкендах.</li>
+<li><strong>Ephemeral Containers:</strong> Команда <code>kubectl debug</code> с образом <code>busybox</code> позволяет дебажить сеть и DNS в защищенных контейнерах без шелла.</li>
+<li><strong>Диагностика Dial vs Read Timeout:</strong> Таймаут на фазе <code>Dial</code> — это отвал сети/файрвола. Таймаут на фазе <code>Read</code> — симптом перегрузки базы данных.</li>
+<li><strong>Сигнал <code>SIGQUIT</code>:</strong> Мгновенный способ получить дамп всех горутин в <code>stderr</code> при поиске Goroutine Leaks в проде.</li>
+<li><strong>eBPF / bpftrace:</strong> Позволяет проводить глубокий аудит системных вызовов ядра без накладных расходов.</li>
 </ol>
-<p>Мы прошли долгий путь от транзисторов и прерываний процессора до оркестрации контейнеров и поиска багов в продакшене. В следующей, заключительной статье раздела мы подведем итоги и сформулируем принципы работы в Production окружении: <a href="7-itogi-razdela-production-okruzhenie.html" class="wikilink">7. Итоги раздела. Production окружение</a>.</p>
+<p>Мы изучили архитектуру операционной системы, сетевой фабрики, контейнеризации и методы спасения систем под огнем. В финальной главе нашего инфраструктурного эпоса мы обобщим все полученные знания в сводный инженерный манифест надежности: <a href="7-itogi-razdela-production-okruzhenie.html" class="wikilink">7. Итоги раздела. Production окружение</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2367,7 +2537,7 @@ tracepoint:syscalls:sys_exit_openat /@start[tid]/ {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#metod-voronki-ot-simptoma-k-kornyu">Метод воронки: От симптома к корню</a></li><li class="toc-item toc-h2"><a href="#keys-1-ubiytsa-oom-out-of-memory">Кейс 1: Убийца OOM (Out of Memory)</a></li><li class="toc-item toc-h3"><a href="#diagnostika">Диагностика</a></li><li class="toc-item toc-h3"><a href="#reshenie-go-spetsifika">Решение (Go-специфика)</a></li><li class="toc-item toc-h2"><a href="#keys-2-prizrachnaya-zaderzhka-cpu-throttling">Кейс 2: Призрачная задержка (CPU Throttling)</a></li><li class="toc-item toc-h3"><a href="#diagnostika">Диагностика</a></li><li class="toc-item toc-h3"><a href="#reshenie">Решение</a></li><li class="toc-item toc-h2"><a href="#keys-3-setevye-taymauty-i-dns">Кейс 3: Сетевые таймауты и ДНС</a></li><li class="toc-item toc-h3"><a href="#diagnostika-uroven-os">Диагностика (Уровень ОС)</a></li><li class="toc-item toc-h2"><a href="#keys-4-utechka-gorutin-goroutine-leak">Кейс 4: Утечка горутин (Goroutine Leak)</a></li><li class="toc-item toc-h3"><a href="#diagnostika-uroven-go">Диагностика (Уровень Go)</a></li><li class="toc-item toc-h2"><a href="#ebpf-i-bpftrace-khirurgiya-yadra">eBPF и bpftrace: Хирургия ядра</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-metod-voronki-ot-simptoma-k-pervoprichine">1. Метод воронки: От симптома к первопричине</a></li><li class="toc-item toc-h2"><a href="#2-keys-1-ubiytsa-oom-out-of-memory-i-yarost-sigkill">2. Кейс 1: Убийца OOM (Out of Memory) и ярость SIGKILL</a></li><li class="toc-item toc-h3"><a href="#diagnostika">Диагностика</a></li><li class="toc-item toc-h3"><a href="#reshenie-go-spetsifika">Решение (Go-специфика)</a></li><li class="toc-item toc-h2"><a href="#3-keys-2-prizrachnaya-zaderzhka-cfs-cpu-throttling">3. Кейс 2: Призрачная задержка (CFS CPU Throttling)</a></li><li class="toc-item toc-h3"><a href="#diagnostika">Диагностика</a></li><li class="toc-item toc-h3"><a href="#reshenie">Решение</a></li><li class="toc-item toc-h2"><a href="#4-keys-3-setevye-taymauty-i-dns">4. Кейс 3: Сетевые таймауты и ДНС</a></li><li class="toc-item toc-h3"><a href="#diagnostika-uroven-os">Диагностика (Уровень ОС)</a></li><li class="toc-item toc-h2"><a href="#5-keys-4-utechka-gorutin-goroutine-leak-i-spasitelnyy-sigquit">5. Кейс 4: Утечка горутин (Goroutine Leak) и спасительный SIGQUIT</a></li><li class="toc-item toc-h3"><a href="#diagnostika-uroven-go">Диагностика (Уровень Go)</a></li><li class="toc-item toc-h4"><a href="#variant-a-standartnyy-pprof">Вариант А: Стандартный pprof</a></li><li class="toc-item toc-h4"><a href="#variant-b-ekstrennyy-damp-cherez-sigquit-v-boevom-prode">Вариант Б: Экстренный дамп через SIGQUIT в боевом проде</a></li><li class="toc-item toc-h2"><a href="#6-ebpf-i-bpftrace-khirurgicheskaya-tochnost-na-urovne-yadra">6. eBPF и bpftrace: Хирургическая точность на уровне ядра</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

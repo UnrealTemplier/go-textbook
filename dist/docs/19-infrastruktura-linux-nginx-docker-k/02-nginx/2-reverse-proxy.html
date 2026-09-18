@@ -2169,24 +2169,26 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Reverse proxy</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Архитектура современного бэкенда немыслима без Reverse Proxy (обратного прокси). Если вы развернете ваш Go-сервис напрямую в интернет, он неизбежно столкнется с проблемами безопасности, медленными клиентами и сложностью маршрутизации. Nginx в роли Reverse Proxy — это не просто транслятор запросов, это мощный щит и координатор.</p>
-<p>В отличие от Forward Proxy (прямого прокси, который выталкивает запросы пользователей в интернет, скрывая их IP), Reverse Proxy стоит <em>перед</em> серверами приложений, принимая входящий трафик из интернета и пробрасывая его внутрь инфраструктуры.</p>
-<h2 id="kak-rabotaet-proxypass-pod-kapotom">Как работает `proxy_pass` под капотом</h2>
+            <h1>Nginx как Reverse Proxy: Анатомия proxy_pass, трансляция заголовков и буферизация</h1>
+<p>В современной архитектуре распределенных бэкендов обратный прокси (<strong>Reverse Proxy</strong>) — это незаменимый архитектурный рубеж. Прямой деплой микросервисов на Go в открытый интернет без промежуточного прокси почти всегда ведет к фатальным эксплуатационным проблемам: уязвимости сетевого периметра, исчерпанию пула горутин из-за медленных клиентов, сложностям с динамической маршрутизацией и хаосу в SSL/TLS сертификатах.</p>
+<p>В отличие от прямого прокси (<strong>Forward Proxy</strong>), который устанавливается на стороне клиентов (например, корпоративный прокси в офисе, скрывающий внутренние IP-адреса рабочих станций при выходе во внешнюю сеть), <strong>Reverse Proxy</strong> развертывается на стороне инфраструктуры сервиса. Он выступает единым фасадом для миллионов внешних пользователей, принимая весь входящий интернет-трафик и деликатно распределяя его по закрытым внутренним подсетям бэкенда.</p>
+<hr />
+<h2 id="1-kak-rabotaet-direktiva-proxypass-pod-kapotom">1. Как работает директива proxy_pass под капотом</h2>
 
-<p>Когда вы указываете в конфиге Nginx директиву <code>proxy_pass http://go_backend:8080</code>, происходит следующее:</p>
+<p>Главная рабочая лошадка конфигурации Nginx — директива <code>proxy_pass</code>. Когда запрос попадает в соответствующий блок <code>location</code>, Nginx разворачивает сложную цепочку низкоуровневых операций:</p>
 <ol>
-<li><strong>Прием соединения</strong>: Nginx принимает TCP-соединение от клиента, читает HTTP-заголовки и тело запроса (если позволяет буфер).</li>
-<li><strong>Пул соединений (Upstream Keepalive)</strong>: Вместо того чтобы при каждом запросе делать системный вызов <code>connect()</code> к Go-бэкенду, Nginx поддерживает пул уже установленных TCP-соединений (keepalive). Он берет соединение из пула, или создает новое, если пул пуст.</li>
-<li><strong>Запись в сокет</strong>: Nginx записывает HTTP-запрос в сокет, связанный с Go-приложением.</li>
-<li><strong>Чтение ответа</strong>: Nginx читает ответ от Go. Если ответ большой, Nginx может временно сохранить его на диск (в папку <code>proxy_temp_path</code>), чтобы не забить оперативную память.</li>
-<li><strong>Отдача клиенту</strong>: Nginx отправляет ответ медленному клиенту в том темпе, который клиент способен переварить.</li>
+<li><strong>Прием клиентского подключения:</strong> Воркер Nginx принимает TCP-соединение от клиента, инициирует TLS Handshake (при HTTPS) и считывает заголовки HTTP-запроса. Если в запросе присутствует тело (body), Nginx читает его в память в пределах лимита <code>client_body_buffer_size</code>.</li>
+<li><strong>Переиспользование пула соединений (Upstream Keepalive):</strong> Открытие нового TCP-соединения на каждый входящий HTTP-запрос — непозволительная роскошь: три системных вызова на рукопожатие (<code>SYN</code>, <code>SYN-ACK</code>, <code>ACK</code>), медленный старт TCP (Slow Start) и накопление сокетов в <code>TIME_WAIT</code>. Nginx поддерживает пул постоянно открытых TCP-соединений к Go-бэкенду (<code>keepalive</code>). При получении запроса воркер берет готовое соединение из пула, избегая системного вызова <code>connect()</code>, либо открывает новое, если пул исчерпан.</li>
+<li><strong>Запись в сокет бэкенда:</strong> Nginx формирует очищенный и обогащенный служебными заголовками HTTP-запрос и асинхронно передает его в сокет Go-приложения через кольцевой буфер ядра.</li>
+<li><strong>Вычитывание ответа и дисковый сброс:</strong> Как только Go-сервис сгенерировал данные, Nginx вычитывает их на максимальной скорости локальной шины. Если ответ превышает размер буферов оперативной памяти (<code>proxy_buffers</code>), Nginx сбрасывает избыток во временные файлы на диске (<code>proxy_temp_path</code>), не заставляя Go ждать медленного клиента.</li>
+<li><strong>Трансляция клиенту:</strong> Nginx передает ответ клиенту в темпе, определяемом пропускной способностью его интернет-провайдера.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2202,22 +2204,23 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Клиент из интернета&quot;] --&gt;|&quot;1\. HTTPS запрос&quot;| B[&quot;Nginx - Reverse Proxy&quot;]
-B --&gt;|&quot;2\. HTTP запрос через keepalive&quot;| C[&quot;Go Backend 1&quot;]
-B --&gt;|&quot;2\. HTTP запрос через keepalive&quot;| D[&quot;Go Backend 2&quot;]
-C --&gt;|&quot;3\. HTTP ответ&quot;| B
-D --&gt;|&quot;3\. HTTP ответ&quot;| B
-B --&gt;|&quot;4\. Расшифровка и отправка&quot;| A
+A[&quot;Клиент из интернета&quot;] --&gt;|&quot;1. HTTPS запрос&quot;| B[&quot;Nginx - Reverse Proxy&quot;]
+B --&gt;|&quot;2. HTTP запрос через keepalive&quot;| C[&quot;Go Backend 1&quot;]
+B --&gt;|&quot;2. HTTP запрос через keepalive&quot;| D[&quot;Go Backend 2&quot;]
+C --&gt;|&quot;3. HTTP ответ&quot;| B
+D --&gt;|&quot;3. HTTP ответ&quot;| B
+B --&gt;|&quot;4. Расшифровка и отправка&quot;| A
   </pre>
 </div>
 
 
-<h2 id="problema-zagolovkov-kto-zvonit">Проблема заголовков: Кто звонит?</h2>
+<hr />
+<h2 id="2-problema-zagolovkov-kto-zvonit">2. Проблема заголовков: «Кто звонит?»</h2>
 
-<p>Главная ловушка Reverse Proxy для Go-разработчика — это потеря информации об оригинальном клиенте.</p>
-<p>Когда Nginx проксирует запрос на Go, он устанавливает <em>свое</em> TCP-соединение с вашим сервером. В результате, если вы вызовете <code>r.RemoteAddr</code> в Go, вы получите IP-адрес Nginx (например, <code>172.16.0.1</code>), а не реальный IP пользователя.</p>
-<p>Чтобы решить эту проблему, Nginx должен добавить специальные заголовки, а Go-приложение должно уметь их читать.</p>
-<p><strong>Минимальный конфиг Nginx для проксирования:</strong></p>
+<p>Пожалуй, самая коварная ловушка при внедрении Reverse Proxy — <strong>потеря контекста оригинального сетевого соединения</strong>.</p>
+<p>Поскольку Nginx устанавливает собственное TCP-соединение с вашим Go-сервисом, вызов стандартного метода <code>r.RemoteAddr</code> вернет внутренний IP-адрес самого Nginx (например, <code>172.16.0.1</code> или <code>127.0.0.1</code>), а поле <code>r.Host</code> может оказаться именем апстрим-группы вместо доменного имени, которое пользователь ввел в адресной строке браузера.</p>
+<p>Если Go-бэкенд полагается на IP-адрес для rate-limiting, геолокации, логирования аудита или защиты от брутфорса, система моментально заблокирует сам Nginx или даст зеленый свет злоумышленникам.</p>
+<p>Для корректной трансляции метаданных Nginx обязан проставлять семейство прокси-заголовков:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2230,39 +2233,55 @@ B --&gt;|&quot;4\. Расшифровка и отправка&quot;| A
   <pre class="language-nginx"><code class="language-nginx">location /api/ {
     proxy_pass http://go_backend:8080;
 
-    # Передаем оригинальный Host
+    # Передаем оригинальный Host из запроса пользователя
     proxy_set_header Host $host;
 
-    # Передаем реальный IP клиента
+    # Передаем физический IP-адрес непосредственного клиента
     proxy_set_header X-Real-IP $remote_addr;
 
-    # Передаем цепочку прокси-серверов
+    # Добавляем IP клиента в цепочку прокси-серверов
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
-    # Указываем, что оригинальный запрос был по HTTPS
+    # Сообщаем бэкенду исходный протокол (http или https)
     proxy_set_header X-Forwarded-Proto $scheme;
 }
 </code></pre>
 </div>
 
-<h3 id="x-forwarded-for-i-spufing">X-Forwarded-For и спуфинг</h3>
+<h3 id="x-forwarded-for-i-uyazvimost-ip-spoofing">X-Forwarded-For и уязвимость IP Spoofing</h3>
 
-<p>Заголовок <code>X-Forwarded-For</code> (XFF) имеет формат: <code>client_ip, proxy1_ip, proxy2_ip</code>. <br />
-Проблема в том, что злоумышленник может подделать этот заголовок, отправив <code>X-Forwarded-For: 1.1.1.1</code> со своим запросом. Nginx с директивой <code>proxy_add_x_forwarded_for</code> просто добавит реальный IP в конец: <code>1.1.1.1, attacker_real_ip</code>. Если ваше Go-приложение доверяет <em>первому</em> IP из этого списка, вы подвергаетесь атаке IP Spoofing.</p>
+<p>Заголовок <code>X-Forwarded-For</code> (XFF) имеет формат: <code>client_ip, proxy1_ip, proxy2_ip</code>. </p>
+<p>Здесь кроется критическая уязвимость безопасности: любой клиент может вручную отправить поддельный заголовок <code>X-Forwarded-For: 1.1.1.1</code>. Директива Nginx <code>$proxy_add_x_forwarded_for</code> просто добавит реальный IP в конец: <code>1.1.1.1, attacker_real_ip</code>. Если ваше Go-приложение доверяет <em>первому</em> IP из этого списка, вы подвергаетесь атаке IP Spoofing.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Наивный парсинг X-Forwarded-For</span>
   </div>
   <div class="callout-body">
-    <p>Никогда не парсьте <code>X-Forwarded-For</code> вручную в Go, чтобы получить IP клиента, если вы не уверены в инфраструктуре перед Nginx. Если балансировщик нагрузки (например, AWS ALB) стоит перед Nginx, цепочка будет расти. <br />
-Безопасный подход в Nginx — использовать модуль <code>realip</code>. Он заставляет Nginx переписывать <code>$remote_addr</code> на основе доверенных прокси, а в Go вы просто читаете <code>X-Real-IP</code> или используете надежные библиотеки-экстракторы IP.</p>
+    <p>Никогда не парсьте <code>X-Forwarded-For</code> вручную в Go, чтобы получить IP клиента, если вы не уверены в инфраструктуре перед Nginx. Если балансировщик нагрузки (например, AWS ALB) стоит перед Nginx, цепочка будет расти.</p>
+<p>Безопасный подход в Nginx — использовать встроенный модуль <strong><code>realip</code></strong> (<code>ngx_http_realip_module</code>):</p>
+
+<div class="code-block" data-lang="nginx">
+  <div class="code-header">
+    <span class="code-lang-tag">NGINX</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-nginx"><code class="language-nginx">set_real_ip_from 10.0.0.0/8;      # Доверяем внутренним балансировщикам Cloud/K8s
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+</code></pre>
+</div>
+
+<p>Он заставляет Nginx переписывать <code>$remote_addr</code> на основе доверенных прокси, отбрасывая фальшивые заголовки. А в Go вы просто читаете <code>X-Real-IP</code> или используете надежные библиотеки-экстракторы IP.</p>
   </div>
 </div>
 
-<h3 id="izvlechenie-realnogo-ip-v-go-idiomatic-way">Извлечение реального IP в Go (Idiomatic way)</h3>
+<h3 id="izvlechenie-realnogo-ip-v-go-idiomatichnyy-podkhod">Извлечение реального IP в Go: Идиоматичный подход</h3>
 
-<p>В стандартной библиотеке Go нет встроенного парсера XFF с учетом доверенных подсетей. Использование популярных пакетов вроде <code>github.com/oapi-codegen/runtime</code> или написание собственного мидлваря с валидацией — стандартная практика. Базовый вариант выглядит так:</p>
+<p>Для защиты от спуфинга Go-приложение должно валидировать входящие адреса. Стандартная библиотека Go не содержит встроенного валидатора цепочек XFF, поэтому разработчики используют надежные экстракторы вроде <code>github.com/oapi-codegen/runtime</code> или пишут строгий middleware:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2272,9 +2291,18 @@ B --&gt;|&quot;4\. Расшифровка и отправка&quot;| A
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func RealIPMiddleware(next http.Handler) http.Handler {
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;net&quot;
+    &quot;net/http&quot;
+    &quot;strings&quot;
+)
+
+// RealIPMiddleware извлекает реальный IP клиента с защитой от спуфинга
+func RealIPMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Сначала проверяем X-Real-IP, который ставит наш Nginx
+        // Сначала проверяем X-Real-IP, который гарантированно выставил наш Nginx
         if ip := r.Header.Get(&quot;X-Real-IP&quot;); ip != &quot;&quot; {
             r.RemoteAddr = ip
         } else if ip := r.Header.Get(&quot;X-Forwarded-For&quot;); ip != &quot;&quot; {
@@ -2283,40 +2311,120 @@ B --&gt;|&quot;4\. Расшифровка и отправка&quot;| A
             ips := strings.Split(ip, &quot;,&quot;)
             r.RemoteAddr = strings.TrimSpace(ips[0])
         }
+
+        // Нормализуем адрес, отсекая порт, если он присутствует
+        if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+            r.RemoteAddr = host
+        }
+
         next.ServeHTTP(w, r)
     })
 }
 </code></pre>
 </div>
 
-<h2 id="buferizatsiya-zashchita-go-ot-medlennykh-klientov">Буферизация: Защита Go от медленных клиентов</h2>
+<hr />
+<h2 id="3-buferizatsiya-zashchita-go-ot-medlennykh-klientov-response-buffering">3. Буферизация: Защита Go от медленных клиентов (Response Buffering)</h2>
 
-<p>Одна из важнейших функций Nginx как Reverse Proxy — <strong>буферизация ответов (Response Buffering)</strong>. По умолчанию она включена (<code>proxy_buffering on</code>).</p>
-<p>Представьте, что ваш Go-сервис генерирует JSON-ответ на 2 МБ за 5 миллисекунд. А клиент, запрашивающий данные, сидит в метро на плохом 3G-соединении и способен принять эти данные только за 10 секунд.</p>
-<p>Если клиент подключен к Go напрямую:<br />
-1. Go пишет ответ в сокет.<br />
-2. Буфер отправки сокета быстро переполняется.<br />
-3. Системный вызов <code>write</code> в Go блокирует горутину, либо данные копятся в памяти рантайма.<br />
-4. Go-рантайм держит горутину и выделенную под ответ память "живыми" в течение 10 секунд. Это резко раздувает Heap и заставляет GC работать интенсивнее.</p>
-<p>С Nginx:<br />
-1. Go мгновенно отдает 2 МБ Nginx (в локальной сети между ними гигабитный канал).<br />
-2. Go закрывает соединение (или возвращает его в пул) и освобождает память.<br />
-3. Nginx сохраняет ответ в свои внутренние буферы (в оперативной памяти, а если ответ большой — на диск).<br />
-4. Nginx медленно "вываливает" данные клиенту со скоростью его соединения.</p>
+<p>По умолчанию в Nginx включена буферизация ответов (<code>proxy_buffering on</code>). Это одна из ключевых причин, почему Nginx бережет оперативную память бэкенда.</p>
+<h3 id="stsenariy-bez-nginx-go-napryamuyu-v-mir">Сценарий без Nginx (Go напрямую в мир):</h3>
+<ol>
+<li>Go-сервис генерирует тяжелый JSON-отчет размером 2 МБ за 5 миллисекунд.</li>
+<li>Клиент подключен через перегруженную сотовую сеть 3G и способен принимать данные со скоростью не более 200 КБ/с.</li>
+<li>Сокетный буфер отправки ядра переполняется за первые 64 КБ.</li>
+<li>Горутина Go блокируется на вызове <code>w.Write()</code> (или тратит такты в Netpoller), удерживая в куче (Heap) срез на 2 МБ в течение 10 секунд.</li>
+<li>При 1 000 таких клиентов в памяти зависает 2 ГБ живых аллокаций. Сборщик мусора Go (GC) входит в фазу паники, вызывая частые циклы Stop-The-World и сжигая CPU.</li>
+</ol>
+<h3 id="stsenariy-s-nginx">Сценарий с Nginx:</h3>
+<ol>
+<li>Go-сервис выплевывает 2 МБ в сокет Nginx за 2 миллисекунды (пропускная способность локальной петли 10–40 Гбит/с).</li>
+<li>Go-хендлер завершает работу, горутина возвращается в пул, а память буфера мгновенно маркируется сборщиком мусора как свободная.</li>
+<li>Nginx сохраняет ответ в свои компактные C-структуры (<code>proxy_buffers 16 64k;</code>), а при нехватке памяти сбрасывает их во временный файл на диск.</li>
+<li>Nginx в своем неблокирующем цикле событий неспешно отдает байты медленному 3G-клиенту, не нагружая процессор и память Go.</li>
+</ol>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Client as Медленный клиент (3G)
+participant Nginx as Nginx (Reverse Proxy)
+participant Go as Go Backend Service
+
+Client-&gt;&gt;Nginx: HTTP GET /api/heavy-report
+Nginx-&gt;&gt;Go: proxy_pass HTTP GET /api/heavy-report
+Note over Go: Вычисление отчета (5 мс)
+Go--&gt;&gt;Nginx: Отдает 2 МБ ответа за 2 мс (Localhost)
+Note over Go: Хендлер завершен! Память освобождена
+Note over Nginx: proxy_buffering on: ответ сохранен в буфере/диске
+loop Медленная отдача (10 секунд)
+Nginx--&gt;&gt;Client: Потоковая передача мелкими пакетами
+end
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Когда буферизация ломает логику</span>
   </div>
   <div class="callout-body">
-    <p>Для стримминга больших файлов или Server-Sent Events (SSE) буферизация Nginx — это смерть. Если Nginx забуферизует ответ, клиент получит данные только когда файл скачается целиком, а SSE перестанет работать в реальном времени. Для таких маршрутов нужно явно выключать буферизацию: <code>proxy_buffering off;</code> или использовать <code>proxy_no_cache 1;</code>.</p>
+    <p>Для потокового вещания видео, стриминга больших файлов или протокола <strong>Server-Sent Events (SSE)</strong> буферизация Nginx — это смерть.</p>
+<p>Если Nginx будет буферизировать поток событий SSE, клиент не получит ни одного обновления в реальном времени: Nginx будет копить чанки, пока не заполнит системный буфер (обычно 4–8 КБ) или пока Go-сервер не закроет соединение.</p>
+<p>Для таких endpoint'ов буферизацию отключают точечно:</p>
+
+<div class="code-block" data-lang="nginx">
+  <div class="code-header">
+    <span class="code-lang-tag">NGINX</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-nginx"><code class="language-nginx">location /api/events {
+    proxy_pass http://go_backend:8080;
+    proxy_buffering off;    # Отключает буферизацию для real-time потока
+    proxy_cache off;        # Исключает сохранение в кэше
+    proxy_no_cache 1;       # Запрещает кэширование ответов
+    chunked_transfer_encoding on;
+}
+</code></pre>
+</div>
+
+<p>Также Go-бэкенд может сам отключить буферизацию Nginx, отправив специальный заголовок <code>X-Accel-Buffering: no</code>.</p>
   </div>
 </div>
 
-<h2 id="websockets-i-http-upgrade">WebSockets и HTTP Upgrade</h2>
+<hr />
+<h2 id="4-websockets-i-protokolnyy-apgreyd-http-upgrade">4. WebSockets и протокольный апгрейд (HTTP Upgrade)</h2>
 
-<p>Веб-сокеты работают поверх HTTP с помощью механизма <code>Upgrade</code>. Клиент отправляет HTTP-запрос с заголовками <code>Connection: Upgrade</code> и <code>Upgrade: websocket</code>.</p>
-<p>По умолчанию Nginx игнорирует или удаляет заголовок <code>Connection</code>, так как HTTP/1.1 требует закрыть соединение после ответа. Чтобы проксировать WebSockets, нужно научить Nginx понимать апгрейд:</p>
+<p>Протокол WebSocket стартует как обычный HTTP/1.1 запрос, но в процессе рукопожатия клиент запрашивает переключение протокола через заголовки:</p>
+
+<div class="code-block" data-lang="http">
+  <div class="code-header">
+    <span class="code-lang-tag">HTTP</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-http"><code class="language-http">Connection: Upgrade
+Upgrade: websocket
+</code></pre>
+</div>
+
+<p>По спецификации HTTP/1.1 заголовки <code>Connection</code> и <code>Upgrade</code> являются hop-by-hop (действуют только на одно соединение). Nginx по умолчанию удаляет их при проксировании. Чтобы WebSocket заработал сквозь Nginx к вашему Go-бэкенду, требуется явная настройка:</p>
 
 <div class="code-block" data-lang="nginx">
   <div class="code-header">
@@ -2328,14 +2436,15 @@ B --&gt;|&quot;4\. Расшифровка и отправка&quot;| A
   </div>
   <pre class="language-nginx"><code class="language-nginx">location /ws/ {
     proxy_pass http://go_backend:8080;
-    proxy_http_version 1.1; # WebSockets требуют HTTP 1.1
+    proxy_http_version 1.1; # WebSockets требуют обязательного HTTP 1.1
 
-    # Переписываем заголовки для Upgrade
+    # Переписываем служебные заголовки для успешного Upgrade
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection &quot;upgrade&quot;;
 
-    # Важно! Таймауты для долгих WS-соединений
-    proxy_read_timeout 86400s; # 24 часа, иначе Nginx закроет WS через 60 секунд
+    # Таймауты для долгоживущих соединений
+    proxy_read_timeout 86400s; # 24 часа, иначе Nginx разорвет WS через дефолтные 60 секунд
+    proxy_send_timeout 86400s;
 }
 </code></pre>
 </div>
@@ -2343,23 +2452,30 @@ B --&gt;|&quot;4\. Расшифровка и отправка&quot;| A
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Ошибочные редиректы на HTTP вместо HTTPS</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Ваше Go-приложение работает за Nginx. Вы используете <code>r.URL.IsAbs()</code> или формируете URL для редиректа, но получаете <code>http://</code> вместо <code>https://</code>. Почему?<br />
-<strong>Ответ:</strong> Nginx терминирует TLS. Связь между Nginx и Go происходит по обычному HTTP. Go видит схему <code>http</code>. Чтобы Go понимал, что оригинальный запрос был по HTTPS, Nginx должен отправлять заголовок <code>X-Forwarded-Proto: https</code>. В Go вы должны использовать мидлварь (например, из пакетов типа <code>gorilla/handlers</code> или вручную), который проверяет этот заголовок и подменяет <code>r.URL.Scheme</code> на <code>https</code> до выполнения редиректа или генерации ссылок.</p>
+    <p><strong>Вопрос:</strong> Ваше Go-приложение работает за Nginx. Вы используете <code>r.URL.IsAbs()</code> или формируете URL для редиректа, но получаете <code>http://</code> вместо <code>https://</code>. Почему?</p>
+<p><strong>Ответ:</strong> <br />
+Nginx терминирует TLS на внешнем порту 443. Связь между Nginx и Go внутри закрытой сети происходит по обычному незашифрованному HTTP (порт 8080). </p>
+<p>В результате рантайм Go видит входящее TCP-соединение без TLS (<code>r.TLS == nil</code>) и считает исходной схемой <code>http</code>. Когда код вызывает редирект или генерирует абсолютные ссылки, формируется URL <code>http://example.com/login</code>. Пользователь переходит по незащищенному адресу, браузер ругается на Mixed Content или уходит в бесконечный цикл редиректов.</p>
+<p><strong>Решение:</strong> <br />
+1. Nginx обязан отправлять заголовок <code>X-Forwarded-Proto: https</code> (директива <code>proxy_set_header X-Forwarded-Proto $scheme;</code>).<br />
+2. В Go на входе подключается middleware (например, из библиотеки <code>gorilla/handlers</code> или стандартный), который считывает заголовок <code>X-Forwarded-Proto</code> и подменяет <code>r.URL.Scheme = "https"</code> до вызова бизнес-логики.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Reverse Proxy</strong> — это фасад, скрывающий внутреннюю архитектуру бэкенда от клиентов.</li>
-<li><strong>Заголовки <code>X-Forwarded-*</code></strong>: Жизненно важный мост для передачи информации (IP клиента, схема, хост) от Nginx к Go. Ошибки в их обработке ведут к багам с авторизацией и редиректами.</li>
-<li><strong>Буферизация</strong>: Nginx берет на себя удар медленных клиентов, позволяя Go-горутинам отрабатывать быстро и освобождать память.</li>
-<li><strong>WebSockets</strong>: Требуют явной конфигурации <code>Upgrade</code> и увеличенных <code>proxy_read_timeout</code>.</li>
+<li><strong>Reverse Proxy как защитный экран:</strong> Nginx скрывает физическую топологию бэкенда, агрегирует соединения через <code>upstream keepalive</code> и защищает Go от сетевых аномалий.</li>
+<li><strong>Заголовки <code>X-Forwarded-*</code></strong>: Жизненно важный мост для передачи информации (<code>Host</code>, <code>X-Real-IP</code>, <code>X-Forwarded-For</code>, <code>X-Forwarded-Proto</code>) от Nginx к Go. Ошибки в их обработке ведут к багам с авторизацией и редиректами.</li>
+<li><strong>Безопасность IP:</strong> Нельзя наивно доверять первому значению <code>X-Forwarded-For</code>; используйте модуль <code>realip</code> в Nginx для отсечения спуфинга.</li>
+<li><strong>Буферизация (Response Buffering):</strong> Защищает кучу и сборщик мусора Go от медленных клиентов, но должна быть отключена (<code>proxy_buffering off;</code>) для SSE и потокового контента.</li>
+<li><strong>WebSocket Upgrade:</strong> Требует явной трансляции заголовков <code>Upgrade</code> и <code>Connection</code>, а также увеличения <code>proxy_read_timeout</code>.</li>
 </ol>
-<p>Nginx не только проксирует запросы, но и умеет распределять их между несколькими инстансами вашего Go-приложения для отказоустойчивости и масштабирования. В следующей статье мы разберем алгоритмы и механику балансировки нагрузки: <a href="3-load-balancing.html" class="wikilink">3. Load balancing</a>.</p>
+<p>В следующей лекции мы разберем, как Nginx балансирует нагрузку между множеством инстансов Go-сервисов, какие существуют алгоритмы распределения трафика и как отслеживать здоровье бэкендов: <a href="3-load-balancing.html" class="wikilink">3. Load balancing</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2387,7 +2503,7 @@ B --&gt;|&quot;4\. Расшифровка и отправка&quot;| A
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#kak-rabotaet-proxypass-pod-kapotom">Как работает proxypass под капотом</a></li><li class="toc-item toc-h2"><a href="#problema-zagolovkov-kto-zvonit">Проблема заголовков: Кто звонит?</a></li><li class="toc-item toc-h3"><a href="#x-forwarded-for-i-spufing">X-Forwarded-For и спуфинг</a></li><li class="toc-item toc-h3"><a href="#izvlechenie-realnogo-ip-v-go-idiomatic-way">Извлечение реального IP в Go (Idiomatic way)</a></li><li class="toc-item toc-h2"><a href="#buferizatsiya-zashchita-go-ot-medlennykh-klientov">Буферизация: Защита Go от медленных клиентов</a></li><li class="toc-item toc-h2"><a href="#websockets-i-http-upgrade">WebSockets и HTTP Upgrade</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-kak-rabotaet-direktiva-proxypass-pod-kapotom">1. Как работает директива proxypass под капотом</a></li><li class="toc-item toc-h2"><a href="#2-problema-zagolovkov-kto-zvonit">2. Проблема заголовков: «Кто звонит?»</a></li><li class="toc-item toc-h3"><a href="#x-forwarded-for-i-uyazvimost-ip-spoofing">X-Forwarded-For и уязвимость IP Spoofing</a></li><li class="toc-item toc-h3"><a href="#izvlechenie-realnogo-ip-v-go-idiomatichnyy-podkhod">Извлечение реального IP в Go: Идиоматичный подход</a></li><li class="toc-item toc-h2"><a href="#3-buferizatsiya-zashchita-go-ot-medlennykh-klientov-response-buffering">3. Буферизация: Защита Go от медленных клиентов (Response Buffering)</a></li><li class="toc-item toc-h3"><a href="#stsenariy-bez-nginx-go-napryamuyu-v-mir">Сценарий без Nginx (Go напрямую в мир):</a></li><li class="toc-item toc-h3"><a href="#stsenariy-s-nginx">Сценарий с Nginx:</a></li><li class="toc-item toc-h2"><a href="#4-websockets-i-protokolnyy-apgreyd-http-upgrade">4. WebSockets и протокольный апгрейд (HTTP Upgrade)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

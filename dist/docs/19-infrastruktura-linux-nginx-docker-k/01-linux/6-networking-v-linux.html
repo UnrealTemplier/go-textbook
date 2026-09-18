@@ -2169,26 +2169,31 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Networking в Linux</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Сеть — это кровеносная система любого бэкенда. В PHP или Python разработчики часто абстрагируются от сети до уровня "я отправил HTTP-запрос", полагаясь на тяжелые рантаймы или веб-серверы (php-fpm, gunicorn). В Go сеть — это ваша прямая ответственность. Вы пишете серверы, вы управляете соединениями, и вы же будете тушить пожары, когда что-то пойдет не так.</p>
-<p>В Linux сетевой стек — это невероятно сложная и высокопроизводительная машина внутри ядра. Понимание того, как пакет с сетевой карты попадает в вашу горутину, отличает Senior-инженера от разработчика, слепо доверяющего магии <code>net/http</code>.</p>
-<h2 id="vsyo-est-fayl-sokety-v-linux">Всё есть файл: Сокеты в Linux</h2>
+            <h1>Сетевой стек Linux: От сокетов ядра и epoll до Go Netpoller</h1>
+<p>Сеть — это кровеносная система любого распределенного бэкенда. В скриптовых языках разработчики часто абстрагируются от сетевого взаимодействия до примитивного уровня «я отправил HTTP-запрос», перекладывая низкоуровневую работу на плечи внешних серверов приложений (php-fpm, Gunicorn, Puma). </p>
+<p>В экосистеме Go сетевой стек — это ваша прямая зона ответственности. Ваши микросервисы самостоятельно открывают слушающие сокеты, мультиплексируют тысячи одновременных TCP-соединений, терминируют TLS и маршрутизируют пакеты. Понимание того, какой путь проходит байт от физической сетевой карты (NIC) через кольцевые буферы ядра до пользовательского буфера в вашей горутине, отличает зрелого Senior-инженера от разработчика, слепо уповающего на «магию» стандартной библиотеки <code>net/http</code>.</p>
+<hr />
+<h2 id="1-vsyo-est-fayl-sokety-i-sistemnye-vyzovy-v-linux">1. Всё есть файл: Сокеты и системные вызовы в Linux</h2>
 
-<p>Вспомним философию Unix: всё есть файл. Сетевое соединение в Linux — это тоже файл, а точнее — <strong>Сокет (Socket)</strong>. Когда вы вызываете в Go <code>net.Listen("tcp", ":8080")</code>, рантайм выполняет системный вызов <code>socket()</code>, который возвращает обычный файловый дескриптор (FD).</p>
-<p>Но перед тем как ваш сервер начнет принимать запросы, ядро должно проделать путь из трех системных вызовов:</p>
+<p>Вспомним фундаментальную философию Unix: <em>«Всё есть файл»</em>. Сетевое соединение в Linux — это тоже разновидность файла, представленная абстракцией <strong>Сокета (Socket)</strong>.</p>
+<p>Когда вы вызываете в коде <code>net.Listen("tcp", ":8080")</code>, рантайм Go обращается к операционной системе через цепочку из трех системных вызовов:</p>
 <ol>
-<li><strong><code>socket()</code></strong>: Создает структуру данных в ядре и возвращает FD.</li>
-<li><strong><code>bind()</code></strong>: Привязывает сокет к конкретному IP-адресу и порту (например, <code>0.0.0.0:8080</code>).</li>
-<li><strong><code>listen()</code></strong>: Переводит сокет в пассивный режим (готовность принимать соединения). Именно здесь ядро выделяет две критически важные очереди:<br />
-   - <strong>SYN Queue (полуоткрытые соединения)</strong>: Клиент отправил SYN, сервер ответил SYN-ACK, ждет ACK от клиента.<br />
-   - <strong>Accept Queue (полностью установленные соединения)</strong>: Трехстороннее рукопожатие TCP завершено, соединение ждет, пока ваше приложение вызовет <code>accept()</code>.</li>
+<li><strong><code>socket()</code></strong>: Ядро выделяет структуру сокета в оперативной памяти и возвращает процессу целочисленный файловый дескриптор (<code>FD</code>).</li>
+<li><strong><code>bind()</code></strong>: Привязывает выделенный сокет к конкретному локальному адресу и порту (например, <code>0.0.0.0:8080</code>).</li>
+<li><strong><code>listen()</code></strong>: Переводит сокет из активного состояния (для исходящих соединений) в пассивный режим прослушивания входящих подключений.</li>
 </ol>
+<p>Именно на этапе вызова <code>listen()</code> ядро Linux аллоцирует две принципиально важные очереди в стеке TCP:</p>
+<ul>
+<li><strong>SYN Queue (очередь полуоткрытых соединений):</strong> Сюда попадают клиенты, приславшие первичный пакет <code>TCP SYN</code>. Ядро отправляет в ответ <code>SYN-ACK</code> и переводит соединение в состояние <code>SYN_RECV</code>, ожидая завершающего <code>ACK</code> от клиента.</li>
+<li><strong>Accept Queue (очередь полностью установленных соединений):</strong> Как только клиент ответил пакетом <code>ACK</code>, трехстороннее рукопожатие (TCP Three-Way Handshake) считается завершенным. Соединение переходит в статус <code>ESTABLISHED</code> и перемещается в Accept Queue. Здесь оно терпеливо ждет, пока ваше приложение вызовет <code>accept()</code>.</li>
+</ul>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2203,9 +2208,10 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Клиент - SYN&quot;] --&gt;|&quot;Ядро&quot;| B[&quot;SYN Queue - Полуоткрытые&quot;]
-B --&gt;|&quot;SYN-ACK -&gt; ACK&quot;| C[&quot;Accept Queue - Готовые к accept&quot;]
-C --&gt;|&quot;syscall accept&quot;| D[&quot;Go Application - net.Listener.Accept&quot;]
+Client[&quot;Клиент - SYN&quot;] --&gt;|&quot;1. TCP SYN&quot;| Kernel[&quot;Ядро Linux&quot;]
+Kernel --&gt;|&quot;Помещение в очередь&quot;| SynQ[&quot;SYN Queue - Полуоткрытые (SYN_RECV)&quot;]
+SynQ --&gt;|&quot;2. SYN-ACK -&gt; 3. ACK&quot;| AcceptQ[&quot;Accept Queue - Готовые к accept (ESTABLISHED)&quot;]
+AcceptQ --&gt;|&quot;syscall accept()&quot;| App[&quot;Go Application - net.Listener.Accept&quot;]
   </pre>
 </div>
 
@@ -2213,24 +2219,65 @@ C --&gt;|&quot;syscall accept&quot;| D[&quot;Go Application - net.Listener.Accep
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Переполнение Accept Queue и тихий сброс пакетов</span>
   </div>
   <div class="callout-body">
-    <p>Если ваше Go-приложение не успевает вызывать <code>Accept()</code> (например, из-за долгой обработки запросов в синхронном коде), Accept Queue переполняется. Когда это происходит, ядро Linux начинает молча отбрасывать входящие SYN-пакеты (или отправлять RST, в зависимости от настройки <code>net.ipv4.tcp_abort_on_overflow</code>). Клиенты видят таймауты или ошибки соединения, хотя на сервере CPU может простаивать. Размер этой очереди задается параметром ядра <code>net.core.somaxconn</code> и аргументом <code>Backlog</code> в функции <code>Listen</code>.</p>
+    <p>Если ваше Go-приложение не успевает вовремя вызывать <code>Accept()</code> (например, из-за блокировки в синхронном коде или нехватки системных потоков), очередь <code>Accept Queue</code> заполняется до отказа.</p>
+<p>Когда это происходит, ядро Linux по умолчанию <strong>молча отбрасывает входящие SYN-пакеты</strong> (либо отправляет клиенту сброс <code>RST</code>, если включен параметр <code>net.ipv4.tcp_abort_on_overflow = 1</code>). </p>
+<p>Клиенты снаружи наблюдают необъяснимые таймауты подключения (Connection Timeout) или ошибки соединения, хотя процессор сервера может быть загружен всего на 5%. </p>
+<p>Максимальный размер этой очереди определяется системным параметром ядра <code>net.core.somaxconn</code> и аргументом <code>Backlog</code> в функции <code>Listen</code>. Убедитесь, что в <code>/etc/sysctl.conf</code> значение <code>net.core.somaxconn</code> увеличено с дефолтных 128/4096 до значений уровня 65535 для высоконагруженных шлюзов.</p>
   </div>
 </div>
 
-<h2 id="problema-c10k-i-rozhdenie-epoll">Проблема C10K и рождение Epoll</h2>
+<hr />
+<h2 id="2-problema-c10k-i-rozhdenie-epoll">2. Проблема C10K и рождение Epoll</h2>
 
-<p>В начале 2000-х возникла проблема C10K (10 000 одновременных соединений). Классический подход "один поток ОС на одно соединение" (thread-per-connection, как в старых версиях Apache или Tomcat) рухнул. 10 000 потоков ОС — это гигабайты памяти на одни только стеки (по 1-8 МБ каждый) и катастрофическое время на Context Switching.</p>
-<p>Решением стал переход от блокирующего IO к неблокирующему с использованием системных вызовов мультиплексирования: <code>select</code>, <code>poll</code>, а затем <strong><code>epoll</code></strong> (в Linux) и <code>kqueue</code> (во FreeBSD/macOS).</p>
-<h3 id="kak-rabotaet-epoll">Как работает Epoll</h3>
+<p>На заре веб-разработки (конец 1990-х) доминировала модель <strong>Thread-per-Connection</strong> (один поток ОС на каждое входящее сетевое соединение), реализованная в классическом Apache HTTPD. </p>
+<p>С ростом интернета индустрия столкнулась с легендарной <strong>проблемой C10K</strong> (необходимость обслуживать 10 000 одновременных подключений на одном сервере). Классический подход потерпел сокрушительное фиаско:<br />
+* <strong>Расход памяти на стек:</strong> Каждый поток ОС (pthread) в Linux требует от 2 до 8 МБ виртуальной памяти под собственный стек. 10 000 потоков моментально съедали десятки гигабайт памяти только на удержание стеков.<br />
+* <strong>Деградация на переключении контекста (Context Switching):</strong> Ядро Linux тратило львиную долю процессорных тактов не на полезную работу бэкенда, а на бесконечные переключения регистров процессора, сброс кэшей инструкций L1i и TLB между тысячами конкурирующих потоков.</p>
+<h3 id="evolyutsiya-multipleksirovaniya-vvoda-vyvoda-select-poll-i-epoll">Эволюция мультиплексирования ввода-вывода: select, poll и epoll</h3>
 
-<p>Вместо того чтобы опрашивать каждый сокет (готов ли он к чтению?), приложение регистрирует все сокеты в специальной структуре ядра через <code>epoll</code>. Когда на сетевой карте появляется данные, ядро само знает, какому сокету они принадлежат, и кладет готовый сокет в очередь событий. Приложение вызывает <code>epoll_wait()</code>, чтобы разом получить список готовых к обработке сокетов.</p>
-<h2 id="go-netpoller-elegantnaya-abstraktsiya">Go Netpoller: Элегантная абстракция</h2>
+<p>Выходом стал переход от блокирующего I/O к неблокирующему мультиплексированию:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Механизм</th>
+<th style="text-align: center;">Сложность проверки</th>
+<th style="text-align: center;">Лимит дескрипторов</th>
+<th>Принцип работы</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong><code>select</code></strong></td>
+<td style="text-align: center;">$O(N)$</td>
+<td style="text-align: center;">Ограничен <code>FD_SETSIZE</code> (1024)</td>
+<td>Процесс передает массив битов в ядро, ядро линейно перебирает все дескрипторы при каждом вызове.</td>
+</tr>
+<tr>
+<td><strong><code>poll</code></strong></td>
+<td style="text-align: center;">$O(N)$</td>
+<td style="text-align: center;">Не ограничен (массив структур)</td>
+<td>Снимает лимит 1024, но продолжает требовать линейного сканирования $O(N)$ дескрипторов при каждом событии.</td>
+</tr>
+<tr>
+<td><strong><code>epoll</code></strong></td>
+<td style="text-align: center;">$O(1)$</td>
+<td style="text-align: center;">Ограничен только памятью</td>
+<td>Дескрипторы регистрируются в красно-черном дереве ядра один раз. Готовые сокеты помещаются в связанный список готовых событий.</td>
+</tr>
+</tbody>
+</table></div>
+<p>В Linux механизмом спасения стал системный вызов <strong><code>epoll</code></strong> (во FreeBSD и macOS его аналогом является <code>kqueue</code>).</p>
+<p>Вместо того чтобы при каждом цикле опрашивать ядро: «Не пришло ли что-то на эти 10 000 сокетов?», приложение регистрирует интерес к сокетам один раз через <code>epoll_ctl()</code>. </p>
+<p>Когда сетевая карта принимает сетевой пакет, ядро через аппаратное прерывание и SoftIRQ аппаратно определяет нужный сокет и помещает его в кольцевой список готовых событий (Ready List). Приложение вызывает единственный системный вызов <code>epoll_wait()</code>, который мгновенно и без линейного перебора возвращает только те сокеты, на которых реально появились данные для чтения или записи.</p>
+<hr />
+<h2 id="3-go-netpoller-elegantnaya-abstraktsiya-nad-neblokiruyushchim-vvodom-vyvodom">3. Go Netpoller: Элегантная абстракция над неблокирующим вводом-выводом</h2>
 
-<p>Go пошел дальше, скрыв сложность <code>epoll</code> внутри рантайма. В Go используется <strong>Netpoller</strong> — подсистема рантайма, которая интегрирует неблокирующий сетевой IO с планировщиком горутин (G-M-P).</p>
-<p>Когда вы пишете:</p>
+<p>Несмотря на колоссальную скорость <code>epoll</code>, писать сырой асинхронный код на Си или Node.js мучительно: логика дробится на функции обратного вызова (Callback Hell) или конечные автоматы (State Machines).</p>
+<p>Создатели Go предложили гениальную концепцию: <strong>синхронный код снаружи, полностью асинхронный и неблокирующий внутри</strong>. Эту связку обеспечивает <strong>Netpoller</strong> — подсистема рантайма Go, бесшовно интегрированная с планировщиком горутин (G-M-P).</p>
+<p>Когда вы пишете в Go привычный линейный код:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2246,13 +2293,52 @@ n, err := conn.Read(buf)       // Тоже выглядит блокирующи
 </code></pre>
 </div>
 
-<p>Под капотом не происходит блокировки потока ОС (M). Рантайм Go переводит FD сокета в неблокирующий режим (флаг <code>O_NONBLOCK</code>). </p>
-<p>Что происходит при вызове <code>Read</code>:<br />
-1. Горутина (G) вызывает системный вызов <code>read</code>.<br />
-2. Так как сокет неблокирующий, если данных нет, ядро возвращает ошибку <code>EAGAIN</code> ("пока нечего читать").<br />
-3. Рантайм Go перехватывает эту ошибку, регистрирует FD в <code>epoll</code> (если еще не зарегистрирован) и <strong>паркует горутину</strong> (<code>gopark</code>), переводя её в состояние <code>waiting</code>.<br />
-4. Поток ОС (M) освобождается и берет из очереди другую горутину для выполнения.<br />
-5. Когда приходят данные от сети, срабатывает <code>epoll</code>, рантайм находит припаркованную горутину и пробуждает её (<code>goready</code>), помещая в очередь выполнения.</p>
+<p>Под капотом не происходит блокировки системного потока ОС (<code>M</code>). Рантайм Go при создании сокета немедленно переводит его файловый дескриптор в неблокирующий режим с помощью флага <code>O_NONBLOCK</code>.</p>
+<h3 id="chto-na-samom-dele-proiskhodit-pri-vyzove-read">Что на самом деле происходит при вызове `Read()`:</h3>
+
+<ol>
+<li>Горутина (<code>G</code>) выполняет системный вызов <code>read</code> над файловым дескриптором.</li>
+<li>Так как дескриптор сокета неблокирующий, а в сетевом буфере ядра данных еще нет, системный вызов не засыпает, а немедленно возвращает ошибку <code>EAGAIN</code> (или <code>EWOULDBLOCK</code> — «ресурс временно недоступен, повторите позже»).</li>
+<li>Рантайм Go ловит <code>EAGAIN</code>, регистрирует данный файловый дескриптор в системном <code>epoll</code> (если он еще не был зарегистрирован) и выполняет внутреннюю команду <strong><code>gopark()</code></strong>.</li>
+<li>Горутина переходит из состояния <code>_Grunning</code> в состояние <code>_Gwaiting</code>.</li>
+<li>Системный поток ОС (<code>M</code>) освобождается! Он не спит, а мгновенно берет из локальной очереди (<code>runq</code>) планировщика другую готовую к выполнению горутину.</li>
+<li>Когда сетевая карта принимает пакет для этого сокета, <code>epoll</code> фиксирует готовность FD. Netpoller находит припаркованную горутину и вызывает <strong><code>goready()</code></strong>, возвращая ее в очередь выполнения <code>_Grunnable</code>.</li>
+<li>Горутина возобновляет работу точно с того места, где прервалась, и повторный вызов <code>read</code> успешно вычитывает поступившие байты.</li>
+</ol>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant G as Горутина (G)
+participant M as Поток ОС (M)
+participant NP as Go Netpoller
+participant Kernel as Ядро Linux (epoll)
+
+G-&gt;&gt;M: conn.Read(buf)
+M-&gt;&gt;Kernel: read(fd) (O_NONBLOCK)
+Kernel--&gt;&gt;M: Ошибка EAGAIN (данных нет)
+M-&gt;&gt;NP: Регистрировать fd в epoll
+M-&gt;&gt;G: gopark() -&gt; перевод в _Gwaiting
+Note over M: Поток M берет другую задачу из runq!
+Kernel--&gt;&gt;NP: epoll_wait: fd готов к чтению!
+NP-&gt;&gt;G: goready() -&gt; перевод в _Grunnable
+G-&gt;&gt;M: Возобновление выполнения
+M-&gt;&gt;Kernel: read(fd) -&gt; Успешно! Чтение байт
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2263,15 +2349,22 @@ n, err := conn.Read(buf)       // Тоже выглядит блокирующи
   </div>
 </div>
 
-<h2 id="setevye-prostranstva-imen-network-namespaces">Сетевые пространства имен (Network Namespaces)</h2>
+<hr />
+<h2 id="4-setevye-prostranstva-imen-network-namespaces-i-izolyatsiya-konteynerov">4. Сетевые пространства имен (Network Namespaces) и изоляция контейнеров</h2>
 
-<p>Раздел "Инфраструктура" невозможен без понимания того, как изолируется сеть в Docker. Ключевой примитив — <strong>Network Namespace (netns)</strong>.</p>
-<p>Когда запускается контейнер, ядро создает новый netns. В этом пространстве:<br />
-- Свой набор сетевых интерфейсов (включая <code>lo</code> - loopback).<br />
-- Своя таблица маршрутизации.<br />
-- Своя таблица NAT и правил iptables.<br />
-- Свой набор портов (вы можете запустить 10 контейнеров, и в каждом будет слушать порт 8080, потому что для хоста они изолированы).</p>
-<p>Чтобы контейнер мог выйти в интернет, создается <strong>Virtual Ethernet Pair (veth pair)</strong> — это как виртуальный патч-корд. Один конец (veth0) опускается в netns контейнера, другой (veth1) подключается к виртуальному мосту (docker0 bridge) на хосте.</p>
+<p>Понимание сетевого стека Linux немыслимо без знания того, как изолируется сеть в контейнерах Docker и подах Kubernetes. Ключевым примитивом изоляции является <strong>Network Namespace (netns)</strong>.</p>
+<p>Когда Docker запускает контейнер, ядро Linux создает для него изолированное сетевое пространство имен. Внутри этого пространства:<br />
+* Изолирован собственный набор сетевых интерфейсов (включая персональный loopback <code>lo</code>).<br />
+* Присутствует собственная независимая таблица маршрутизации (Routing Table).<br />
+* Действует собственная таблица правил фильтрации и трансляции адресов (iptables / nftables).<br />
+* Доступен весь диапазон сетевых портов (от 1 до 65535). Вы можете запустить на одном сервере 100 контейнеров, и каждый из них будет слушать порт <code>8080</code>, не конфликтуя с соседями.</p>
+<h3 id="virtualnyy-patch-kord-veth-pair">Виртуальный патч-корд: Veth Pair</h3>
+
+<p>Каким образом изолированный контейнер связывается с хостовой сетью и выходит в интернет? </p>
+<p>Ядро Linux создает пару виртуальных связанных интерфейсов — <strong>Virtual Ethernet Pair (veth pair)</strong>. Это программный аналог сетевого патч-корда с двумя разъемами:<br />
+1. Один конец («разъем») помещается внутрь netns контейнера и переименовывается в <code>eth0</code>.<br />
+2. Второй конец остается в сетевом пространстве хоста и подключается к виртуальному сетевому мосту (программному коммутатору, например <code>docker0 bridge</code>).<br />
+3. Для выхода во внешнюю сеть хост выполняет трансляцию адресов (NAT / Masquerade) через правила iptables.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2286,10 +2379,10 @@ n, err := conn.Read(buf)       // Тоже выглядит блокирующи
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Go App в контейнере&quot;] --&gt;|&quot;Слушает 8080&quot;| B[&quot;eth0 внутри netns&quot;]
-B --&gt;|&quot;Veth Pair&quot;| C[&quot;Docker0 Bridge - Хост&quot;]
-C --&gt;|&quot;NAT / iptables&quot;| D[&quot;Физический интерфейс хоста - eth0&quot;]
-D --&gt; E[&quot;Внешняя сеть&quot;]
+A[&quot;Go App в контейнере&quot;] --&gt;|&quot;Слушает :8080&quot;| B[&quot;eth0 внутри netns&quot;]
+B --&gt;|&quot;Veth Pair (Виртуальный кабель)&quot;| C[&quot;Docker0 Bridge (Коммутатор хоста)&quot;]
+C --&gt;|&quot;NAT / iptables&quot;| D[&quot;Физический интерфейс хоста (eth0)&quot;]
+D --&gt; E[&quot;Внешняя сеть / Интернет&quot;]
   </pre>
 </div>
 
@@ -2297,40 +2390,64 @@ D --&gt; E[&quot;Внешняя сеть&quot;]
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Директива EXPOSE против публикации портов</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Вы запускаете Go-сервер в Docker. В Dockerfile указано <code>EXPOSE 8080</code>. При запуске контейнера снаружи (с хоста) подключиться на <code>localhost:8080</code> не получается. Почему?<br />
-<strong>Ответ:</strong> Директива <code>EXPOSE</code> в Dockerfile — это исключительно документация. Она не пробрасывает порты и не настраивает iptables. Чтобы пробросить порт из netns контейнера в пространство хоста, нужно запустить контейнер с флагом <code>-p 8080:8080</code>. Только тогда Docker создаст правило DNAT в iptables хоста, перенаправляющее трафик с порта 8080 хоста на внутренний IP контейнера.</p>
+    <p><strong>Вопрос:</strong> Вы запускаете Go-сервер в Docker. В Dockerfile указано <code>EXPOSE 8080</code>. При запуске контейнера снаружи (с хоста) подключиться на <code>localhost:8080</code> не получается. Почему?</p>
+<p><strong>Ответ:</strong> Директива <code>EXPOSE</code> в Dockerfile — это исключительно документация и метаданные образа. Она не пробрасывает порты и не настраивает iptables ядра.</p>
+<p>Чтобы открыть доступ к сервису извне, необходимо запустить контейнер с флагом публикации портов: <code>-p 8080:8080</code>. В этот момент демон Docker обращается к подсистеме ядра и создает правило <strong>DNAT (Destination NAT)</strong> в таблице <code>nat</code> цепочки <code>PREROUTING</code> iptables хоста. Это правило перехватывает пакеты, приходящие на порт 8080 хоста, и подменяет адрес назначения на приватный IP-адрес контейнера в виртуальном мосту <code>docker0</code>.</p>
   </div>
 </div>
 
-<h2 id="problema-timewait-i-soreuseaddr">Проблема TIME_WAIT и SO_REUSEADDR</h2>
+<hr />
+<h2 id="5-problema-timewait-i-optsiya-soreuseaddr">5. Проблема TIME_WAIT и опция SO_REUSEADDR</h2>
 
-<p>При интенсивной нагрузке (особенно если ваше Go-приложение выступает в роли клиента, делающего много исходящих HTTP-запросов, или постоянно перезапускается) вы столкнетесь с состоянием TCP <code>TIME_WAIT</code>.</p>
-<p>Когда соединение закрывается, сторона, инициировавшая закрытие (отправившая первый FIN), должна перейти в <code>TIME_WAIT</code> и находиться в нем 2 * MSL (Maximum Segment Lifetime, обычно около 60 секунд). Это нужно, чтобы запоздавшие пакеты старого соединения не попали в новое.</p>
-<p>Проблема: в <code>TIME_WAIT</code> локальный IP и порт остаются занятыми. Если вы попытаетесь перезапустить сервер и забиндиться на тот же порт, получите ошибку <code>bind: address already in use</code>.</p>
+<p>При высокой сетевой нагрузке — особенно когда Go-приложение совершает огромное количество исходящих HTTP-запросов к сторонним API или микросервисам (без пула соединений), либо когда веб-сервер часто перезапускается — инженеры неизбежно сталкиваются с состоянием сокетов <strong><code>TIME_WAIT</code></strong>.</p>
+<p>Согласно спецификации TCP (RFC 793), сторона, инициировавшая закрытие TCP-соединения (отправившая первый пакет <code>FIN</code>), после получения финального <code>ACK</code> обязана удерживать сокет в состоянии <code>TIME_WAIT</code> в течение удвоенного максимального времени жизни сегмента: $2 \times \text{MSL}$ (Maximum Segment Lifetime, в Linux по умолчанию составляет около 60 секунд).</p>
+<h3 id="zachem-nuzhen-timewait">Зачем нужен TIME_WAIT?</h3>
+<ol>
+<li><strong>Гарантия надежного закрытия:</strong> Если последний пакет <code>ACK</code> потеряется в сети, противоположная сторона повторно пришлет <code>FIN</code>. Сервер в состоянии <code>TIME_WAIT</code> сможет ответить повторным <code>ACK</code>.</li>
+<li><strong>Защита от блуждающих пакетов:</strong> Защищает от ситуации, когда пакеты от старого соединения запоздали в маршрутизаторах интернета и ошибочно попали в новое соединение, случайно открытое на той же комбинации (Source IP, Source Port, Dest IP, Dest Port).</li>
+</ol>
+<p>Цена <code>TIME_WAIT</code>: в течение 60 секунд пара «IP-адрес : порт» заблокирована ядром. Если сервер аварийно перезапустится и попытается заново вызвать <code>bind()</code> на свой порт, ядро вернет ошибку:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">bind: address already in use
+</code></pre>
+</div>
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Борьба с TIME_WAIT на клиенте и сервере</span>
   </div>
   <div class="callout-body">
-    <p>В Linux по умолчанию порты в <code>TIME_WAIT</code> нельзя переиспользовать. Наивное решение — уменьшить <code>net.ipv4.tcp_fin_timeout</code>, но это нарушает TCP-спецификацию. Правильное решение — опция сокета <code>SO_REUSEADDR</code>.<br />
-В Go стандартная библиотека <code>net</code> автоматически устанавливает флаг <code>SO_REUSEADDR</code> при создании серверных сокетов (начиная с определенных версий и ОС), что позволяет биндиться на порт, даже если есть соединения в <code>TIME_WAIT</code>. Для клиентских соединений (исходящих) в Linux также полезно включать <code>net.ipv4.tcp_tw_reuse = 1</code>, что позволяет использовать порты из <code>TIME_WAIT</code> для новых исходящих соединений (если это безопасно в вашей сети).</p>
+    <p>В Linux по умолчанию порты в <code>TIME_WAIT</code> нельзя переиспользовать. Наивное и опасное решение — грубо уменьшить системный таймаут <code>net.ipv4.tcp_fin_timeout</code>, что грубо нарушает протокол TCP.</p>
+<p><strong>Правильные инженерные практики:</strong><br />
+1. <strong>На стороне сервера (Incoming):</strong> Использование опции сокета <strong><code>SO_REUSEADDR</code></strong>. В Go стандартная библиотека <code>net</code> автоматически устанавливает флаг <code>SO_REUSEADDR</code> при создании серверных сокетов (начиная с определенных версий и ОС), что позволяет биндиться на порт, даже если есть соединения в <code>TIME_WAIT</code>.<br />
+2. <strong>На стороне клиента (Outgoing):</strong> Если ваше Go-приложение совершает тысячи исходящих вызовов и исчерпывает диапазон эфемерных портов (<code>ephemeral ports</code>), ядро Linux позволяет включить параметр <code>net.ipv4.tcp_tw_reuse = 1</code>. Это разрешает ядру безопасно переиспользовать сокеты из <code>TIME_WAIT</code> для новых исходящих TCP-соединений, если временные метки TCP Timestamps подтверждают актуальность пакетов.<br />
+3. <strong>В Go-коде:</strong> Всегда переиспользуйте HTTP-клиенты (<code>http.Client</code>) с включенным Connection Pooling (<code>http.Transport</code>), чтобы не открывать новое TCP-соединение на каждый микрозапрос!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Сокеты — это файлы</strong>. Жизненный цикл сетевого сервиса начинается с <code>socket</code>, <code>bind</code>, <code>listen</code>, а размер <code>Accept Queue</code> (backlog) критически важен при высоких нагрузках.</li>
-<li><strong>Epoll</strong> — это механизм, решивший проблему C10K, позволив одному потоку следить за тысячами сокетов.</li>
-<li><strong>Go Netpoller</strong> интегрирует <code>epoll</code> в планировщик. Блокирующие вызовы <code>Read</code>/<code>Write</code> в горутинах не блокируют потоки ОС, а парковят горутины до появления данных.</li>
-<li><strong>Network Namespaces</strong> и <strong>Veth pairs</strong> — фундамент изоляции сети в Docker, позволяющий контейнерам иметь свои IP и порты.</li>
-<li><strong>TIME_WAIT</strong> — защитный механизм TCP. При частых рестартах или海量 исходящих соединениях настраивайте <code>SO_REUSEADDR</code> и <code>tcp_tw_reuse</code>.</li>
+<li><strong>Сокеты — это файлы ядра:</strong> Жизненный цикл сервера начинается с системных вызовов <code>socket()</code>, <code>bind()</code> и <code>listen()</code>. Задержка обработки в <code>Accept()</code> приводит к переполнению очереди <code>Accept Queue</code> и тихому дропу пакетов ядром.</li>
+<li><strong>Epoll разрешил проблему C10K:</strong> Механизм событийного мультиплексирования с алгоритмической сложностью $O(1)$ позволил ядру масштабироваться до сотен тысяч одновременных соединений без затрат на Context Switch.</li>
+<li><strong>Go Netpoller — шедевр рантайма:</strong> Он трансформирует неблокирующий I/O ядра с ошибками <code>EAGAIN</code> в видимость прямолинейного синхронного кода: вызовы <code>Read</code>/<code>Write</code> в горутинах не блокируют потоки ОС, а паркуют горутины через <code>gopark()</code> и отдают освободившийся поток <code>M</code> другим задачам.</li>
+<li><strong>Network Namespaces и Veth Pairs:</strong> Формируют фундамент изоляции сети контейнеров, связывая виртуальный сетевой стек внутри контейнера с мостом хоста через виртуальный сетевой кабель.</li>
+<li><strong>Контроль за TIME_WAIT:</strong> Понимание жизненного цикла TCP-сегментов, включение опции <code>SO_REUSEADDR</code>, тюнинг <code>net.ipv4.tcp_tw_reuse = 1</code> и пулинг клиентских соединений спасают распределенную систему от исчерпания сетевых портов.</li>
 </ol>
-<p>Linux предоставляет инфраструктуру для запуска приложений, но в мире микросервисов голого Linux недостаточно. Вам нужен инструмент, который примет трафик из интернета, распределит его между подами и снимет с ваших Go-сервисов нагрузку по TLS. В следующем разделе мы переходим к главному шлюзу бэкенда и разберем его архитектуру: <a href="../02-nginx/1-nginx-arkhitektura.html" class="wikilink">1. nginx. Архитектура</a>.</p>
+<p>Освоив сетевую архитектуру Linux, мы готовы перейти к исследованию шлюзов, которые принимают трафик из глобальной сети и распределяют его между нашими сервисами. В следующем разделе мы разберем архитектуру легендарного обратного прокси: <a href="../02-nginx/1-nginx-arkhitektura.html" class="wikilink">1. nginx. Архитектура</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2358,7 +2475,7 @@ D --&gt; E[&quot;Внешняя сеть&quot;]
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vsyo-est-fayl-sokety-v-linux">Всё есть файл: Сокеты в Linux</a></li><li class="toc-item toc-h2"><a href="#problema-c10k-i-rozhdenie-epoll">Проблема C10K и рождение Epoll</a></li><li class="toc-item toc-h3"><a href="#kak-rabotaet-epoll">Как работает Epoll</a></li><li class="toc-item toc-h2"><a href="#go-netpoller-elegantnaya-abstraktsiya">Go Netpoller: Элегантная абстракция</a></li><li class="toc-item toc-h2"><a href="#setevye-prostranstva-imen-network-namespaces">Сетевые пространства имен (Network Namespaces)</a></li><li class="toc-item toc-h2"><a href="#problema-timewait-i-soreuseaddr">Проблема TIMEWAIT и SOREUSEADDR</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-vsyo-est-fayl-sokety-i-sistemnye-vyzovy-v-linux">1. Всё есть файл: Сокеты и системные вызовы в Linux</a></li><li class="toc-item toc-h2"><a href="#2-problema-c10k-i-rozhdenie-epoll">2. Проблема C10K и рождение Epoll</a></li><li class="toc-item toc-h3"><a href="#evolyutsiya-multipleksirovaniya-vvoda-vyvoda-select-poll-i-epoll">Эволюция мультиплексирования ввода-вывода: select, poll и epoll</a></li><li class="toc-item toc-h2"><a href="#3-go-netpoller-elegantnaya-abstraktsiya-nad-neblokiruyushchim-vvodom-vyvodom">3. Go Netpoller: Элегантная абстракция над неблокирующим вводом-выводом</a></li><li class="toc-item toc-h3"><a href="#chto-na-samom-dele-proiskhodit-pri-vyzove-read">Что на самом деле происходит при вызове Read():</a></li><li class="toc-item toc-h2"><a href="#4-setevye-prostranstva-imen-network-namespaces-i-izolyatsiya-konteynerov">4. Сетевые пространства имен (Network Namespaces) и изоляция контейнеров</a></li><li class="toc-item toc-h3"><a href="#virtualnyy-patch-kord-veth-pair">Виртуальный патч-корд: Veth Pair</a></li><li class="toc-item toc-h2"><a href="#5-problema-timewait-i-optsiya-soreuseaddr">5. Проблема TIMEWAIT и опция SOREUSEADDR</a></li><li class="toc-item toc-h3"><a href="#zachem-nuzhen-timewait">Зачем нужен TIMEWAIT?</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

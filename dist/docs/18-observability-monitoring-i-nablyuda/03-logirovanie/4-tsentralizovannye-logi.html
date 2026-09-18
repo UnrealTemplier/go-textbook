@@ -2169,20 +2169,30 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 18</span>
-              <span class="meta-tag read-time">⏱ ~11 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Централизованные логи</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="ot-faylov-k-potokam-dannykh">От файлов к потокам данных</h2>
+            <h1>4. Централизованные логи: Архитектура сбора и доставки в распределенных системах</h1>
+<blockquote>
+<p><em>"Programs that chatter to the user or write junk to files are a nuisance. Write streams that can be composed."</em><br />
+— Дуглас Макилрой</p>
+</blockquote>
+<p>В предыдущей статье мы рассмотрели библиотеки структурированного логирования внутри самого Go-приложения. Однако умение генерировать безупречный JSON с контекстными атрибутами совершенно бесполезно, если эти записи остаются запертыми внутри изолированного контейнера.</p>
+<p>В современной облачной архитектуре с сотнями микросервисов и тысячами динамических подов Kubernetes подход «зайти по SSH на сервер и полистать лог через <code>tail -f</code> или <code>less</code>» больше не работает. Контейнеры эфемерны: они перезапускаются, перемещаются планировщиком между физическими нодами, а их локальная файловая система уничтожается при падении.</p>
+<p>Попытка искать причину аварии запуском <code>kubectl logs &lt;pod_name&gt;</code> по сотне реплик превращается в мучительный хаос. Для эффективной работы бэкенда необходима <strong>Централизованная система логирования (Centralized Logging Pipeline)</strong>.</p>
+<hr />
+<h2 id="ot-faylov-k-potokam-dannykh">От файлов к потокам данных</h2>
 
-<p>В предыдущей статье мы рассмотрели библиотеки логирования внутри Go-приложения. Но в мире микросервисов и Kubernetes умение правильно писать логи бесполезно, если вы не можете их <strong>собрать</strong> и <strong>прочитать</strong>.</p>
-<p>Когда у вас 100 подов (pods) с репликами вашего сервиса, использование <code>kubectl logs &lt;pod_name&gt;</code> для поиска ошибки превращается в ад. Вам нужна <strong>Централизованная система логирования</strong>.</p>
+<p>В манифесте двенадцатифакторных приложений (The Twelve-Factor App) одиннадцатый фактор формулирует непреложный закон: <strong>«Рассматривайте логи как потоки событий (Event Streams)»</strong>.</p>
+<p>Приложение не должно управлять файлами логов на диске, заботиться о путях, создавать директории или самостоятельно реализовывать ротацию. Приложение просто выбрасывает непрерывный поток небуферизованных событий в стандартный поток вывода (<code>stdout</code>) и поток ошибок (<code>stderr</code>). Вся дальнейшая логика доставки, фильтрации, обогащения и долговременного хранения делегируется инфраструктурной платформе.</p>
+<hr />
 <h2 id="arkhitektura-pipeline-sbora-logov">Архитектура Pipeline сбора логов</h2>
 
-<p>Классическая архитектура централизованного логирования состоит из нескольких этапов. Цель — доставить лог от приложения к хранилищу, не перегрузив при этом сеть и само приложение.</p>
+<p>Классический пайплайн доставки логов от пользовательского кода до экрана дежурного инженера состоит из шести четко разграниченных этапов:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2199,21 +2209,31 @@
 flowchart LR
 A[&quot;Go App&lt;br&gt;stdout/stderr&quot;] --&gt; B[&quot;Container Runtime&lt;br&gt;Docker/Containerd&quot;]
 B --&gt; C[&quot;Log File&lt;br&gt;/var/log/containers/...&quot;]
-C --&gt; D[&quot;Agent&lt;br&gt;DamonSet: Promtail/Filebeat&quot;]
+C --&gt; D[&quot;Agent&lt;br&gt;DaemonSet: Promtail/Filebeat&quot;]
 D --&gt;|&quot;Push&lt;br&gt;TCP/HTTP&quot;| E[&quot;Aggregator&lt;br&gt;Loki/Logstash&quot;]
 E --&gt; F[&quot;Storage&lt;br&gt;Object Storage/Disk&quot;]
 F --&gt; G[&quot;UI&lt;br&gt;Grafana/Kibana&quot;]
 
-style A fill:#f9f,stroke:#333
-style D fill:#bbf,stroke:#333
-style E fill:#bfb,stroke:#333
+style A fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#fff
+style B fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#fff
+style D fill:#78350f,stroke:#f59e0b,stroke-width:2px,color:#fff
+style E fill:#065f46,stroke:#10b981,color:#fff
+style G fill:#0f172a,stroke:#475569,color:#fff
   </pre>
 </div>
 
 
+<p>Каждое звено этой цепи решает строгую задачу:<br />
+1. <strong>Приложение (Go App):</strong> генерирует структурированные записи и сбрасывает их в файловые дескрипторы 1 и 2.<br />
+2. <strong>Контейнерный рантайм (Containerd / CRI-O):</strong> перехватывает пайпы процесса и сохраняет строки в стандартные файлы хоста.<br />
+3. <strong>Локальный агент (DaemonSet Agent):</strong> непрерывно читает файлы логов на ноде, обогащает их метаданными Kubernetes и пачками отправляет в сеть.<br />
+4. <strong>Агрегатор / Приемник (Loki / Logstash):</strong> валидирует поток, строит индексы и записывает сжатые блоки данных в хранилище.<br />
+5. <strong>Хранилище (Storage):</strong> объектное хранилище (S3/MinIO) или дисковые кластеры для долгосрочного архива.<br />
+6. <strong>Пользовательский интерфейс (UI):</strong> веб-консоль для визуализации, фильтрации и расследования инцидентов.</p>
+<hr />
 <h2 id="mechanical-sympathy-stdout-vs-file">Mechanical Sympathy: Stdout vs File</h2>
 
-<p>В традиционных системах (PHP, старые Go-сервисы) логи писали в файлы на диске (<code>/var/log/app.log</code>). В Kubernetes подход изменился: <strong>Приложение должно писать в stdout/stderr</strong>.</p>
+<p>В традиционных монолитных системах сервисы писали логи напрямую в файлы на диске (<code>/var/log/app.log</code>). В среде контейнеризации и Kubernetes этот паттерн категорически запрещен: <strong>приложение обязано писать исключительно в stdout/stderr</strong>.</p>
 <h3 id="pochemu-eto-luchshe">Почему это лучше?</h3>
 
 <ol>
@@ -2222,10 +2242,24 @@ style E fill:#bfb,stroke:#333
 <li><strong>Separation of Concerns:</strong> Приложение не знает о инфраструктуре. Инженеры SRE могут менять драйвер логирования (например, отправлять сразу в Fluentd), не меняя код приложения.</li>
 </ol>
 <h3 id="under-the-hood-kak-eto-rabotaet-v-go">Under the Hood: Как это работает в Go?</h3>
+
 <p>Когда вы пишете <code>fmt.Println</code> или <code>slog.Info</code> в Go:<br />
 1.  Данные попадают в файловый дескриптор <code>1</code> (stdout) или <code>2</code> (stderr).<br />
-2.  Это простой <code>write</code> syscall.<br />
+2.  Это простой <code>write</code> syscall ядра Linux.<br />
 3.  Контейнерный рантайм читает этот пайп и пишет на диск хоста (обычно <code>/var/log/pods/...</code> в формате JSON, где есть поле <code>log</code> и <code>time</code>).</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">[ Go Process (FD 1) ] ──► [ Linux Pipe ] ──► [ Containerd CRI ] ──► [ /var/log/pods/.../*.log ]
+</code></pre>
+</div>
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2238,6 +2272,7 @@ Stdout/stderr в Go небуферизированы по умолчанию (и
   </div>
 </div>
 
+<hr />
 <h2 id="agenty-sbora-log-agents">Агенты сбора (Log Agents)</h2>
 
 <p>Следующий шаг — забрать логи с ноды. Для этого используется <strong>DaemonSet</strong> (под, который крутится на каждой ноде кластера). Популярные агенты: <strong>Promtail</strong> (для Loki), <strong>Filebeat</strong> (для Elastic), <strong>Fluent Bit</strong>.</p>
@@ -2245,9 +2280,13 @@ Stdout/stderr в Go небуферизированы по умолчанию (и
 1.  Следить за файлами в <code>/var/log/containers/</code>.<br />
 2.  Парсить строки (JSON → Fields).<br />
 3.  Отправлять в хранилище.</p>
+<p>Агент монтирует системную директорию ноды <code>/var/log/pods</code> в режиме read-only и держит открытыми файловые дескрипторы на активные логи (механизм <code>tail -f</code>).</p>
 <h3 id="label-based-routing">Label-based Routing</h3>
+
 <p>Агенты используют Kubernetes Metadata для enrichment (обогащения) логов. К логу добавляются лейблы: <code>app=payment-service</code>, <code>namespace=prod</code>, <code>pod_name=...</code>.<br />
 Это критически важно, так как позволяет фильтровать логи в UI: "Покажи мне логи только сервиса Payment".</p>
+<p>Благодаря этому разработчик избавлен от необходимости хардкодить имя пода или namespace в коде на Go — инфраструктура добавляет эти метаданные автоматически на границе ноды.</p>
+<hr />
 <h2 id="sravnenie-podkhodov-k-khraneniyu">Сравнение подходов к хранению</h2>
 
 <p>Существует два основных типа хранилищ для логов, и выбор между ними влияет на архитектуру вашего бэкенда.</p>
@@ -2275,18 +2314,21 @@ Stdout/stderr в Go небуферизированы по умолчанию (и
   </div>
 </div>
 
+<hr />
 <h2 id="poterya-soobshcheniy-i-backpressure">Потеря сообщений и Backpressure</h2>
 
 <p>В распределенных системах всегда есть риск, что хранилище логов (Loki/ES) упадет или сеть ляжет. Что будет с вашим Go-приложением?</p>
 <ol>
-<li><strong>Приложение -&gt; Stdout:</strong> Приложение не блокируется. Оно пишет в пайп ядра ОС. Если агент не успевает читать, пайп переполняется (редко, возможно с而死).</li>
-<li><strong>Агент -&gt; Storage:</strong> Агент имеет буфер. Если буфер полон, у агента есть стратегии:<ul>
+<li><strong>Приложение -&gt; Stdout:</strong> Приложение не блокируется. Оно пишет в пайп ядра ОС. Если агент не успевает читать, пайп переполняется (буфер ядра Linux обычно 64 КБ). Если буфер забит, системный вызов <code>write(2)</code> заблокирует горутину, если поток открыт в блокирующем режиме.</li>
+<li><strong>Агент -&gt; Storage:</strong> Агент имеет буфер в оперативной памяти и на диске. Если буфер полон, у агента есть стратегии:<ul>
 <li><strong>Block:</strong> Остановить чтение с диска (приводит к росту файлов логов на ноде).</li>
 <li><strong>Drop:</strong> Выбрасывать новые логи (Data Loss, но система жива).</li>
 </ul>
 </li>
 </ol>
 <p>Это называется <strong>Backpressure</strong>. В продакшене часто настраивают Drop логов, чтобы падение мониторинга не убило само приложение (например, не забило диск ноды логами).</p>
+<p>Бизнес-транзакции клиентов всегда имеют высший приоритет над телеметрией: если система вынуждена выбирать между отказом в оплате заказа и потерей лог-записи об этой оплате, зрелая архитектура жертвует логом, гарантируя работоспособность сервиса.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>

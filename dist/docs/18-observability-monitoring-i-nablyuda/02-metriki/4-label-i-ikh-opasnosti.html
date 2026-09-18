@@ -2169,18 +2169,29 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 18</span>
-              <span class="meta-tag read-time">⏱ ~11 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Label и их опасности</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="leybly-moshch-i-opasnost">Лейблы: Мощь и опасность</h2>
+            <h1>4. Label и их опасности: Кардинальность и утечки памяти</h1>
+<blockquote>
+<p><em>"Complexity is that one thing that always grows by itself unless you deliberately fight it."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>В предыдущей статье мы научились экспортировать базовые метрики из Go-сервиса. Однако плоский счетчик <code>http_requests_total</code>, возвращающий единственное агрегированное число, мало чем поможет инженеру в три часа ночи: невозможно понять, какой эндпоинт деградирует, какой метод дает сбои и какой код ошибки возвращается клиентам.</p>
+<p>Всю мощь и выразительность современным системам мониторинга дают <strong>Labels (Лейблы, или метки)</strong>. Лейблы превращают одномерный скаляр в многомерное пространство измерений (Dimensions). Но за эту гибкость приходится платить. Бездумное обращение с лейблами — это причина номер один аварий систем мониторинга и внезапных OOM-падений бэкендов в продакшене.</p>
+<hr />
+<h2 id="leybly-moshch-i-opasnost">Лейблы: Мощь и опасность</h2>
 
-<p>В предыдущей статье мы научились экспортировать метрики из Go-приложения. Однако простое добавление счетчиков не делает систему наблюдаемой. Всю мощь Prometheus раскрывает именно <strong>Labels (Лейблы)</strong>.</p>
 <p>Лейблы позволяют разбить одну метрику на множество измерений (Dimensions). Например, метрика <code>http_requests_total</code> без лейблов покажет общее количество запросов. Но добавив лейбл <code>status</code>, мы можем узнать, сколько было успешных ответов (200), а сколько ошибок сервера (500).</p>
-<p>Однако именно лейблы являются источником главных проблем в продакшене.</p>
+<p>Мы можем мгновенно фильтровать и группировать потоки данных по методам, HTTP-статусам, срезам инфраструктуры:<br />
+- <code>http_requests_total{method="POST", status="500"}</code><br />
+- <code>sum by (status) (rate(http_requests_total[5m]))</code></p>
+<p>Однако каждый добавленный лейбл — это не просто дополнительное поле в JSON. Это порождение нового физического объекта как в памяти вашего приложения, так и в базе данных Prometheus.</p>
+<hr />
 <h2 id="model-dannykh-time-series">Модель данных: Time Series</h2>
 
 <p>В Prometheus нет понятия "объект" или "экземпляр". Есть только <strong>Time Series (Временной ряд)</strong>.<br />
@@ -2188,19 +2199,50 @@
 <p>$$ \text{Time Series} = \text{Metric Name} + \text{Label Set} $$</p>
 <p>Если у вас есть метрика <code>http_requests_total</code> с лейблами <code>method="GET"</code> и <code>status="200"</code>, это <strong>один</strong> временной ряд.<br />
 Если пришел запрос с <code>status="404"</code>, Prometheus создаст <strong>другой</strong> временной ряд: <code>http_requests_total{method="GET", status="404"}</code>.</p>
+<p>Каждый уникальный кортеж значений лейблов порождает независимый поток данных, который требует своего буфера в оперативной памяти, своей записи в инвертированном индексе и отдельного сжатого чанка на диске.</p>
+<hr />
 <h2 id="under-the-hood-kak-eto-rabotaet-v-go">Under the Hood: Как это работает в Go</h2>
 
 <p>В библиотеке <code>client_golang</code> метрики с лейблами реализованы через структуры <code>*Vec</code> (CounterVec, GaugeVec, HistogramVec).</p>
 <p>Когда вы вызываете метод <code>.WithLabelValues("value")</code>, происходит следующее:</p>
 <ol>
-<li><strong>Хеширование:</strong> Клиент вычисляет хеш от переданных значений лейблов.</li>
-<li><strong>Поиск в карте:</strong> Он ищет этот хеш во внутренней карте (<code>map[uint64]metric)</code>).</li>
+<li><strong>Хеширование:</strong> Клиент вычисляет хеш (обычно быстрый 64-битный FNV-1a) от переданных значений лейблов.</li>
+<li><strong>Поиск в карте:</strong> Он ищет этот хеш во внутренней карте (<code>map[uint64]metric)</code>) под <code>RWMutex.RLock()</code>.</li>
 <li><strong>Создание или получение:</strong><ul>
 <li>Если метрика с таким набором лейблов уже есть — возвращается ссылка на неё.</li>
-<li>Если нет — <strong>создается новый объект</strong> (новый счетчик) и помещается в карту.</li>
+<li>Если нет — захватывается <code>RWMutex.Lock()</code>, <strong>создается новый объект</strong> (новый счетчик) и помещается в карту.</li>
 </ul>
 </li>
 </ol>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Call[&quot;WithLabelValues(&#x27;GET&#x27;, &#x27;200&#x27;)&quot;] --&gt; Hash[&quot;1. Hash FNV-1a(&#x27;GET&#x27;, &#x27;200&#x27;)&quot;]
+Hash --&gt; Lookup{&quot;2. metricMap.RLock()&lt;br&gt;Хеш найден?&quot;}
+Lookup --&gt;|Да| Return[&quot;3. Возврат существующего *Counter&quot;]
+Lookup --&gt;|Нет| Lock[&quot;4. metricMap.Lock()&quot;]
+Lock --&gt; Alloc[&quot;5. new(Counter) + аллокация в Heap&quot;]
+Alloc --&gt; Insert[&quot;6. metricMap[hash] = counter&quot;]
+Insert --&gt; Return
+
+style Call fill:#312e81,stroke:#818cf8,color:#fff
+style Return fill:#065f46,stroke:#10b981,color:#fff
+style Alloc fill:#78350f,stroke:#f59e0b,color:#fff
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2213,9 +2255,11 @@
   </div>
 </div>
 
+<hr />
 <h2 id="glavnyy-vrag-unbounded-cardinality-neogranichennaya-kardinalnost">Главный враг: Unbounded Cardinality (Неограниченная кардинальность)</h2>
 
 <p>Самая частая ошибка, убивающая мониторинг — использование неограниченных значений в лейблах.</p>
+<p>Кардинальность (Cardinality) — это количество уникальных комбинаций лейблов. Если число возможных значений конечно и мало (десятки или сотни), система работает безупречно. Если число значений потенциально бесконечно — наступает катастрофа.</p>
 <h3 id="primer-oshibki-url-paths">Пример ошибки: URL Paths</h3>
 
 <p>Представьте, что вы пишете метрику для HTTP-хендлера:</p>
@@ -2273,7 +2317,8 @@ func promMiddleware(next http.Handler) http.Handler {
 </code></pre>
 </div>
 
-<p>Библиотеки вроде <code>gorilla/mux</code>, <code>chi</code> или <code>gin</code> позволяют получить "шаблон" маршрута (<code>r.URL.Path</code> -&gt; <code>/users/:id</code>), что превращает бесконечное множество URL в один дискретный лейбл.</p>
+<p>Библиотеки вроде <code>gorilla/mux</code>, <code>chi</code> или <code>gin</code> позволяют получить "шаблон" маршрута (<code>r.URL.Path</code> -&gt; <code>/users/:id</code>), что превращает бесконечное множество URL в один дискретный лейбл. В стандартной библиотеке Go 1.22+ обновленный <code>net/http.Request</code> также предоставляет метод <code>r.Pattern</code>, возвращающий зарегистрированный шаблон маршрута (например, <code>/users/{id}</code>).</p>
+<hr />
 <h2 id="cardinality-explosion-vliyanie-na-tsdb">Cardinality Explosion: Влияние на TSDB</h2>
 
 <p>Проблема масштабируется не только в памяти вашего приложения, но и в памяти Prometheus сервера.</p>
@@ -2309,6 +2354,8 @@ style H fill:#f55,stroke:#333
 
 
 <p>Каждый временной ряд в Prometheus требует выделения памяти под "Head Chunk" (буфер для записи новых точек данных). Чем больше рядов, тем больше оперативной памяти потребляет сервер мониторинга.</p>
+<p>Кроме того, Prometheus строит инвертированный индекс (Inverted Index) по всем лейблам. При миллионах уникальных строк размер индекса раздувается до десятков гигабайт, время сжатия (Compaction) возрастает экспоненциально, а CPU сервера мониторинга начинает захлебываться при выполнении любых PromQL-запросов.</p>
+<hr />
 <h2 id="best-practices-bezopasnaya-rabota-s-leyblami">Best Practices: Безопасная работа с лейблами</h2>
 
 <ol>
@@ -2357,6 +2404,8 @@ style H fill:#f55,stroke:#333
   </div>
 </div>
 
+<p>Также в веб-интерфейсе Prometheus доступна встроенная системная страница <code>Status -&gt; TSDB Status</code>, которая мгновенно показывает топ-10 метрик по количеству серий, самые часто встречающиеся имена лейблов и максимальную длину postings-списков без необходимости писать сложные PromQL-запросы.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Лейблы — это мощный инструмент для срезов данных, но они требуют дисциплины.<br />

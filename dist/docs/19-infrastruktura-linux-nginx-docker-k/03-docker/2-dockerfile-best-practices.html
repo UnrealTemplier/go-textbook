@@ -2169,19 +2169,22 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~14 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Dockerfile best practices</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Написание Dockerfile для Go-приложения — это не просто последовательность команд <code>RUN</code> и <code>COPY</code>. Это архитектурный процесс, который определяет, насколько быстро будет разворачиваться ваш сервис, сколько места он займет в registry и, что самое важное, насколько безопасным и предсказуемым он будет в продакшене.</p>
-<p>Для Go-разработчика Dockerfile — это мост между компилятором и инфраструктурой. И здесь действуют свои законы Mechanical Sympathy.</p>
-<h2 id="invalidatsiya-kesha-kak-docker-vidit-sloi">Инвалидация кэша: Как Docker видит слои</h2>
+            <h1>Лучшие практики написания Dockerfile для Go: От кэширования слоев до флагов компилятора</h1>
+<p>Написание Dockerfile для сервиса на Go — это не просто механическое перечисление директив <code>RUN</code>, <code>COPY</code> и <code>CMD</code>. Это тонкий архитектурный процесс, определяющий скорость и стоимость пайплайнов CI/CD, объем потребляемого трафика и дискового пространства в реестрах контейнеров (Container Registry), а главное — безопасность и предсказуемость вашего приложения в боевой эксплуатации.</p>
+<p>Для Go-разработчика Dockerfile служит прямым мостом между компилятором <code>go build</code> и низкоуровневой инфраструктурой ядра Linux. Здесь в полной мере раскрывается концепция <strong>Mechanical Sympathy</strong>: понимание того, как сборочный движок (Docker BuildKit) кэширует слои и как флаги линковщика влияют на отлаживаемость и устойчивость процесса к атакам.</p>
+<hr />
+<h2 id="1-mekhanika-invalidatsii-kesha-kak-docker-vidit-sloi">1. Механика инвалидации кэша: Как Docker видит слои</h2>
 
-<p>Docker собирает образы пошагово. Каждая инструкция в Dockerfile (например, <code>RUN</code>, <code>COPY</code>) создает новый слой (layer). Если слой не изменился, Docker берет его из локального кэша при следующей сборке.</p>
-<p>Ключевой принцип: <strong>Инструкция выполняется заново, если изменился любой из предыдущих слоев или файлы, которые в нее копируются.</strong></p>
+<p>Сборщик Docker строит образ пошагово: каждая инструкция в Dockerfile (<code>FROM</code>, <code>RUN</code>, <code>COPY</code>, <code>ADD</code>) порождает неизменяемый снимок файловой системы — <strong>слой (Layer)</strong>. </p>
+<p>При повторных сборках движок проверяет контрольные суммы входных данных каждого шага. Если инструкция и ее входной контекст не изменились, Docker берет готовый слой из локального кэша (<code>CACHED</code>), экономя драгоценное время.</p>
+<p>Фундаментальный закон кэширования Docker: <strong>Если изменился хотя бы один байт во входных данных текущего слоя, кэш этого слоя и ВСЕХ последующих слоев немедленно сгорает (инвалидируется)!</strong></p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2196,7 +2199,7 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;FROM golang:1.22&quot;] --&gt; B[&quot;COPY . .&quot;]
+A[&quot;FROM golang:1.22-alpine&quot;] --&gt; B[&quot;COPY . . (Копируем всё дерево)&quot;]
 B --&gt; C[&quot;RUN go mod download&quot;]
 C --&gt; D[&quot;RUN go build -o myapp&quot;]
 
@@ -2207,10 +2210,16 @@ G --&gt; H[&quot;Кэш слоя RUN build сгорает!&quot;]
 </div>
 
 
-<p>Если вы копируете весь исходный код (<code>COPY . .</code>) перед скачиванием зависимостей (<code>go mod download</code>), то при изменении <em>любого</em> файла (даже комментария в коде) будет инвалидирован кэш слоя с зависимостями. Docker начнет заново скачивать сотни мегабайт пакетов из интернета, что в CI/CD увеличивает время сборки с секунд до минут.</p>
-<h2 id="idiomatichnyy-pattern-keshirovanie-zavisimostey">Идиоматичный паттерн: Кэширование зависимостей</h2>
+<h3 id="v-chem-fatalnaya-oshibka-naivnogo-podkhoda">В чем фатальная ошибка наивного подхода?</h3>
+<p>Если разработчик пишет <code>COPY . .</code> в самом начале Dockerfile, то любое косметическое изменение — будь то правка комментария в коде, обновление <code>README.md</code> или добавление иконки — приводит к инвалидации слоя с зависимостями. </p>
+<p>Сборщик вынужден заново выполнять команду <code>RUN go mod download</code>, выкачивая сотни мегабайт внешних пакетов из глобальной сети. В результате время сборки микросервиса в CI/CD возрастает с 5 секунд до 3–5 минут, парализуя работу команды.</p>
+<hr />
+<h2 id="2-idiomatichnyy-pattern-razdelnoe-keshirovanie-zavisimostey">2. Идиоматичный паттерн: Раздельное кэширование зависимостей</h2>
 
-<p>В Go зависимости описываются в двух файлах: <code>go.mod</code> и <code>go.sum</code>. Они меняются редко. Идиоматичный подход — скопировать их первыми, скачать зависимости, и только потом копировать исходный код.</p>
+<p>В экосистеме Go дерево внешних модулей и их криптографические контрольные суммы строго зафиксированы в двух файлах: <code>go.mod</code> и <code>go.sum</code>. В стабильном проекте эти файлы меняются на порядки реже, чем исходный код бизнес-логики.</p>
+<p>Идиоматичный подход заключается в разделении сборочного контекста на два изолированных этапа:<br />
+1. Сначала копируются исключительно <code>go.mod</code> и <code>go.sum</code> и выполняется выкачивание зависимостей в кэш модулей.<br />
+2. И только затем копируется остальной исходный код.</p>
 
 <div class="code-block" data-lang="dockerfile">
   <div class="code-header">
@@ -2224,54 +2233,61 @@ G --&gt; H[&quot;Кэш слоя RUN build сгорает!&quot;]
 
 WORKDIR /app
 
-# 1. Копируем только файлы зависимостей
+# 1. Копируем только манифесты зависимостей
 COPY go.mod go.sum ./
 
-# 2. Скачиваем зависимости (этот слой будет закэширован, 
-# пока мы не поменяем go.mod/go.sum)
+# 2. Скачиваем зависимости (этот слой будет надежно закэширован, 
+# пока мы явно не обновим библиотеки в go.mod/go.sum)
 RUN go mod download
 
-# 3. Копируем остальной исходный код
+# 3. Копируем остальной исходный код (меняется часто)
 COPY . .
 
-# 4. Сборка бинарника
+# 4. Сборка бинарника (использует уже прогретый локальный кэш модулей)
 RUN go build -o /myapp .
 </code></pre>
 </div>
 
-<h2 id="flagi-kompilyatora-optimizatsiya-pod-konteynery">Флаги компилятора: Оптимизация под контейнеры</h2>
+<p>При таком подходе 95% сборок при коммитах в код стартуют сразу с шага 3, занимая считанные секунды!</p>
+<hr />
+<h2 id="3-flagi-kompilyatora-tonkaya-nastroyka-binarnika-pod-konteynery">3. Флаги компилятора: Тонкая настройка бинарника под контейнеры</h2>
 
-<p>Когда вы собираете бинарник внутри Docker, вы должны учитывать специфику окружения. Сборка "как на локальной машине" — это антипаттерн.</p>
-<h3 id="cgoenabled0-staticheskaya-kompilyatsiya">`CGO_ENABLED=0`: Статическая компиляция</h3>
-
-<p>Мы уже обсуждали это в статье <a href="1-konteynerizatsiya-osnovy.html" class="wikilink">1. Контейнеризация. Основы</a>. По умолчанию, если вы не используете CGO (вызовы C-кода), Go все равно может попытаться слинковаться с динамическими библиотеками <code>glibc</code> (например, для DNS-резолвинга). </p>
-<p>Флаг <code>CGO_ENABLED=0</code> заставляет компилятор использовать чистый Go-рантайм и собственные реализации системных вызовов. Бинарник становится полностью статическим и независимым от <code>glibc</code> или <code>musl</code> базового образа. Это позволяет запускать его в пустом образе <code>scratch</code>.</p>
-<h3 id="ldflags-s-w-stripping-otladochnoy-informatsii">`-ldflags="-s -w"`: Стриппинг отладочной информации</h3>
-
-<p>Флаги линковщика <code>-s</code> и <code>-w</code> удаляют из бинарника таблицу символов (symbol table) и отладочную информацию (DWARF). В Go это может уменьшить размер бинарника на 20-30%.</p>
+<p>Сборка Go-кода внутри контейнера по умолчанию («как на рабочем ноутбуке») — распространенный антипаттерн. В контейнерной среде компилятору необходимо передавать специализированные флаги.</p>
+<h3 id="1-cgoenabled0-polnaya-staticheskaya-kompilyatsiya">1. `CGO_ENABLED=0`: Полная статическая компиляция</h3>
+<p>Как мы выяснили в лекции <a href="1-konteynerizatsiya-osnovy.html" class="wikilink">1. Контейнеризация. Основы</a>, рантайм Go при компиляции по умолчанию может попытаться использовать системную библиотеку Си (<code>glibc</code>) хоста — например, для системного резолвинга DNS или вызова криптографических функций ОС.</p>
+<p>Флаг <code>CGO_ENABLED=0</code> принудительно отключает мост CGO. Компилятор использует чистый Go-рантайм и встроенный DNS-резолвер Go. Сгенерированный ELF-бинарник становится <strong>полностью статическим</strong>: у него нет динамических связей (<code>not a dynamic executable</code>), и он может исполняться в абсолютно пустом окружении <code>scratch</code> или минимальном образе без <code>glibc</code> (Alpine на базе <code>musl</code>).</p>
+<h3 id="2-ldflags-s-w-stripping-otladochnykh-simvolov">2. `-ldflags="-s -w"`: Стриппинг отладочных символов</h3>
+<p>Флаги компоновщика (линкера) <code>-s</code> и <code>-w</code> удаляют из скомпилированного бинарника таблицу символов (Symbol Table) и отладочные структуры формата DWARF:<br />
+* <code>-s</code>: вырезает таблицу символов.<br />
+* <code>-w</code>: отключает генерацию отладочной информации DWARF.</p>
+<p>Это сокращает физический вес бинарного файла на 20–30% (например, с 35 МБ до 24 МБ).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Скрытая цена флагов -s -w в продакшене</span>
   </div>
   <div class="callout-body">
-    <p>Использование <code>-s -w</code> — это компромисс. Да, вы экономите десятки мегабайт в образе и немного ускоряете запуск (меньше данных для загрузки в память). Но если ваше приложение упадет с паникой (panic) в продакшене, вы не увидите имен функций и номеров строк в стектрейсе — только адреса памяти. Также вы лишаетесь возможности использовать <code>runtime.Caller</code> и некоторые профилировщики.<br />
-Если размер образа не критичен (а в 2024 году пара десятков мегабайт редко решает), лучше оставить отладочную информацию для удобства дебага.</p>
+    <p>Удаление отладочной информации через <code>-s -w</code> — это всегда компромисс между размером и наблюдаемостью (<strong>Observability</strong>).</p>
+<p>Если приложение упадет с критической паникой (<code>panic</code>), в журнале ошибок вы рискуете увидеть лишь невнятные шестнадцатеричные адреса памяти вместо человекочитаемых имен функций и точных номеров строк в исходных файлах. </p>
+<p>Кроме того, стриппинг ломает корректную работу профилировщиков производительности (pprof, Linux perf) и системных вызовов интроспекции <code>runtime.Caller</code>. Если размер диска в реестре не является критическим лимитом, в продакшене рекомендуется <strong>сохранять отладочные символы</strong> ради быстрой локализации инцидентов.</p>
   </div>
 </div>
 
-<h3 id="trimpath-vosproizvodimost-sborki">`-trimpath`: Воспроизводимость сборки</h3>
-
-<p>По умолчанию Go "зашивает" абсолютные пути вашего компьютера в бинарник. Если вы собираете код из <code>/home/developer/project</code>, этот путь попадет в стектрейсы и профильную информацию. Это проблема безопасности (утечка структуры директорий CI-сервера) и нарушение принципа Reproducible Builds.</p>
-<p>Флаг <code>-trimpath</code> удаляет все локальные пути из бинарника, заменяя их на относительные пути модулей.</p>
+<h3 id="3-trimpath-vosproizvodimost-i-bezopasnost-sborki">3. `-trimpath`: Воспроизводимость и безопасность сборки</h3>
+<p>По умолчанию компилятор Go вшивает в бинарник абсолютные файловые пути машины, на которой происходила компиляция (например, <code>/home/runner/work/backend/src/...</code>). </p>
+<p>Это несет две проблемы:<br />
+1. <strong>Утечка внутренней информации:</strong> Злоумышленник, получивший бинарник, может извлечь структуру директорий серверов сборки и логины разработчиков.<br />
+2. <strong>Нарушение Reproducible Builds:</strong> Бинарники, собранные из одного коммита на разных компьютерах, будут иметь разные контрольные суммы из-за отличающихся путей.</p>
+<p>Флаг <code>-trimpath</code> вырезает все локальные пути из бинарника: если вы собирали проект из <code>/home/developer/project</code>, этот путь больше не попадет в бинарник, заменяясь на относительные пути модулей.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Динамическое внедрение версии через -ldflags -X</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как собрать Go-бинарник так, чтобы он показывал версию сборки (git commit hash) во время выполнения, не меняя при этом исходный код каждый раз?<br />
-<strong>Ответ:</strong> Использовать <code>-ldflags</code> с флагом <code>-X</code>. Вы передаете значение переменной из окружения CI/CD (например, Git SHA) в глобальную переменную внутри Go-пакета прямо на этапе линковки.</p>
+    <p><strong>Вопрос:</strong> Как передать в Go-бинарник версию приложения, хэш git-коммита и дату сборки во время билда в CI/CD, не модифицируя исходный код?</p>
+<p><strong>Ответ:</strong> <br />
+Для этого используется флаг линкера <code>-X</code>. Он позволяет перезаписать значение строковой переменной прямо на этапе сборки:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2281,7 +2297,7 @@ RUN go build -o /myapp .
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go build -ldflags=&quot;-X main.buildVersion=$(git rev-parse HEAD)&quot; -o myapp
+  <pre class="language-bash"><code class="language-bash">go build -ldflags=&quot;-X main.buildVersion=$(git rev-parse --short HEAD)&quot; -o myapp
 </code></pre>
 </div>
 
@@ -2289,10 +2305,12 @@ RUN go build -o /myapp .
   </div>
 </div>
 
-<h2 id="dockerignore-gigiena-konteksta-sborki">.dockerignore: Гигиена контекста сборки</h2>
+<hr />
+<h2 id="4-fayl-dockerignore-gigiena-sborochnogo-konteksta">4. Файл .dockerignore: Гигиена сборочного контекста</h2>
 
-<p>Когда Docker выполняет <code>COPY . .</code>, он отправляет весь контекст директории (запускаемой команды <code>docker build</code>) демону Docker. Если в вашей папке лежат <code>vendor/</code>, <code>.git/</code>, локальные бинарники или тяжелые логи, всё это полетит в демон, раздувая время передачи и размер кэша.</p>
-<p>Обязательный файл <code>.dockerignore</code> в корне проекта:</p>
+<p>Когда вы запускаете <code>docker build -t myapp .</code>, клиент Docker упаковывает <strong>все файлы текущей директории</strong> в tar-архив и передает их демону Docker (это называется <em>Build Context</em>).</p>
+<p>Если в репозитории лежат скрытая папка <code>.git/</code> (которая может весить сотни мегабайт истории), локальные тестовые дампы, временные бинарники из папки <code>bin/</code> или директория <code>vendor/</code>, все эти гигабайты мусора полетят по сокету в сборочный демон, раздувая время сборки и ломая кэш.</p>
+<p>Обязательный файл <code>.dockerignore</code> в корне каждого Go-репозитория:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2302,21 +2320,34 @@ RUN go build -o /myapp .
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text"># Исключаем всё, что не нужно для сборки
+  <pre class="language-text"><code class="language-text"># Исключаем служебные файлы системы контроля версий
 .git/
+.gitignore
+
+# Исключаем локальные бинарники и временные каталоги
 bin/
 tmp/
+dist/
+
+# Исключаем документацию и тесты
 *.md
 *.test
-# В Docker мы сами качаем зависимости, локальный кэш не нужен
+*_test.go
+
+# В Dockerfile зависимости скачиваются через go mod download
 vendor/
+
+# Локальные конфиги с секретами разработчиков
+.env
+local.yaml
 </code></pre>
 </div>
 
-<h2 id="bezopasnost-least-privilege">Безопасность: Least Privilege</h2>
+<hr />
+<h2 id="5-bezopasnost-least-privilege">5. Безопасность: Least Privilege</h2>
 
-<p>Как мы узнали из статьи <a href="../01-linux/4-prava-dostupa-i-bezopasnost.html" class="wikilink">4. Права доступа и безопасность</a>, запуск процесса от <code>root</code> — смертный грех. Даже в изолированном контейнере.</p>
-<p>В базовых образах (Alpine, Debian) часто нет готового непривилегированного пользователя. Вы должны создать его сами. В Alpine для этого используется утилита <code>adduser</code>.</p>
+<p>Как мы подробно разбирали в статье <a href="../01-linux/4-prava-dostupa-i-bezopasnost.html" class="wikilink">4. Права доступа и безопасность</a>, запуск сетевого сервиса от пользователя <code>root</code> (UID 0) внутри контейнера — опасная антипрактика. Если в Go-приложении будет найдена уязвимость типа Remote Code Execution (RCE), злоумышленник получит права суперпользователя в контейнере и сможет попытаться атаковать ядро хоста.</p>
+<p>В минимальных базовых образах (Alpine Linux) непривилегированный пользователь отсутствует по умолчанию, поэтому его создают вручную:</p>
 
 <div class="code-block" data-lang="dockerfile">
   <div class="code-header">
@@ -2326,21 +2357,22 @@ vendor/
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-dockerfile"><code class="language-dockerfile"># ... этап сборки бинарника ...
+  <pre class="language-dockerfile"><code class="language-dockerfile"># ... этап компиляции бинарника ...
 
-# Создаем группу и пользователя с конкретным UID/GID
+# Создаем системную группу и системного пользователя с фиксированными UID/GID
 RUN addgroup -S appgroup &amp;&amp; adduser -S appuser -G appgroup
 
-# Меняем владельца директорий, куда приложение может писать (логи, кэш)
-# Если этого не сделать, при запуске от appuser приложение упадет с Permission Denied
+# Создаем рабочие каталоги и назначаем права владения appuser
+# Без этого запись логов или кэша завершится ошибкой Permission Denied
 RUN mkdir -p /app/data &amp;&amp; chown -R appuser:appgroup /app/data
 
-# Явно переключаемся на непривилегированного пользователя
+# Явно переключаемся на непривилегированного пользователя для всех последующих инструкций
 USER appuser
 
-# Копируем бинарник (убедитесь, что он доступен для выполнения)
+# Копируем скомпилированный бинарник
 COPY --from=builder /myapp /app/myapp
 
+# Запускаем приложение
 ENTRYPOINT [&quot;/app/myapp&quot;]
 </code></pre>
 </div>
@@ -2348,23 +2380,26 @@ ENTRYPOINT [&quot;/app/myapp&quot;]
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Что происходит на уровне ядра при директиве USER</span>
   </div>
   <div class="callout-body">
-    <p>Директива <code>USER appuser</code> в Dockerfile работает через механизмы Cgroups и Namespaces Linux. Когда контейнер стартует, Docker делает системный вызов <code>setuid()</code> и <code>setgid()</code> для процесса-инициатора. Все последующие процессы внутри контейнера наследуют эти UID/GID. Если вы попытаетесь выполнить привилегированный системный вызов (например, открыть сырой сокет или примонтировать диск), ядро Linux откажет, так как EUID процесса не равен 0.</p>
+    <p>Директива <code>USER appuser</code> инструктирует рантайм <code>runc</code> выполнить системные вызовы <strong><code>setgid()</code></strong> и <strong><code>setuid()</code></strong> непосредственно перед запуском целевого процесса в контейнере.</p>
+<p>Эффективный идентификатор пользователя (<strong>EUID</strong>) процесса становится ненулевым (например, 1001). </p>
+<p>С этого момента ядро Linux активирует стандартные проверки прав: процессу запрещается открывать низкоуровневые сокеты (<code>SOCK_RAW</code>), монтировать файловые системы, изменять сетевые маршруты или модифицировать системные файлы ядра. Любая попытка несанкционированного системного вызова пресекается ошибкой <code>EPERM</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Кэширование слоев</strong>: Копируйте <code>go.mod</code>/<code>go.sum</code> первыми, чтобы <code>go mod download</code> не выполнялся при каждом изменении кода.</li>
-<li><strong><code>CGO_ENABLED=0</code></strong>: Гарантирует статическую компиляцию и совместимость с <code>scratch</code>/<code>distroless</code> образами.</li>
-<li><strong><code>-trimpath</code></strong>: Критически важен для безопасности и воспроизводимости сборки, удаляя локальные пути из бинарника.</li>
-<li><strong><code>.dockerignore</code></strong>: Обязателен для исключения мусора (<code>.git</code>, <code>vendor</code>) из контекста сборки.</li>
-<li><strong><code>USER appuser</code></strong>: Запуск от непривилегированного пользователя — стандарт безопасности, который нужно настраивать вручную.</li>
+<li><strong>Кэширование слоев:</strong> Копируйте <code>go.mod</code> и <code>go.sum</code> отдельным шагом перед исходным кодом, гарантируя мгновенную сборку при изменении логики.</li>
+<li><strong><code>CGO_ENABLED=0</code>:</strong> Гарантирует статическую компиляцию и совместимость с <code>scratch</code>/<code>distroless</code> образами.</li>
+<li><strong><code>-trimpath</code>:</strong> Обеспечивает воспроизводимость сборки и защищает от утечки путей файловой системы разработчиков.</li>
+<li><strong><code>.dockerignore</code>:</strong> Отсекает мусор (<code>.git</code>, <code>vendor</code>, временные файлы), ускоряя передачу контекста сборки.</li>
+<li><strong><code>USER appuser</code>:</strong> Запуск от непривилегированного пользователя — незыблемое правило информационной безопасности.</li>
 </ol>
-<p>Все эти практики замечательны, но они оставляют нас с дилеммой: для сборки нам нужен тяжелый образ с компилятором (<code>golang:1.22-alpine</code> весит ~300 МБ), а для запуска — только бинарник и ядро Linux. Как не тащить компилятор в продакшен? Ответ кроется в паттерне, который разделил Docker-сборки на "до" и "после". В следующей статье мы разберем его: <a href="3-multi-stage-build.html" class="wikilink">3. Multi stage build</a>.</p>
+<p>Все эти оптимизации приближают нас к идеалу, однако базовый образ с компилятором Go (<code>golang:1.22-alpine</code>) весит около 300 МБ. Тащить компилятор, сборочные утилиты и исходный код в боевой продакшен — непозволительная расточительность. В следующей лекции мы освоим паттерн, ставший золотым стандартом упаковки Go-сервисов: <a href="3-multi-stage-build.html" class="wikilink">3. Multi stage build</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2392,7 +2427,7 @@ ENTRYPOINT [&quot;/app/myapp&quot;]
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#invalidatsiya-kesha-kak-docker-vidit-sloi">Инвалидация кэша: Как Docker видит слои</a></li><li class="toc-item toc-h2"><a href="#idiomatichnyy-pattern-keshirovanie-zavisimostey">Идиоматичный паттерн: Кэширование зависимостей</a></li><li class="toc-item toc-h2"><a href="#flagi-kompilyatora-optimizatsiya-pod-konteynery">Флаги компилятора: Оптимизация под контейнеры</a></li><li class="toc-item toc-h3"><a href="#cgoenabled0-staticheskaya-kompilyatsiya">CGOENABLED=0: Статическая компиляция</a></li><li class="toc-item toc-h3"><a href="#ldflags-s-w-stripping-otladochnoy-informatsii">-ldflags=&quot;-s -w&quot;: Стриппинг отладочной информации</a></li><li class="toc-item toc-h3"><a href="#trimpath-vosproizvodimost-sborki">-trimpath: Воспроизводимость сборки</a></li><li class="toc-item toc-h2"><a href="#dockerignore-gigiena-konteksta-sborki">.dockerignore: Гигиена контекста сборки</a></li><li class="toc-item toc-h2"><a href="#bezopasnost-least-privilege">Безопасность: Least Privilege</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-mekhanika-invalidatsii-kesha-kak-docker-vidit-sloi">1. Механика инвалидации кэша: Как Docker видит слои</a></li><li class="toc-item toc-h3"><a href="#v-chem-fatalnaya-oshibka-naivnogo-podkhoda">В чем фатальная ошибка наивного подхода?</a></li><li class="toc-item toc-h2"><a href="#2-idiomatichnyy-pattern-razdelnoe-keshirovanie-zavisimostey">2. Идиоматичный паттерн: Раздельное кэширование зависимостей</a></li><li class="toc-item toc-h2"><a href="#3-flagi-kompilyatora-tonkaya-nastroyka-binarnika-pod-konteynery">3. Флаги компилятора: Тонкая настройка бинарника под контейнеры</a></li><li class="toc-item toc-h3"><a href="#1-cgoenabled0-polnaya-staticheskaya-kompilyatsiya">1. CGOENABLED=0: Полная статическая компиляция</a></li><li class="toc-item toc-h3"><a href="#2-ldflags-s-w-stripping-otladochnykh-simvolov">2. -ldflags=&quot;-s -w&quot;: Стриппинг отладочных символов</a></li><li class="toc-item toc-h3"><a href="#3-trimpath-vosproizvodimost-i-bezopasnost-sborki">3. -trimpath: Воспроизводимость и безопасность сборки</a></li><li class="toc-item toc-h2"><a href="#4-fayl-dockerignore-gigiena-sborochnogo-konteksta">4. Файл .dockerignore: Гигиена сборочного контекста</a></li><li class="toc-item toc-h2"><a href="#5-bezopasnost-least-privilege">5. Безопасность: Least Privilege</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

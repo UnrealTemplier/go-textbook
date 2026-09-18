@@ -2169,20 +2169,24 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 18</span>
-              <span class="meta-tag read-time">⏱ ~13 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Экспорт метрик в Go</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="integratsiya-prometheus-v-go-prilozhenie">Интеграция Prometheus в Go-приложение</h2>
-
-<p>В предыдущей статье мы рассмотрели архитектуру Prometheus и модель Pull. Теперь перейдем к практике: как правильно внедрить экспорт метрик в Go-сервис, чтобы он был эффективным, безопасным и идиоматичным.</p>
-<p>Стандартом индустрии является библиотека <code>prometheus/client_golang</code>. Однако, просто подключить её недостаточно — нужно понимать, как она взаимодействует с рантаймом Go.</p>
+            <h1>3. Экспорт метрик в Go: Архитектура клиентской библиотеки</h1>
+<blockquote>
+<p><em>"The best diagnostic tool is often a well-placed counter."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>В предыдущей статье мы изучили внутреннее устройство сервера Prometheus и его парадигму Pull. Теперь настало время ответить на главный практический вопрос инженера: <strong>как правильно научить Go-приложение экспортировать метрики</strong>, чтобы сбор телеметрии не создавал паразитной нагрузки на CPU, не провоцировал GC-паузы и оставался чистым с точки зрения архитектуры кода.</p>
+<p>Де-факто стандартом индустрии для экспорта метрик в Go является официальная библиотека <code>github.com/prometheus/client_golang</code>. Однако просто импортировать пакет и скопировать пару строчек из документации недостаточно. Настоящий бэкенд-инженер должен понимать, что происходит в памяти процесса в момент скрейпинга, как изолировать мониторинг от бизнес-логики и как проектировать метрики так, чтобы юнит-тесты не превращались в ночной кошмар из-за глобального состояния.</p>
+<hr />
 <h2 id="bazovaya-nastroyka-hello-world-monitoringa">Базовая настройка: "Hello World" мониторинга</h2>
 
-<p>Самый простой способ начать — использовать пакет <code>promhttp</code>. Он предоставляет готовый <code>http.Handler</code>.</p>
+<p>Самый быстрый способ начать отдавать метрики наружу — подключить пакет <code>promhttp</code>. Он предоставляет готовый HTTP-обработчик (<code>http.Handler</code>), который инкапсулирует сериализацию данных реестра в текстовый формат OpenMetrics/Prometheus.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2195,7 +2199,9 @@
   <pre class="language-go"><code class="language-go">package main
 
 import (
+    &quot;log&quot;
     &quot;net/http&quot;
+
     &quot;github.com/prometheus/client_golang/prometheus/promhttp&quot;
 )
 
@@ -2203,19 +2209,54 @@ func main() {
     // Регистрируем обработчик для эндпоинта /metrics
     http.Handle(&quot;/metrics&quot;, promhttp.Handler())
 
-    http.ListenAndServe(&quot;:8080&quot;, nil)
+    log.Println(&quot;Сервер метрик запущен на :8080/metrics&quot;)
+    if err := http.ListenAndServe(&quot;:8080&quot;, nil); err != nil {
+        log.Fatalf(&quot;Ошибка запуска сервера: %v&quot;, err)
+    }
 }
 </code></pre>
 </div>
 
-<p>При обращении к <code>http://localhost:8080/metrics</code>, этот хендлер сгенерирует ответ в текстовом формате. По умолчанию он уже экспортирует метрики рантайма Go (память, горутины, GC), благодаря встроенному сборщику <code>collectors.NewGoCollector</code>.</p>
+<p>При обращении к <code>http://localhost:8080/metrics</code>, этот хендлер сгенерирует ответ в текстовом формате. По умолчанию он уже экспортирует богатейший набор метрик рантайма Go (память кучи, количество живых горутин, активность сборщика мусора GC), благодаря встроенному сборщику <code>collectors.NewGoCollector</code>.</p>
+<hr />
 <h2 id="mechanical-sympathy-chto-proiskhodit-vo-vremya-scrape">Mechanical Sympathy: Что происходит во время Scrape?</h2>
+
+<p>Что на самом деле делает машина, когда Prometheus присылает HTTP GET-запрос на ваш эндпоинт <code>/metrics</code>?</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Scrape[&quot;Prometheus Scrape&lt;br&gt;(HTTP GET /metrics)&quot;] --&gt; RLock[&quot;1. Registry.Gather()&lt;br&gt;RWMutex.RLock()&quot;]
+RLock --&gt; Collect[&quot;2. Обход всех Collectors&lt;br&gt;(Go runtime, Process, User metrics)&quot;]
+Collect --&gt; Build[&quot;3. Генерация dto.Metric&lt;br&gt;(Атомарное чтение значений)&quot;]
+Build --&gt; Encode[&quot;4. Сериализация в Text Format&lt;br&gt;(Буферизованный вывод)&quot;]
+Encode --&gt; Flush[&quot;5. Запись в сокет&lt;br&gt;http.ResponseWriter&quot;]
+Flush --&gt; RUnlock[&quot;6. RWMutex.RUnlock()&quot;]
+
+style Scrape fill:#312e81,stroke:#818cf8,color:#fff
+style RLock fill:#1e293b,stroke:#38bdf8,color:#fff
+style Collect fill:#0f172a,stroke:#475569,color:#fff
+style Flush fill:#065f46,stroke:#10b981,color:#fff
+  </pre>
+</div>
+
 
 <p>Когда Prometheus дергает ваш эндпоинт <code>/metrics</code>, происходят следующие процессы:</p>
 <ol>
-<li><strong>Блокировка Реестра (Registry Lock):</strong> Реестр метрик (<code>prometheus.Registry</code>) блокируется на чтение. Это значит, что попытки записать новые данные в метрики (вызвать <code>Inc()</code> или <code>Observe()</code>) <strong>не заблокируются</strong>, так как используются атомарные операции или RWMutex (в зависимости от типа метрики).</li>
-<li><strong>Сериализация:</strong> Хендлер проходит по всем зарегистрированным метрикам и вызывает их метод <code>Write</code> для конвертации в текстовый формат Protocol Buffers или Plain Text.</li>
-<li><strong>I/O:</strong> Данные пишутся в <code>http.ResponseWriter</code>.</li>
+<li><strong>Блокировка Реестра (Registry Lock):</strong> Реестр метрик (<code>prometheus.Registry</code>) блокируется на чтение (<code>RWMutex.RLock()</code>). Это значит, что попытки записать новые данные в метрики (вызвать <code>Inc()</code> или <code>Observe()</code>) <strong>не заблокируются</strong>, так как используются атомарные операции или RWMutex (в зависимости от типа метрики).</li>
+<li><strong>Сбор данных (Gathering):</strong> Реестр вызывает метод <code>Collect()</code> у каждого зарегистрированного коллектора. Стандартные метрики рантайма обращаются к системным структурам <code>runtime.MemStats</code> и <code>runtime/metrics</code>.</li>
+<li><strong>Сериализация:</strong> Хендлер проходит по всем зарегистрированным метрикам и вызывает их метод <code>Write</code> для конвертации в текстовый формат Protocol Buffers или Plain Text. В памяти аллоцируются буферы для форматирования строк.</li>
+<li><strong>I/O:</strong> Данные пишутся в <code>http.ResponseWriter</code> и улетают по сетевому сокету серверу мониторинга.</li>
 </ol>
 <div class="callout callout-warning">
   <div class="callout-header">
@@ -2229,12 +2270,18 @@ func main() {
   </div>
 </div>
 
+<p>Разделение портов гарантирует две вещи:<br />
+- Внешний трафик из интернета никогда не получит доступ к внутренним деталям вашей системы через <code>/metrics</code>.<br />
+- Внезапно зависший или слишком тяжелый скрейпинг не исчерпает лимит файловых дескрипторов и потоков входящего бизнес-трафика.</p>
+<hr />
 <h2 id="pattern-proektirovaniya-middleware-middleware-pattern">Паттерн проектирования: Middleware (Middleware Pattern)</h2>
 
 <p>В реальном бэкенде мы не пишем <code>Inc()</code> внутри каждого хендлера. Мы используем паттерн "Middleware" (или "Interceptor"). Это позволяет отделить бизнес-логику от инфраструктурной.</p>
+<p>Бизнес-код должен отвечать за создание заказа или регистрацию пользователя, а не за вычисление длительности HTTP-запроса.</p>
 <h3 id="realizatsiya-sobstvennogo-middleware">Реализация собственного Middleware</h3>
 
 <p>Хотя в библиотеке есть готовый <code>promhttp.InstrumentHandler...</code>, для Senior-разработчика полезно понимать, как это работает внутри, чтобы иметь возможность кастомизации.</p>
+<p>Главная сложность в стандартном <code>net/http</code> — перехватить код ответа (<code>HTTP Status Code</code>), так как стандартный интерфейс <code>http.ResponseWriter</code> не предоставляет метода для чтения уже записанного статуса. Нам потребуется паттерн «Декоратор»:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2244,7 +2291,48 @@ func main() {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// promMiddleware оборачивает http.Handler и собирает метрики
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;net/http&quot;
+    &quot;strconv&quot;
+    &quot;time&quot;
+
+    &quot;github.com/prometheus/client_golang/prometheus&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/promauto&quot;
+)
+
+var (
+    httpRequestsTotal = promauto.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: &quot;http_requests_total&quot;,
+            Help: &quot;Общее количество обработанных HTTP-запросов.&quot;,
+        },
+        []string{&quot;method&quot;, &quot;code&quot;},
+    )
+
+    httpDuration = promauto.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    &quot;http_request_duration_seconds&quot;,
+            Help:    &quot;Гистограмма длительности HTTP-запросов.&quot;,
+            Buckets: prometheus.DefBuckets,
+        },
+        []string{&quot;path&quot;},
+    )
+)
+
+// responseWriter перехватывает HTTP-статус код
+type responseWriter struct {
+    http.ResponseWriter
+    statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.statusCode = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+// promMiddleware оборачивает http.Handler и собирает метрики
 func promMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         start := time.Now()
@@ -2267,7 +2355,14 @@ func promMiddleware(next http.Handler) http.Handler {
 </div>
 
 <h3 id="ispolzovanie-promhttp-production-way">Использование `promhttp` (Production Way)</h3>
+
 <p>В продакшене лучше использовать готовые инструменты, чтобы не изобретать велосипед.</p>
+<p>Официальный пакет <code>promhttp</code> содержит готовые фабрики декораторов:<br />
+- <code>promhttp.InstrumentHandlerCounter</code><br />
+- <code>promhttp.InstrumentHandlerDuration</code><br />
+- <code>promhttp.InstrumentHandlerInFlight</code><br />
+- <code>promhttp.InstrumentHandlerResponseSize</code></p>
+<p>Вот как выглядит идеальная компоновка production-сервера с собственным изолированным реестром:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2277,7 +2372,22 @@ func promMiddleware(next http.Handler) http.Handler {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func main() {
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;net/http&quot;
+
+    &quot;github.com/prometheus/client_golang/prometheus&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/collectors&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/promauto&quot;
+    &quot;github.com/prometheus/client_golang/prometheus/promhttp&quot;
+)
+
+func myHandler(w http.ResponseWriter, r *http.Request) {
+    _, _ = w.Write([]byte(&quot;Hello, Observability!&quot;))
+}
+
+func main() {
     // Создаем пользовательский регистр (best practice)
     reg := prometheus.NewRegistry()
 
@@ -2290,13 +2400,22 @@ func promMiddleware(next http.Handler) http.Handler {
     reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
     // Инициализируем метрики
-    httpRequestsTotal := promauto.With(reg).NewCounterVec(...)
+    httpRequestsTotal := promauto.With(reg).NewCounterVec(
+        prometheus.CounterOpts{
+            Name: &quot;http_requests_total&quot;,
+            Help: &quot;Total number of HTTP requests.&quot;,
+        },
+        []string{&quot;code&quot;, &quot;method&quot;},
+    )
 
     // Создаем хендлер с инструментированием
     instrumentedHandler := promhttp.InstrumentHandlerCounter(
         httpRequestsTotal,
         http.HandlerFunc(myHandler),
     )
+
+    mux := http.NewServeMux()
+    mux.Handle(&quot;/api/v1/hello&quot;, instrumentedHandler)
 
     // Запускаем сервер с кастомным регистром
     http.Handle(&quot;/metrics&quot;, promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
@@ -2305,6 +2424,7 @@ func promMiddleware(next http.Handler) http.Handler {
 </code></pre>
 </div>
 
+<hr />
 <h2 id="under-the-hood-promauto-i-registry">Under the Hood: `promauto` и `Registry`</h2>
 
 <p>Библиотека предоставляет пакет <code>promauto</code>, который регистрирует метрики в глобальном реестре по умолчанию.</p>
@@ -2339,6 +2459,8 @@ func promMiddleware(next http.Handler) http.Handler {
   </div>
 </div>
 
+<p>Через интерфейс <code>testRegistry.Gather()</code> в юнит-тесте можно программно извлечь значение любого счетчика и написать четкое утверждение: <code>assert.Equal(t, 1.0, metricValue)</code>.</p>
+<hr />
 <h2 id="optimizatsiya-gaugefunc-i-counterfunc">Оптимизация: `GaugeFunc` и `CounterFunc`</h2>
 
 <p>Иногда значение метрики вычисляется сложным образом или уже существует в системе (например, размер очереди <code>len(queue)</code>). Вместо того чтобы запускать горутину, которая апдейтит Gauge каждые N секунд, используйте функции-коллбеки.</p>
@@ -2365,6 +2487,8 @@ promauto.NewGaugeFunc(prometheus.GaugeOpts{
 </div>
 
 <p>Это экономит CPU, так как вычисление происходит только по запросу (раз в 15-60 секунд), а не на каждое действие в приложении.</p>
+<p>Физическая аналогия: зачем круглосуточно качать воду насосом в мерный стакан, расходуя электричество, если можно заглянуть в колодец ровно в ту секунду, когда пришел контролер с проверкой?</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
@@ -2401,7 +2525,7 @@ promauto.NewGaugeFunc(prometheus.GaugeOpts{
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#integratsiya-prometheus-v-go-prilozhenie">Интеграция Prometheus в Go-приложение</a></li><li class="toc-item toc-h2"><a href="#bazovaya-nastroyka-hello-world-monitoringa">Базовая настройка: &quot;Hello World&quot; мониторинга</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-proiskhodit-vo-vremya-scrape">Mechanical Sympathy: Что происходит во время Scrape?</a></li><li class="toc-item toc-h2"><a href="#pattern-proektirovaniya-middleware-middleware-pattern">Паттерн проектирования: Middleware (Middleware Pattern)</a></li><li class="toc-item toc-h3"><a href="#realizatsiya-sobstvennogo-middleware">Реализация собственного Middleware</a></li><li class="toc-item toc-h3"><a href="#ispolzovanie-promhttp-production-way">Использование promhttp (Production Way)</a></li><li class="toc-item toc-h2"><a href="#under-the-hood-promauto-i-registry">Under the Hood: promauto и Registry</a></li><li class="toc-item toc-h2"><a href="#optimizatsiya-gaugefunc-i-counterfunc">Оптимизация: GaugeFunc и CounterFunc</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#bazovaya-nastroyka-hello-world-monitoringa">Базовая настройка: &quot;Hello World&quot; мониторинга</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-proiskhodit-vo-vremya-scrape">Mechanical Sympathy: Что происходит во время Scrape?</a></li><li class="toc-item toc-h2"><a href="#pattern-proektirovaniya-middleware-middleware-pattern">Паттерн проектирования: Middleware (Middleware Pattern)</a></li><li class="toc-item toc-h3"><a href="#realizatsiya-sobstvennogo-middleware">Реализация собственного Middleware</a></li><li class="toc-item toc-h3"><a href="#ispolzovanie-promhttp-production-way">Использование promhttp (Production Way)</a></li><li class="toc-item toc-h2"><a href="#under-the-hood-promauto-i-registry">Under the Hood: promauto и Registry</a></li><li class="toc-item toc-h2"><a href="#optimizatsiya-gaugefunc-i-counterfunc">Оптимизация: GaugeFunc и CounterFunc</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

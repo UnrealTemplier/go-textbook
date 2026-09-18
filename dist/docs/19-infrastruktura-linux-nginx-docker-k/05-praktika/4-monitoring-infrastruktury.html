@@ -2169,25 +2169,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Мониторинг инфраструктуры</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы настраивали деплой и масштабирование, предполагая, что приложение работает корректно. Но в мире распределенных систем слепая вера в здоровье инфраструктуры — это путь к долгим ночным дежурствам. </p>
-<p>Мониторинг инфраструктуры — это не просто красивые графики в Grafana. Это механический sympathy (сочувствие железу) в чистом виде: понимание того, как Linux-ядро, Cgroups, K8s и ваше Go-приложение делят физические ресурсы ноды.</p>
-<h2 id="kontseptsiya-the-four-golden-signals">Концепция: The Four Golden Signals</h2>
+            <h1>4. Мониторинг инфраструктуры: Четыре золотых сигнала, Prometheus, cAdvisor и метрики Go-рантайма</h1>
+<p>В предыдущих главах мы детально настраивали деплой, горизонтальное масштабирование и сетевую маршрутизацию. Однако слепая вера в то, что развернутый кластер работает идеально только потому, что HTTP-запросы возвращают код 200, — самый короткий путь к ночным дежурствам и катастрофическим инцидентам в продакшене.</p>
+<p>Мониторинг инфраструктуры — это не просто набор красочных графиков в Grafana для успокоения менеджмента. Это <strong>Mechanical Sympathy (механическое сочувствие к машине)</strong> в чистом инженерном выражении: способность видеть сквозь абстракции контейнеризации и понимать, как ядро Linux, подсистема Cgroups, планировщик Kubernetes и рантайм Go делят между собой физические такты процессора, страницы оперативной памяти и очереди дисковых накопителей.</p>
+<hr />
+<h2 id="1-kontseptsiya-the-four-golden-signals">1. Концепция: The Four Golden Signals</h2>
 
-<p>Прежде чем строить дашборды, нужно понять, <em>что</em> измерять. Книга Google SRE вводит концепцию четырех золотых сигналов:<br />
-1. <strong>Latency (Задержка)</strong>: Время обслуживания запроса (отличайте ошибки от успешных запросов — медленные ошибки хуже быстрых).<br />
-2. <strong>Traffic (Трафик)</strong>: Объем запросов (RPS для HTTP, MPS для gRPC).<br />
-3. <strong>Errors (Ошибки)</strong>: Частота неудачных запросов (явные 500-е или неявные 200 OK с мусором внутри).<br />
-4. <strong>Saturation (Насыщение)</strong>: Насколько близко вы к пределу системы (CPU, RAM, дисковые очереди, пул коннектов в Go). Этот сигнал предсказывает проблемы <em>до</em> того, как они ударят по Latency.</p>
-<h2 id="arkhitektura-nablyudaemosti-v-k8s">Архитектура наблюдаемости в K8s</h2>
-
-<p>Мониторинг K8s — это слоеный пирог. Вы не можете поставить один агент и получить всё.</p>
+<p>Прежде чем бросаться собирать терабайты метрик, необходимо определить метрический фундамент. В классической библии надежности <em>Google SRE Book</em> сформулирована концепция <strong>четырех золотых сигналов</strong> (The Four Golden Signals), позволяющая мгновенно оценить состояние любой распределенной системы:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2202,142 +2197,26 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Нода Linux&quot;] --&gt; B[&quot;Node Exporter&lt;br&gt;Метрики ядра и ОС&quot;]
-A --&gt; C[&quot;cAdvisor&lt;br&gt;Метрики контейнеров - Cgroups&quot;]
-D[&quot;K8s Control Plane&quot;] --&gt; E[&quot;Kube-state-metrics&lt;br&gt;Состояние объектов K8s&quot;]
-B --&gt; F[&quot;Prometheus Server&lt;br&gt;Pull модель - scrape&quot;]
-C --&gt; F
-E --&gt; F
-F --&gt; G[&quot;Grafana и Alertmanager&quot;]
+subgraph GoldenSignals[&quot;The Four Golden Signals (Google SRE)&quot;]
+L[&quot;1. Latency (Задержка)\nВремя обслуживания запроса.\nВажно отделять латентность успехов от задержек медленных ошибок!&quot;]
+T[&quot;2. Traffic (Трафик)\nМера входящей нагрузки:\nRPS (Requests Per Second) для HTTP, MPS для брокеров и gRPC.&quot;]
+E[&quot;3. Errors (Ошибки)\nЧастота сбоев: явные HTTP 500/502/504\nили неявные &#x27;тихие&#x27; бизнес-ошибки.&quot;]
+S[&quot;4. Saturation (Насыщение)\nСтепень исчерпания ресурсов:\nCPU throttle, RAM, сокеты, пулы коннектов к БД.&quot;]
+end
   </pre>
 </div>
 
 
-<h2 id="sloy-1-noda-node-exporter">Слой 1: Нода (Node Exporter)</h2>
-
-<p><strong>Node Exporter</strong> — это демон на Go, который раскрывает метрики самой машины (CPU, RAM, Disk, Network). Он не знает про K8s, он читает виртуальные файловые системы ядра Linux.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Node Exporter получает данные, парся псевдо-файловые системы:<br />
-*   <code>/proc/stat</code> — CPU time, context switches, interrupts.<br />
-*   <code>/proc/meminfo</code> — RAM, Swap, Page Cache.<br />
-*   <code>/sys/class/block/</code> — статистика дискового IO.<br />
-*   <code>/proc/net/dev</code> — байты и пакеты на сетевых интерфейсах.</p>
-<p>Для Go-разработчика здесь важно наблюдать за <strong>Context Switches</strong> (переключения контекста). Если их количество аномально высоко, это значит, что планировщик Linux не справляется с количеством потоков (M в модели G-M-P), и ваши горутины проводят время в очереди на выполнение, а не работая.</p>
-  </div>
-</div>
-
-<h3 id="mechanical-sympathy-iowait-isteal">Mechanical Sympathy: iowait и_steal</h3>
-<p>При анализе CPU через Node Exporter обращайте внимание не только на <code>user</code> и <code>system</code> время, но и на:<br />
-*   <strong>iowait</strong>: Процент времени, когда CPU простаивал, ожидая завершения дискового IO. Высокий iowait означает, что ваши Go-процессы заблокированы на syscall <code>read/write</code> (как мы разбирали в статье <a href="../01-linux/3-faylovaya-sistema-linux.html" class="wikilink">3. Файловая система Linux</a>).<br />
-*   <strong>steal</strong>: Время, украденное гипервизором у вашей виртуальной машины в облаке. Если steal &gt; 5%, облако перегрузило физический хост (Noisy Neighbors), и вам пора требовать миграцию VM.</p>
-<h2 id="sloy-2-konteyner-cadvisor">Слой 2: Контейнер (cAdvisor)</h2>
-
-<p>Как K8s понимает, сколько CPU/RAM потребляет контейнер? Он читает метрики из <strong>Cgroups</strong>. Для этого в K8s встроен <strong>cAdvisor</strong> (Container Advisor), который также написан на Go.</p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p>Самая частая боль Go-разработчиков в K8s — метрика <code>container_cpu_cfs_throttled_periods_total</code>.<br />
-Как мы обсуждали в <a href="../04-kubernetes/5-scaling-i-autoscaling.html" class="wikilink">5. Scaling и autoscaling</a>, если вы задали <code>resources.limits.cpu: "500m"</code> (0.5 ядра), CFS (Completely Fair Scheduler) выделяет контейнеру квоту — 50мс процессорного времени каждые 100мс. <br />
-Если ваш Go-сервис отработает свои 50мс за 60мс (из-за всплеска трафика или тяжелого GC), оставшиеся 40мс <strong>ядро заморозит процесс</strong> (Throttle). На графике это выглядит так: трафик есть, а CPU падает до нуля, и Latency взлетает до небес. Если вы видите throttle-графики — либо увеличивайте лимиты, либо используйте <code>GOMEMLIMIT</code>, чтобы снизить оверхед GC.</p>
-  </div>
-</div>
-
-<h2 id="sloy-3-obekty-k8s-kube-state-metrics">Слой 3: Объекты K8s (Kube-state-metrics)</h2>
-
-<p><strong>Kube-state-metrics</strong> не смотрит на железо. Он смотрит в API Server и генерирует метрики о <em>состоянии объектов K8s</em>.<br />
-*   Сколько реплик Deployment запрошено и сколько реально работает?<br />
-*   Сколько Подов в статусе <code>CrashLoopBackOff</code>?<br />
-*   Сколько PVC (дисков) в статусе <code>Pending</code>?</p>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между метриками от cAdvisor и Kube-state-metrics?<br />
-<strong>Ответ:</strong> cAdvisor отвечает на вопрос "Как?" (Какая загрузка CPU у этого Пода?). Kube-state-metrics отвечает на вопрос "Что?" (Находится ли этот Под в статусе Ready?). Вы алертитесь на данные Kube-state-metrics, если Pod падает, и на данные cAdvisor, если Pod работает, но ему не хватает ресурсов.</p>
-  </div>
-</div>
-
-<h2 id="prometheus-arkhitektura-pull-modeli">Prometheus: Архитектура Pull-модели</h2>
-
-<p>Prometheus — стандарт де-факто для мониторинга в K8s. В отличие от систем Push-модели (Graphite, Datadog), Prometheus сам ходит (scrape) по HTTP-эндпоинтам ваших приложений и забирает метрики.</p>
-<p><strong>Почему Pull лучше для инфраструктуры?</strong><br />
-1. <strong>Обнаружение отказов</strong>: Если приложение полностью зависло (deadlock) или нода упала, оно не сможет <em>отправить</em> метрику (Push). В Push-системах это выглядит как "стабильность" (нет данных — нет проблем). Prometheus же явно видит, что scrape упал, и поднимает алерт <code>TargetDown</code>.<br />
-2. <strong>Service Discovery</strong>: Prometheus интегрирован с K8s API. Он сам находит все Поды с нужным лейблом (например, <code>prometheus.io/scrape: "true"</code>) и начинает их опрашивать, не требуя ручного добавления IP-адресов.</p>
-<h2 id="integratsiya-go-runtime-metriki">Интеграция Go: Runtime-метрики</h2>
-
-<p>Библиотека <code>prometheus/client_golang</code> делает магию: при инициализации она автоматически регистрирует коллектор <code>collectors.NewGoCollector()</code>, который вытаскивает метрики самого Go-рантайма.</p>
-<p>Для инфраструктурного мониторинга Go-сервиса критически важны:<br />
-1. <code>go_goroutines</code>: Количество горутин. Резкий рост без увеличения RPS — признак утечки горутин (goroutine leak).<br />
-2. <code>go_gc_duration_seconds</code>: Время работы Garbage Collector. Всплески означают, что GC работает тяжело (возможно, из-за фрагментации кучи).<br />
-3. <code>go_memstats_heap_inuse_bytes</code>: Размер кучи в использовании. Должен иметь паттерн "пилы" (рост аллокаций -&gt; сброс GC). Если график только растет — memory leak.</p>
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">package main
-
-import (
-    &quot;net/http&quot;
-    &quot;github.com/prometheus/client_golang/prometheus/promhttp&quot;
-)
-
-func main() {
-    // Стандартный обработчик, отдающий и кастомные метрики, и go_ метрики
-    http.Handle(&quot;/metrics&quot;, promhttp.Handler())
-    http.ListenAndServe(&quot;:2112&quot;, nil)
-}
-</code></pre>
-</div>
-
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p>Разделяйте метрики <strong>контейнера</strong> (cAdvisor) и метрики <strong>приложения</strong> (Prometheus client).<br />
-Если ваш Go-сервис потребляет 1 ГБ памяти, а метрика <code>container_memory_working_set_bytes</code> показывает 1.5 ГБ, разницу составляют Page Cache и overhead Cgroups. Ориентироваться только на метрики ОС при поиске утечек памяти в Go бессмысленно. Смотрите на <code>go_memstats_heap_inuse_bytes</code> и <code>container_memory_working_set_bytes</code> совместно.</p>
-  </div>
-</div>
-
-<h2 id="itog">Итог</h2>
-
 <ol>
-<li><strong>Four Golden Signals</strong>: Стройте дашборды вокруг Latency, Traffic, Errors и Saturation.</li>
-<li><strong>Node Exporter</strong>: Читает <code>/proc</code> и <code>/sys</code>. Следите за <code>iowait</code> и <code>context switches</code>.</li>
-<li><strong>cAdvisor</strong>: Читает Cgroups. Если видите <code>cfs_throttled</code>, ваше Go-приложение душится лимитами CPU.</li>
-<li><strong>Kube-state-metrics</strong>: Мониторит желаемое vs текущее состояние K8s (CrashLooping, Replicas).</li>
-<li><strong>Pull модель Prometheus</strong>: Идеально для обнаружения "мертвых" сервисов, так как отсутствие ответа на scrape — это само по себе событие.</li>
-<li><strong>Go Runtime</strong>: Обязательно мониторьте <code>go_goroutines</code> и <code>go_gc_duration_seconds</code> для раннего обнаружения утечек ресурсов.</li>
+<li><strong>Latency (Задержка):</strong> Время, затраченное на обработку запроса. Инженеры часто совершают ошибку, усредняя латентность. Важно измерять перцентили (p95, p99) и строго разделять задержку успешных ответов и задержку ошибок. Медленно падающий с таймаутом запрос гораздо опаснее быстрого ответа <code>500 Internal Server Error</code>.</li>
+<li><strong>Traffic (Трафик):</strong> Количественная мера спроса на систему. Для HTTP-бэкенда это RPS (Requests Per Second), для gRPC или брокеров очередей — MPS (Messages Per Second) или байты в секунду.</li>
+<li><strong>Errors (Ошибки):</strong> Интенсивность отказов. Сюда входят как явные системные ошибки (HTTP 500/502/503/504, сетевые сбросы соединений), так и коварные неявные сбои (когда сервис возвращает статус <code>200 OK</code>, но с пустым или битым JSON внутри).</li>
+<li><strong>Saturation (Насыщение):</strong> Насколько система близка к своему физическому пределу (утилизация очередей ядра, пула потоков, памяти, дискового IO). <strong>Насыщение предсказывает проблемы задолго до того, как они ударят по Latency и вызовут Errors.</strong></li>
 </ol>
-<p>Метрики показывают нам <em>что</em> сломалось и <em>когда</em>, но редко говорят <em>почему</em>. Чтобы понять коренную причину падения или зависания, нужны контекстные данные о событиях. В следующей статье мы разберем логирование инфраструктуры: <a href="5-logi-infrastruktury.html" class="wikilink">5. Логи инфраструктуры</a>.<br />
-В предыдущих статьях мы настраивали деплой и масштабирование, предполагая, что приложение работает корректно. Но в мире распределенных систем слепая вера в здоровье инфраструктуры — это путь к долгим ночным дежурствам. </p>
-<p>Мониторинг инфраструктуры — это не просто красивые графики в Grafana. Это механический sympathy (сочувствие железу) в чистом виде: понимание того, как Linux-ядро, Cgroups, K8s и ваше Go-приложение делят физические ресурсы ноды.</p>
-<h2 id="kontseptsiya-the-four-golden-signals">Концепция: The Four Golden Signals</h2>
+<hr />
+<h2 id="2-arkhitektura-nablyudaemosti-v-kubernetes-trekhurovnevyy-pirog">2. Архитектура наблюдаемости в Kubernetes: Трехуровневый пирог</h2>
 
-<p>Прежде чем строить дашборды, нужно понять, <em>что</em> измерять. Книга Google SRE вводит концепцию четырех золотых сигналов:<br />
-1. <strong>Latency (Задержка)</strong>: Время обслуживания запроса (отличайте ошибки от успешных запросов — медленные ошибки хуже быстрых).<br />
-2. <strong>Traffic (Трафик)</strong>: Объем запросов (RPS для HTTP, MPS для gRPC).<br />
-3. <strong>Errors (Ошибки)</strong>: Частота неудачных запросов (явные 500-е или неявные 200 OK с мусором внутри).<br />
-4. <strong>Saturation (Насыщение)</strong>: Насколько близко вы к пределу системы (CPU, RAM, дисковые очереди, пул коннектов в Go). Этот сигнал предсказывает проблемы <em>до</em> того, как они ударят по Latency.</p>
-<h2 id="arkhitektura-nablyudaemosti-v-k8s">Архитектура наблюдаемости в K8s</h2>
-
-<p>Мониторинг K8s — это слоеный пирог. Вы не можете поставить один агент и получить всё.</p>
+<p>Невозможно поставить один универсальный агент и собрать исчерпывающую телеметрию. Мониторинг кластера Kubernetes строится как многослойный пирог из трех независимых источников данных:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2352,84 +2231,131 @@ func main() {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Нода Linux&quot;] --&gt; B[&quot;Node Exporter&lt;br&gt;Метрики ядра и ОС&quot;]
-A --&gt; C[&quot;cAdvisor&lt;br&gt;Метрики контейнеров - Cgroups&quot;]
-D[&quot;K8s Control Plane&quot;] --&gt; E[&quot;Kube-state-metrics&lt;br&gt;Состояние объектов K8s&quot;]
-B --&gt; F[&quot;Prometheus Server&lt;br&gt;Pull модель - scrape&quot;]
-C --&gt; F
-E --&gt; F
-F --&gt; G[&quot;Grafana и Alertmanager&quot;]
+subgraph Host[&quot;Физический сервер / Worker Node&quot;]
+NE[&quot;Node Exporter\n(Метрики ядра Linux: /proc, /sys)&quot;]
+cAdv[&quot;cAdvisor (внутри Kubelet)\n(Метрики Cgroups контейнеров)&quot;]
+GoPod[&quot;Go Application Pod\n(/metrics endpoint)&quot;]
+end
+
+subgraph ControlPlane[&quot;Kubernetes Control Plane&quot;]
+KSM[&quot;Kube-state-metrics\n(Состояние объектов: Pods, Deployments, PVC)&quot;]
+end
+
+subgraph MonitoringStack[&quot;Подсистема мониторинга&quot;]
+Prom[&quot;Prometheus Server\n(Pull-модель: HTTP Scrape каждые 15с)&quot;]
+Grafana[&quot;Grafana Дашборды&quot;]
+Alert[&quot;Alertmanager (Алерты в Slack / PagerDuty)&quot;]
+
+Prom --&gt; Grafana
+Prom --&gt; Alert
+end
+
+NE --&gt;|&quot;Scrape :9100&quot;| Prom
+cAdv --&gt;|&quot;Scrape :10250&quot;| Prom
+GoPod --&gt;|&quot;Scrape :2112&quot;| Prom
+KSM --&gt;|&quot;Scrape :8080&quot;| Prom
   </pre>
 </div>
 
 
-<h2 id="sloy-1-noda-node-exporter">Слой 1: Нода (Node Exporter)</h2>
+<p>Каждый слой решает строго определенную задачу и смотрит на мир под своим углом.</p>
+<hr />
+<h2 id="3-sloy-1-noda-node-exporter">3. Слой 1: Нода (Node Exporter)</h2>
 
-<p><strong>Node Exporter</strong> — это демон на Go, который раскрывает метрики самой машины (CPU, RAM, Disk, Network). Он не знает про K8s, он читает виртуальные файловые системы ядра Linux.</p>
+<p><strong>Node Exporter</strong> — это специализированный демон (DaemonSet в K8s), написанный на Go. Он ничего не знает о концепциях Kubernetes, подах или контейнерах. Его цель — раскрыть физическое состояние операционной системы Linux и аппаратного сервера.</p>
+<p>Node Exporter добывает метрики путем прямого парсинга псевдо-файловых систем ядра:<br />
+* <code>/proc/stat</code> — тики процессорного времени, прерывания (interrupts), переключения контекста (<strong>context switches</strong>).<br />
+* <code>/proc/meminfo</code> — детальная раскладка RAM: анонимная память, Swap, Page Cache, буферы и slabs ядра.<br />
+* <code>/sys/class/block/</code> — глубина дисковых очередей, время операций чтения/записи (IOPS, iostat).<br />
+* <code>/proc/net/dev</code> — сетевой трафик, отброшенные пакеты (drops), ошибки контроллера (errors).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Context Switches и планировщик Go</span>
   </div>
   <div class="callout-body">
-    <p>Node Exporter получает данные, парся псевдо-файловые системы:<br />
-*   <code>/proc/stat</code> — CPU time, context switches, interrupts.<br />
-*   <code>/proc/meminfo</code> — RAM, Swap, Page Cache.<br />
-*   <code>/sys/class/block/</code> — статистика дискового IO.<br />
-*   <code>/proc/net/dev</code> — байты и пакеты на сетевых интерфейсах.</p>
-<p>Для Go-разработчика здесь важно наблюдать за <strong>Context Switches</strong> (переключения контекста). Если их количество аномально высоко, это значит, что планировщик Linux не справляется с количеством потоков (M в модели G-M-P), и ваши горутины проводят время в очереди на выполнение, а не работая.</p>
+    <p>В метриках Node Exporter критически важно отслеживать всплески <strong>Context Switches</strong>.<br />
+В модели рантайма Go (G-M-P) каждая системная нить <code>M</code> (OS Thread) конкурирует за физические ядра с другими потоками хоста. Если планировщик ядра Linux перегружен десятками тысяч потоков сторонних процессов, число переключений контекста взлетает до сотен тысяч в секунду. Процессор тратит до 30% времени на сброс регистров и L1-кэшей, а горутины вашего сервиса простаивают в очереди на выполнение (Run Queue).</p>
   </div>
 </div>
 
-<h3 id="mechanical-sympathy-iowait-isteal">Mechanical Sympathy: iowait и_steal</h3>
-<p>При анализе CPU через Node Exporter обращайте внимание не только на <code>user</code> и <code>system</code> время, но и на:<br />
-*   <strong>iowait</strong>: Процент времени, когда CPU простаивал, ожидая завершения дискового IO. Высокий iowait означает, что ваши Go-процессы заблокированы на syscall <code>read/write</code> (как мы разбирали в статье <a href="../01-linux/3-faylovaya-sistema-linux.html" class="wikilink">3. Файловая система Linux</a>).<br />
-*   <strong>steal</strong>: Время, украденное гипервизором у вашей виртуальной машины в облаке. Если steal &gt; 5%, облако перегрузило физический хост (Noisy Neighbors), и вам пора требовать миграцию VM.</p>
-<h2 id="sloy-2-konteyner-cadvisor">Слой 2: Контейнер (cAdvisor)</h2>
+<h3 id="mechanical-sympathy-analiz-iowait-i-steal">Mechanical Sympathy: Анализ iowait и steal</h3>
+<p>При исследовании метрик процессора опытный инженер смотрит глубже базовых процентов <code>user</code> и <code>system</code>:<br />
+* <strong><code>iowait</code>:</strong> Процент процессорного времени, в течение которого ядра бездействовали в ожидании ответа от медленных накопителей (SSD/HDD). Высокий <code>iowait</code> сигнализирует, что потоки Go-приложения заблокированы в ядре на блокирующих системных вызовах <code>read/write</code> (как мы выяснили в <a href="../01-linux/3-faylovaya-sistema-linux.html" class="wikilink">3. Файловая система Linux</a>), и рантайм вынужден создавать новые потоки <code>M</code>.<br />
+* <strong><code>steal</code>:</strong> Процент процессорных квантов времени, физически «украденных» гипервизором облачного провайдера в пользу других виртуальных машин. Если метрика <code>steal</code> превышает 3–5%, ваш сервис страдает от проблемы шумных соседей (<strong>Noisy Neighbors</strong>). Единственное решение — миграция виртуальной машины или аренда Dedicated/Bare-metal инстансов.</p>
+<hr />
+<h2 id="4-sloy-2-konteyner-cadvisor">4. Слой 2: Контейнер (cAdvisor)</h2>
 
-<p>Как K8s понимает, сколько CPU/RAM потребляет контейнер? Он читает метрики из <strong>Cgroups</strong>. Для этого в K8s встроен <strong>cAdvisor</strong> (Container Advisor), который также написан на Go.</p>
+<p>Откуда Kubernetes узнает, сколько памяти или процессора потребил конкретный Docker-контейнер? Он опрашивает контроллер <strong>cAdvisor (Container Advisor)</strong>, встроенный прямо в демон <code>kubelet</code>. cAdvisor также написан на Go и считывает сырые данные из виртуальной файловой системы Cgroups (<code>/sys/fs/cgroup</code>).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Cgroup[&quot;/sys/fs/cgroup/cpu,memory\n(Ядро Linux)&quot;] --&gt; cAdv[&quot;cAdvisor (Go daemon)&quot;]
+cAdv --&gt;|&quot;Prometheus Format&quot;| Kubelet[&quot;Kubelet API (:10250/metrics/cadvisor)&quot;]
+Kubelet --&gt; Prom[&quot;Prometheus Server&quot;]
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: container_cpu_cfs_throttled_periods_total</span>
   </div>
   <div class="callout-body">
-    <p>Самая частая боль Go-разработчиков в K8s — метрика <code>container_cpu_cfs_throttled_periods_total</code>.<br />
-Как мы обсуждали в <a href="../04-kubernetes/5-scaling-i-autoscaling.html" class="wikilink">5. Scaling и autoscaling</a>, если вы задали <code>resources.limits.cpu: "500m"</code> (0.5 ядра), CFS (Completely Fair Scheduler) выделяет контейнеру квоту — 50мс процессорного времени каждые 100мс. <br />
-Если ваш Go-сервис отработает свои 50мс за 60мс (из-за всплеска трафика или тяжелого GC), оставшиеся 40мс <strong>ядро заморозит процесс</strong> (Throttle). На графике это выглядит так: трафик есть, а CPU падает до нуля, и Latency взлетает до небес. Если вы видите throttle-графики — либо увеличивайте лимиты, либо используйте <code>GOMEMLIMIT</code>, чтобы снизить оверхед GC.</p>
+    <p>Самая частая головная боль Go-разработчиков в Kubernetes — скрытое удушение процессов планировщиком ядра, отражаемое метрикой <code>container_cpu_cfs_throttled_periods_total</code>.</p>
+<p>Как мы подробно выяснили в <a href="../04-kubernetes/5-scaling-i-autoscaling.html" class="wikilink">5. Scaling и autoscaling</a>, лимит <code>resources.limits.cpu: "500m"</code> принудительно включает CFS (Completely Fair Scheduler). Контейнеру выделяется квота в 50 мс на каждые 100 мс системного периода.</p>
+<p>Если 4 горутины в Go-сервисе параллельно выполняют тяжелый парсинг JSON или сработал цикл сборщика мусора (GC), суммарная процессорная квота в 50 мс исчерпывается за считанные миллисекунды. <strong>На оставшуюся часть 100-мс периода ядро Linux принудительно усыпляет контейнер!</strong></p>
+<p>На мониторинге это выглядит как необъяснимый всплеск задержек (p99 latency вырастает ровно на 80–100 мс). Если вы видите рост графика <code>cfs_throttled</code> — немедленно увеличивайте лимиты, убирайте CPU limits вовсе либо настраивайте переменную <code>GOMEMLIMIT</code>, чтобы сгладить пики аллокаций.</p>
   </div>
 </div>
 
-<h2 id="sloy-3-obekty-k8s-kube-state-metrics">Слой 3: Объекты K8s (Kube-state-metrics)</h2>
+<hr />
+<h2 id="5-sloy-3-obekty-kubernetes-kube-state-metrics">5. Слой 3: Объекты Kubernetes (Kube-state-metrics)</h2>
 
-<p><strong>Kube-state-metrics</strong> не смотрит на железо. Он смотрит в API Server и генерирует метрики о <em>состоянии объектов K8s</em>.<br />
-*   Сколько реплик Deployment запрошено и сколько реально работает?<br />
-*   Сколько Подов в статусе <code>CrashLoopBackOff</code>?<br />
-*   Сколько PVC (дисков) в статусе <code>Pending</code>?</p>
+<p>Демон <strong>Kube-state-metrics</strong> не измеряет байты и герцы. Он подключается к K8s API Server через библиотеку <code>client-go</code> и транслирует в метрики Prometheus само <strong>декларативное состояние объектов кластера</strong>:<br />
+* Запрошенное количество реплик Deployment против реально доступных (<code>kube_deployment_status_replicas_available</code>).<br />
+* Поды, застрявшие в циклах перезапусков (<code>CrashLoopBackOff</code> или <code>OOMKilled</code>).<br />
+* Дисковые тома PersistentVolumeClaim, зависшие в статусе <code>Pending</code>.<br />
+* Статус готовности нод кластера (<code>kube_node_status_condition</code>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос для собеседования: cAdvisor против Kube-state-metrics</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между метриками от cAdvisor и Kube-state-metrics?<br />
-<strong>Ответ:</strong> cAdvisor отвечает на вопрос "Как?" (Какая загрузка CPU у этого Пода?). Kube-state-metrics отвечает на вопрос "Что?" (Находится ли этот Под в статусе Ready?). Вы алертитесь на данные Kube-state-metrics, если Pod падает, и на данные cAdvisor, если Pod работает, но ему не хватает ресурсов.</p>
+    <p><strong>Вопрос:</strong> В чем принципиальная разница между метриками cAdvisor и Kube-state-metrics?<br />
+<strong>Ответ:</strong> <br />
+* <strong>cAdvisor отвечает на вопрос «КАК? (Ресурсы)»:</strong> Какова физическая утилизация контейнера? Сколько байт оперативной памяти занято? Сколько периодов CPU было задушено?<br />
+* <strong>Kube-state-metrics отвечает на вопрос «ЧТО? (Состояние)»:</strong> В каком статусе находится оркестрация? Находится ли Pod в статусе Ready? Сколько реплик запущено? Не упал ли под в <code>CrashLoopBackOff</code>?</p>
+<p>В грамотном мониторинге вы настраиваете критические алерты (P1) на данные Kube-state-metrics (если под упал или не готов), а упреждающие алерты (P2/P3) — на данные cAdvisor (если сервису скоро перестанет хватать памяти).</p>
   </div>
 </div>
 
-<h2 id="prometheus-arkhitektura-pull-modeli">Prometheus: Архитектура Pull-модели</h2>
+<hr />
+<h2 id="6-prometheus-arkhitektura-pull-modeli-i-service-discovery">6. Prometheus: Архитектура Pull-модели и Service Discovery</h2>
 
-<p>Prometheus — стандарт де-факто для мониторинга в K8s. В отличие от систем Push-модели (Graphite, Datadog), Prometheus сам ходит (scrape) по HTTP-эндпоинтам ваших приложений и забирает метрики.</p>
-<p><strong>Почему Pull лучше для инфраструктуры?</strong><br />
-1. <strong>Обнаружение отказов</strong>: Если приложение полностью зависло (deadlock) или нода упала, оно не сможет <em>отправить</em> метрику (Push). В Push-системах это выглядит как "стабильность" (нет данных — нет проблем). Prometheus же явно видит, что scrape упал, и поднимает алерт <code>TargetDown</code>.<br />
-2. <strong>Service Discovery</strong>: Prometheus интегрирован с K8s API. Он сам находит все Поды с нужным лейблом (например, <code>prometheus.io/scrape: "true"</code>) и начинает их опрашивать, не требуя ручного добавления IP-адресов.</p>
-<h2 id="integratsiya-go-runtime-metriki">Интеграция Go: Runtime-метрики</h2>
+<p>Индустриальным стандартом сбора метрик в облачной инфраструктуре является <strong>Prometheus</strong>. В отличие от классических систем с Push-моделью (StatsD, Graphite, Datadog), где приложения сами обязаны отправлять метрики на центральный сервер, Prometheus реализует <strong>Pull-модель (Scrape)</strong>: он сам периодически приходит по HTTP на порт каждого инстанса.</p>
+<h3 id="pochemu-pull-model-idealna-dlya-infrastruktury">Почему Pull-модель идеальна для инфраструктуры?</h3>
+<ol>
+<li><strong>Надежное обнаружение отказов (Deadlock Detection):</strong> В push-системе, если Go-приложение намертво зависло в дедлоке или упало вместе с нодой, оно просто перестает слать пакеты. Push-сервер видит пустоту и считает: «Нет ошибок — значит, всё спокойно». Prometheus же при очередном опросе не получает HTTP 200 и немедленно генерирует системный алерт <strong><code>TargetDown</code></strong>.</li>
+<li><strong>Динамический Service Discovery:</strong> Prometheus тесно интегрирован с API Kubernetes. Ему не нужно прописывать статические IP-адреса: он автоматически обнаруживает новые поды по аннотациям (например, <code>prometheus.io/scrape: "true"</code>) и меткам селекторов, удаляя исчезнувшие инстансы из списка опроса.</li>
+</ol>
+<hr />
+<h2 id="7-integratsiya-go-metriki-rantayma-pod-mikroskopom">7. Интеграция Go: Метрики рантайма под микроскопом</h2>
 
-<p>Библиотека <code>prometheus/client_golang</code> делает магию: при инициализации она автоматически регистрирует коллектор <code>collectors.NewGoCollector()</code>, который вытаскивает метрики самого Go-рантайма.</p>
-<p>Для инфраструктурного мониторинга Go-сервиса критически важны:<br />
-1. <code>go_goroutines</code>: Количество горутин. Резкий рост без увеличения RPS — признак утечки горутин (goroutine leak).<br />
-2. <code>go_gc_duration_seconds</code>: Время работы Garbage Collector. Всплески означают, что GC работает тяжело (возможно, из-за фрагментации кучи).<br />
-3. <code>go_memstats_heap_inuse_bytes</code>: Размер кучи в использовании. Должен иметь паттерн "пилы" (рост аллокаций -&gt; сброс GC). Если график только растет — memory leak.</p>
+<p>Официальный SDK <code>github.com/prometheus/client_golang</code> при вызове стандартного хэндлера <code>promhttp.Handler()</code> автоматически подключает коллектор <code>collectors.NewGoCollector()</code>. Он раскрывает глубокие внутренности среды исполнения Go без написания единой строчки прикладного кода!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2442,40 +2368,58 @@ F --&gt; G[&quot;Grafana и Alertmanager&quot;]
   <pre class="language-go"><code class="language-go">package main
 
 import (
+    &quot;log&quot;
     &quot;net/http&quot;
+
     &quot;github.com/prometheus/client_golang/prometheus/promhttp&quot;
 )
 
 func main() {
-    // Стандартный обработчик, отдающий и кастомные метрики, и go_ метрики
+    // Стандартный эндпоинт, отдающий метрики рантайма Go и кастомные метрики
     http.Handle(&quot;/metrics&quot;, promhttp.Handler())
-    http.ListenAndServe(&quot;:2112&quot;, nil)
+
+    log.Println(&quot;Сервер метрик Prometheus слушает на порту :2112...&quot;)
+    if err := http.ListenAndServe(&quot;:2112&quot;, nil); err != nil {
+        log.Fatalf(&quot;ошибка запуска метрик: %v&quot;, err)
+    }
 }
 </code></pre>
 </div>
 
+<h3 id="kriticheski-vazhnye-runtime-metriki-go">Критически важные runtime-метрики Go:</h3>
+<ol>
+<li><strong><code>go_goroutines</code>:</strong> Текущее количество активных горутин в памяти. Рост графика горутин при стабильном входящем RPS — классический симптом утечки горутин (<strong>goroutine leak</strong>), зависших на незакрытых каналах или сокетах.</li>
+<li><strong><code>go_gc_duration_seconds</code>:</strong> Гистограмма длительности фаз сборки мусора (Stop-The-World и Concurrent phases). Всплески длительности сигнализируют о сильной фрагментации кучи или нехватке памяти.</li>
+<li><strong><code>go_memstats_heap_inuse_bytes</code>:</strong> Объем оперативной памяти, занятый живыми объектами в куче. В здоровом сервисе график имеет строгий пилообразный вид (рост аллокаций сменяется резким обрывом после прохода GC). Монотонный непрерывный рост без падений — стопроцентный признак утечки памяти (Memory Leak).</li>
+</ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Подводный камень: Память контейнера vs Память Go</span>
   </div>
   <div class="callout-body">
-    <p>Разделяйте метрики <strong>контейнера</strong> (cAdvisor) и метрики <strong>приложения</strong> (Prometheus client).<br />
-Если ваш Go-сервис потребляет 1 ГБ памяти, а метрика <code>container_memory_working_set_bytes</code> показывает 1.5 ГБ, разницу составляют Page Cache и overhead Cgroups. Ориентироваться только на метрики ОС при поиске утечек памяти в Go бессмысленно. Смотрите на <code>go_memstats_heap_inuse_bytes</code> и <code>container_memory_working_set_bytes</code> совместно.</p>
+    <p>Начинающие инженеры часто путают метрику приложения <code>go_memstats_heap_inuse_bytes</code> и метрику контейнера <code>container_memory_working_set_bytes</code>.</p>
+<p>Если Go-приложение рапортует об использовании 1 ГБ кучи, а cAdvisor показывает 1.6 ГБ, это не баг! <br />
+Разницу составляют:<br />
+* Системный стек горутин (по 2–8 КБ на каждую).<br />
+* Пул свободных страниц рантайма (Go не отдает освобожденную память ядру ОС мгновенно, а удерживает ее в <code>mcache</code>/<code>mcentral</code> для будущих аллокаций).<br />
+* Страничный кэш ядра (<strong>Page Cache</strong>) при операциях с файлами.</p>
+<p>Системный OOM Killer ядра Linux ориентируется именно на метрику <code>working_set_bytes</code> из cgroups. Поэтому для предотвращения падений анализируйте поведение обеих метрик совместно!</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Four Golden Signals</strong>: Стройте дашборды вокруг Latency, Traffic, Errors и Saturation.</li>
-<li><strong>Node Exporter</strong>: Читает <code>/proc</code> и <code>/sys</code>. Следите за <code>iowait</code> и <code>context switches</code>.</li>
-<li><strong>cAdvisor</strong>: Читает Cgroups. Если видите <code>cfs_throttled</code>, ваше Go-приложение душится лимитами CPU.</li>
-<li><strong>Kube-state-metrics</strong>: Мониторит желаемое vs текущее состояние K8s (CrashLooping, Replicas).</li>
-<li><strong>Pull модель Prometheus</strong>: Идеально для обнаружения "мертвых" сервисов, так как отсутствие ответа на scrape — это само по себе событие.</li>
-<li><strong>Go Runtime</strong>: Обязательно мониторьте <code>go_goroutines</code> и <code>go_gc_duration_seconds</code> для раннего обнаружения утечек ресурсов.</li>
+<li><strong>Four Golden Signals:</strong> Дашборды и системы оповещения должны строиться вокруг задержки (Latency), нагрузки (Traffic), сбоев (Errors) и степени насыщения (Saturation).</li>
+<li><strong>Node Exporter:</strong> Читает <code>/proc</code> и <code>/sys</code>. Следите за количеством переключений контекста (<code>context switches</code>), блокировками на диске (<code>iowait</code>) и украденными тактами гипервизора (<code>steal</code>).</li>
+<li><strong>cAdvisor:</strong> Извлекает метрики Cgroups. Рост <code>container_cpu_cfs_throttled_periods_total</code> указывает на опасный троттлинг процессора ядром Linux.</li>
+<li><strong>Kube-state-metrics:</strong> Мониторит жизненный цикл и расхождения между желаемым и реальным состоянием кластера K8s (<code>CrashLoopBackOff</code>, <code>Pending</code>).</li>
+<li><strong>Pull-модель Prometheus:</strong> Позволяет обнаруживать зависшие сервисы с помощью алертов <code>TargetDown</code> и обеспечивает нативный Service Discovery подов.</li>
+<li><strong>Go Runtime:</strong> Автоматический коллектор <code>collectors.NewGoCollector()</code> дает прозрачный контроль за утечками горутин (<code>go_goroutines</code>), здоровьем сборщика мусора (<code>go_gc_duration_seconds</code>) и размером кучи.</li>
 </ol>
-<p>Метрики показывают нам <em>что</em> сломалось и <em>когда</em>, но редко говорят <em>почему</em>. Чтобы понять коренную причину падения или зависания, нужны контекстные данные о событиях. В следующей статье мы разберем логирование инфраструктуры: <a href="5-logi-infrastruktury.html" class="wikilink">5. Логи инфраструктуры</a>.</p>
+<p>Метрики дают точный ответ на вопросы: <em>«Где сломалось?»</em> и <em>«Когда сломалось?»</em>. Однако они бессильны объяснить глубинную причину: <em>«Что именно произошло?»</em>. Чтобы восстановить детальный контекст инцидента, необходима вторая опора наблюдаемости — централизованное логирование. В следующей главе мы разберем сбор логов инфраструктуры: <a href="5-logi-infrastruktury.html" class="wikilink">5. Логи инфраструктуры</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2503,7 +2447,7 @@ func main() {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#kontseptsiya-the-four-golden-signals">Концепция: The Four Golden Signals</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-nablyudaemosti-v-k8s">Архитектура наблюдаемости в K8s</a></li><li class="toc-item toc-h2"><a href="#sloy-1-noda-node-exporter">Слой 1: Нода (Node Exporter)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-iowait-isteal">Mechanical Sympathy: iowait иsteal</a></li><li class="toc-item toc-h2"><a href="#sloy-2-konteyner-cadvisor">Слой 2: Контейнер (cAdvisor)</a></li><li class="toc-item toc-h2"><a href="#sloy-3-obekty-k8s-kube-state-metrics">Слой 3: Объекты K8s (Kube-state-metrics)</a></li><li class="toc-item toc-h2"><a href="#prometheus-arkhitektura-pull-modeli">Prometheus: Архитектура Pull-модели</a></li><li class="toc-item toc-h2"><a href="#integratsiya-go-runtime-metriki">Интеграция Go: Runtime-метрики</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li><li class="toc-item toc-h2"><a href="#kontseptsiya-the-four-golden-signals">Концепция: The Four Golden Signals</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-nablyudaemosti-v-k8s">Архитектура наблюдаемости в K8s</a></li><li class="toc-item toc-h2"><a href="#sloy-1-noda-node-exporter">Слой 1: Нода (Node Exporter)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-iowait-isteal">Mechanical Sympathy: iowait иsteal</a></li><li class="toc-item toc-h2"><a href="#sloy-2-konteyner-cadvisor">Слой 2: Контейнер (cAdvisor)</a></li><li class="toc-item toc-h2"><a href="#sloy-3-obekty-k8s-kube-state-metrics">Слой 3: Объекты K8s (Kube-state-metrics)</a></li><li class="toc-item toc-h2"><a href="#prometheus-arkhitektura-pull-modeli">Prometheus: Архитектура Pull-модели</a></li><li class="toc-item toc-h2"><a href="#integratsiya-go-runtime-metriki">Интеграция Go: Runtime-метрики</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-kontseptsiya-the-four-golden-signals">1. Концепция: The Four Golden Signals</a></li><li class="toc-item toc-h2"><a href="#2-arkhitektura-nablyudaemosti-v-kubernetes-trekhurovnevyy-pirog">2. Архитектура наблюдаемости в Kubernetes: Трехуровневый пирог</a></li><li class="toc-item toc-h2"><a href="#3-sloy-1-noda-node-exporter">3. Слой 1: Нода (Node Exporter)</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-analiz-iowait-i-steal">Mechanical Sympathy: Анализ iowait и steal</a></li><li class="toc-item toc-h2"><a href="#4-sloy-2-konteyner-cadvisor">4. Слой 2: Контейнер (cAdvisor)</a></li><li class="toc-item toc-h2"><a href="#5-sloy-3-obekty-kubernetes-kube-state-metrics">5. Слой 3: Объекты Kubernetes (Kube-state-metrics)</a></li><li class="toc-item toc-h2"><a href="#6-prometheus-arkhitektura-pull-modeli-i-service-discovery">6. Prometheus: Архитектура Pull-модели и Service Discovery</a></li><li class="toc-item toc-h3"><a href="#pochemu-pull-model-idealna-dlya-infrastruktury">Почему Pull-модель идеальна для инфраструктуры?</a></li><li class="toc-item toc-h2"><a href="#7-integratsiya-go-metriki-rantayma-pod-mikroskopom">7. Интеграция Go: Метрики рантайма под микроскопом</a></li><li class="toc-item toc-h3"><a href="#kriticheski-vazhnye-runtime-metriki-go">Критически важные runtime-метрики Go:</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

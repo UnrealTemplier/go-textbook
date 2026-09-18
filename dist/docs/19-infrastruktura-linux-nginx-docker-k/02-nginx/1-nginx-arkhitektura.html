@@ -2169,26 +2169,32 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. nginx. Архитектура</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Когда мы говорим о высоконагруженном бэкенде, Nginx — это первая линия обороны. Это шлюз, который принимает на себя удар десятков тысяч TCP-соединений, термит TLS, раздает статику и только потом аккуратно прокидывает запросы к вашим Go-сервисам. </p>
-<p>Многие разработчики воспринимают Nginx как "чёрный ящик", который просто работает. Но для Senior/Lead инженера понимание архитектуры Nginx критически важно. Только так можно объяснить латентность, правильно настроить балансировку и избежать странных багов с обрывами соединений при пиковых нагрузках.</p>
-<h2 id="ot-apache-k-nginx-problema-c10k">От Apache к Nginx: Проблема C10K</h2>
+            <h1>Архитектура Nginx: От проблемы C10K до высокопроизводительного обратного прокси</h1>
+<p>В современной инфраструктуре высоконагруженного бэкенда веб-сервер <strong>Nginx</strong> занимает позицию первой линии обороны. Это мощный фронтальный шлюз, принимающий на себя шквал сотен тысяч одновременных TCP-соединений из ненадежного публичного интернета, терминирующий TLS, сжимающий трафик, раздающий терабайты статического контента и аккуратно распределяющий запросы между пулами ваших микросервисов на Go.</p>
+<p>Многие инженеры склонны воспринимать Nginx как утилитарный «черный ящик», который достаточно однажды настроить по гайдам из StackOverflow и забыть. Однако для Senior-разработчика и архитектора глубокое понимание внутреннего устройства Nginx критически важно. Только зная механику событийного цикла, процессную модель и поведение ядра Linux под капотом, можно осознанно бороться с задержками (latency), устранять просадки пропускной способности при пиковых нагрузках и проектировать по-настоящему отказоустойчивые системы.</p>
+<hr />
+<h2 id="1-ot-apache-k-nginx-problema-c10k">1. От Apache к Nginx: Проблема C10K</h2>
 
-<p>В 90-х и начале 2000-х доминировал веб-сервер Apache. Его архитектура строилась на модели <strong>Process/Thread-per-Connection</strong> (один процесс или тред ОС на каждое клиентское соединение). Пока клиент медленно читал ответ по медленному 3G-каналу, целый тред ОС висел в заблокированном состоянии, ожидая завершения записи в сокет.</p>
-<p>Когда количество одновременных соединений перевалило за 10 000 (проблема C10K), Apache начал задыхаться. 10 000 потоков ОС — это десятки гигабайт памяти только на стеки и катастрофическое время на Context Switching. </p>
-<p>Nginx (созданный Игорем Сысоевым) предложил революционный для того времени подход: <strong>Event-Driven Architecture (Событийная архитектура)</strong>.</p>
-<h2 id="protsessnaya-model-master-i-workers">Процессная модель: Master и Workers</h2>
+<p>В 1990-х и начале 2000-х годов де-факто стандартом серверного интернета являлся веб-сервер Apache HTTP Server. Архитектура Apache опиралась на парадигму <strong>Process/Thread-per-Connection</strong> (один отдельный процесс или поток операционной системы на каждое активное сетевое соединение). </p>
+<p>В эпоху медленных каналов связи эта модель оказалась фатальной. Если мобильный клиент через нестабильное 3G-соединение передавал тело POST-запроса в течение 30 секунд со скоростью 5 КБ/с, выделенный поток операционной системы висел в заблокированном состоянии, удерживая память и ресурсы сервера.</p>
+<p>На рубеже тысячелетий индустрия сформулировала знаменитую <strong>проблему C10K</strong> (необходимость обслуживать свыше 10 000 одновременных клиентских подключений на одной физической машине):<br />
+* <strong>Колоссальный расход памяти на стеки:</strong> 10 000 потоков ОС (с дефолтным размером стека 2–8 МБ) требовали десятки гигабайт оперативной памяти исключительно под служебные нужды.<br />
+* <strong>Катастрофические затраты на Context Switching:</strong> Планировщик ядра тратил большую часть тактов CPU на смену регистров, сброс кэшей команд L1/L2 и таблиц страниц TLB, а не на выполнение бизнес-логики.</p>
+<p>Созданный Игорем Сысоевым веб-сервер Nginx предложил фундаментально иное решение: <strong>Event-Driven Architecture (Событийно-ориентированная асинхронная архитектура)</strong> на базе неблокирующего ввода-вывода.</p>
+<hr />
+<h2 id="2-protsessnaya-model-master-i-worker-protsessy">2. Процессная модель: Master и Worker-процессы</h2>
 
-<p>Nginx не запускает тысячи потоков. Он использует строго детерминированную мультипроцессную модель.</p>
+<p>Nginx не плодит тысячи потоков на каждый чих. Вместо этого он использует строгую, детерминированную многопроцессную архитектуру, состоящую из одного управляющего процесса и фиксированного пула рабочих воркеров:</p>
 <ol>
-<li><strong>Master Process</strong>: Запускается от <code>root</code> (чтобы иметь возможность забиндиться на порты 80 и 443). Его главная задача — чтение конфига, управление воркерами, bind сокетов и graceful reload.</li>
-<li><strong>Worker Processes</strong>: Форкаются от Master. Master передает им слушающие сокеты (через <code>fork()</code> или <code>exec</code>), а затем дропает привилегии до непривилегированного пользователя (например, <code>nginx</code> или <code>www-data</code>). Воркеры делают всю тяжелую работу.</li>
+<li><strong>Master Process:</strong> Запускается с правами суперпользователя (<code>root</code>). Привилегии <code>root</code> требуются для того, чтобы забиндить привилегированные сетевые порты (80 для HTTP и 443 для HTTPS), прочитать конфигурационные файлы (<code>nginx.conf</code>) и криптографические приватные ключи TLS. Главные задачи Master — парсинг конфигурации, инициализация сокетов, запуск воркеров и управление их жизненным циклом (включая горячую перезагрузку конфигурации без простоя — Zero-Downtime Reload).</li>
+<li><strong>Worker Processes:</strong> Форкаются от Master-процесса через системный вызов <code>fork()</code> (или при обновлении бинарника через <code>exec</code>). Мастер передает воркерам дескрипторы слушающих сокетов, после чего каждый воркер сбрасывает привилегии (<code>setuid</code>/<code>setgid</code>) до непривилегированного пользователя (обычно <code>nginx</code> или <code>www-data</code>). Всю реальную сетевую работу выполняют именно воркеры.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2219,107 +2225,32 @@ C --&gt;|&quot;Проксирование&quot;| F
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: CPU Affinity и отсутствие блокировок</span>
   </div>
   <div class="callout-body">
-    <p>Количество воркеров обычно задается равным количеству логических ядер CPU (<code>worker_processes auto;</code>). Поскольку каждый воркер — это однопоточный процесс (Single-threaded), привязка воркера к ядру CPU (CPU Affinity) минимизирует промахи кэша L1/L2 и исключает конкуренцию за мьютексы между потоками. В Nginx почти нет блокировок (mutexes) между воркерами, так как они не шарят память в стиле(thread-local storage), за исключением подсчета общей статистики и кэша (который шарится через shared memory zones, требуя атомарных операций).</p>
+    <p>В production количество воркеров конфигурируется директивой <code>worker_processes auto;</code>, что соответствует числу доступных логических ядер процессора.</p>
+<p>Каждый воркер — это строго однопоточный процесс (Single-threaded). С помощью системного механизма <strong>CPU Affinity</strong> (<code>worker_cpu_affinity</code>) каждый рабочий процесс привязывается к конкретному физическому ядру. </p>
+<p>Это решение обладает выдающейся аппаратной эффективностью (<strong>Mechanical Sympathy</strong>):<br />
+1. Воркер постоянно греет свой персональный кэш L1/L2, исключая дорогостоящую миграцию потока между ядрами CPU.<br />
+2. Между воркерами полностью отсутствует борьба за мьютексы (Mutex Contention) в пользовательском пространстве — воркеры не делят динамическую память кучи, как это бывает в многопоточных программах с thread-local storage.<br />
+3. Разделяемые данные (общая статистика, зоны rate-limiting и кэш) вынесены в специальные сегменты разделяемой памяти (<strong>Shared Memory Zones</strong>), где синхронизация выполняется через быстрые атомарные инструкции ядра (<code>spinlocks</code> и atomic CAS).</p>
   </div>
 </div>
 
-<h2 id="sobytiynyy-tsikl-event-loop-i-epoll">Событийный цикл (Event Loop) и Epoll</h2>
+<hr />
+<h2 id="3-sobytiynyy-tsikl-event-loop-i-epoll">3. Событийный цикл (Event Loop) и Epoll</h2>
 
-<p>Каждый Worker работает в бесконечном событийном цикле (Event Loop). Вспомним предыдущую статью про <a href="../01-linux/6-networking-v-linux.html" class="wikilink">6. Networking в Linux</a>: Nginx использует системный вызов <code>epoll</code> (на Linux) или <code>kqueue</code> (на FreeBSD/macOS).</p>
-<p>Вместо того чтобы блокироваться на чтении конкретного сокета, воркер регистрирует тысячи сокетов в <code>epoll</code>. Когда ядро сигнализирует, что в каком-то сокете появились данные (клиент прислал HTTP-запрос), <code>epoll_wait</code> возвращает управление Nginx.</p>
-<h3 id="konechnyy-avtomat-state-machine">Конечный автомат (State Machine)</h3>
+<p>Каждый воркер Nginx функционирует внутри бесконечного событийного цикла (<strong>Event Loop</strong>). Как мы выяснили в лекции <a href="../01-linux/6-networking-v-linux.html" class="wikilink">6. Networking в Linux</a>, Nginx использует системный вызов <code>epoll</code> в Linux (или <code>kqueue</code> во FreeBSD/macOS).</p>
+<p>Воркер не засыпает в ожидании ответа от конкретного клиента. Он регистрирует все активные дескрипторы клиентских и апстрим-сокетов в ядре через <code>epoll_ctl()</code>. Системный вызов <code>epoll_wait()</code> мгновенно возвращает массив дескрипторов, на которых произошло событие: пришли данные, сокет освободился для записи или завершилось сетевое рукопожатие.</p>
+<h3 id="konechnyy-avtomat-obrabotki-zaprosa-state-machine">Конечный автомат обработки запроса (State Machine)</h3>
 
-<p>Как Nginx обрабатывает запрос без блокировок? Он разбивает обработку на мелкие неблокирующие шаги и реализует <strong>конечный автомат (State Machine)</strong>:</p>
+<p>Nginx обрабатывает HTTP-транзакцию как <strong>детерминированный конечный автомат (State Machine)</strong>, разбивая жизненный цикл соединения на атомарные неблокирующие фазы:</p>
 <ol>
-<li><strong>Чтение заголовков</strong>: <code>epoll</code> сказал, что есть данные. Nginx читает заголовки. Если заголовки пришли не полностью (клиент медленный), Nginx сохраняет текущее состояние соединения и переходит к другим сокетам.</li>
-<li><strong>Маршрутизация</strong>: Заголовки прочитаны. Nginx определяет location, проверяет лимиты (rate limit).</li>
-<li><strong>Чтение тела (если есть)</strong>: Опять через неблокирующее чтение по частям.</li>
-<li><strong>Обращение к Upstream (проксирование в Go)</strong>: Nginx устанавливает соединение с вашим Go-бэкендом. Если бэкенд не отвечает мгновенно, Nginx <em>не ждет</em>. Он регистрирует сокет бэкенда в <code>epoll</code> и переключается на обслуживание других клиентов.</li>
-<li><strong>Запись ответа клиенту</strong>: Когда Go-бэкенд ответил, Nginx начинает писать ответ в сокет клиента. Если буфер сокета переполнен (клиент не читает), Nginx приостанавливает запись и снова идет в <code>epoll</code>.</li>
-</ol>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдет, если медленный клиент (на Dial-up) скачивает большой файл с сервера через Nginx, а Go-бэкенд сгенерировал этот файл мгновенно?<br />
-<strong>Ответ:</strong> Если Nginx попытается записать весь ответ в сокет клиента, буфер записи сокета переполнится. Чтобы не блокировать Event Loop (что остановило бы обслуживание всех остальных клиентов этого воркера), Nginx включит механизм <strong>Disk I/O</strong> или запишет данные во временный файл на диске, либо заблокирует чтение из сокета бэкенда (Backpressure), уведомив Go-приложение через механизм TCP Window (уменьшив окно приема), чтобы Go перестал слать данные. Это защищает память Nginx от исчерпания.</p>
-  </div>
-</div>
-
-<h2 id="mechanical-sympathy-sendfile-i-zero-copy">Mechanical Sympathy: Sendfile и Zero-Copy</h2>
-
-<p>Одна из причин феноменальной скорости Nginx при раздаче статики — использование системного вызова <code>sendfile()</code>.</p>
-<p>При классическом чтении файла и отправке в сокет данные копируются 4 раза и происходит 2 переключения контекста:<br />
-1. Диск -&gt; Буфер ядра (Page Cache)<br />
-2. Буфер ядра -&gt; Буфер User Space (приложение читает <code>read()</code>)<br />
-3. User Space -&gt; Буфер сокета ядра (приложение пишет <code>write()</code>)<br />
-4. Буфер сокета -&gt; Сетевая карта NIC</p>
-<p><code>sendfile()</code> позволяет передать данные напрямую из Page Cache в буфер сокета, <strong>минуя User Space</strong>. Данные не копируются в память приложения Nginx вообще.</p>
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">// В nginx.conf
-location /static/ {
-    sendfile on;       // Включает zero-copy
-    tcp_nopush on;     // Отправляет заголовки и начало файла в одном пакете
-    tcp_nodelay on;    // Отключает алгоритм Нагла для минимальной задержки динамического контента
-}
-</code></pre>
-</div>
-
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p><code>sendfile</code> работает только для передачи статических файлов (с диска в сокет). Если вы проксируете запрос на Go-бэкенд (upstream), <code>sendfile</code> бесполезен, так как данные генерируются динамически и всё равно должны пройти через User Space Nginx. Более того, <code>sendfile</code> несовместим с некоторыми фильтрами Nginx (например, <code>gzip</code> на лету в старых версиях), так как фильтрам нужны данные в User Space.</p>
-  </div>
-</div>
-
-<h2 id="nginx-vs-go-zachem-nginx-pered-go">Nginx vs. Go: Зачем Nginx перед Go?</h2>
-
-<p>Частый вопрос на архитектурных собеседованиях: "Зачем нам Nginx, если в Go отличный встроенный веб-сервер <code>net/http</code>?" </p>
-<p>Go действительно может слушать порты и обслуживать HTTP/2. Но Nginx впереди по нескольким системным причинам:</p>
-<ol>
-<li><strong>Изоляция сбоев (Blast Radius)</strong>: Nginx работает в отдельном процессе. Если в вашем Go-коде произойдет утечка памяти (OOM) или паника, Nginx продолжит работать. Он сможет вернуть клиенту заглушку 502 Bad Gateway, вместо того чтобы клиент получил "Connection Refused" на уровне TCP.</li>
-<li><strong>TLS Termination</strong>: Расшифровка TLS (RSA/ECDHE) — тяжелая математика. Nginx умеет оффлаодить это на аппаратные инструкции CPU и кэшировать сессии, снимая эту нагрузку с Go-рантайма.</li>
-<li><strong>Снижение давления на Go GC</strong>: Если клиенты медленные, Nginx со своими буферами и временными файлами возьмет на себя удар, сбросив данные на диск. Если бы Go общался с медленными клиентами напрямую, буферы в куче (heap) разрослись бы, заставив Garbage Collector работать на износ.</li>
-<li><strong>Безопасность и ограничители</strong>: Nginx на уровне C работает быстрее для rate-limiting, отбрасывания плохих пакетов и защиты от DDoS, чем промежуточный слой в Go.</li>
-</ol>
-<h2 id="itog">Итог</h2>
-
-<ol>
-<li><strong>Event-Driven</strong>: Nginx решает проблему C10K с помощью событийной модели на основе <code>epoll</code>, обрабатывая тысячи соединений в одном потоке (Worker).</li>
-<li><strong>Конечный автомат</strong>: Обработка запроса разбита на неблокирующие шаги; медленные клиенты не останавливают работу воркера.</li>
-<li><strong>Zero-Copy (<code>sendfile</code>)</strong>: Статика отдается напрямую из кэша ядра в сетевой стек, минуя память процесса.</li>
-<li><strong>Защита бэкенда</strong>: Nginx работает как щит, изолируя Go-приложения от медленных клиентов, DDoS-атак и тяжелых криптографических операций (TLS).</li>
-</ol>
-<p>Архитектура Nginx делает его идеальным кандидатом на роль Reverse Proxy. В следующей статье мы разберем, как именно Nginx проксирует трафик к вашим Go-сервисам, что такое <code>proxy_pass</code> и как избежать классических проблем с заголовками: <a href="2-reverse-proxy.html" class="wikilink">2. Reverse proxy</a>.<br />
-Когда мы говорим о высоконагруженном бэкенде, Nginx — это первая линия обороны. Это шлюз, который принимает на себя удар десятков тысяч TCP-соединений, термит TLS, раздает статику и только потом аккуратно прокидывает запросы к вашим Go-сервисам. </p>
-<p>Многие разработчики воспринимают Nginx как "чёрный ящик", который просто работает. Но для Senior/Lead инженера понимание архитектуры Nginx критически важно. Только так можно объяснить латентность, правильно настроить балансировку и избежать странных багов с обрывами соединений при пиковых нагрузках.</p>
-<h2 id="ot-apache-k-nginx-problema-c10k">От Apache к Nginx: Проблема C10K</h2>
-
-<p>В 90-х и начале 2000-х доминировал веб-сервер Apache. Его архитектура строилась на модели <strong>Process/Thread-per-Connection</strong> (один процесс или тред ОС на каждое клиентское соединение). Пока клиент медленно читал ответ по медленному 3G-каналу, целый тред ОС висел в заблокированном состоянии, ожидая завершения записи в сокет.</p>
-<p>Когда количество одновременных соединений перевалило за 10 000 (проблема C10K), Apache начал задыхаться. 10 000 потоков ОС — это десятки гигабайт памяти только на стеки и катастрофическое время на Context Switching. </p>
-<p>Nginx (созданный Игорем Сысоевым) предложил революционный для того времени подход: <strong>Event-Driven Architecture (Событийная архитектура)</strong>.</p>
-<h2 id="protsessnaya-model-master-i-workers">Процессная модель: Master и Workers</h2>
-
-<p>Nginx не запускает тысячи потоков. Он использует строго детерминированную мультипроцессную модель.</p>
-<ol>
-<li><strong>Master Process</strong>: Запускается от <code>root</code> (чтобы иметь возможность забиндиться на порты 80 и 443). Его главная задача — чтение конфига, управление воркерами, bind сокетов и graceful reload.</li>
-<li><strong>Worker Processes</strong>: Форкаются от Master. Master передает им слушающие сокеты (через <code>fork()</code> или <code>exec</code>), а затем дропает привилегии до непривилегированного пользователя (например, <code>nginx</code> или <code>www-data</code>). Воркеры делают всю тяжелую работу.</li>
+<li><strong>Чтение HTTP-заголовков:</strong> Сигнал от <code>epoll</code> будит воркер. Nginx вычитывает пришедшую порцию байтов в буфер. Если заголовки пришли не полностью (медленный мобильный клиент), воркер не блокируется: он сохраняет текущее состояние парсера в структуре соединения и возвращается в цикл <code>epoll</code> для обработки других запросов.</li>
+<li><strong>Маршрутизация и фильтрация:</strong> Когда заголовки полностью собраны, Nginx определяет подходящий блок <code>server</code> и <code>location</code>, проверяет списки доступа, лимиты запросов (<code>limit_req</code>) и зоны авторизации.</li>
+<li><strong>Чтение тела запроса (Request Body):</strong> Если запрос содержит payload (POST/PUT), воркер вычитывает его неблокирующими порциями. При превышении размера <code>client_body_buffer_size</code> тело сбрасывается во временный файл на диске.</li>
+<li><strong>Проксирование в Go Upstream:</strong> Nginx инициирует неблокирующее TCP-подключение к Go-бэкенду. Пока бэкенд вычисляет ответ, Nginx <em>не простаивает</em>: он ставит сокет бэкенда на учет в <code>epoll</code> и мгновенно переключается на обслуживание сотен других входящих соединений.</li>
+<li><strong>Отправка ответа клиенту:</strong> Получив ответ от Go, Nginx начинает запись в сокет клиента. Если буфер сокета заполнен (клиент не успевает скачивать), Nginx приостанавливает отправку для этого сокета, включает механизм обратного давления (Backpressure) и идет обрабатывать другие события.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2334,77 +2265,91 @@ location /static/ {
     </button>
   </div>
   <pre class="mermaid">
-flowchart TD
-A[&quot;Master Process - PID 1 - Root&quot;] --&gt;|&quot;fork + drop privs&quot;| B[&quot;Worker 1 - User nginx&quot;]
-A --&gt;|&quot;fork + drop privs&quot;| C[&quot;Worker 2 - User nginx&quot;]
-A --&gt;|&quot;fork + drop privs&quot;| D[&quot;Worker N - User nginx&quot;]
-E[&quot;Клиенты - Сетевой трафик&quot;] --&gt;|&quot;epoll&quot;| B
-E --&gt;|&quot;epoll&quot;| C
-E --&gt;|&quot;epoll&quot;| D
-B --&gt;|&quot;Проксирование&quot;| F[&quot;Go Backend Upstream&quot;]
-C --&gt;|&quot;Проксирование&quot;| F
+stateDiagram-v2
+[*] --&gt; ReadHeaders: epoll_wait (Данные в сокете)
+ReadHeaders --&gt; MatchLocation: Заголовки готовы
+ReadHeaders --&gt; ReadHeaders: Частичные заголовки (EAGAIN)
+MatchLocation --&gt; ProxyToUpstream: Обращение к Go
+ProxyToUpstream --&gt; WaitBackend: Неблокирующий запрос
+WaitBackend --&gt; WriteClient: Ответ от Go получен
+WriteClient --&gt; [*]: Соединение завершено / Keep-Alive
   </pre>
 </div>
 
 
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Количество воркеров обычно задается равным количеству логических ядер CPU (<code>worker_processes auto;</code>). Поскольку каждый воркер — это однопоточный процесс (Single-threaded), привязка воркера к ядру CPU (CPU Affinity) минимизирует промахи кэша L1/L2 и исключает конкуренцию за мьютексы между потоками. В Nginx почти нет блокировок (mutexes) между воркерами, так как они не шарят память в стиле(thread-local storage), за исключением подсчета общей статистики и кэша (который шарится через shared memory zones, требуя атомарных операций).</p>
-  </div>
-</div>
-
-<h2 id="sobytiynyy-tsikl-event-loop-i-epoll">Событийный цикл (Event Loop) и Epoll</h2>
-
-<p>Каждый Worker работает в бесконечном событийном цикле (Event Loop). Вспомним предыдущую статью про <a href="../01-linux/6-networking-v-linux.html" class="wikilink">6. Networking в Linux</a>: Nginx использует системный вызов <code>epoll</code> (на Linux) или <code>kqueue</code> (на FreeBSD/macOS).</p>
-<p>Вместо того чтобы блокироваться на чтении конкретного сокета, воркер регистрирует тысячи сокетов в <code>epoll</code>. Когда ядро сигнализирует, что в каком-то сокете появились данные (клиент прислал HTTP-запрос), <code>epoll_wait</code> возвращает управление Nginx.</p>
-<h3 id="konechnyy-avtomat-state-machine">Конечный автомат (State Machine)</h3>
-
-<p>Как Nginx обрабатывает запрос без блокировок? Он разбивает обработку на мелкие неблокирующие шаги и реализует <strong>конечный автомат (State Machine)</strong>:</p>
-<ol>
-<li><strong>Чтение заголовков</strong>: <code>epoll</code> сказал, что есть данные. Nginx читает заголовки. Если заголовки пришли не полностью (клиент медленный), Nginx сохраняет текущее состояние соединения и переходит к другим сокетам.</li>
-<li><strong>Маршрутизация</strong>: Заголовки прочитаны. Nginx определяет location, проверяет лимиты (rate limit).</li>
-<li><strong>Чтение тела (если есть)</strong>: Опять через неблокирующее чтение по частям.</li>
-<li><strong>Обращение к Upstream (проксирование в Go)</strong>: Nginx устанавливает соединение с вашим Go-бэкендом. Если бэкенд не отвечает мгновенно, Nginx <em>не ждет</em>. Он регистрирует сокет бэкенда в <code>epoll</code> и переключается на обслуживание других клиентов.</li>
-<li><strong>Запись ответа клиенту</strong>: Когда Go-бэкенд ответил, Nginx начинает писать ответ в сокет клиента. Если буфер сокета переполнен (клиент не читает), Nginx приостанавливает запись и снова идет в <code>epoll</code>.</li>
-</ol>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Защита бэкенда от медленных клиентов</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что произойдет, если медленный клиент (на Dial-up) скачивает большой файл с сервера через Nginx, а Go-бэкенд сгенерировал этот файл мгновенно?<br />
-<strong>Ответ:</strong> Если Nginx попытается записать весь ответ в сокет клиента, буфер записи сокета переполнится. Чтобы не блокировать Event Loop (что остановило бы обслуживание всех остальных клиентов этого воркера), Nginx включит механизм <strong>Disk I/O</strong> или запишет данные во временный файл на диске, либо заблокирует чтение из сокета бэкенда (Backpressure), уведомив Go-приложение через механизм TCP Window (уменьшив окно приема), чтобы Go перестал слать данные. Это защищает память Nginx от исчерпания.</p>
+    <p><strong>Вопрос:</strong> Что произойдет, если медленный клиент (на Dial-up или нестабильном 2G) скачивает тяжелый отчет, который Go-бэкенд сгенерировал в памяти за 5 миллисекунд?</p>
+<p><strong>Ответ:</strong> <br />
+Если бы Go-сервер отдавал ответ клиенту напрямую, горутина висела бы в памяти все 60 секунд передачи, удерживая буферы кучи. </p>
+<p>Nginx берет удар на себя:<br />
+1. Он на максимальной скорости локальной сети вычитывает ответ из Go-бэкенда, освобождая ресурсы Go за пару миллисекунд.<br />
+2. Nginx начинает транслировать данные клиенту. Когда буфер сокета ядра переполняется, Nginx буферизирует оставшуюся часть ответа на диск (Disk I/O во временные файлы <code>proxy_temp_path</code>).<br />
+3. Если буферы диска и памяти заполнены, Nginx задействует механизм <strong>TCP Window</strong>: уменьшает окно приема (Window Size) в сокете с Go-бэкендом, приостанавливая генерацию трафика на стороне Go (Backpressure).<br />
+Это защищает Go-рантайм от деградации сборщика мусора и раздувания пула горутин.</p>
   </div>
 </div>
 
-<h2 id="mechanical-sympathy-sendfile-i-zero-copy">Mechanical Sympathy: Sendfile и Zero-Copy</h2>
+<hr />
+<h2 id="4-mechanical-sympathy-zero-copy-i-sistemnyy-vyzov-sendfile">4. Mechanical Sympathy: Zero-Copy и системный вызов sendfile</h2>
 
-<p>Одна из причин феноменальной скорости Nginx при раздаче статики — использование системного вызова <code>sendfile()</code>.</p>
-<p>При классическом чтении файла и отправке в сокет данные копируются 4 раза и происходит 2 переключения контекста:<br />
-1. Диск -&gt; Буфер ядра (Page Cache)<br />
-2. Буфер ядра -&gt; Буфер User Space (приложение читает <code>read()</code>)<br />
-3. User Space -&gt; Буфер сокета ядра (приложение пишет <code>write()</code>)<br />
-4. Буфер сокета -&gt; Сетевая карта NIC</p>
-<p><code>sendfile()</code> позволяет передать данные напрямую из Page Cache в буфер сокета, <strong>минуя User Space</strong>. Данные не копируются в память приложения Nginx вообще.</p>
+<p>Одной из причин колоссальной производительности Nginx при отдаче статических файлов (изображения, фронтенд-бандлы, медиа) является использование механизма <strong>Zero-Copy</strong> через системный вызов <strong><code>sendfile()</code></strong>.</p>
+<h3 id="traditsionnyy-vvod-vyvod-4-kopirovaniya-dannykh">Традиционный ввод-вывод (4 копирования данных):</h3>
+<p>При классической связке <code>read()</code> + <code>write()</code> данные совершают 4 пересылки через системную шину и требуют 2 переключения контекста ядра:<br />
+1. Контроллер диска через DMA копирует файл в кэш страниц ядра (<strong>Page Cache</strong>).<br />
+2. Ядро копирует данные из Page Cache в пользовательский буфер приложения Nginx в User Space (<code>read()</code>).<br />
+3. Приложение Nginx копирует данные из User Space обратно в память ядра — в сетевой буфер сокета (<code>write()</code>).<br />
+4. Сетевая карта через DMA вычитывает данные из буфера сокета и передает в физический провод (NIC).</p>
+<h3 id="optimizatsiya-sendfile-zero-copy">Оптимизация sendfile() (Zero-Copy):</h3>
+<p>Системный вызов <code>sendfile()</code> в Linux передает данные <strong>напрямую из Page Cache ядра в кольцевой буфер сетевой карты</strong>, вообще минуя пользовательское пространство (User Space). Память процесса Nginx даже не касается этих байтов!</p>
 
-<div class="code-block" data-lang="go">
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Classic [&quot;Традиционный read/write (4 копирования)&quot;]
+D1[&quot;Диск&quot;] --&gt;|&quot;DMA&quot;| PC1[&quot;Page Cache (Ядро)&quot;]
+PC1 --&gt;|&quot;Копирование 1&quot;| US1[&quot;User Space (Буфер Nginx)&quot;]
+US1 --&gt;|&quot;Копирование 2&quot;| SB1[&quot;Буфер сокета (Ядро)&quot;]
+SB1 --&gt;|&quot;DMA&quot;| NIC1[&quot;Сетевая карта (NIC)&quot;]
+end
+
+subgraph ZeroCopy [&quot;Механизм sendfile (Zero-Copy)&quot;]
+D2[&quot;Диск&quot;] --&gt;|&quot;DMA&quot;| PC2[&quot;Page Cache (Ядро)&quot;]
+PC2 --&gt;|&quot;Прямая передача дескриптора&quot;| SB2[&quot;Буфер сокета (Заголовки)&quot;]
+PC2 --&gt;|&quot;DMA напрямую&quot;| NIC2[&quot;Сетевая карта (NIC)&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Конфигурация в <code>nginx.conf</code>:</p>
+
+<div class="code-block" data-lang="nginx">
   <div class="code-header">
-    <span class="code-lang-tag">Go</span>
+    <span class="code-lang-tag">NGINX</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// В nginx.conf
-location /static/ {
-    sendfile on;       // Включает zero-copy
-    tcp_nopush on;     // Отправляет заголовки и начало файла в одном пакете
-    tcp_nodelay on;    // Отключает алгоритм Нагла для минимальной задержки динамического контента
+  <pre class="language-nginx"><code class="language-nginx">location /static/ {
+    sendfile on;       # Включает прямую передачу из Page Cache в сетевой сокет (Zero-Copy)
+    tcp_nopush on;     # Заставляет ядро накапливать заголовки и тело пакета, отправляя полный MSS
+    tcp_nodelay on;    # Отключает алгоритм Нагла для минимальной задержки интерактивного трафика
 }
 </code></pre>
 </div>
@@ -2412,32 +2357,36 @@ location /static/ {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Границы применения sendfile</span>
   </div>
   <div class="callout-body">
-    <p><code>sendfile</code> работает только для передачи статических файлов (с диска в сокет). Если вы проксируете запрос на Go-бэкенд (upstream), <code>sendfile</code> бесполезен, так как данные генерируются динамически и всё равно должны пройти через User Space Nginx. Более того, <code>sendfile</code> несовместим с некоторыми фильтрами Nginx (например, <code>gzip</code> на лету в старых версиях), так как фильтрам нужны данные в User Space.</p>
+    <p><code>sendfile</code> применим <strong>исключительно для статически сохраненных файлов на диске</strong>. </p>
+<p>Если вы проксируете динамический ответ от Go-бэкенда (Upstream), вызов <code>sendfile</code> бессилен: динамические байты генерируются рантаймом Go, передаются по TCP-сокету и в любом случае должны пройти через User Space Nginx.</p>
+<p>Кроме того, <code>sendfile</code> несовместим с динамической трансформацией контента на лету (например, фильтрами <code>gzip</code> или шифрованием, требующим модификации потока байт в User Space).</p>
   </div>
 </div>
 
-<h2 id="nginx-vs-go-zachem-nginx-pered-go">Nginx vs. Go: Зачем Nginx перед Go?</h2>
+<hr />
+<h2 id="5-nginx-vs-go-zachem-stavit-nginx-pered-go-servisom">5. Nginx vs. Go: Зачем ставить Nginx перед Go-сервисом?</h2>
 
-<p>Частый вопрос на архитектурных собеседованиях: "Зачем нам Nginx, если в Go отличный встроенный веб-сервер <code>net/http</code>?" </p>
-<p>Go действительно может слушать порты и обслуживать HTTP/2. Но Nginx впереди по нескольким системным причинам:</p>
+<p>Популярный вопрос на собеседованиях: <em>«В Go встроен великолепный, конкурентный и производительный веб-сервер <code>net/http</code>. Зачем усложнять архитектуру и громоздить перед Go еще и Nginx?»</em></p>
+<p>Ответ кроется в разделении зон ответственности и системной защите инфраструктуры:</p>
 <ol>
-<li><strong>Изоляция сбоев (Blast Radius)</strong>: Nginx работает в отдельном процессе. Если в вашем Go-коде произойдет утечка памяти (OOM) или паника, Nginx продолжит работать. Он сможет вернуть клиенту заглушку 502 Bad Gateway, вместо того чтобы клиент получил "Connection Refused" на уровне TCP.</li>
-<li><strong>TLS Termination</strong>: Расшифровка TLS (RSA/ECDHE) — тяжелая математика. Nginx умеет оффлаодить это на аппаратные инструкции CPU и кэшировать сессии, снимая эту нагрузку с Go-рантайма.</li>
-<li><strong>Снижение давления на Go GC</strong>: Если клиенты медленные, Nginx со своими буферами и временными файлами возьмет на себя удар, сбросив данные на диск. Если бы Go общался с медленными клиентами напрямую, буферы в куче (heap) разрослись бы, заставив Garbage Collector работать на износ.</li>
-<li><strong>Безопасность и ограничители</strong>: Nginx на уровне C работает быстрее для rate-limiting, отбрасывания плохих пакетов и защиты от DDoS, чем промежуточный слой в Go.</li>
+<li><strong>Изоляция сбоев (Blast Radius):</strong> Nginx изолирован от рантайма Go. Если в Go-сервисе случится утечка памяти, OOM-киллер убьет процесс или приложение упадет по необработанной панике (<code>panic</code>), Nginx не упадет. Он моментально вернет клиенту аккуратную страницу с кодом <code>502 Bad Gateway</code> вместо аварийного разрыва TCP-соединения (<code>Connection Refused</code>).</li>
+<li><strong>Терминация TLS (TLS Termination):</strong> Асимметричная криптография (RSA, ECDHE) требует огромных процессорных мощностей. Nginx написан на C и оптимизирован под векторные инструкции CPU (AES-NI, AVX). Он умеет кэшировать TLS-сессии (Session Tickets / Session Cache) в разделяемой памяти между воркерами, разгружая Go GC и планировщик от нецелевой криптографической нагрузки.</li>
+<li><strong>Снижение давления на сборщик мусора Go (GC Pacer):</strong> Медленные клиенты заставляют бэкенд долго удерживать открытые TCP-буферы. Перекладывая буферизацию медленных соединений на Nginx (с его временными дисковыми файлами), мы гарантируем, что Go-сервер общается только по сверхбыстрому локальному сокету (loopback или unix domain socket) с минимальным временем жизни объектов в куче.</li>
+<li><strong>Защита периметра и Rate Limiting:</strong> Nginx эффективнее фильтрует вредоносный трафик, отражает SYN-флуд и выполняет ограничение частоты запросов (<code>limit_req</code> на алгоритме Leaky Bucket / Token Bucket) прямо в C-коде, не подпуская мусорный трафик к рантайму Go.</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Event-Driven</strong>: Nginx решает проблему C10K с помощью событийной модели на основе <code>epoll</code>, обрабатывая тысячи соединений в одном потоке (Worker).</li>
-<li><strong>Конечный автомат</strong>: Обработка запроса разбита на неблокирующие шаги; медленные клиенты не останавливают работу воркера.</li>
-<li><strong>Zero-Copy (<code>sendfile</code>)</strong>: Статика отдается напрямую из кэша ядра в сетевой стек, минуя память процесса.</li>
-<li><strong>Защита бэкенда</strong>: Nginx работает как щит, изолируя Go-приложения от медленных клиентов, DDoS-атак и тяжелых криптографических операций (TLS).</li>
+<li><strong>Event-Driven модель:</strong> Nginx победил проблему C10K благодаря связке неблокирующего ввода-вывода и системного вызова <code>epoll</code>, обрабатывая десятки тысяч запросов в рамках единичных воркеров.</li>
+<li><strong>Конечный автомат (State Machine):</strong> Каждый воркер продвигает обработку сотен соединений параллельно без блокировки тредов операционной системы.</li>
+<li><strong>Zero-Copy (<code>sendfile</code>):</strong> Передача статического контента с диска прямо в сетевой интерфейс исключает копирование данных в память приложения и экономит такты процессора.</li>
+<li><strong>Надежный щит бэкенда:</strong> Nginx снимает с Go-приложений задачи терминации TLS, буферизации медленных клиентов, защиты от атак и статической раздачи файлов.</li>
 </ol>
-<p>Архитектура Nginx делает его идеальным кандидатом на роль Reverse Proxy. В следующей статье мы разберем, как именно Nginx проксирует трафик к вашим Go-сервисам, что такое <code>proxy_pass</code> и как избежать классических проблем с заголовками: <a href="2-reverse-proxy.html" class="wikilink">2. Reverse proxy</a>.</p>
+<p>В следующей статье мы подробно изучим конфигурацию Nginx в роли обратного прокси, разберем директиву <code>proxy_pass</code>, правильную трансляцию заголовков и сокрытие топологии сети: <a href="2-reverse-proxy.html" class="wikilink">2. Reverse proxy</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2465,7 +2414,7 @@ location /static/ {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#ot-apache-k-nginx-problema-c10k">От Apache к Nginx: Проблема C10K</a></li><li class="toc-item toc-h2"><a href="#protsessnaya-model-master-i-workers">Процессная модель: Master и Workers</a></li><li class="toc-item toc-h2"><a href="#sobytiynyy-tsikl-event-loop-i-epoll">Событийный цикл (Event Loop) и Epoll</a></li><li class="toc-item toc-h3"><a href="#konechnyy-avtomat-state-machine">Конечный автомат (State Machine)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-sendfile-i-zero-copy">Mechanical Sympathy: Sendfile и Zero-Copy</a></li><li class="toc-item toc-h2"><a href="#nginx-vs-go-zachem-nginx-pered-go">Nginx vs. Go: Зачем Nginx перед Go?</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li><li class="toc-item toc-h2"><a href="#ot-apache-k-nginx-problema-c10k">От Apache к Nginx: Проблема C10K</a></li><li class="toc-item toc-h2"><a href="#protsessnaya-model-master-i-workers">Процессная модель: Master и Workers</a></li><li class="toc-item toc-h2"><a href="#sobytiynyy-tsikl-event-loop-i-epoll">Событийный цикл (Event Loop) и Epoll</a></li><li class="toc-item toc-h3"><a href="#konechnyy-avtomat-state-machine">Конечный автомат (State Machine)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-sendfile-i-zero-copy">Mechanical Sympathy: Sendfile и Zero-Copy</a></li><li class="toc-item toc-h2"><a href="#nginx-vs-go-zachem-nginx-pered-go">Nginx vs. Go: Зачем Nginx перед Go?</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-ot-apache-k-nginx-problema-c10k">1. От Apache к Nginx: Проблема C10K</a></li><li class="toc-item toc-h2"><a href="#2-protsessnaya-model-master-i-worker-protsessy">2. Процессная модель: Master и Worker-процессы</a></li><li class="toc-item toc-h2"><a href="#3-sobytiynyy-tsikl-event-loop-i-epoll">3. Событийный цикл (Event Loop) и Epoll</a></li><li class="toc-item toc-h3"><a href="#konechnyy-avtomat-obrabotki-zaprosa-state-machine">Конечный автомат обработки запроса (State Machine)</a></li><li class="toc-item toc-h2"><a href="#4-mechanical-sympathy-zero-copy-i-sistemnyy-vyzov-sendfile">4. Mechanical Sympathy: Zero-Copy и системный вызов sendfile</a></li><li class="toc-item toc-h3"><a href="#traditsionnyy-vvod-vyvod-4-kopirovaniya-dannykh">Традиционный ввод-вывод (4 копирования данных):</a></li><li class="toc-item toc-h3"><a href="#optimizatsiya-sendfile-zero-copy">Оптимизация sendfile() (Zero-Copy):</a></li><li class="toc-item toc-h2"><a href="#5-nginx-vs-go-zachem-stavit-nginx-pered-go-servisom">5. Nginx vs. Go: Зачем ставить Nginx перед Go-сервисом?</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

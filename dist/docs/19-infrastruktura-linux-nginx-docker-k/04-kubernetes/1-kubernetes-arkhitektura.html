@@ -2169,42 +2169,57 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~13 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Kubernetes. Архитектура</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Когда вы переходите от одиночных Docker-контейнеров к полноценному продакшену, возникает вопрос: что делать, если сервер (нода) умирает? Как обновить 50 инстансов вашего Go-сервиса без даунтайма? Как автоматически масштабировать их при росте нагрузки?</p>
-<p>Ответ — оркестратор. И в облачном мире де-факто стандартом стал <strong>Kubernetes (K8s)</strong>. </p>
-<p>Для разработчика Kubernetes часто кажется черным ящиком — непонятной магией, которая почему-то деплоит код. Но K8s написан на Go, и его архитектура глубоко отражает Go-философию: декларативность, конкурентность и коммуникацию через очереди/события. Понимание его архитектуры — это пропуск в мир System Design уровня Senior/Lead.</p>
-<h2 id="filosofiya-deklarativnoe-sostoyanie-desired-state">Философия: Декларативное состояние (Desired State)</h2>
+            <h1>Архитектура Kubernetes: От циклов согласования etcd до механики List-Watch в Go</h1>
+<p>Когда распределенная система вырастает из масштабов одиночных серверов с Docker Compose до сотен узлов и тысяч микросервисов, перед инженерами встают вызовы совершенно иного порядка:<br />
+* Что делать, если физический сервер внезапно сгорает в дата-центре?<br />
+* Как обновить 100 запущенных реплик Go-приложения с нулевым временем простоя (<strong>Zero-Downtime Rolling Update</strong>)?<br />
+* Как автоматически балансировать входящий трафик и динамически масштабировать сервисы при утреннем пике нагрузки?</p>
+<p>Ответом облачной индустрии стал <strong>Kubernetes (K8s)</strong> — де-факто промышленный стандарт оркестрации контейнеризированных приложений.</p>
+<p>Для многих разработчиков Kubernetes выглядит непостижимым «черным ящиком», пугающим сотнями строк конфигурационных YAML-файлов. Однако Kubernetes целиком написан на языке <strong>Go</strong>. Вся его внутренняя архитектура является образцовым воплощением классической философии Go: конкурентность, декларативность, реактивная обработка событий и общение компонентов через очереди вместо блокировок. Глубокое понимание устройства Control Plane и Worker-нод — обязательный рубеж для перехода на уровень Senior и Staff/Lead инженера.</p>
+<hr />
+<h2 id="1-filosofiya-kubernetes-deklarativnoe-sostoyanie-i-tsikly-soglasovaniya">1. Философия Kubernetes: Декларативное состояние и циклы согласования</h2>
 
-<p>Главный сдвиг парадигмы при работе с K8s: вы не говорите ему, <em>что делать</em> (императивно), вы говорите, <em>каким должен быть результат</em> (декларативно). </p>
-<p>Вы отправляете в K8s манифест: "Я хочу 3 реплики моего Go-сервиса". Если одна нода сгорит, K8s увидит, что текущее состояние (Current State) — 1 реплика, а желаемое (Desired State) — 3, и сам запустит недостающие две на других серверах. </p>
-<p>Вся архитектура K8s построена вокруг приведения Current State к Desired State через <strong>Циклы согласования (Reconciliation Loops)</strong>.</p>
-<h2 id="control-plane-mozg-klastera">Control Plane: Мозг кластера</h2>
+<p>Ключевой сдвиг ментальной парадигмы при переходе к K8s — отказ от императивного управления в пользу <strong>декларативного подхода (Declarative State)</strong>.</p>
+<p>В традиционных скриптах развертывания (Bash, Ansible) мы отдаем императивные команды: <em>«Скачай образ, останови старый процесс, запусти новый на порту 8080»</em>. Если на промежуточном шаге моргнет сеть, скрипт упадет в непредсказуемом состоянии.</p>
+<p>В Kubernetes вы не приказываете кластеру, <em>что именно делать</em>. Вы декларируете, <strong>каким должен быть желаемый финальный результат (Desired State)</strong>:</p>
+<blockquote>
+<p><em>«В кластере должно работать ровно 3 живые реплики микросервиса <code>auth-service</code> с лимитом памяти 512 МБ»</em>.</p>
+</blockquote>
+<p>Оркестратор непрерывно сравнивает реальное текущее состояние системы (<strong>Current State</strong>) с желаемым (<strong>Desired State</strong>). Если нода сгорает и одна реплика погибает, K8s фиксирует расхождение (Current: 2, Desired: 3) и самостоятельно планирует запуск недостающего контейнера на другом физическом сервере.</p>
+<p>Этот непрерывный процесс называется <strong>циклом согласования (Reconciliation Loop)</strong>:</p>
 
-<p>Управляющий слой (Control Plane, бывший Master) принимает решения о состоянии кластера. В продакшене его компоненты резервируются на нескольких нодах.</p>
-<h3 id="1-api-server-edinaya-tochka-vkhoda">1. API Server (Единая точка входа)</h3>
-<p>Единственный компонент Control Plane, с которым общаются все остальные (и вы через <code>kubectl</code>). Это мощный REST API-сервер на Go. Он принимает манифесты YAML/JSON, валидирует их, сохраняет в <code>etcd</code> и рассылает уведомления подписчикам. Никто другой напрямую в <code>etcd</code> не пишет.</p>
-<h3 id="2-etcd-pamyat-klastera">2. Etcd (Память кластера)</h3>
-<p>Распределенное key-value хранилище (написано на Go), использующее алгоритм консенсуса Raft. В нем лежит <em>всё</em> состояние кластера: какие есть поды, сервисы, секреты, конфиги.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
   </div>
-  <div class="callout-body">
-    <p>Etcd использует библиотеку Bbolt (ранее BoltDB) под капотом для хранения данных на диске (B+ деревья). Это означает, что производительность <code>etcd</code> критически зависит от дискового IO. Каждая транзакция в <code>etcd</code> требует вызова <code>fsync()</code>. Если вы запустите Control Plane на медленных сетевых дисках (HDD или перегруженные EBS), <code>fsync</code> будет тормозить, API Server будет зависать, и весь кластер ляжет. Для <code>etcd</code> нужны быстрые NVMe SSD.</p>
-  </div>
+  <pre class="mermaid">
+flowchart LR
+A[&quot;Desired State (Манифест YAML)&quot;] --&gt; C{&quot;Reconciliation Loop&quot;}
+B[&quot;Current State (Реальность кластера)&quot;] --&gt; C
+C --&gt;|&quot;Расхождение обнаружено&quot;| D[&quot;Управляющее действие: запуск/удаление&quot;]
+D --&gt; B
+  </pre>
 </div>
 
-<h3 id="3-scheduler-planirovshchik">3. Scheduler (Планировщик)</h3>
-<p>Следит за появлением новых Подов (Pod), которым не назначена нода (состояние <code>Pending</code>). Scheduler оценивает ресурсы (CPU/RAM requests), ограничения (nodeSelector, taints/tolerations) и решает, на какую Worker-ноду поместить Под. Он <em>не</em> запускает под — он просто пишет имя ноды в объект Pod в API Server.</p>
-<h3 id="4-controller-manager-menedzher-kontrollerov">4. Controller Manager (Менеджер контроллеров)</h3>
-<p>Набор циклов согласования (Reconciliation Loops). Например, ReplicaSet Controller следит, чтобы количество запущенных Подов совпадало с числом <code>replicas</code> в YAML. Если под убили, контроллер создает новый. Deployment Controller управляет стратегией обновлений (Rolling Update).</p>
+
+<hr />
+<h2 id="2-control-plane-mozg-i-komandnyy-punkt-klastera">2. Control Plane: Мозг и командный пункт кластера</h2>
+
+<p>Слой управления (<strong>Control Plane</strong>, исторически называемый Master) отвечает за принятие глобальных решений в кластере: планирование подов, реакцию на сбои и хранение конфигураций. В продакшене все компоненты Control Plane резервируются на 3 или 5 независимых серверах.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2219,66 +2234,155 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Пользователь - kubectl apply&quot;] --&gt;|&quot;HTTP POST YAML&quot;| B[&quot;API Server&quot;]
-B --&gt;|&quot;Запись состояния&quot;| C[&quot;etcd&quot;]
-B --&gt;|&quot;Событие: новый Pod без ноды&quot;| D[&quot;Scheduler&quot;]
-D --&gt;|&quot;Назначение ноды через API&quot;| B
-B --&gt;|&quot;Событие: Pod назначен на ноду X&quot;| E[&quot;Kubelet на ноде X&quot;]
-E --&gt;|&quot;Создание контейнера&quot;| F[&quot;Container Runtime - containerd&quot;]
+User[&quot;Разработчик - kubectl apply&quot;] --&gt;|&quot;HTTP POST YAML (mTLS)&quot;| APIServer[&quot;kube-apiserver (REST API на Go)&quot;]
+APIServer --&gt;|&quot;Сохранение состояния (Raft)&quot;| Etcd[(&quot;etcd (Key-Value Store)&quot;)]
+
+APIServer --&gt;|&quot;Событие: Новый Pod без ноды&quot;| Scheduler[&quot;kube-scheduler&quot;]
+Scheduler --&gt;|&quot;Назначение ноды (NodeBinding)&quot;| APIServer
+
+APIServer --&gt;|&quot;Reconciliation Loops&quot;| KCM[&quot;kube-controller-manager&quot;]
+
+APIServer --&gt;|&quot;Событие: Pod назначен на ноду X&quot;| Kubelet[&quot;Kubelet (на Worker Node X)&quot;]
+Kubelet --&gt;|&quot;Запуск через CRI&quot;| Runtime[&quot;Container Runtime (containerd)&quot;]
   </pre>
 </div>
 
 
-<h2 id="worker-nodes-myshtsy-klastera">Worker Nodes: Мышцы кластера</h2>
+<h3 id="1-kube-apiserver-edinaya-tochka-vkhoda">1. `kube-apiserver` (Единая точка входа)</h3>
+<p>Центральный нервный узел всей системы. Это высокопроизводительный HTTP/REST сервер на Go. <br />
+* Единственный компонент кластера, который имеет право напрямую читать и писать в базу данных <code>etcd</code>.<br />
+* Все остальные участники (включая утилиту <code>kubectl</code>, планировщик, контроллеры и агенты на нодах) взаимодействуют строго с API Server по защищенному протоколу HTTPS с двусторонней аутентификацией (mTLS).<br />
+* Выполняет валидацию манифестов (Schema Validation), аутентификацию (JWT, токены, сертификаты), авторизацию (RBAC) и запуск мутирующих и валидирующих хуков (<strong>Admission Webhooks</strong>).</p>
+<h3 id="2-etcd-pamyat-klastera">2. `etcd` (Память кластера)</h3>
+<p>Высоконадежное распределенное key-value хранилище, написанное на Go. Оно реализует строгий алгоритм консенсуса <strong>Raft</strong>, обеспечивающий устойчивость к разделению сети (Network Partitions). В <code>etcd</code> хранится абсолютно всё состояние кластера: описания подов, сервисов, секреты, роли доступа и текущие сетевые эндпоинты.</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Дисковый I/O и библиотека Bbolt в etcd</span>
+  </div>
+  <div class="callout-body">
+    <p>Под капотом <code>etcd</code> использует библиотеку <strong>Bbolt</strong> (форк классической BoltDB, написанной на чистом Go). </p>
+<p>Bbolt хранит данные в файле на диске в виде B+ дерева с отображением в память через <code>mmap</code>. </p>
+<p>Каждая транзакция записи в <code>etcd</code> требует обязательного синхронного вызова системного вызова <strong><code>fsync()</code></strong>, гарантирующего физический сброс страниц кэша ядра на накопитель. </p>
+<p>Если ноды Control Plane запущены на медленных дисках (HDD или перегруженных облачных сетевых томах с лимитом IOPS), вызовы <code>fsync()</code> начинают зависать на десятки миллисекунд. Это приводит к разрыву Raft-сердечных сокращений (Heartbeats), потере лидерства в <code>etcd</code>, зависанию <code>kube-apiserver</code> и общему коллапсу управления кластером. Для <code>etcd</code> требуются <strong>локальные выделенные NVMe SSD</strong>.</p>
+  </div>
+</div>
 
-<p>Воркер-ноды — это серверы, где реально крутится ваш Go-код.</p>
-<h3 id="1-kubelet">1. Kubelet</h3>
-<p>Агент K8s на каждой ноде. Его задача — следить, чтобы Поды, назначенные на его ноду, были живы. Kubelet читает спецификацию Пода из API Server, обращается к Container Runtime (через CRI — Container Runtime Interface) для скачивания образов и старта контейнеров.<br />
-Также Kubelet выполняет пробы (Liveness, Readiness), о которых мы поговорим в следующей статье.</p>
-<h3 id="2-kube-proxy">2. Kube-proxy</h3>
-<p>Сетевой демон. Отвечает за маршрутизацию трафика к Сервисам (Services). Когда вы создаете Service, Kube-proxy создает правила на ноде, чтобы трафик с VIP-адреса Service попадал в IP-адреса Подов.</p>
+<h3 id="3-kube-scheduler-planirovshchik">3. `kube-scheduler` (Планировщик)</h3>
+<p>Интеллектуальный диспетчер, написанный на Go. Он непрерывно мониторит API Server в поисках вновь созданных Подов, у которых поле <code>nodeName</code> пустое (статус <code>Pending</code>).<br />
+Планировщик анализирует ресурсы:<br />
+1. <strong>Фильтрация (Predicates):</strong> Отсекает ноды, на которых недостаточно свободной памяти или CPU (<code>requests</code>), либо нарушены правила <code>nodeSelector</code>, <code>taints/tolerations</code> и ограничения affinity/anti-affinity.<br />
+2. <strong>Скоринг (Priorities):</strong> Ранжирует подходящие ноды по специальной оценочной шкале (например, равномерность распределения реплик одного сервиса по разным стойкам и зонам доступности).<br />
+3. <strong>Биндинг (Binding):</strong> Планировщик <em>не запускает</em> контейнер сам! Он лишь отправляет в API Server команду связать Под с выбранной нодой.</p>
+<h3 id="4-kube-controller-manager-menedzher-kontrollerov">4. `kube-controller-manager` (Менеджер контроллеров)</h3>
+<p>Монолитный Go-бинарник, объединяющий десятки параллельных циклов согласования (Reconciliation Loops):<br />
+* <strong>Deployment Controller:</strong> Следит за обновлениями образов и организует стратегии выкатки (Rolling Updates).<br />
+* <strong>ReplicaSet Controller:</strong> Следит за тем, чтобы количество живых реплик пода строго соответствовало спецификации <code>replicas</code>.<br />
+* <strong>Node Controller:</strong> Реагирует на потерю связи с серверами: если нода не отвечает более 5 минут, инициирует аварийное выселение (Eviction) всех запущенных на ней подов.</p>
+<hr />
+<h2 id="3-worker-nodes-muskuly-klastera">3. Worker Nodes: Мускулы кластера</h2>
+
+<p>Воркер-ноды — это физические серверы или виртуальные машины, на которых непосредственно исполняется полезная нагрузка — ваши Go-микросервисы.</p>
+<h3 id="1-kubelet-khostovyy-agent">1. `kubelet` (Хостовый агент)</h3>
+<p>Главный агент Kubernetes на каждом сервере, написанный на Go. Kubelet отвечает за реальную жизнь подов на конкретной ноде:<br />
+* Отслеживает в API Server поды, назначенные на его ноду.<br />
+* Общается со средой исполнения контейнеров через интерфейс <strong>CRI (Container Runtime Interface)</strong> по протоколу gRPC.<br />
+* Монтирует тома и пробрасывает секреты из <code>ConfigMap</code> и <code>Secret</code>.<br />
+* Регулярно запускает проверки жизнеспособности подов (<strong>Liveness, Readiness и Startup Probes</strong>), перезапуская зависшие контейнеры.</p>
+<h3 id="2-kube-proxy-setevoy-dispetcher">2. `kube-proxy` (Сетевой диспетчер)</h3>
+<p>Сетевой компонент, обеспечивающий абстракцию <strong>Kubernetes Service</strong>. Он отвечает за то, чтобы запросы на стабильный виртуальный IP-адрес сервиса (ClusterIP) равномерно балансировались между эфемерными IP-адресами реальных подов.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Производительность iptables против IPVS в kube-proxy</span>
   </div>
   <div class="callout-body">
-    <p>Kube-proxy работает в двух режимах: <code>iptables</code> и <code>IPVS</code>.<br />
-По умолчанию используется <code>iptables</code>. Правафа отбора (rules) в iptables читаются <strong>последовательно</strong> — O(N). Если у вас 10 000 Сервисов, каждый сетевой пакет должен пройти через огромную цепочку правил, что убивает сетевую производительность на высоких нагрузках.<br />
-Режим <strong>IPVS</strong> (IP Virtual Server) работает на уровне ядра Linux и использует хеш-таблицы для маршрутизации — O(1). Для высоконагруженных Go-бэкендов с тысячами микросервисов <em>всегда</em> включайте IPVS в K8s.</p>
+    <p><code>kube-proxy</code> умеет работать в двух режимах трансляции трафика:</p>
+<ol>
+<li><strong>Режим <code>iptables</code> (по умолчанию):</strong> Для каждого эндпоинта каждого сервиса <code>kube-proxy</code> добавляет правила в таблицы <code>iptables</code> ядра Linux. Однако ядро проверяет правила iptables <strong>последовательно (линейный поиск с алгоритмической сложностью $O(N)$)</strong>. В кластере с 5 000 сервисов и 20 000 подов таблица iptables разрастается до сотен тысяч строк. Каждый сетевой пакет тратит миллисекунды только на последовательный перебор цепочек ядра!</li>
+<li><strong>Режим <code>IPVS</code> (IP Virtual Server):</strong> Механизм балансировки L4, встроенный непосредственно в ядро Linux. IPVS организует виртуальные сервисы на базе эффективных хэш-таблиц ядра (<strong>алгоритмическая сложность $O(1)$</strong>). </li>
+</ol>
+<p><strong>Рекомендация для Senior-инженера:</strong> В любых нагруженных кластерах переключайте <code>kube-proxy</code> в режим <code>mode: ipvs</code> (или используйте современные eBPF-решения вроде Cilium), обеспечивая предсказуемую субмиллисекундную задержку сети независимо от масштаба кластера.</p>
   </div>
 </div>
 
-<h3 id="3-container-runtime">3. Container Runtime</h3>
-<p>Программа, запускающая контейнеры. Исторически это был Docker, но из-за своего монолитного дизайна он объявлен deprecated в K8s. Современный стандарт — <strong>containerd</strong> (или CRI-O). Он легче, быстрее и работает напрямую с образами OCI.</p>
-<h2 id="mekhanika-k8s-list-watch-i-informers">Механика K8s: List-Watch и Informers</h2>
+<h3 id="3-container-runtime-sreda-ispolneniya">3. Container Runtime (Среда исполнения)</h3>
+<p>Низкоуровневый программный комплекс, управляющий контейнерами на ноде. С версии Kubernetes 1.24 поддержка монолитного Docker Engine была официально исключена (Dockershim removed). Стандартом де-факто стал легковесный рантайм <strong>containerd</strong> (или <strong>CRI-O</strong>), который взаимодействует с Kubelet через строгий интерфейс OCI.</p>
+<hr />
+<h2 id="4-mekhanika-sinkhronizatsii-pattern-list-watch-i-informers-v-go">4. Механика синхронизации: Паттерн List-Watch и Informers в Go</h2>
 
-<p>Как компоненты K8s узнают об изменениях, не опрашивая API Server каждую секунду (что убило бы и API Server, и etcd)?</p>
-<p>K8s использует паттерн <strong>List-Watch</strong>:<br />
-1. При старте компонент делает <code>LIST</code> запрос к API Server, получая текущее состояние всех объектов (снапшот).<br />
-2. Затем он открывает долгоживущее TCP-соединение <code>WATCH</code> (используя HTTP Chunked Transfer Encoding). API Server шлет события (Added, Modified, Deleted) в реальном времени.</p>
-<p>В Go-коде самого Kubernetes и ваших кастомных операторах это реализовано через библиотеку <code>client-go</code> и механизм <strong>Informers</strong>. Informer локально кэширует состояние объектов в памяти (Thread-safe Store) и вызывает ваши коллбэки (Event Handlers) при изменениях.</p>
+<p>Каким образом тысячи распределенных агентов (Kubelet, Scheduler, Controllers) мгновенно узнают об изменениях манифестов в <code>kube-apiserver</code>, не убивая базу данных <code>etcd</code> постоянным поллингом?</p>
+<p>Kubernetes решает эту задачу с помощью изящного архитектурного паттерна <strong>List-Watch</strong>:</p>
+<ol>
+<li><strong>Фаза <code>LIST</code> (Инициализация):</strong> При холодном старте компонент отправляет обычный HTTP GET-запрос к API Server: <code>GET /api/v1/pods</code>. Он получает полный моментальный снимок (Snapshot) всех объектов и фиксирует текущую версию ресурса (<strong><code>resourceVersion</code></strong>).</li>
+<li><strong>Фаза <code>WATCH</code> (Подписка на поток дельт):</strong> Компонент открывает долгоживущее HTTP-соединение с параметром <code>?watch=true&amp;resourceVersion=12345</code>. API Server удерживает это TCP-соединение и потоково передает компактные события об изменениях (<strong>ADDED</strong>, <strong>MODIFIED</strong>, <strong>DELETED</strong>) по мере их появления в <code>etcd</code>.</li>
+</ol>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Client as Kubelet / Controller (client-go)
+participant API as kube-apiserver
+participant Etcd as etcd (Raft)
+
+Client-&gt;&gt;API: 1. LIST /api/v1/pods (Холодный старт)
+API-&gt;&gt;Etcd: Чтение снапшота
+Etcd--&gt;&gt;API: Срез объектов (resourceVersion=100)
+API--&gt;&gt;Client: Снапшот объектов
+Note over Client: Кэширование в local Thread-safe Store
+
+Client-&gt;&gt;API: 2. WATCH /api/v1/pods?resourceVersion=100
+Note over API,Client: Постоянное HTTP/2 соединение
+Etcd--&gt;&gt;API: Изменение: Pod A перешел в Running (ver=101)
+API--&gt;&gt;Client: Событие MODIFIED (Pod A)
+Note over Client: Вызов пользовательских Event Handlers
+  </pre>
+</div>
+
+
+<p>В официальной клиентской библиотеке <strong><code>k8s.io/client-go</code></strong> эта концепция упакована в абстракцию <strong>SharedInformer</strong>:<br />
+* Информер держит локальный потокобезопасный кэш объектов в памяти (<strong>Indexer / Thread-safe Store</strong>).<br />
+* Бизнес-логика контроллера читает данные <strong>только из локального кэша</strong>, вообще не создавая нагрузки на API Server.<br />
+* При поступлении событий информер складывает ключи изменившихся объектов в очередь с дедупликацией (<strong>WorkQueue</strong>), из которой рабочие горутины вызывают циклы согласования.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Живучесть подов при падении Control Plane</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему при падении API Server уже запущенные приложения (Go-поды) продолжают работать?<br />
-<strong>Ответ:</strong> Потому что K8s децентрализован в плане исполнения. Kubelet на каждой ноде содержит локальный кэш манифестов Подов. Если API Server падает, Kubelet продолжает управлять контейнерами, проверять пробы и перезапускать их при падении. То же самое с Kube-proxy — правила iptables/IPVS уже загружены в ядро Linux. Падение Control Plane блокирует <em>изменения</em> (деплои, скейлинг), но не <em>текущую работу</em> (data plane).</p>
+    <p><strong>Вопрос:</strong> В кластере Kubernetes полностью рухнули все ноды Control Plane (сгорел etcd или упал kube-apiserver). Что произойдет с уже запущенными в кластере Go-микросервисами?</p>
+<p><strong>Ответ:</strong> <br />
+Запущенные сервисы <strong>продолжат работать без каких-либо сбоев!</strong></p>
+<p>Kubernetes строго разделяет <strong>Control Plane</strong> (плоскость управления) и <strong>Data Plane</strong> (плоскость передачи данных):<br />
+1. <code>kubelet</code> на каждой воркер-ноде хранит локальный кэш манифестов запущенных подов. Он продолжит мониторить процессы, снимать liveness-пробы и перезапускать контейнеры при сбоях.<br />
+2. <code>kube-proxy</code> уже загрузил все правила маршрутизации в таблицы ядра <code>iptables</code>/<code>IPVS</code>. Сетевой трафик клиентов между сервисами и подами идет напрямую через сетевой стек ядра Linux, вообще не касаясь API Server.</p>
+<p>Падение Control Plane блокирует только <strong>возможность вносить изменения</strong>: нельзя задеплоить новую версию, применить манифест или выполнить горизонтальное авто масштабирование. Но текущая работа сервисов не пострадает.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Декларативность</strong>: K8s стремится привести Current State к Desired State через Reconciliation Loops.</li>
-<li><strong>API Server</strong> — единственная точка входа; <strong>etcd</strong> — единственное хранилище состояния (требует быстрых SSD).</li>
-<li><strong>Kube-proxy</strong>: Режим <code>iptables</code> убивает масштабируемость сети; используйте <code>IPVS</code> для O(1) маршрутизации.</li>
-<li><strong>List-Watch</strong>: Компоненты не опрашивают API, а подписываются на поток событий через HTTP/2, используя Informers в Go.</li>
-<li><strong>Отказоустойчивость</strong>: Падение Control Plane не убивает запущенные сервисы, так как Kubelet и Kube-proxy автономны на уровне ноды.</li>
+<li><strong>Декларативное управление:</strong> Kubernetes непрерывно приводит Current State системы к Desired State с помощью Reconciliation Loops.</li>
+<li><strong>Control Plane:</strong> <code>kube-apiserver</code> выступает единственным фасадом к <code>etcd</code>, планировщик <code>kube-scheduler</code> находит оптимальные ноды, а <code>kube-controller-manager</code> управляет жизненным циклом ресурсов.</li>
+<li><strong>Требования к etcd:</strong> Распределенное хранилище консенсуса критически чувствительно к задержкам дискового ввода-вывода (<code>fsync()</code>) и требует скоростных NVMe SSD.</li>
+<li><strong>IPVS в kube-proxy:</strong> Масштабирование сервисов требует перехода с последовательных правил <code>iptables</code> ($O(N)$) на хэш-таблицы ядра <code>IPVS</code> ($O(1)$).</li>
+<li><strong>Механика List-Watch:</strong> Реактивная подписка на события через <code>client-go</code> Informers минимизирует нагрузку на API Server и обеспечивает мгновенную реакцию на изменения.</li>
+<li><strong>Автономия Data Plane:</strong> Выход из строя Control Plane не нарушает работу уже запущенных сервисов.</li>
 </ol>
-<p>Архитектура K8s задает платформу, но основные сущности, с которыми вы будете работать daily — это Поды, Деплойменты и Сервисы. В следующей статье мы разберем их устройство и связь с Go-рантаймом: <a href="2-pod-deployment-service.html" class="wikilink">2. Pod, Deployment, Service</a>.</p>
+<p>Архитектура кластера задает базовый каркас оркестрации. Но повседневная работа разработчика сосредоточена вокруг базовых примитивов рабочей нагрузки: Подов, Деплойментов и Сервисов. В следующей статье мы разберем их анатомию и жизненный цикл: <a href="2-pod-deployment-service.html" class="wikilink">2. Pod, Deployment, Service</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2306,7 +2410,7 @@ E --&gt;|&quot;Создание контейнера&quot;| F[&quot;Container Ru
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#filosofiya-deklarativnoe-sostoyanie-desired-state">Философия: Декларативное состояние (Desired State)</a></li><li class="toc-item toc-h2"><a href="#control-plane-mozg-klastera">Control Plane: Мозг кластера</a></li><li class="toc-item toc-h3"><a href="#1-api-server-edinaya-tochka-vkhoda">1. API Server (Единая точка входа)</a></li><li class="toc-item toc-h3"><a href="#2-etcd-pamyat-klastera">2. Etcd (Память кластера)</a></li><li class="toc-item toc-h3"><a href="#3-scheduler-planirovshchik">3. Scheduler (Планировщик)</a></li><li class="toc-item toc-h3"><a href="#4-controller-manager-menedzher-kontrollerov">4. Controller Manager (Менеджер контроллеров)</a></li><li class="toc-item toc-h2"><a href="#worker-nodes-myshtsy-klastera">Worker Nodes: Мышцы кластера</a></li><li class="toc-item toc-h3"><a href="#1-kubelet">1. Kubelet</a></li><li class="toc-item toc-h3"><a href="#2-kube-proxy">2. Kube-proxy</a></li><li class="toc-item toc-h3"><a href="#3-container-runtime">3. Container Runtime</a></li><li class="toc-item toc-h2"><a href="#mekhanika-k8s-list-watch-i-informers">Механика K8s: List-Watch и Informers</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-filosofiya-kubernetes-deklarativnoe-sostoyanie-i-tsikly-soglasovaniya">1. Философия Kubernetes: Декларативное состояние и циклы согласования</a></li><li class="toc-item toc-h2"><a href="#2-control-plane-mozg-i-komandnyy-punkt-klastera">2. Control Plane: Мозг и командный пункт кластера</a></li><li class="toc-item toc-h3"><a href="#1-kube-apiserver-edinaya-tochka-vkhoda">1. kube-apiserver (Единая точка входа)</a></li><li class="toc-item toc-h3"><a href="#2-etcd-pamyat-klastera">2. etcd (Память кластера)</a></li><li class="toc-item toc-h3"><a href="#3-kube-scheduler-planirovshchik">3. kube-scheduler (Планировщик)</a></li><li class="toc-item toc-h3"><a href="#4-kube-controller-manager-menedzher-kontrollerov">4. kube-controller-manager (Менеджер контроллеров)</a></li><li class="toc-item toc-h2"><a href="#3-worker-nodes-muskuly-klastera">3. Worker Nodes: Мускулы кластера</a></li><li class="toc-item toc-h3"><a href="#1-kubelet-khostovyy-agent">1. kubelet (Хостовый агент)</a></li><li class="toc-item toc-h3"><a href="#2-kube-proxy-setevoy-dispetcher">2. kube-proxy (Сетевой диспетчер)</a></li><li class="toc-item toc-h3"><a href="#3-container-runtime-sreda-ispolneniya">3. Container Runtime (Среда исполнения)</a></li><li class="toc-item toc-h2"><a href="#4-mekhanika-sinkhronizatsii-pattern-list-watch-i-informers-v-go">4. Механика синхронизации: Паттерн List-Watch и Informers в Go</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2169,20 +2169,27 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Логи инфраструктуры</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статье <a href="4-monitoring-infrastruktury.html" class="wikilink">4. Мониторинг инфраструктуры</a> мы настраивали метрики. Метрики отвечают на вопрос <em>«Что сломалось и когда?»</em>. Но чтобы понять <em>«Почему это сломалось?»</em>, нужны логи. </p>
-<p>В традиционном подходе (на голом железе) приложение пишет логи в файл, а администратор настраивает <code>logrotate</code>. В мире контейнеров и Kubernetes эта модель рушится. Поды эфемерны: если контейнер упал и перезапустился, все логи, написанные внутри его файловой системы (OverlayFS), исчезнут навсегда.</p>
-<p>Инфраструктурное логирование в K8s требует полного пересмотра парадигмы: от записи в файлы к потоковой передаче (streaming) и агрегации.</p>
-<h2 id="filosofiya-vsyo-est-potok-stream">Философия: Всё есть поток (Stream)</h2>
+            <h1>5. Логирование инфраструктуры: Потоки ввода-вывода, Disk Pressure, containerd и structured slog в Go</h1>
+<p>В предыдущей главе (<a href="4-monitoring-infrastruktury.html" class="wikilink">4. Мониторинг инфраструктуры</a>) мы научились опрашивать числовые метрики. Метрики — это высокоуровневый компас инженера: они мгновенно показывают <em>«Что именно сломалось и в какую секунду»</em>. Но когда графики заливаются красным цветом, метрики бессильны объяснить глубинную причину: <em>«Какая конкретно ошибка привела к падению?»</em>. Здесь на сцену выходит журналирование событий — логи.</p>
+<p>В старом мире монолитов на физических серверах логирование казалось тривиальной задачей: приложение открывало локальный файл <code>/var/log/app.log</code>, дописывало в него строки, а системный демон <code>logrotate</code> по ночам упаковывал старые файлы в <code>gzip</code>. </p>
+<p>В эфемерной вселенной контейнеров и Kubernetes этот подход терпит сокрушительный крах. Поды живут в изолированных слоях файловой системы <code>OverlayFS</code>. Если контейнер упал с паникой и был перезапущен демоном <code>containerd</code>, все файлы, записанные им во внутреннее дисковое пространство, уничтожаются ядром Linux без возможности восстановления.</p>
+<p>Инфраструктурное логирование в Kubernetes требует фундаментальной смены парадигмы: <strong>отказ от локальных файлов в пользу бесконечных потоков данных (Streaming I/O) и централизованной агрегации</strong>.</p>
+<hr />
+<h2 id="1-filosofiya-unix-vsyo-est-potok-stream-io">1. Философия Unix: Всё есть поток (Stream I/O)</h2>
 
-<p>В Linux приложение общается с внешним миром через файловые дескрипторы. Стандартный вывод (stdout, FD 1) и стандартный поток ошибок (stderr, FD 2) — это потоки байт. </p>
-<p>Docker и Kubernetes перехватывают эти потоки. Когда ваше Go-приложение делает <code>fmt.Println</code> или <code>slog.Info</code>, рантайм пишет данные в FD 1. Container Runtime (containerd) перехватывает этот поток, добавляет метаданные (имя контейнера, timestamp) и сохраняет на диск хост-ноды в формате JSON.</p>
+<p>Один из основополагающих принципов операционной системы Unix гласит: <em>«Программа должна читать из стандартного ввода и писать в стандартный вывод, ничего не зная о том, куда направлен этот поток»</em>.</p>
+<p>В Linux любой процесс при старте получает три открытых системных файловых дескриптора:<br />
+* <code>FD 0</code>: <code>stdin</code> (стандартный ввод);<br />
+* <code>FD 1</code>: <code>stdout</code> (стандартный вывод);<br />
+* <code>FD 2</code>: <code>stderr</code> (стандартный поток ошибок).</p>
+<p>Docker и Kubernetes превратили этот принцип в абсолютный стандарт (Двенадцатый фактор методологии 12-Factor App). Ваше Go-приложение больше не создает файлов на диске! Когда вы вызываете <code>fmt.Println</code>, <code>log.Printf</code> или структурированный <code>slog.Info</code>, рантайм Go выполняет системный вызов <code>write(1, data)</code>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2197,32 +2204,57 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Go Application&quot;] --&gt;|&quot;Write to FD 1 - stdout&quot;| B[&quot;Container Runtime - containerd/CRI&quot;]
-B --&gt;|&quot;Parse and add metadata&quot;| C[&quot;Хост-нодa&lt;br&gt;/var/log/pods/namespace_pod_uid/container/0.log&quot;]
-C --&gt;|&quot;Read by kubelet&quot;| D[&quot;kubectl logs&quot;]
-C --&gt;|&quot;Tail by Fluent Bit&quot;| E[&quot;Centralized Log Aggregator&lt;br&gt;Loki or ELK&quot;]
+GoApp[&quot;Go Application Pod\n(write() в FD 1 stdout)&quot;] --&gt;|&quot;UNIX Pipe&quot;| CRI[&quot;Container Runtime\n(containerd / CRI-O)&quot;]
+
+CRI --&gt;|&quot;Обогащение метаданными\n(namespace, pod, container, time)&quot;| HostDisk[&quot;Хост-нода Linux\n/var/log/pods/namespace_pod_uid/container/0.log&quot;]
+
+HostDisk --&gt;|&quot;Прямое чтение Kubelet&quot;| Kubelet[&quot;Kubelet API\n(kubectl logs)&quot;]
+HostDisk --&gt;|&quot;Монтирование каталога&quot;| Collector[&quot;DaemonSet Log Collector\n(Fluent Bit / Promtail)&quot;]
+
+Collector --&gt;|&quot;HTTP Batch Push&quot;| LogStorage[&quot;Центральное хранилище\n(Grafana Loki / Elasticsearch / ClickHouse)&quot;]
   </pre>
 </div>
 
 
+<p>Среда исполнения контейнеров (<strong>containerd</strong> через CRI) перехватывает этот поток байтов, оборачивает каждую строку в JSON-конверт с метаданными (временная метка ISO 8601, маркер <code>stdout/stderr</code>) и атомарно дописывает в файл на физическом диске хоста.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Где физически лежат логи в K8s?</span>
   </div>
   <div class="callout-body">
-    <p>В Kubernetes путь к логам на ноде строится по строгой конвенции: <code>/var/log/pods/&lt;namespace&gt;_&lt;pod-name&gt;_&lt;pod-uid&gt;/&lt;container-name&gt;/&lt;restart-count&gt;.log</code>. Когда вы выполняете <code>kubectl logs</code>, Kubelet просто читает этот файл и отдает вам по HTTP. Поэтому <code>kubectl logs</code> работает быстро и не требует общения с API Server'ом для стриминга самого потока.</p>
+    <p>В Kubernetes путь к лог-файлам строго стандартизирован:<br />
+<code>/var/log/pods/&lt;namespace&gt;_&lt;pod-name&gt;_&lt;pod-uid&gt;/&lt;container-name&gt;/&lt;restart-count&gt;.log</code></p>
+<p>Когда дежурный инженер выполняет команду <code>kubectl logs my-pod</code>, запрос не идет к API Server'у за потоком данных. API Server лишь перенаправляет вызов на агент <code>kubelet</code> нужной ноды, а <code>kubelet</code> просто открывает этот локальный файл на диске хоста и стримит его обратно по HTTP. Это объясняет, почему <code>kubectl logs</code> работает молниеносно даже в гигантских кластерах.</p>
   </div>
 </div>
 
-<h2 id="opasnost-neogranichennykh-logov-disk-pressure">Опасность неограниченных логов (Disk Pressure)</h2>
+<hr />
+<h2 id="2-opasnost-neogranichennykh-logov-lovushka-disk-pressure">2. Опасность неограниченных логов: Ловушка Disk Pressure</h2>
 
-<p>По умолчанию Docker использует лог-драйвер <code>json-file</code> без ротации. Если ваше Go-приложение уйдет в бесконечный цикл с <code>log.Printf</code>, оно забьет логами весь диск хост-ноды. </p>
-<p>Когда на ноде заканчивается место, происходят страшные вещи:<br />
-1. Containerd не может создать новый контейнер.<br />
-2. Kubelet перестает отправлять heartbeat в API Server, и нода выпадает из кластера (Status <code>NotReady</code>).<br />
-3. Etcd (если он на этой ноде) падает, так как не может сделать <code>fsync</code>.</p>
-<p><strong>Решение:</strong> В K8s обязательно настраивать лимиты логов в конфигурации Kubelet (<code>/var/lib/kubelet/config.yaml</code>):</p>
+<p>По умолчанию классический лог-драйвер Docker <code>json-file</code> не имеет встроенных лимитов на размер файлов. Если в вашем Go-коде закрался бесконечный цикл, спамящий ошибками через <code>log.Printf</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">for {
+    log.Printf(&quot;failed to connect to database: %v&quot;, err)
+}
+</code></pre>
+</div>
+
+<p>Такой контейнер способен за считанные часы выплюнуть на диск хоста сотни гигабайт текстового мусора.</p>
+<p>Когда физический диск сервера заполняется до 85–90%, ядро Linux и Kubernetes включают защитные механизмы, оборачивающиеся катастрофой:<br />
+1. <strong>Состояние <code>DiskPressure</code>:</strong> Планировщик Kubernetes помечает ноду флагом <code>DiskPressure</code> и запрещает запуск новых подов на этом узле.<br />
+2. <strong>Падение Kubelet:</strong> Демон <code>kubelet</code> не может создавать временные сокеты и обновлять чекпоинты. Сервер выпадает из кластера в статус <strong><code>NotReady</code></strong>.<br />
+3. <strong>Краш базы данных etcd:</strong> Если на этом узле развернут контроллер кластера, база метаданных <code>etcd</code> падает с фатальной ошибкой: она не может выполнить системный вызов <code>fsync</code> для сброса WAL-журнала на переполненный диск.</p>
+<h3 id="reshenie-nastroyka-rotatsii-logov-v-kubelet">Решение: Настройка ротации логов в Kubelet</h3>
+<p>На каждом сервере кластера в файле конфигурации Kubelet (<code>/var/lib/kubelet/config.yaml</code>) обязательно должны быть зафиксированы жесткие квоты ротации:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2233,41 +2265,123 @@ C --&gt;|&quot;Tail by Fluent Bit&quot;| E[&quot;Centralized Log Aggregator&lt;b
     </button>
   </div>
   <pre class="language-yaml"><code class="language-yaml">containerLogMaxSize: &quot;50Mi&quot;    # Максимальный размер одного лог-файла до ротации
-containerLogMaxFiles: 5        # Сколько старых лог-файлов хранить
+containerLogMaxFiles: 5        # Сколько архивных копий хранить (всего не более 250 МиБ)
 </code></pre>
 </div>
 
-<p>Когда файл достигает 50 МБ, CRI делает <code>rotate</code> (переименовывает его в <code>.1</code> и создает новый). </p>
-<h2 id="mechanical-sympathy-blokirovka-na-zapisi-blocking-writes">Mechanical Sympathy: Блокировка на записи (Blocking Writes)</h2>
+<p>Как только объем логов достигает 50 МБ, <code>containerd</code> мгновенно ротирует файл (<code>0.log</code> -&gt; <code>0.log.1</code>) и создает чистый файл, защищая диск сервера от переполнения.</p>
+<hr />
+<h2 id="3-mechanical-sympathy-blokirovka-na-sistemnom-vyzove-write-blocking-writes">3. Mechanical Sympathy: Блокировка на системном вызове write (Blocking Writes)</h2>
 
-<p>Это одна из самых неочевидных проблем логирования в Go-бэкендах под нагрузкой. </p>
-<p>Запись в <code>stdout</code> в Go по умолчанию синхронна. Когда вы делаете <code>slog.Info</code>, Go-рантайм делает системный вызов <code>write(1, data)</code>. В обычных условиях он отрабатывает мгновенно. Но что, если процесс, читающий из пайпа (containerd), не успевает забирать данные?</p>
-<p>Если буфер пайпа (pipe buffer в Linux, обычно 64 КБ) переполняется, ядро Linux <strong>блокирует</strong> системный вызов <code>write</code>. Ваша Go-горутина, которая должна была обработать HTTP-запрос за 5мс, зависает на 200мс, ожидая, пока containerd освободит место в буфере. Это приводит к лавинообразному росту Latency (tail latency), который невозможно объяснить профилировщиком CPU.</p>
+<p>Это одна из самых коварных ловушек логирования в высоконагруженных Go-сервисах, которую практически невозможно диагностировать обычными профилировщиками CPU.</p>
+<p>По умолчанию системный вывод <code>stdout</code> в Unix-системах — это <strong>блокирующий анонимный канал (UNIX Pipe)</strong>. Когда Go-приложение вызывает <code>slog.Info()</code>, рантайм вызывает системный вызов ядра:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">write(1, &quot;request processed\n&quot;, 18)
+</code></pre>
+</div>
+
+<p>В Linux буфер пайпа между процессом Go и процессом <code>containerd</code> имеет фиксированный размер — <strong>всего 64 КБ</strong> (<code>F_SETPIPE_SZ</code>).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Go as Go Goroutine (HTTP Handler)
+participant Kernel as Linux Pipe Buffer (Лимит 64 КБ)
+participant CRI as containerd (Reader)
+participant Disk as Physical Host Disk
+
+Note over Go,Disk: Штатный режим: containerd быстро сбрасывает данные на диск
+Go-&gt;&gt;Kernel: write(1, log_data) -&gt; Мгновенный возврат (0.01 мс)
+Kernel-&gt;&gt;CRI: Чтение из буфера
+CRI-&gt;&gt;Disk: Запись в /var/log/pods/
+
+Note over Disk: Диск перегружен! Disk I/O заблокирован (High iowait)
+Disk--&gt;&gt;CRI: Задержка fsync на 200 мс!
+Note over Kernel: Буфер 64 КБ переполнен!
+Go-&gt;&gt;Kernel: write(1, log_data)
+Note over Go: ЯДРО БЛОКИРУЕТ ГОРУТИНУ! (Wait on pipe buffer)
+Kernel--&gt;&gt;Go: Возврат из syscall только через 200 мс!
+Note over Go: Всплеск p99 latency у клиентов!
+  </pre>
+</div>
+
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Деградация сервиса из-за чужого дискового ввода-вывода</span>
   </div>
   <div class="callout-body">
-    <p>Классический сценарий: на ноде начался Disk Pressure, containerd притормозил запись на диск. В этот момент ваши Go-сервисы начинают деградировать по Latency, хотя CPU и RAM свободны. Никогда не синхронизируйте бизнес-логику с IO-операциями логирования. Используйте асинхронные буферы или отдельные горутины для записи логов.</p>
+    <p>Представьте: на той же ноде соседний контейнер (например, бэкап базы данных) начал интенсивно заливать диск гигабайтами данных. Дисковая очередь хоста забилась (<code>iowait</code> подскочил).</p>
+<p>Демон <code>containerd</code> не успевает сбрасывать логи из памяти на перегруженный диск. В результате системный буфер пайпа размером 64 КБ переполняется за миллисекунды.</p>
+<p>В эту секунду ядро Linux <strong>принудительно усыпляет системный вызов <code>write(1, data)</code></strong> в вашем Go-приложении! Горутина, которая должна была мгновенно обработать платеж за 2 миллисекунды, намертво виснет на 200–500 мс в ожидании освобождения буфера логов. Задержки (tail latency) у клиентов взлетают, хотя CPU и память Go-сервиса простаивают!</p>
+<p><strong>Лечение в кодовой базе:</strong> При экстремальных нагрузках (&gt;10 000 RPS) никогда не пишите логи в <code>stdout</code> синхронно внутри критического пути обработки запроса. Используйте асинхронные буферизованные логгеры (кольцевые буферы в памяти с каналом <code>chan []byte</code>), отбрасывающие низкоприоритетные логи (<code>Drop on overflow</code>) при возникновении затора.</p>
   </div>
 </div>
 
-<h2 id="arkhitektura-agregatsii-logov-daemonset-vs-sidecar">Архитектура агрегации логов: DaemonSet vs Sidecar</h2>
+<hr />
+<h2 id="4-arkhitektura-agregatsii-logov-daemonset-vs-sidecar">4. Архитектура агрегации логов: DaemonSet vs Sidecar</h2>
 
 <p>Чтобы логи попали в Grafana Loki или Elasticsearch, их нужно собрать с нод. В K8s есть два паттерна:</p>
 <h3 id="1-daemonset-standart-industrii">1. DaemonSet (Стандарт индустрии)</h3>
 <p>На каждой ноде запускается один Pod с агентом сбора (Fluent Bit, Promtail, Filebeat). Он монтирует <code>/var/log/pods</code> хоста и читает логи всех контейнеров напрямую.<br />
-*   <strong>Плюсы:</strong> Минимальный оверхед (1 агент на ноду), не требует изменений в ваших Deployment'ах.<br />
-*   <strong>Минусы:</strong> Агент не знает метаданных K8s (имя Deployment, неймспейс). Ему приходится обращаться к API Server, чтобы обогатить логи лейблами.</p>
+* <strong>Плюсы:</strong> Минимальный оверхед (1 агент на ноду), не требует изменений в ваших Deployment'ах.<br />
+* <strong>Минусы:</strong> Агент не знает метаданных K8s (имя Deployment, неймспейс). Ему приходится обращаться к API Server, чтобы обогатить логи лейблами.</p>
 <h3 id="2-sidecar-dlya-izolyatsii">2. Sidecar (Для изоляции)</h3>
 <p>В каждый Pod вашего приложения добавляется контейнер с логгером (например, <code>fluentd</code>). Ваше Go-приложение пишет логи в локальный файл (shared Volume между контейнерами Пода), а Sidecar их читает и отправляет.<br />
-*   <strong>Плюсы:</strong> Идеальная изоляция (можно парсить логи специфичным для сервиса образом), логи не теряются при падении сети на ноде.<br />
-*   <strong>Минусы:</strong> Колоссальный расход ресурсов (CPU/RAM). Если у вас 100 Подов, у вас работает 100 агентов. Это антипаттерн для микросервисов.</p>
-<h2 id="spetsifika-go-strukturirovannye-logi-logslog">Специфика Go: Структурированные логи (`log/slog`)</h2>
+* <strong>Плюсы:</strong> Идеальная изоляция (можно парсить логи специфичным для сервиса образом), логи не теряются при падении сети на ноде.<br />
+* <strong>Минусы:</strong> Колоссальный расход ресурсов (CPU/RAM). Если у вас 100 Подов, у вас работает 100 агентов <code>fluentd</code>. Это антипаттерн для микросервисов.</p>
 
-<p>До Go 1.21 стандартная библиотека <code>log</code> писала неструктурированный текст. В мире ELK/Loki парсить текст регулярками — это боль и потеря производительности.</p>
-<p>С появлением <code>log/slog</code> писать JSON-логи стало идиоматичным стандартом:</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph DaemonSetPattern[&quot;Рекомендуемый паттерн: DaemonSet&quot;]
+P1[&quot;Go Pod 1&quot;] --&gt;|&quot;stdout&quot;| F1[&quot;/var/log/pods/1.log&quot;]
+P2[&quot;Go Pod 2&quot;] --&gt;|&quot;stdout&quot;| F2[&quot;/var/log/pods/2.log&quot;]
+F1 --&gt; FB[&quot;Fluent Bit DaemonSet\n(1 инстанс на хост)&quot;]
+F2 --&gt; FB
+FB --&gt;|&quot;HTTP Batch&quot;| Loki[&quot;Grafana Loki&quot;]
+end
+  </pre>
+</div>
+
+
+<hr />
+<h2 id="5-spetsifika-go-strukturirovannoe-logirovanie-s-logslog">5. Специфика Go: Структурированное логирование с log/slog</h2>
+
+<p>До релиза Go 1.21 стандартный пакет <code>log</code> умел генерировать лишь неструктурированные текстовые строки:<br />
+<code>2024/05/10 12:00:00 User 42 bought item 100</code></p>
+<p>Для систем агрегации логов (Loki, ELK) парсинг такого текста с помощью регулярных выражений превращается в вычислительный ад и сжигает процессорные мощности сборщиков логов.</p>
+<p>С выходом Go 1.21 в стандартную библиотеку был внедрен пакет <strong><code>log/slog</code></strong>, сделавший высокоскоростное JSON-логирование стандартным языковым идиоматическим решением:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2286,28 +2400,48 @@ import (
 )
 
 func main() {
-    // Обязательно JSON для K8s инфраструктуры
-    logger := slog.New(slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{
+    // Настраиваем структурированный JSON-обработчик для K8s инфраструктуры
+    opts := &amp;slog.HandlerOptions{
         Level: slog.LevelInfo,
-    }))
+    }
+    logger := slog.New(slog.NewJSONHandler(os.Stdout, opts))
     slog.SetDefault(logger)
 
-    http.HandleFunc(&quot;/&quot;, func(w http.ResponseWriter, r *http.Request) {
-        // Логи автоматически обогатятся ключами user_id и path
-        slog.Info(&quot;request processed&quot;,
+    http.HandleFunc(&quot;/api/v1/order&quot;, func(w http.ResponseWriter, r *http.Request) {
+        // Лог автоматически сериализуется в валидный плоский JSON
+        slog.Info(&quot;обработка заказа&quot;,
             slog.String(&quot;path&quot;, r.URL.Path),
             slog.Int(&quot;user_id&quot;, 42),
+            slog.String(&quot;trace_id&quot;, r.Header.Get(&quot;X-Trace-ID&quot;)),
         )
+        w.WriteHeader(http.StatusOK)
     })
+
+    slog.Info(&quot;HTTP сервер запущен на порту :8080&quot;)
     http.ListenAndServe(&quot;:8080&quot;, nil)
 }
 </code></pre>
 </div>
 
+<p>Контейнер выведет в <code>stdout</code> чистую валидную JSON-строку:</p>
+
+<div class="code-block" data-lang="json">
+  <div class="code-header">
+    <span class="code-lang-tag">JSON</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-json"><code class="language-json">{&quot;time&quot;:&quot;2026-09-18T12:00:00Z&quot;,&quot;level&quot;:&quot;INFO&quot;,&quot;msg&quot;:&quot;обработка заказа&quot;,&quot;path&quot;:&quot;/api/v1/order&quot;,&quot;user_id&quot;:42,&quot;trace_id&quot;:&quot;a1b2c3d4&quot;}
+</code></pre>
+</div>
+
+<p>Агент Fluent Bit мгновенно парсит эти поля за наносекунды без тяжелых регулярок, автоматически превращая <code>user_id</code> и <code>trace_id</code> в фильтруемые индексы в Loki или OpenSearch!</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос для собеседования: Проблема многострочных стектрейсов (Multiline Logs)</span>
   </div>
   <div class="callout-body">
     <p><strong>Вопрос:</strong> Как Fluent Bit/Loki корректно склеивает многострочный стектрейс (multiline logs) при панике в Go?<br />
@@ -2316,24 +2450,43 @@ func main() {
   </div>
 </div>
 
-<h2 id="bezopasnost-sekrety-v-logakh">Безопасность: Секреты в логах</h2>
+<hr />
+<h2 id="6-bezopasnost-sekrety-v-logakh">6. Безопасность: Секреты в логах</h2>
 
-<p>В K8s управление секретами реализовано через <a href="../04-kubernetes/3-configmap-i-secret.html" class="wikilink">3. ConfigMap и Secret</a>. Но если ваше Go-приложение логирует структуру запроса целиком (например, <code>slog.Info("login", slog.Any("body", req))</code>), вы можете случайно записать пароль пользователя в stdout.</p>
-<p>Этот пароль попадет в <code>/var/log/pods</code>, затем в Fluent Bit, а оттуда — в Elasticsearch, где его прочитает любой разработчик. </p>
-<p><strong>Правила безопасности логов в Go:</strong><br />
-1. Никогда не логируйте тела HTTP-запросов (Request Body) целиком.<br />
-2. Используйте типы-обертки для конфиденциальных данных, скрывающие значение при форматировании (например, переопределение метода <code>String()</code>).<br />
-3. На уровне Fluent Bit используйте фильтры <code>grep</code> или <code>parser</code> для маскирования полей, выглядящих как кредитные карты (PCI DSS) или токены.</p>
-<h2 id="itog">Итог</h2>
+<p>В статье <a href="../04-kubernetes/3-configmap-i-secret.html" class="wikilink">3. ConfigMap и Secret</a> мы подробно изучили, как безопасно хранить пароли, API-ключи и сертификаты. Однако самая частая причина утечки закрытых данных в продакшене — банальная неосторожность разработчика при логировании:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// ОПАСНО ДЛЯ ЖИЗНИ: случайная запись паролей и токенов в открытый лог!
+slog.Info(&quot;попытка авторизации&quot;, slog.Any(&quot;body&quot;, req))
+</code></pre>
+</div>
+
+<p>Если сериализовать объект запроса <code>req</code> целиком, конфиденциальный пароль пользователя попадет в <code>/var/log/pods</code>, оттуда через Fluent Bit перелетит в центральное хранилище логов, где станет доступен любому сотруднику компании с доступом к Grafana.</p>
+<h3 id="pravila-bezopasnosti-logov-v-go">Правила безопасности логов в Go:</h3>
+<ol>
+<li><strong>Никогда не логируйте тела HTTP-запросов (Request Body) целиком:</strong> Логируйте только идентификаторы сущностей (<code>user_id</code>, <code>order_id</code>), но не чувствительное содержимое (пароли, номера кредитных карт).</li>
+<li><strong>Используйте типы-обертки для конфиденциальных данных:</strong> Скрывайте значение при форматировании (например, переопределение метода <code>String()</code>).</li>
+<li><strong>Фильтрация на уровне агентов:</strong> На уровне Fluent Bit используйте фильтры <code>grep</code> или <code>parser</code> для маскирования полей, выглядящих как кредитные карты (PCI DSS) или токены.</li>
+</ol>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Эфемерность</strong>: Логи внутри контейнеров исчезают при пересоздании Пода. Приложение должно писать только в <code>stdout/stderr</code>.</li>
-<li><strong>Disk Pressure</strong>: Неограниченные логи убивают ноды. Всегда настраивайте <code>containerLogMaxSize</code> в Kubelet.</li>
-<li><strong>Блокировка записи (Blocking Write)</strong>: При проблемах с IO на ноде синхронная запись в stdout заблокирует Go-горутину. Используйте асинхронные обертки или будьте готовы к скачкам Latency.</li>
-<li><strong>DaemonSet vs Sidecar</strong>: Используйте DaemonSet (Fluent Bit/Promtail) для сбора логов с нод — это стандарт, не тратящий ресурсы кластера.</li>
-<li><strong><code>log/slog</code> и JSON</strong>: Структурированные логи в JSON формате решают проблему парсинга, склейки многострочных стектрейсов и отлично интегрируются с современными системами агрегации.</li>
+<li><strong>Иммутабельность и эфемерность:</strong> Поды не хранят логи на внутренних дисках. Всё логирование строится как непрерывный поток данных в дескрипторы <code>stdout</code> (FD 1) и <code>stderr</code> (FD 2).</li>
+<li><strong>Kubelet и пути:</strong> Логи физически хранятся на хосте в <code>/var/log/pods/</code>. Утилита <code>kubectl logs</code> читает их напрямую через <code>kubelet</code>.</li>
+<li><strong>Борьба с Disk Pressure:</strong> Неограниченный поток логов способен убить ноду и etcd. Настраивайте <code>containerLogMaxSize</code> и <code>containerLogMaxFiles</code> в конфигурации Kubelet.</li>
+<li><strong>Mechanical Sympathy:</strong> Запись в <code>stdout</code> идет через системный буфер пайпа в 64 КБ. При перегрузке диска хоста вызов <code>write(1, data)</code> блокирует горутины Go, взвинчивая задержки.</li>
+<li><strong>DaemonSet — выбор продакшена:</strong> Сбор логов агентом Fluent Bit по модели DaemonSet экономит гигабайты оперативной памяти по сравнению с Sidecar.</li>
+<li><strong>Пакет <code>log/slog</code>:</strong> Стандартизирует структурированные логи в формате JSON, избавляя сборщики от дорогого парсинга регулярками и решая проблему многострочных стектрейсов паники.</li>
 </ol>
-<p>Метрики показывают масштаб трагедии, логи — её причину. Но иногда для поиска бага нужны данные о конкретном запросе, прошедшем через всю распределенную систему. В следующей статье мы объединим всё это в единый процесс поиска неисправностей: <a href="6-troubleshooting-prodakshena.html" class="wikilink">6. Troubleshooting продакшена</a>.</p>
+<p>Метрики сигнализируют о масштабе пожара, логи указывают на загоревшийся модуль. Но когда инцидент уже случился, и серверы задыхаются прямо сейчас, инженеру требуется четкий, хладнокровный протокол поиска неисправностей. В следующей статье мы разберем комплексный траблшутинг продакшена: <a href="6-troubleshooting-prodakshena.html" class="wikilink">6. Troubleshooting продакшена</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2361,7 +2514,7 @@ func main() {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#filosofiya-vsyo-est-potok-stream">Философия: Всё есть поток (Stream)</a></li><li class="toc-item toc-h2"><a href="#opasnost-neogranichennykh-logov-disk-pressure">Опасность неограниченных логов (Disk Pressure)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-blokirovka-na-zapisi-blocking-writes">Mechanical Sympathy: Блокировка на записи (Blocking Writes)</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-agregatsii-logov-daemonset-vs-sidecar">Архитектура агрегации логов: DaemonSet vs Sidecar</a></li><li class="toc-item toc-h3"><a href="#1-daemonset-standart-industrii">1. DaemonSet (Стандарт индустрии)</a></li><li class="toc-item toc-h3"><a href="#2-sidecar-dlya-izolyatsii">2. Sidecar (Для изоляции)</a></li><li class="toc-item toc-h2"><a href="#spetsifika-go-strukturirovannye-logi-logslog">Специфика Go: Структурированные логи (log/slog)</a></li><li class="toc-item toc-h2"><a href="#bezopasnost-sekrety-v-logakh">Безопасность: Секреты в логах</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-filosofiya-unix-vsyo-est-potok-stream-io">1. Философия Unix: Всё есть поток (Stream I/O)</a></li><li class="toc-item toc-h2"><a href="#2-opasnost-neogranichennykh-logov-lovushka-disk-pressure">2. Опасность неограниченных логов: Ловушка Disk Pressure</a></li><li class="toc-item toc-h3"><a href="#reshenie-nastroyka-rotatsii-logov-v-kubelet">Решение: Настройка ротации логов в Kubelet</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-blokirovka-na-sistemnom-vyzove-write-blocking-writes">3. Mechanical Sympathy: Блокировка на системном вызове write (Blocking Writes)</a></li><li class="toc-item toc-h2"><a href="#4-arkhitektura-agregatsii-logov-daemonset-vs-sidecar">4. Архитектура агрегации логов: DaemonSet vs Sidecar</a></li><li class="toc-item toc-h3"><a href="#1-daemonset-standart-industrii">1. DaemonSet (Стандарт индустрии)</a></li><li class="toc-item toc-h3"><a href="#2-sidecar-dlya-izolyatsii">2. Sidecar (Для изоляции)</a></li><li class="toc-item toc-h2"><a href="#5-spetsifika-go-strukturirovannoe-logirovanie-s-logslog">5. Специфика Go: Структурированное логирование с log/slog</a></li><li class="toc-item toc-h2"><a href="#6-bezopasnost-sekrety-v-logakh">6. Безопасность: Секреты в логах</a></li><li class="toc-item toc-h3"><a href="#pravila-bezopasnosti-logov-v-go">Правила безопасности логов в Go:</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

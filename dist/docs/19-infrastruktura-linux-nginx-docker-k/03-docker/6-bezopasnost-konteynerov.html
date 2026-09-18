@@ -2169,45 +2169,57 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
               
             </div>
             <h1 class="article-title">6. Безопасность контейнеров</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Миф о том, что контейнеры обеспечивают полную изоляцию, подобно виртуальным машинам, — одна из самых опасных иллюзий в инфраструктуре. Контейнеры — это просто процессы с ограниченной видимостью (Namespaces) и потреблением (Cgroups), но они <strong>разделяют ядро хоста</strong>.</p>
-<p>Если злоумышленник найдет уязвимость нулевого дня в ядре Linux или вы неправильно сконфигурируете контейнер, процесс вырвется из своей песочницы (Container Escape) и получит контроль над хост-системой и всеми соседними контейнерами. Безопасность контейнеров — это не бинарная величина, а глубоко эшелонированная оборона (Defense in Depth).</p>
-<h2 id="grekh-pervyy-zapusk-ot-root">Грех первый: Запуск от Root</h2>
+            <h1>Безопасность контейнеров: От сброса Capabilities и Seccomp до защиты Supply Chain в Go</h1>
+<p>В инфраструктурной среде до сих пор циркулирует опасная иллюзия: <em>«Контейнер надежно изолирует сервис, поэтому внутри него можно делать всё что угодно»</em>. Как мы детально выяснили в предыдущих лекциях, контейнеры — это не герметичные виртуальные машины. Это обычные процессы операционной системы с урезанной видимостью (Namespaces) и лимитами ресурсов (Cgroups), <strong>разделяющие единое монолитное ядро Linux с хостом</strong>.</p>
+<p>Если атакующий обнаружит уязвимость нулевого дня (0-day) в коде ядра или воспользуется ошибкой конфигурации контейнера, процесс может совершить побег (<strong>Container Escape</strong>) и получить неограниченный контроль над физическим сервером, базой данных и всеми соседними сервисами. Безопасность контейнеров строится не на надежде на изоляцию, а на принципе глубоко эшелонированной обороны (<strong>Defense in Depth</strong>).</p>
+<hr />
+<h2 id="1-grekh-pervyy-zapusk-ot-root">1. Грех первый: Запуск от Root</h2>
 
-<p>Как мы обсуждали в статье <a href="../01-linux/4-prava-dostupa-i-bezopasnost.html" class="wikilink">4. Права доступа и безопасность</a>, UID 0 — это бог. По умолчанию Docker запускает контейнеры от root. Даже если внутри контейнера процесс изолирован в своем PID Namespace, он всё равно имеет UID 0 на хосте.</p>
-<p>Если злоумышленник через RCE (Remote Code Execution) в вашем Go-коде получит доступ к shell внутри контейнера, он сразу же станет root. А если на хосте примонтирована директория с правами записи, злоумышленник сможет изменить файл <code>/etc/crontab</code> на хосте или подменить бинарники других сервисов.</p>
+<p>В классической модели безопасности Unix идентификатор пользователя <strong>UID 0</strong> обладает абсолютной и неограниченной властью над операционной системой. </p>
+<p>По умолчанию демон Docker запускает контейнеры с привилегиями <code>root</code>. Даже если процесс помещен в изолированное пространство <code>PID Namespace</code>, для ядра хоста его эффективный идентификатор пользователя (<strong>EUID</strong>) равен <code>0</code>.</p>
+<p>Если злоумышленник через уязвимость удаленного исполнения кода (<strong>RCE</strong>) в Go-бэкенде или небезопасный системный вызов захватит контроль над контейнером, он немедленно окажется root-пользователем:<br />
+* Имея доступ к смонтированным томам, он сможет перезаписать критические системные файлы хоста (например, <code>/etc/crontab</code> или <code>/etc/shadow</code>).<br />
+* Он получит возможность взаимодействовать с системным сокетом ядра и атаковать недокументированные системные вызовы.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Иллюзия безопасности User Namespaces</span>
   </div>
   <div class="callout-body">
-    <p>Многие разработчики думают: "Я использую User Namespace (параметр <code>--userns-remap</code> демона Docker), поэтому мой root внутри контейнера — это обычный пользователь на хосте, всё безопасно". <br />
-Проблема в том, что по умолчанию Docker <strong>не включает</strong> User Namespaces. И даже если вы включите их, это сломает многие функции (например, привязку к портам &lt; 1024 без <code>CAP_NET_BIND_SERVICE</code> и монтирование NFS). Единственный надежный путь — <strong>всегда использовать директиву <code>USER</code> в Dockerfile</strong>.</p>
+    <p>Многие инженеры полагают: «В Docker есть механизм User Namespaces (<code>--userns-remap</code>), который маппит root контейнера на непривилегированного пользователя хоста, поэтому запуск от root безопасен».</p>
+<p>Это опасное заблуждение:<br />
+1. По умолчанию Docker <strong>не включает</strong> User Namespaces.<br />
+2. Активация <code>userns-remap</code> ломает множество стандартных системных сценариев: привязку к привилегированным портам ниже 1024 без <code>CAP_NET_BIND_SERVICE</code>, монтирование томов NFS и работу некоторых системных утилит.</p>
+<p>Единственный надежный и бескомпромиссный путь — <strong>всегда явно указывать директиву <code>USER</code> в Dockerfile</strong>, запуская Go-сервис от непривилегированного пользователя с ненулевым UID (например, 10001).</p>
   </div>
 </div>
 
-<h2 id="linux-capabilities-razdelenie-polnomochiyroot">Linux Capabilities: Разделение полномочийRoot</h2>
+<hr />
+<h2 id="2-linux-capabilities-razdelenie-polnomochiy-superpolzovatelya">2. Linux Capabilities: Разделение полномочий суперпользователя</h2>
 
-<p>Даже если вы запускаете контейнер от непривилегированного пользователя, ему могут быть выданы опасные привилегии. По умолчанию Docker выдает контейнерам набор из ~14 Linux Capabilities (например, <code>CAP_NET_RAW</code>, <code>CAP_CHOWN</code>).</p>
-<p>Для типичного Go-бэкенда, который слушает HTTP на порту &gt; 1024 и ходит в БД, подавляющее большинство capabilities не нужны.</p>
+<p>В традиционном Unix привилегии были бинарными: либо процесс обычный пользователь, либо всемогущий root. Начиная с версии ядра 2.2, в Linux появился механизм <strong>Linux Capabilities (Привилегии)</strong>, который разделил права root на десятки независимых атомарных разрешений.</p>
+<p>По умолчанию Docker наделяет вновь созданный контейнер набором из ~14 привилегий, включая <code>CAP_NET_RAW</code>, <code>CAP_CHOWN</code>, <code>CAP_MKNOD</code>, <code>CAP_FOWNER</code>. </p>
+<p>Однако типичному Go-микросервису, который слушает непривилегированный HTTP-порт (например, 8080) и общается с базой данных, эти привилегии абсолютно не нужны! Наличие <code>CAP_NET_RAW</code>, например, позволяет скомпрометированному контейнеру генерировать сырые Ethernet-фреймы, проводить ARP-спуфинг внутри Docker-сети и перехватывать трафик соседних сервисов.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Проверка привилегий в ядре Linux</span>
   </div>
   <div class="callout-body">
-    <p>Когда процесс делает системный вызов, требующий привилегий (например, <code>chown</code> или создание raw-сокета), ядро проверяет наличие соответствующего флага в структуре <code>cred</code> процесса, а не просто проверяет <code>uid == 0</code>. Удалив <code>CAP_NET_RAW</code>, вы лишаете злоумышленника возможности делать ping-флуд или IP-спуфинг даже если он захватит ваш контейнер.</p>
+    <p>Когда процесс выполняет чувствительный системный вызов (например, меняет владельца файла через <code>chown</code> или открывает сокет <code>AF_PACKET</code>), ядро Linux проверяет не просто равенство <code>uid == 0</code>. </p>
+<p>Ядро анализирует битовую маску возможностей в структуре учетных данных процесса <strong><code>struct cred</code></strong>. Сбросив флаг <code>CAP_NET_RAW</code>, вы гарантируете, что даже если атакующий получит доступ к шеллу внутри контейнера, системный вызов создания сырого сокета будет заблокирован ядром с ошибкой <code>EPERM</code>.</p>
   </div>
 </div>
 
-<p><strong>Безопасный запуск (Principle of Least Privilege):</strong></p>
+<h3 id="bezopasnyy-zapusk-po-printsipu-naimenshikh-privilegiy-least-privilege">Безопасный запуск по принципу наименьших привилегий (Least Privilege)</h3>
+<p>Лучшая практика безопасности — сначала <strong>сбросить абсолютно все привилегии</strong>, а затем явно выдать только минимально необходимые:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2221,78 +2233,85 @@
 </code></pre>
 </div>
 
-<p>Сначала мы сбрасываем <em>все</em> capabilities, а затем добавляем только те, которые реально нужны (например, возможность слушать 80 порт).</p>
-<h2 id="seccomp-filtratsiya-sistemnykh-vyzovov">Seccomp: Фильтрация системных вызовов</h2>
+<p>Флаг <code>--cap-drop ALL</code> превращает процесс в абсолютно безобидного обывателя ОС, а <code>--cap-add NET_BIND_SERVICE</code> при необходимости разрешает забиндить стандартный 80 или 443 порт.</p>
+<hr />
+<h2 id="3-filtratsiya-sistemnykh-vyzovov-seccomp-secure-computing-mode">3. Фильтрация системных вызовов: Seccomp (Secure Computing Mode)</h2>
 
-<p><strong>Seccomp (Secure Computing Mode)</strong> — это механизм ядра Linux, позволяющий ограничить системные вызовы, которые может делать процесс. </p>
-<p>Go-рантайм использует очень ограниченный набор системных вызовов (эпохи epoll, чтение/запись, mmap и т.д.). Ему абсолютно не нужны <code>ptrace</code> (отладка), <code>mount</code> (монтирование ФС) или <code>reboot</code>.</p>
-<p>Docker использует профиль Seccomp по умолчанию, который блокирует около 44 опасных системных вызовов (из сотен доступных в Linux). Но для продакшена лучше писать кастомные профили.</p>
+<p>Ядро современного Linux поддерживает около 350 системных вызовов. Среди них есть мощные и опасные инструменты администрирования: <code>ptrace</code> (отладка и инспекция памяти чужих процессов), <code>reboot</code> (перезагрузка сервера), <code>mount</code> (монтирование блочных устройств) или <code>kexec_load</code>.</p>
+<p>Механизм <strong>Seccomp (Secure Computing Mode)</strong> ядра Linux позволяет сформировать декларативный BPF-фильтр системных вызовов, блокирующий доступ к неиспользуемым интерфейсам ядра.</p>
+<p>Рантайм Go невероятно компактен и предсказуем: он использует системные вызовы для сетевого поллера (<code>epoll_create1</code>, <code>epoll_ctl</code>, <code>epoll_wait</code>), ввода-вывода (<code>read</code>, <code>write</code>), управления памятью (<code>mmap</code>, <code>madvise</code>) и планировщика горутин (<code>clone</code>, <code>futex</code>). Ни один корректный Go-бэкенд никогда не вызывает <code>ptrace</code> или <code>reboot</code>!</p>
+<p>По умолчанию Docker использует профиль Seccomp, блокирующий около 44 заведомо деструктивных системных вызовов. Однако для высокозащищенных сред создаются жесткие кастомные профили (Whitelists), разрешающие только строго необходимый список вызовов для Go.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Атака через системный вызов ptrace</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как злоумышленник может использовать системный вызов <code>ptrace</code> внутри контейнера, даже если он не root?<br />
-<strong>Ответ:</strong> Если в контейнере не отключена capability <code>CAP_SYS_PTRACE</code> и не заблокирован syscall <code>ptrace</code> через Seccomp, злоумышленник, получивший доступ к контейнеру, может "прицепиться" (attach) к другим процессам внутри контейнера и читать их память. Если другой процесс хранит секреты (токены, пароли БД) в памяти, злоумышленник их украдет. Go-рантайму <code>ptrace</code> не нужен, его необходимо блокировать.</p>
+    <p><strong>Вопрос:</strong> Какую критическую угрозу несет доступность системного вызова <code>ptrace</code> внутри скомпрометированного контейнера, даже если процесс не обладает правами root?</p>
+<p><strong>Ответ:</strong> <br />
+Если в контейнере сохранена capability <code>CAP_SYS_PTRACE</code> или системный вызов <code>ptrace</code> не заблокирован профилем Seccomp, злоумышленник может использовать вызов <code>ptrace(PTRACE_ATTACH, ...)</code> для подключения к любому другому процессу с тем же UID внутри контейнера.</p>
+<p>С помощью <code>ptrace</code> атакующий может остановить процесс, прочитать всю его оперативную память (дамп кучи) и переписать регистры CPU. Если соседний процесс (или горутина) хранил в памяти JWT-секреты, токены доступа к Cloud API или пароли к базе данных, они будут мгновенно скомпрометированы. Для Go-приложений <code>ptrace</code> должен быть безусловно заблокирован.</p>
   </div>
 </div>
 
-<h2 id="spetsifika-go-statika-protiv-cgo">Специфика Go: Статика против CGO</h2>
+<hr />
+<h2 id="4-spetsifika-go-staticheskaya-linkovka-protiv-cgo">4. Специфика Go: Статическая линковка против CGO</h2>
 
-<p>С точки зрения безопасности, у Go есть огромные преимущества перед C++, Python или Java:</p>
+<p>Архитектура языка Go дарует разработчику уникальные преимущества в области безопасности, недоступные в Python, Node.js или традиционном C++:</p>
 <ol>
-<li><strong>Отсутствие <code>LD_PRELOAD</code> атак</strong>: Поскольку Go-бинарник при <code>CGO_ENABLED=0</code> линкуется статически и использует собственный загрузчик (в обход <code>glibc</code>), классическая атака через подмену динамических библиотек (например, запись зловредного <code>libc.so.6</code> в директорию) не сработает. Go просто не будет ее читать.</li>
-<li><strong>Меньше Syscalls</strong>: Статический Go-бинарник делает предсказуемый набор системных вызовов. Написать строгий Seccomp-профиль для Go-приложения намного проще, чем для Python, который динамически загружает модули и вызывает непредсказуемые syscalls.</li>
-<li><strong>Distroless / Scratch</strong>: Как обсуждалось в <a href="3-multi-stage-build.html" class="wikilink">3. Multi stage build</a>, использование пустых образов означает, что в контейнере нет оболочки (<code>sh</code>, <code>bash</code>), нет <code>curl</code>, <code>wget</code> и пакетного менеджера. Если хакер попадет в контейнер через уязвимость в вашем коде (например, небезопасный <code>os.Exec</code>), ему будет нечем воспользоваться для горизонтального перемещения (Lateral Movement).</li>
+<li><strong>Иммунитет к атакам через <code>LD_PRELOAD</code>:</strong> В динамически компонуемых приложениях (C/Python) злоумышленник, получивший доступ к файловой системе, может подложить вредоносную динамическую библиотеку <code>libc.so.6</code> или переопределить переменную <code>LD_PRELOAD</code>. При следующем запуске динамический компоновщик хоста послушно загрузит код атакующего. Go-бинарник, собранный с <code>CGO_ENABLED=0</code>, линкуется <strong>полностью статически</strong> и использует собственный встроенный рантайм-загрузчик. Он физически игнорирует системные библиотеки и переменные <code>LD_PRELOAD</code>!</li>
+<li><strong>Детерминированный профиль Syscalls:</strong> В отличие от скриптовых языков, где сторонний пакет может непредсказуемо вызвать произвольный системный интерфейс, статический Go-код чрезвычайно прост для аудита и покрытия жесткими профилями Seccomp.</li>
+<li><strong>Образы Scratch и Distroless:</strong> Как мы разбирали в лекции <a href="3-multi-stage-build.html" class="wikilink">3. Multi stage build</a>, Go-бинарник может запускаться в пустом контейнере без шелла (<code>sh</code>, <code>bash</code>), без утилит <code>curl</code>, <code>wget</code> и пакетных менеджеров. Это блокирует горизонтальное перемещение (<strong>Lateral Movement</strong>): даже если атакующий эксплуатирует уязвимость в HTTP-хендлере, вызывающем команду через <code>os.Exec</code>, ядро вернет ошибку, так как командной оболочки в контейнере просто не существует.</li>
 </ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Включение CGO сводит на нет преимущества изоляции</span>
   </div>
   <div class="callout-body">
-    <p>Как только вы включаете CGO (<code>CGO_ENABLED=1</code>), вы теряете эти преимущества. Ваш бинарник начинает использовать системный <code>glibc</code>, открывая вектор для атак через уязвимости самой <code>glibc</code> (как это было с печально известным GHOST или buffer overflows в <code>dlopen</code>). Если CGO неизбежен (например, драйвер SQLite), обновляйте базовые образы (Alpine/Debian) еще чаще.</p>
+    <p>Как только вы собираете проект с флагом <code>CGO_ENABLED=1</code> (например, для использования SQLite, Kafka C-клиента или графических библиотек), бинарник начинает динамически связываться с системной библиотекой <code>glibc</code> или <code>musl</code>.</p>
+<p>Это моментально открывает вектор атак на уязвимости низкоуровневых C-библиотек (вспомним исторические уязвимости GHOST, переполнения буфера в <code>dlopen</code> или ошибки парсинга DNS в <code>glibc</code>). </p>
+<p>Если CGO неизбежен, базовые образы контейнеров обязаны обновляться и сканироваться на регулярной основе!</p>
   </div>
 </div>
 
-<h2 id="supply-chain-security-uyazvimosti-zavisimostey">Supply Chain Security: Уязвимости зависимостей</h2>
+<hr />
+<h2 id="5-bezopasnost-tsepochki-postavok-supply-chain-security">5. Безопасность цепочки поставок (Supply Chain Security)</h2>
 
-<p>Ваш Go-код может быть идеален, но если в базовом образе Alpine или в сторонней библиотеке (например, <code>github.com/gorilla/websocket</code>) есть CVE (уязвимость), ваш контейнер скомпрометирован.</p>
+<p>Ваш собственный Go-код может быть безупречен и покрыт тестами на 100%. Однако современный микросервис включает сотни сторонних библиотек из открытых репозиториев (например, <code>github.com/gorilla/websocket</code>) и базируется на образах операционных систем (Alpine/Debian). Если в них обнаружится критическая CVE-уязвимость, весь контейнер окажется скомпрометирован.</p>
+<p>Атака на цепочку поставок (<strong>Supply Chain Attack</strong>) — один из главных векторов современных взломов:</p>
 <ol>
-<li><strong>Сканирование образов</strong>: Интегрируйте в CI/CD пайплайн сканеры уязвимостей, такие как <strong>Trivy</strong> или <strong>Snyk</strong>. Они сверяют пакеты в образе с базами данных CVE.<br />
+<li><strong>Сканирование уязвимостей в CI/CD:</strong> В сборочный пайплайн обязательно внедряются специализированные сканеры безопасности — <strong>Trivy</strong> или <strong>Snyk</strong>:<br />
 <code>bash
-   trivy image my-registry/my-go-app:latest</code></li>
-<li><strong>Фиксация версий базового образа</strong>: Никогда не используйте <code>FROM golang:latest</code>. Используйте точные дайджесты (SHA256) или минорные версии (например, <code>FROM golang:1.22.3-alpine3.19</code>), чтобы избежать непредсказуемых изменений.</li>
+   trivy image --severity HIGH,CRITICAL my-registry/my-go-app:latest</code><br />
+   Сканер анализирует манифесты зависимостей (<code>go.sum</code>) и бинарный файл, сверяя хэши модулей с глобальными базами данных общеизвестных уязвимостей (CVE) и блокируя деплой при обнаружении критических брешей.</li>
+<li><strong>Фиксация точных версий базовых образов:</strong> Категорически запрещено использовать плавающие теги вроде <code>FROM golang:latest</code> или <code>FROM alpine:latest</code>. В продакшене используются либо точные минорные версии дистрибутивов (<code>FROM golang:1.22.3-alpine3.19</code>), либо неизменяемые криптографические дайджесты SHA256 (<code>FROM alpine@sha256:c5b1261d...</code>).</li>
 </ol>
-<h2 id="zashchita-sekretov-secrets">Защита секретов (Secrets)</h2>
+<hr />
+<h2 id="6-zashchita-sekretov-i-konfiguratsii">6. Защита секретов и конфигурации</h2>
 
-<p>Никогда не передавайте пароли, API-ключи или TLS-сертификаты напрямую в коде или через переменные окружения в Dockerfile (они остаются в истории слоев образа). </p>
-<p>В Docker есть механизм <strong>Docker Secrets</strong> (в Swarm) или просто монтирование секретов из внешних хранилищ (HashiCorp Vault, AWS Secrets Manager). В Kubernetes для этого существуют <a href="../04-kubernetes/3-configmap-i-secret.html" class="wikilink">3. ConfigMap и Secret</a>.</p>
-<p>Если вам нужно пробросить секрет в Go-контейнер для локальной разработки, используйте флаг <code>--secret</code> или монтируйте файл как Read-Only Volume:</p>
-
-<div class="code-block" data-lang="bash">
-  <div class="code-header">
-    <span class="code-lang-tag">Bash</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-bash"><code class="language-bash">docker run -v $(pwd)/db_password.txt:/run/secrets/db_password:ro my-go-app
-</code></pre>
-</div>
-
+<p>Никогда не зашивайте пароли к базам данных, приватные ключи RSA и токены API в исходный код и не передавайте их через директиву <code>ENV</code> в Dockerfile:<br />
+* Переменные окружения, объявленные в Dockerfile, сохраняются в метаданных слоев образа и навсегда остаются видны через команду <code>docker inspect</code> любому, у кого есть доступ к registry.</p>
+<h3 id="nadezhnye-sposoby-probrosa-sekretov">Надежные способы проброса секретов:</h3>
+<ol>
+<li><strong>Флаг <code>--secret</code> и монтирование в режиме Read-Only Volume:</strong> Для передачи учетных данных при сборке используется флаг <code>--secret</code> в BuildKit, а для локального запуска секреты пробрасываются через файлы в защищенном временном хранилище:<br />
+<code>bash
+   docker run -v $(pwd)/db_password.txt:/run/secrets/db_password:ro my-go-app</code></li>
+<li><strong>Интеграция с внешними Vault:</strong> Использование специализированных хранилищ (HashiCorp Vault, AWS Secrets Manager, Yandex Lockbox), откуда Go-сервис запрашивает секреты в память по защищенному mTLS-каналу в момент старта.</li>
+<li><strong>Оркестрация через Kubernetes:</strong> В продакшен-кластерах управление конфиденциальными данными делегируется нативным примитивам, о которых мы поговорим в лекции <a href="../04-kubernetes/3-configmap-i-secret.html" class="wikilink">3. ConfigMap и Secret</a>.</li>
+</ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Не запускайте от Root</strong>: <code>USER appuser</code> — обязательное правило. Контейнер с root-процессом — это мина замедленного действия.</li>
-<li><strong>Cap-drop ALL</strong>: Удаляйте все Linux Capabilities и добавляйте только необходимые.</li>
-<li><strong>Seccomp</strong>: Ограничивайте системные вызовы. Go идеально подходит для жестких Seccomp-профилей.</li>
-<li><strong>Scratch / Distroless</strong>: Минимизация инструментов внутри контейнера усложняет жизнь хакеру при захвате.</li>
-<li><strong>CGO — это риск</strong>: Избегайте CGO, чтобы закрыть векторы атак на динамический линковщик и использовать статическую безопасность Go.</li>
+<li><strong>Запрет на Root:</strong> Директива <code>USER appuser</code> обязательна; процесс с UID 0 в разделяемом ядре хоста представляет собой критическую угрозу.</li>
+<li><strong>Сброс Capabilities:</strong> Комбинация <code>--cap-drop ALL</code> нейтрализует потенциал злоумышленника при захвате контейнера.</li>
+<li><strong>Seccomp фильтрация:</strong> Блокирует опасные системные вызовы ядра (<code>ptrace</code>, <code>reboot</code>, <code>mount</code>), оставляя только предсказуемый сетевой набор Go.</li>
+<li><strong>Статическая чистота Go:</strong> Сборка с <code>CGO_ENABLED=0</code> блокирует атаки подмены динамических библиотек и устраняет уязвимости <code>glibc</code>.</li>
+<li><strong>Контроль Supply Chain:</strong> Регулярное сканирование образов через Trivy и фиксация дайджестов базовых слоев защищают от скрытых CVE в сторонних зависимостях.</li>
 </ol>
-<p>Изоляция на уровне Docker — это отличный фундамент, но управление тысячами контейнеров, их сетями, секретами и масштабированием требует оркестратора. Мы переходим к вершине инфраструктурной эволюции — Kubernetes. В следующей статье мы разберем его архитектуру: <a href="../04-kubernetes/1-kubernetes-arkhitektura.html" class="wikilink">1. Kubernetes. Архитектура</a>.</p>
+<p>Мы завершили фундаментальное погружение в Docker: от пространств имен и файловых систем до боевой безопасности и сборки микрообразов. Однако запуск единичных контейнеров на отдельных хостах не решает задач автоматического масштабирования, самовосстановления и балансировки между дата-центрами. </p>
+<p>Мы переходим к вершине инфраструктурного стека — платформе <strong>Kubernetes</strong>. В следующей лекции мы детально разберем ее внутреннюю архитектуру: <a href="../04-kubernetes/1-kubernetes-arkhitektura.html" class="wikilink">1. Kubernetes. Архитектура</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2320,7 +2339,7 @@
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#grekh-pervyy-zapusk-ot-root">Грех первый: Запуск от Root</a></li><li class="toc-item toc-h2"><a href="#linux-capabilities-razdelenie-polnomochiyroot">Linux Capabilities: Разделение полномочийRoot</a></li><li class="toc-item toc-h2"><a href="#seccomp-filtratsiya-sistemnykh-vyzovov">Seccomp: Фильтрация системных вызовов</a></li><li class="toc-item toc-h2"><a href="#spetsifika-go-statika-protiv-cgo">Специфика Go: Статика против CGO</a></li><li class="toc-item toc-h2"><a href="#supply-chain-security-uyazvimosti-zavisimostey">Supply Chain Security: Уязвимости зависимостей</a></li><li class="toc-item toc-h2"><a href="#zashchita-sekretov-secrets">Защита секретов (Secrets)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-grekh-pervyy-zapusk-ot-root">1. Грех первый: Запуск от Root</a></li><li class="toc-item toc-h2"><a href="#2-linux-capabilities-razdelenie-polnomochiy-superpolzovatelya">2. Linux Capabilities: Разделение полномочий суперпользователя</a></li><li class="toc-item toc-h3"><a href="#bezopasnyy-zapusk-po-printsipu-naimenshikh-privilegiy-least-privilege">Безопасный запуск по принципу наименьших привилегий (Least Privilege)</a></li><li class="toc-item toc-h2"><a href="#3-filtratsiya-sistemnykh-vyzovov-seccomp-secure-computing-mode">3. Фильтрация системных вызовов: Seccomp (Secure Computing Mode)</a></li><li class="toc-item toc-h2"><a href="#4-spetsifika-go-staticheskaya-linkovka-protiv-cgo">4. Специфика Go: Статическая линковка против CGO</a></li><li class="toc-item toc-h2"><a href="#5-bezopasnost-tsepochki-postavok-supply-chain-security">5. Безопасность цепочки поставок (Supply Chain Security)</a></li><li class="toc-item toc-h2"><a href="#6-zashchita-sekretov-i-konfiguratsii">6. Защита секретов и конфигурации</a></li><li class="toc-item toc-h3"><a href="#nadezhnye-sposoby-probrosa-sekretov">Надежные способы проброса секретов:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

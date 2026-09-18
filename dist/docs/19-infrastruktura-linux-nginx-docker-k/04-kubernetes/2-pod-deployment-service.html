@@ -2169,26 +2169,32 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Pod, Deployment, Service</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Разобрав общую архитектуру Kubernetes в <a href="1-kubernetes-arkhitektura.html" class="wikilink">1. Kubernetes. Архитектура</a>, пора спуститься на уровень объектов, с которыми вы будете работать каждый день. Тройка <code>Pod</code>, <code>Deployment</code> и <code>Service</code> — это святая троица K8s. Понимание того, как они взаимодействуют, критически важно для деплоя Go-приложений без простоев.</p>
-<h2 id="pod-atom-k8s">Pod: Атом K8s</h2>
+            <h1>Pod, Deployment и Service: Анатомия примитивов Kubernetes и Graceful Shutdown в Go</h1>
+<p>Разобрав архитектурный фундамент Kubernetes в лекции <a href="1-kubernetes-arkhitektura.html" class="wikilink">1. Kubernetes. Архитектура</a>, мы готовы спуститься на уровень базовых абстракций рабочей нагрузки (Workload API), с которыми бэкенд-инженер взаимодействует ежедневно.</p>
+<p>Триада <strong><code>Pod</code></strong>, <strong><code>Deployment</code></strong> и <strong><code>Service</code></strong> — это краеугольный камень оркестрации в K8s. Понимание их взаимодействия, скрытой роли служебного контейнера <code>pause</code>, механики зондирования (Probes) и асинхронного выбывания из сетевой балансировки критически важно для развертывания высоконагруженных сервисов на Go с истинным нулевым временем простоя (<strong>Zero-Downtime Deployment</strong>).</p>
+<hr />
+<h2 id="1-pod-atomarnaya-chastitsa-kubernetes-i-konteyner-pause">1. Pod: Атомарная частица Kubernetes и контейнер Pause</h2>
 
-<p>В Docker минимальной единицей является контейнер. В Kubernetes минимальная единица развертывания — <strong>Pod (Под)</strong>. </p>
-<p>Под — это не просто контейнер. Это изолированная среда (sandbox), в которой работает один или несколько контейнеров. Все контейнеры внутри одного Пода:<br />
-1. Разделяют один Network Namespace (один IP-адрес, один диапазон портов).<br />
-2. Разделяют один IPC Namespace (могут общаться через общую память).<br />
-3. Могут разделять Volume (хранение данных).</p>
-<h3 id="pod-kapotom-konteyner-pause">Под капотом: Контейнер Pause</h3>
-
-<p>Как K8s гарантирует, что несколько контейнеров в Поде умрут и воскреснут вместе, сохранив тот же IP-адрес?</p>
-<p>Когда K8s создает Под, он первым запускает специальный контейнер — <strong><code>pause</code></strong> (также известен как sandbox container). Этот контейнер делает ровно одну вещь: вызывает <code>pause()</code> системный вызов, бесконечно спя и удерживая Network Namespace.</p>
-<p>Когда ваш Go-контейнер (и sidecar-контейнеры, вроде Envoy/Istio proxy) запускается, он присоединяется к уже существующему Network Namespace контейнера <code>pause</code>. Если ваш Go-контейнер упадет и Kubelet перезапустит его, сетевой стек (IP, порты, открытые соединения) не разрушится — он привязан к <code>pause</code>.</p>
+<p>В Docker базовой единицей изоляции выступает отдельный контейнер. В Kubernetes минимальной неделимой единицей планирования и развертывания является <strong>Pod (Под)</strong>.</p>
+<p>Под — это не контейнер, а <strong>группа из одного или нескольких тесно связанных контейнеров</strong>, помещенных в единую изолированную среду (<strong>Sandbox</strong>). </p>
+<p>Все контейнеры внутри одного Пода:<br />
+1. <strong>Разделяют общий Network Namespace:</strong> У них один общий IP-адрес, единый диапазон сетевых портов и общий сетевой стек. Контейнеры внутри пода обращаются друг к другу через интерфейс локальной петли <strong><code>localhost</code></strong>.<br />
+2. <strong>Разделяют общий IPC Namespace:</strong> Могут взаимодействовать через высокоскоростную разделяемую память (POSIX Shared Memory, семафоры).<br />
+3. <strong>Могут монтировать общие тома (Volumes):</strong> Например, один контейнер генерирует файлы, а sidecar-контейнер передает их в S3.</p>
+<h3 id="pod-kapotom-rol-sluzhebnogo-konteynera-pause">Под капотом: Роль служебного контейнера Pause</h3>
+<p>Каким образом Kubernetes гарантирует, что при аварийном падении вашего Go-бинарника сетевой IP-адрес пода не исчезнет, а открытые сетевые сокеты и правила маршрутизации останутся в сохранности?</p>
+<p>Когда Kubelet создает Pod, он первым делом запускает скрытый инфраструктурный контейнер — <strong><code>pause</code></strong> (sandbox container):<br />
+* Бинарник <code>pause</code> написан на Си и скомпилирован статически; он весит считанные килобайты.<br />
+* Вся его задача — вызвать системный вызов <code>pause()</code>, который навсегда усыпляет процесс в ожидании сигналов ОС.<br />
+* Контейнер <code>pause</code> создает и удерживает пространства имен <strong>Network</strong> и <strong>IPC</strong>.</p>
+<p>Когда стартует ваш основной Go-контейнер и вспомогательные контейнеры (Sidecars, например Envoy-прокси в Service Mesh или сборщик логов Fluentbit), они запускаются с директивой объединения пространств имен (<code>--net=container:pause</code>). Если ваш Go-сервер рухнет с паникой и Kubelet начнет перезапуск, сетевой интерфейс пода ни на микросекунду не отключится, потому что его надежно удерживает спящий процесс <code>pause</code>!</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2214,43 +2220,107 @@ C --&gt;|&quot;localhost:8080&quot;| D
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Конфликт сетевых портов внутри Пода</span>
   </div>
   <div class="callout-body">
-    <p>Так как контейнеры в Поде делят один Network Namespace, они <strong>не могут слушать один и тот же порт</strong>. Если ваш Go-сервис слушает <code>:8080</code>, а sidecar (например, Prometheus exporter) тоже попытается забиндиться на <code>8080</code>, вы получите ошибку <code>bind: address already in use</code>. Координируйте порты внутри Пода.</p>
+    <p>Поскольку все контейнеры в Поде делят общий сетевой стек, они <strong>категорически не могут слушать один и тот же порт</strong>. </p>
+<p>Если ваше Go-приложение биндится на <code>:8080</code>, а sidecar-экспортер метрик Prometheus тоже попытается занять порт <code>8080</code>, системный вызов <code>bind()</code> немедленно вернет ошибку ядра:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">bind: address already in use
+</code></pre>
+</div>
+
+<p>Всегда жестко разводите номера портов между основным приложением и вспомогательными sidecar-контейнерами.</p>
   </div>
 </div>
 
-<h2 id="deployment-upravlenie-zhiznennym-tsiklom">Deployment: Управление жизненным циклом</h2>
+<hr />
+<h2 id="2-deployment-upravlenie-zhiznennym-tsiklom-i-replikatsiey">2. Deployment: Управление жизненным циклом и репликацией</h2>
 
-<p>Вы никогда не создаете Поды напрямую в продакшене (за исключением редких случаев с Jobs). Если нода умрет, "голый" Под умрет вместе с ней навсегда. Для управления репликами используется <strong>Deployment</strong>.</p>
-<p>Deployment не управляет Подами напрямую. Он создает <strong>ReplicaSet</strong>, который уже следит за тем, чтобы количество запущенных Подов равнялось желаемому (Desired State). При обновлении версии образа Deployment создает <em>новый</em> ReplicaSet, плавно масштабирует его вверх, а старый — вниз (Rolling Update).</p>
-<h3 id="proby-probes-integratsiya-k8s-i-go">Пробы (Probes): Интеграция K8s и Go</h3>
+<p>В продакшен-средах «голые» поды напрямую практически никогда не создаются вручную. Если физический сервер перезагрузится, одиночный Pod погибнет навсегда.</p>
+<p>Управление жизненным циклом делегируется контроллеру <strong><code>Deployment</code></strong>:<br />
+1. Deployment описывает желаемое состояние: версию образа, стратегию выкатки и количество реплик.<br />
+2. Deployment создает и контролирует дочерний объект — <strong><code>ReplicaSet</code></strong>.<br />
+3. ReplicaSet гарантирует, что в кластере в любой момент времени запущено ровно <code>replicas</code> одинаковых подов.<br />
+4. При обновлении тега образа Deployment создает <strong>второй ReplicaSet</strong>, постепенно наращивая в нем число подов и синхронно уменьшая реплики в старом ReplicaSet (<strong>Rolling Update</strong>).</p>
 
-<p>Ключевая особенность, отличающая "контейнер" от "здорового приложения" — это Пробы. K8s не знает, жив ли ваш Go-код внутри. Он проверяет это через пробы:</p>
-<ol>
-<li><strong>Startup Probe</strong>: Проверяет, запустилось ли приложение. Полезно для тяжелых Go-сервисов, которые при старте грузят в память словари или делают миграции БД. Пока эта проба не станет успешной, остальные пробы не проверяются.</li>
-<li><strong>Liveness Probe</strong>: Проверяет, не завис ли процесс (deadlock). Если проба падает, K8с убивает Под (отправляет SIGTERM) и перезапускает его. <strong>Никогда не используйте Liveness для проверки внешних зависимостей</strong> (БД, Redis). Иначе каскадный сбой сети убьет все ваши инстансы.</li>
-<li><strong>Readiness Probe</strong>: Проверяет, готов ли Под принимать трафик. Если она падает, K8s <strong>исключает IP Пода из Service</strong> (из балансировки), но не убивает Под. Это идеальное место для проверки БД.</li>
-</ol>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+D[&quot;Deployment (v2)&quot;] --&gt; RS1[&quot;ReplicaSet v1 (Уменьшение: 3 -&gt; 0)&quot;]
+D --&gt; RS2[&quot;ReplicaSet v2 (Увеличение: 0 -&gt; 3)&quot;]
+RS1 -.-&gt; P1[&quot;Pod v1 (Terminating)&quot;]
+RS2 --&gt; P2[&quot;Pod v2 (Running)&quot;]
+  </pre>
+</div>
+
+
+<hr />
+<h2 id="3-proby-zhiznesposobnosti-probes-simbioz-kubelet-i-rantayma-go">3. Пробы жизнеспособности (Probes): Симбиоз Kubelet и рантайма Go</h2>
+
+<p>Kubernetes не может знать внутреннее состояние вашего приложения, просто глядя на статус процесса в ОС. Процесс Go может не падать, но намертво зависнуть в бесконечном цикле или дедлоке мьютексов. </p>
+<p>Для проверки реального здоровья Kubelet использует три типа проб:</p>
+<h3 id="1-startupprobe-proba-zapuska">1. `startupProbe` (Проба запуска)</h3>
+<p>Предназначена для медленно инициализирующихся сервисов. Если ваш Go-бэкенд при холодном старте выполняет миграции БД, прогревает тяжелые кэши или вычитывает гигабайтные справочники в память, <code>startupProbe</code> дает ему запас времени (например, до 2 минут). Пока startup-проба не вернет статус <code>Success</code>, остальные пробы даже не запускаются.</p>
+<h3 id="2-livenessprobe-proba-zhivuchesti">2. `livenessProbe` (Проба живучести)</h3>
+<p>Проверяет, способен ли процесс выполнять работу в принципе. Если liveness-проба падает (например, 3 раза подряд вернула HTTP-код 500 или таймаут), Kubelet безжалостно <strong>уничтожает Pod</strong> сигналом <code>SIGTERM</code>, а затем <code>SIGKILL</code>, и перезапускает контейнер.</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Каскадный блэкаут при внешней проверке в Liveness Probe</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Никогда не проверяйте состояние внешних зависимостей (PostgreSQL, Redis, Kafka) внутри Liveness Probe!</strong></p>
+<p>Если в вашем дата-центре кратковременно моргнет сеть до базы данных PostgreSQL, и эндпоинт <code>/healthz</code> вашего Go-сервиса начнет возвращать ошибку 503 из-за недоступности БД, Kubelet решит, что сломался сам сервис. Он начнет <strong>одновременно перезапускать все 100 подов кластера</strong>. </p>
+<p>Когда сеть до БД восстановится, база захлебнется от одновременного шквала входящих подключений (Thundering Herd) от сотен перезапускающихся сервисов. Liveness Probe обязана проверять <strong>только внутреннее состояние Go-процесса</strong> (отсутствие дедлока, работу локального рантайма).</p>
+  </div>
+</div>
+
+<h3 id="3-readinessprobe-proba-gotovnosti">3. `readinessProbe` (Проба готовности)</h3>
+<p>Проверяет, готов ли сервис принимать входящий пользовательский трафик в данный момент. Если readiness-проба возвращает ошибку, Kubernetes <strong>не убивает контейнер</strong>! Он просто временно <strong>исключает IP-адрес этого пода из балансировщика Service</strong>. Это идеальное место для проверки доступности БД и прогрева кэшей.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Задержки распространения статуса Readiness</span>
   </div>
   <div class="callout-body">
-    <p>Пробы реализованы в Kubelet. Он периодически делает HTTP GET запрос (или executes command) внутри контейнера. Важно понимать тайминги: K8s не удаляет Под из балансировщика Service мгновенно при падении Readiness. Kubelet сообщает API Serverу об изменении статуса, API Server обновляет etcd, а Kube-proxy на <em>всех</em> нодах должен обновить свои правила iptables/IPVS. Этот конвейер может занимать секунды, что критично для понимания даунтаймов при деплое.</p>
+    <p>Пробы выполняет Kubelet локально на ноде с интервалом <code>periodSeconds</code>. </p>
+<p>Когда readiness-проба падает, Kubelet не может мгновенно снять трафик со всех балансировщиков мира. Он отправляет обновление статуса в <code>kube-apiserver</code>, тот обновляет объект <code>Endpoints</code> в <code>etcd</code>, а демоны <code>kube-proxy</code> на всех 500 нодах кластера должны вычитать это событие и перестроить свои таблицы <code>iptables</code>/<code>IPVS</code>.</p>
+<p>Этот распределенный конвейер занимает от 1 до 5 секунд.</p>
   </div>
 </div>
 
-<h2 id="service-stabilnaya-set-v-khaose">Service: Стабильная сеть в хаосе</h2>
+<hr />
+<h2 id="4-service-stabilnaya-tochka-vkhoda-v-mire-efemernykh-podov">4. Service: Стабильная точка входа в мире эфемерных подов</h2>
 
-<p>Поды эфемерны — они умирают, resurrectаются с новыми IP-адресами при каждом деплое. Вашим Go-сервисам нужен стабильный адрес для общения. Эту задачу решает <strong>Service</strong>.</p>
-<p>Service — это абстракция, которая определяет логическую группу Подов (обычно с помощью селектора <code>app=my-go-app</code>) и политику доступа к ним.</p>
-<p>Когда вы создаете Service типа ClusterIP, происходит следующее:<br />
-1. K8s выделяет стабильный виртуальный IP-адрес (ClusterIP) из специального диапазона.<br />
-2. Внутренний DNS-сервер CoreDNS создает запись <code>my-go-app.default.svc.cluster.local</code>, указывающую на этот IP.<br />
-3. Kube-proxy на каждой ноде создает правила в iptables или IPVS, перехватывающие трафик, идущий на ClusterIP, и перенаправляющие его на реальные IP-адреса Подов (DNAT).</p>
+<p>Поскольку поды постоянно пересоздаются, их IP-адреса непрерывно меняются. Чтобы клиенты могли стабильно обращаться к пулу бэкендов, Kubernetes предоставляет абстракцию <strong><code>Service</code></strong>.</p>
+<p>Service объединяет поды с помощью строкового селектора меток (например, <code>selector: app=my-go-app</code>) и выделяет виртуальный неизменяемый адрес <strong>ClusterIP</strong> (VIP):</p>
+<ol>
+<li>Выделяется стабильный виртуальный IP из специального диапазона кластера (ClusterIP).</li>
+<li>Внутренний DNS-сервер <strong>CoreDNS</strong> создает запись:<br />
+<code>text
+   my-go-app.default.svc.cluster.local</code></li>
+<li>Демоны <code>kube-proxy</code> настраивают правила ядра (<code>iptables</code> или <code>IPVS</code>), перехватывающие запросы на ClusterIP и транслирующие их через DNAT на реальные IP-адреса здоровых подов.</li>
+</ol>
+<p>В Go-коде межсервисное взаимодействие выглядит прямолинейно:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2260,39 +2330,58 @@ C --&gt;|&quot;localhost:8080&quot;| D
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// В вашем Go-коде вы обращаетесь к другому микросервису 
-// не по его IP, а по DNS имени Service
+  <pre class="language-go"><code class="language-go">// Обращение по символическому DNS-имени Сервиса
 resp, err := http.Get(&quot;http://billing-service:8080/api/charge&quot;)
 </code></pre>
 </div>
 
-<h3 id="headless-service-dlya-stateful-prilozheniy">Headless Service: Для Stateful-приложений</h3>
+<h3 id="headless-service-clusterip-none">Headless Service (clusterIP: None)</h3>
+<p>Если указать в манифесте <code>clusterIP: None</code>, сервис переходит в режим <strong>Headless (Безголовый)</strong>:<br />
+* K8s не выделяет виртуальный ClusterIP и не создает правила проксирования.<br />
+* DNS-сервер CoreDNS при запросе к такому сервису возвращает <strong>список реальных IP-адресов всех запущенных подов (A-записи)</strong>.</p>
+<p>Это критически важно для развертывания распределенных Stateful-систем на Go (кластеры Raft, CockroachDB, Kafka, Cassandra), где узлам необходимо напрямую общаться с конкретными пирами, а не балансироваться случайным образом.</p>
+<hr />
+<h2 id="5-samaya-strashnaya-gonka-anatomiya-zero-downtime-graceful-shutdown">5. Самая страшная гонка: Анатомия Zero-Downtime Graceful Shutdown</h2>
 
-<p>Если вы создадите Service с полем <code>clusterIP: None</code>, K8с не выделит виртуальный IP и не настроит прокси. Такой сервис называется <strong>Headless</strong>.</p>
-<p>Когда Go-приложение делает DNS-запрос к Headless Service, CoreDNS возвращает <em>не один виртуальный IP</em>, а список A-записей с реальными IP-адресами всех Подов. </p>
-<p>Это критически важно для баз данных (PostgreSQL, Cassandra) и распределенных систем на Go (Raft-кластеры, Kafka), где клиенту нужно знать адреса конкретных узлов, а не случайным образом балансироваться кластером.</p>
-<h2 id="samaya-strashnaya-gonka-race-condition-graceful-shutdown">Самая страшная гонка (Race Condition): Graceful Shutdown</h2>
+<p>Пожалуй, самая распространенная эксплуатационная ошибка, приводящая к появлению ошибок <code>502 Bad Gateway</code> и <code>Connection Refused</code> во время деплоя, — это неправильно реализованный <strong>Graceful Shutdown</strong> в Go.</p>
+<h3 id="v-chem-sut-raspredelennoy-gonki-race-condition">В чем суть распределенной гонки (Race Condition)?</h3>
+<p>Когда Kubernetes обновляет Deployment, для старого пода происходят два независимых асинхронных процесса:<br />
+1. <strong>Процесс остановки пода:</strong> Kubelet отправляет главному процессу контейнера сигнал <strong><code>SIGTERM</code></strong>.<br />
+2. <strong>Процесс обновления сети:</strong> API Server регистрирует удаление пода и рассылает события всем <code>kube-proxy</code> на всех воркер-нодах кластера для удаления IP-адреса пода из цепочек <code>iptables</code>/<code>IPVS</code>.</p>
 
-<p>Это классическая проблема, на которой обжигаются все Go-разработчики при переезде в K8s.</p>
-<p>Когда вы обновляете Deployment, K8s плавно убивает старый Под и поднимает новый. Шаги:<br />
-1. K8s создает новый Под.<br />
-2. K8s отправляет SIGTERM старому Поду.<br />
-3. K8с <strong>асинхронно</strong> удаляет IP старого Пода из правил iptables (через API Server -&gt; Kube-proxy).<br />
-4. Старый Под завершает Graceful Shutdown и умирает.</p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
   </div>
-  <div class="callout-body">
-    <p>Проблема в шагах 2 и 3. Удаление IP из iptables на всех нодах может занимать до 10 секунд (из-за задержек API Server и синхронизации Kube-proxy). Если ваш Go-код при получении SIGTERM немедленно закрывает HTTP-сервер, трафик от других Подов, у которых в iptables <em>ещё</em> остался IP старого Пода, упадет с ошибкой <code>Connection Refused</code>.</p>
-<p><strong>Решение (Обязательный паттерн для Go в K8s):</strong><br />
-1. При получении SIGTERM ваш Go-сервер должен <strong>перестать принимать новые соединения</strong> (отказываться от Readiness пробы), но <strong>продолжать обрабатывать текущие</strong>.<br />
-2. <strong>Обязательно подождать 5-15 секунд</strong> перед началом Shutdown, чтобы дать Kube-proxy время вычистить ваш IP из балансировщиков на всех нодах кластера.</p>
-  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant K8s as Control Plane (API Server)
+participant Pod as Go App Pod (Terminating)
+participant Proxy as Kube-proxy (Все ноды)
+participant Client as Другие микросервисы
+
+par Асинхронные потоки событий
+K8s-&gt;&gt;Pod: 1. Отправка сигнала SIGTERM
+K8s-&gt;&gt;Proxy: 2. Удаление Pod IP из Endpoints
+end
+Note over Pod: НАИВНЫЙ ПОДХОД: немедленный srv.Shutdown()!
+Note over Pod: Сервер закрывает слушающий порт!
+Client-&gt;&gt;Pod: 3. Запрос по старому правилу iptables
+Pod--&gt;&gt;Client: ОШИБКА: Connection Refused (502 Bad Gateway)!
+Note over Proxy: Спустя 3-5 секунд: правила iptables обновлены
+  </pre>
 </div>
 
-<p>Пример правильного Graceful Shutdown для K8s:</p>
+
+<p>Если Go-разработчик наивно напишет:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2302,32 +2391,85 @@ resp, err := http.Get(&quot;http://billing-service:8080/api/charge&quot;)
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func main() {
-    // ... настройка сервера ...
+  <pre class="language-go"><code class="language-go">&lt;-sigChan
+srv.Shutdown(ctx) // Закрываем сокет НЕМЕДЛЕННО
+</code></pre>
+</div>
 
+<p>то сервер мгновенно закроет слушающий порт <code>:8080</code>. Но в течение следующих 2–5 секунд <code>kube-proxy</code> на соседних серверах <em>еще не успеет обновить таблицы iptables ядра</em>! </p>
+<p>Внешние балансировщики и соседние микросервисы продолжат слать запросы на старый IP-адрес, получая в ответ немедленный сброс соединения (<strong>TCP RST / Connection Refused</strong>) и выбивая ошибки пользователям.</p>
+<h3 id="kanonicheskiy-pattern-graceful-shutdown-dlya-go-v-kubernetes">Канонический паттерн Graceful Shutdown для Go в Kubernetes</h3>
+
+<p>Чтобы гарантировать 100% Zero-Downtime, Go-сервис обязан выдержать <strong>паузу тишины (Draining Delay)</strong> перед закрытием слушающего сокета:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;log&quot;
+    &quot;net/http&quot;
+    &quot;os&quot;
+    &quot;os/signal&quot;
+    &quot;syscall&quot;
+    &quot;time&quot;
+)
+
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc(&quot;/healthz&quot;, func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte(&quot;OK&quot;))
+    })
+    mux.HandleFunc(&quot;/api/work&quot;, func(w http.ResponseWriter, r *http.Request) {
+        time.Sleep(100 * time.Millisecond) // полезная работа
+        w.Write([]byte(&quot;Done&quot;))
+    })
+
+    srv := &amp;http.Server{
+        Addr:    &quot;:8080&quot;,
+        Handler: mux,
+    }
+
+    // 1. Контекст перехвата системных сигналов завершения
     ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
     defer stop()
 
     go func() {
-        if err := srv.ListenAndServe(); err != nil &amp;&amp; err != http.ErrServerClosed {
-            log.Fatalf(&quot;Server failed: %v&quot;, err)
+        if err := srv.ListenAndServe(); err != nil &amp;&amp; !errors.Is(err, http.ErrServerClosed) {
+            log.Fatalf(&quot;HTTP server failed: %v&quot;, err)
         }
     }()
 
-    &lt;-ctx.Done()
-    log.Println(&quot;SIGTERM received, waiting for K8s to update iptables...&quot;)
+    log.Println(&quot;Service started on :8080&quot;)
+    &lt;-ctx.Done() // Ожидаем SIGTERM от Kubernetes
 
-    // КРИТИЧЕСКИ ВАЖНО: Спим, пока Kube-proxy вычищает наш IP
-    time.Sleep(10 * time.Second) 
+    log.Println(&quot;SIGTERM received, entering network drain pause...&quot;)
 
-    log.Println(&quot;Shutting down gracefully...&quot;)
+    // 2. КРИТИЧЕСКИ ВАЖНО: Спим 5-10 секунд, пока Kube-proxy вычищает наш IP из всех iptables!
+    // Сервер ПРОДОЛЖАЕТ принимать и обрабатывать запросы в этот период.
+    time.Sleep(10 * time.Second)
+
+    log.Println(&quot;Shutting down HTTP server gracefully...&quot;)
+
+    // 3. Штатный Shutdown: закрываем сокет на прием новых подключений,
+    // но даем активным HTTP-обработчикам 15 секунд на завершение
     shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
     defer cancel()
 
-    // Останавливаем сервер, дожидаясь обработки активных запросов
     if err := srv.Shutdown(shutdownCtx); err != nil {
-        log.Printf(&quot;Server shutdown error: %v&quot;, err)
+        log.Printf(&quot;Server forced to shutdown: %v&quot;, err)
     }
+
+    log.Println(&quot;Service exited cleanly&quot;)
 }
 </code></pre>
 </div>
@@ -2335,23 +2477,30 @@ resp, err := http.Get(&quot;http://billing-service:8080/api/charge&quot;)
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Параметр terminationGracePeriodSeconds</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Зачем в манифесте Пода нужно задавать <code>terminationGracePeriodSeconds</code> и как он связан с Graceful Shutdown в Go?<br />
-<strong>Ответ:</strong> <code>terminationGracePeriodSeconds</code> (по умолчанию 30) — это время, которое K8s даст вашему Поду после отправки SIGTERM, прежде чем отправить SIGKILL. Важно, чтобы сумма вашего искусственного слипа (на обновление iptables) и времени <code>http.Server.Shutdown</code> не превышала этот таймаут. Иначе K8с прибьет процесс (SIGKILL), оборвав активные соединения пользователей. Оптимально: terminationGracePeriodSeconds = 30, слип = 10с, Shutdown timeout = 15с.</p>
+    <p><strong>Вопрос:</strong> Как корректно настроить параметр <code>terminationGracePeriodSeconds</code> в спецификации Пода с учетом Graceful Shutdown в Go?</p>
+<p><strong>Ответ:</strong> <br />
+Директива <code>terminationGracePeriodSeconds</code> (по умолчанию 30 секунд) задает максимальный тайм-лимит, который Kubernetes выделяет Поду после отправки <code>SIGTERM</code>. По истечении этого таймера ядро Linux принудительно отправляет бескомпромиссный сигнал <code>SIGKILL</code>.</p>
+<p><strong>Золотое уравнение таймингов:</strong><br />
+$$\text{Задержка сети (Sleep)} + \text{Таймаут Shutdown} &lt; \text{terminationGracePeriodSeconds}$$</p>
+<p>Если в коде заложена пауза 10 секунд на слив iptables и 15 секунд на <code>http.Server.Shutdown</code>, их сумма составляет 25 секунд. В этом случае дефолтного значения <code>terminationGracePeriodSeconds: 30</code> достаточно. <br />
+Если же обработка очередей или длинных запросов требует 30 секунд, <code>terminationGracePeriodSeconds</code> в YAML-манифесте обязан быть увеличен до 45–60 секунд, иначе K8s убьет процесс по <code>SIGKILL</code>, оборвав клиентские транзакции на полуслове!</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Pod</strong> — это набор контейнеров, разделяющих сеть (через контейнер <code>pause</code>). Контейнеры в Поде общаются через <code>localhost</code>.</li>
-<li><strong>Deployment</strong> управляет ReplicaSet и обеспечивает бесперебойное обновление (Rolling Update). Пробы (Readiness) — ваш инструмент управления балансировкой.</li>
-<li><strong>Service</strong> предоставляет стабильный IP и DNS-имя для эфемерных Подов, используя DNAT на уровне ядра Linux.</li>
-<li><strong>Race Condition при Shutdown</strong>: K8s удаляет IP из балансировщика асинхронно. Всегда добавляйте задержку перед <code>srv.Shutdown()</code> в Go при получении SIGTERM, иначе вы получите 502/504 ошибки в моменты деплоя.</li>
+<li><strong>Под как песочница:</strong> Контейнеры внутри Пода разделяют сеть через спящий процесс <code>pause</code> и общаются по <code>localhost</code>.</li>
+<li><strong>Иерархия Deployment -&gt; ReplicaSet -&gt; Pod:</strong> Гарантирует поддержание желаемого числа реплик и плавный Rolling Update.</li>
+<li><strong>Строгое разделение проб:</strong> <code>startupProbe</code> защищает медленный старт, <code>readinessProbe</code> управляет балансировкой трафика, а <code>livenessProbe</code> должна проверять только локальные дедлоки без внешних зависимостей.</li>
+<li><strong>Service и CoreDNS:</strong> Создают стабильный ClusterIP и имя хоста для пула подов, балансируя трафик через таблицы ядра <code>iptables</code>/<code>IPVS</code>.</li>
+<li><strong>Draining Delay при остановке:</strong> Асинхронное удаление IP из сети требует обязательной паузы (sleep 5–10с) в Go перед вызовом <code>srv.Shutdown()</code>, исключая ошибки 502 при обновлении кластера.</li>
 </ol>
-<p>Ваши Go-приложения теперь могут принимать трафик, но жестко хардкодить конфигурацию (адреса БД, порты) в бинарник — плохая практика. В следующей статье мы разберем, как K8s инжектит конфигурацию и секреты: <a href="3-configmap-i-secret.html" class="wikilink">3. ConfigMap и Secret</a>.</p>
+<p>Наши сервисы запущены, защищены от сбоев и корректно завершают работу. Однако хардкодить параметры конфигурации и секретные ключи в образы недопустимо. В следующей статье мы разберем декларативное управление конфигурациями: <a href="3-configmap-i-secret.html" class="wikilink">3. ConfigMap и Secret</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2379,7 +2528,7 @@ resp, err := http.Get(&quot;http://billing-service:8080/api/charge&quot;)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pod-atom-k8s">Pod: Атом K8s</a></li><li class="toc-item toc-h3"><a href="#pod-kapotom-konteyner-pause">Под капотом: Контейнер Pause</a></li><li class="toc-item toc-h2"><a href="#deployment-upravlenie-zhiznennym-tsiklom">Deployment: Управление жизненным циклом</a></li><li class="toc-item toc-h3"><a href="#proby-probes-integratsiya-k8s-i-go">Пробы (Probes): Интеграция K8s и Go</a></li><li class="toc-item toc-h2"><a href="#service-stabilnaya-set-v-khaose">Service: Стабильная сеть в хаосе</a></li><li class="toc-item toc-h3"><a href="#headless-service-dlya-stateful-prilozheniy">Headless Service: Для Stateful-приложений</a></li><li class="toc-item toc-h2"><a href="#samaya-strashnaya-gonka-race-condition-graceful-shutdown">Самая страшная гонка (Race Condition): Graceful Shutdown</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-pod-atomarnaya-chastitsa-kubernetes-i-konteyner-pause">1. Pod: Атомарная частица Kubernetes и контейнер Pause</a></li><li class="toc-item toc-h3"><a href="#pod-kapotom-rol-sluzhebnogo-konteynera-pause">Под капотом: Роль служебного контейнера Pause</a></li><li class="toc-item toc-h2"><a href="#2-deployment-upravlenie-zhiznennym-tsiklom-i-replikatsiey">2. Deployment: Управление жизненным циклом и репликацией</a></li><li class="toc-item toc-h2"><a href="#3-proby-zhiznesposobnosti-probes-simbioz-kubelet-i-rantayma-go">3. Пробы жизнеспособности (Probes): Симбиоз Kubelet и рантайма Go</a></li><li class="toc-item toc-h3"><a href="#1-startupprobe-proba-zapuska">1. startupProbe (Проба запуска)</a></li><li class="toc-item toc-h3"><a href="#2-livenessprobe-proba-zhivuchesti">2. livenessProbe (Проба живучести)</a></li><li class="toc-item toc-h3"><a href="#3-readinessprobe-proba-gotovnosti">3. readinessProbe (Проба готовности)</a></li><li class="toc-item toc-h2"><a href="#4-service-stabilnaya-tochka-vkhoda-v-mire-efemernykh-podov">4. Service: Стабильная точка входа в мире эфемерных подов</a></li><li class="toc-item toc-h3"><a href="#headless-service-clusterip-none">Headless Service (clusterIP: None)</a></li><li class="toc-item toc-h2"><a href="#5-samaya-strashnaya-gonka-anatomiya-zero-downtime-graceful-shutdown">5. Самая страшная гонка: Анатомия Zero-Downtime Graceful Shutdown</a></li><li class="toc-item toc-h3"><a href="#v-chem-sut-raspredelennoy-gonki-race-condition">В чем суть распределенной гонки (Race Condition)?</a></li><li class="toc-item toc-h3"><a href="#kanonicheskiy-pattern-graceful-shutdown-dlya-go-v-kubernetes">Канонический паттерн Graceful Shutdown для Go в Kubernetes</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

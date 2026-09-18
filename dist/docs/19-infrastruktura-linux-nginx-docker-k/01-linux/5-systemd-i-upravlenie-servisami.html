@@ -2169,27 +2169,68 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Systemd и управление сервисами</h1>
           </header>
 
           <div class="article-markdown">
-            <p>Когда вы разрабатываете бэкенд на PHP, Python или Node.js, вы почти всегда используете промежуточный менеджер процессов (php-fpm, Gunicorn, PM2), который следит за воркерами, перезапускает их при падении и управляет логами. В экосистеме Go всё иначе. Ваш скомпилированный бинарник — это уже самодостаточный процесс, который сам себе воркер и сам себе веб-сервер.</p>
-<p>Но кто будет следить за самим бинарником? Кто запустит его при старте сервера? Кто перезапустит его при панике (panic) или Segfault? Кто аккуратно отправит ему <code>SIGTERM</code> при обновлении? В современном Linux ответ один — <strong>Systemd</strong>.</p>
-<h2 id="ot-demonizatsii-k-systemd">От демонизации к Systemd</h2>
+            <h1>Systemd и управление сервисами в Linux: От демонизации к современной оркестрации</h1>
+<p>Разработчики, пришедшие в Go из мира Python, Ruby, PHP или Node.js, привыкли полагаться на внешние менеджеры процессов — Gunicorn, Puma, php-fpm или PM2. Эти надстройки брали на себя заботу о размножении рабочих процессов (воркеров), их перезапуске при сбоях и агрегации журналов. </p>
+<p>В Go картина мира кардинально иная. Скомпилированный Go-бинарник — это полноценный, самодостаточный сервер. Внутри него уже зашит высокопроизводительный планировщик горутин (M:N), собственный HTTP/gRPC-сервер на базе неблокирующего сетевого поллера ядра и сборщик мусора. Никакой промежуточный сервер приложений не требуется.</p>
+<p>Но возникает фундаментальный эксплуатационный вопрос: кто будет управлять самим бинарником на физическом сервере или виртуальной машине? Кто поднимет процесс после перезагрузки ОС? Кто перезапустит его при непредвиденной панике (<code>panic</code>) или фатальном <code>SIGSEGV</code>? Кто передаст ему сигналы мягкого завершения (<code>SIGTERM</code>) при деплое новой версии? В современной экосистеме Linux эту роль выполняет <strong>Systemd</strong> — системный менеджер и диспетчер инициализации с PID 1.</p>
+<hr />
+<h2 id="1-ot-klassicheskoy-demonizatsii-k-deklarativnomu-upravleniyu">1. От классической демонизации к декларативному управлению</h2>
 
-<p>В старые добрые времена Unix процесс должен был "демонизировать" себя (double-fork magic): отсоединиться от терминала, стать лидером сессии, закрыть стандартные дескрипторы и записать PID в <code>/var/run/app.pid</code>. </p>
-<p>В Go попытка реализовать классическую демонизацию — это антипаттерн. Во-первых, это сложно из-за работы с потоками ОС (M) и горутинами. Во-вторых, это противоречит философии современных систем: <strong>процесс не должен управлять собственным жизненным циклом</strong>.</p>
-<p>Systemd (работающий как PID 1) берет всю рутину на себя. Ваш Go-бинарник должен работать как простая программа на переднем плане (foreground), а Systemd обеспечит:<br />
-1. Запуск в нужном порядке (после поднятия сети и БД).<br />
-2. Перенаправление stdout/stderr в логическую систему (journald).<br />
-3. Изоляцию через Cgroups и Namespaces.<br />
-4. Управление жизненным циклом через сигналы.</p>
-<h2 id="anatomiya-unit-fayla">Анатомия Unit-файла</h2>
+<p>В классических Unix-системах долгоживущие фоновые программы (демоны) должны были самостоятельно «демонизировать» себя. Этот ритуал в Си требовал строгого и нетривиального набора системных вызовов:</p>
+<ol>
+<li>Первый <code>fork()</code>: родительский процесс завершается, дочерний уходит в фон.</li>
+<li><code>setsid()</code>: создание новой пользовательской сессии, отсоединяющей процесс от управляющего терминала (TTY), чтобы случайное нажатие <code>Ctrl+C</code> или закрытие сессии SSH не убило демон сигналом <code>SIGHUP</code>.</li>
+<li>Второй <code>fork()</code>: гарантия того, что процесс никогда больше не сможет случайно захватить новый управляющий терминал.</li>
+<li><code>chdir("/")</code>: смена текущего рабочего каталога на корень, чтобы демон не блокировал размонтирование файловых систем.</li>
+<li><code>umask(0)</code>: сброс маски прав создания файлов.</li>
+<li>Переоткрытие дескрипторов 0, 1, 2 (<code>stdin</code>, <code>stdout</code>, <code>stderr</code>) в <code>/dev/null</code>.</li>
+<li>Запись своего PID в файл блокировки (например, <code>/var/run/app.pid</code>).</li>
+</ol>
 
-<p>Конфигурация Systemd для сервиса описывается в <code>.service</code> файлах. Для Go-бэкенда идеальный production-ready unit-файл выглядит так:</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+A[&quot;Родительский процесс&quot;] --&gt;|&quot;1. fork()&quot;| B[&quot;Первый потомок&quot;]
+A --&gt;|&quot;Завершение&quot;| Exit1[&quot;exit(0)&quot;]
+B --&gt;|&quot;2. setsid()&quot;| C[&quot;Лидер новой сессии (без TTY)&quot;]
+C --&gt;|&quot;3. fork()&quot;| D[&quot;Второй потомок (настоящий демон)&quot;]
+C --&gt;|&quot;Завершение&quot;| Exit2[&quot;exit(0)&quot;]
+D --&gt;|&quot;4. chdir(&#x27;/&#x27;) / umask(0) / закрытие FD&quot;| E[&quot;Фоновый процесс (Daemon)&quot;]
+D --&gt;|&quot;5. Запись PID&quot;| F[&quot;/var/run/app.pid&quot;]
+  </pre>
+</div>
+
+
+<h3 id="pochemu-v-go-demonizatsiya-opasnyy-antipattern">Почему в Go демонизация — опасный антипаттерн?</h3>
+
+<p>Попытка реализовать этот танец в Go сопряжена с критическими проблемами:</p>
+<ul>
+<li><strong>Потоки ОС и планировщик:</strong> Системный вызов <code>fork()</code> в многопоточной программе копирует память только того системного потока ОС (<code>M</code>), который его вызвал. Состояние мьютексов других потоков рантайма Go оказывается поврежденным или замороженным. Рантайм Go принципиально запрещает вызов <code>fork()</code> в пользовательском коде без немедленного <code>execve()</code>.</li>
+<li><strong>Нарушение принципа разделения ответственности:</strong> Процесс не должен отвечать за собственный мониторинг. Если процесс зависнет в deadlock'е или рухнет до записи PID-файла, внешняя система мониторинга потеряет над ним контроль.</li>
+</ul>
+<p>Философия современных облачных и серверных архитектур гласит: <strong>процесс не должен управлять собственным жизненным циклом</strong>. Приложение должно работать на переднем плане (foreground). Оно читает переменные окружения, слушает сокет и пишет структурированные логи в <code>stdout</code>/<code>stderr</code>. Всю инфраструктурную работу — запуск, слежение за падениями, ограничение ресурсов и изоляцию — берет на себя Systemd (PID 1).</p>
+<hr />
+<h2 id="2-anatomiya-etalonnogo-unit-fayla-dlya-go-servisa">2. Анатомия эталонного Unit-файла для Go-сервиса</h2>
+
+<p>Конфигурация юнитов Systemd описывается в декларативном формате INI. Файлы сервисов размещаются в <code>/etc/systemd/system/&lt;name&gt;.service</code>.</p>
+<p>Ниже представлен образцовый, закаленный в production unit-файл для высоконагруженного Go-бэкенда:</p>
 
 <div class="code-block" data-lang="ini">
   <div class="code-header">
@@ -2200,59 +2241,78 @@
     </button>
   </div>
   <pre class="language-ini"><code class="language-ini">[Unit]
-Description=My Awesome Go Backend
+Description=My Awesome Go Backend Service
 After=network-online.target postgresql.service
 Wants=network-online.target
+Documentation=https://internal.wiki/docs/backend
 
 [Service]
-# Тип notify означает, что приложение само скажет Systemd, когда будет готово
+# Режим notify: приложение само скажет Systemd, когда готово принимать трафик
 Type=notify
 NotificationSocket=/run/myapp-notify.sock
 
-# Исполняемый файл
+# Запуск с передачей флагов или конфигурационного файла
 ExecStart=/usr/local/bin/myapp --config /etc/myapp/config.yaml
 
-# Перезапуск только если процесс упал с ошибкой (не 0) или по сигналу (кроме SIGTERM/SIGINT)
+# Перезапуск только если процесс упал с ошибкой (не 0) или по сигналу
 Restart=on-failure
 RestartSec=5s
 
-# Graceful Shutdown: отправляем SIGTERM, ждем 30 секунд, затем убиваем SIGKILL
+# Graceful Shutdown: отправляем SIGTERM, ждем 30 секунд, затем SIGKILL
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
-# Лимиты (Mechanical Sympathy)
+# Лимиты системных дескрипторов (Mechanical Sympathy)
 LimitNOFILE=65536
-# Интеграция с Cgroups (важно для Go 1.19+)
-MemoryMax=512M
 
-# Безопасность (Hardening)
+# Интеграция с Cgroups v2 (критично для Go 1.19+)
+MemoryMax=512M
+CPUQuota=200%
+
+# Безопасность и изоляция (Linux Hardening)
 User=myapp-user
 Group=myapp-group
 NoNewPrivileges=true
 ProtectSystem=strict
+ProtectHome=true
 PrivateTmp=true
+ReadWritePaths=/var/log/myapp /tmp
 
 [Install]
 WantedBy=multi-user.target
 </code></pre>
 </div>
 
+<p>Разберем ключевые директивы:</p>
+<ul>
+<li><code>After=network-online.target postgresql.service</code> и <code>Wants=network-online.target</code>: гарантируют, что сервис не попытается стартовать до того, как сетевой стек поднимет маршруты и поднимется локальная СУБД.</li>
+<li><code>LimitNOFILE=65536</code>: снимает стандартное ограничение ядра на 1024 открытых файловых дескриптора. Для Go-сервера, обслуживающего тысячи одновременных TCP-соединений (keep-alive, базы данных, gRPC-каналы), дефолтный лимит означает мгновенную ошибку <code>socket: too many open files</code>.</li>
+<li><code>NoNewPrivileges=true</code>, <code>ProtectSystem=strict</code>, <code>PrivateTmp=true</code>: на уровне ядра блокируют повышение привилегий через SUID, монтируют системные каталоги (<code>/usr</code>, <code>/boot</code>, <code>/etc</code>) в режиме Read-Only и создают изолированный каталог <code>/tmp</code> в отдельном пространстве имен.</li>
+</ul>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка: Директива `Restart=always` против `Restart=on-failure`</span>
   </div>
   <div class="callout-body">
-    <p>Директива <code>Restart=always</code> может быть опасна. Если ваше приложение падает по <code>SIGTERM</code> (например, вы сами делаете <code>systemctl stop</code>), Systemd не перезапустит его. Но если приложение завершается с <code>os.Exit(0)</code> из-за фатальной ошибки в логике (которую вы считаете "нормальным" выходом), Systemd радостно поднимет его снова. Используйте <code>Restart=on-failure</code>, чтобы перезапуск шел только при ненулевом коде возврата или сигналах вроде <code>SIGSEGV</code>.</p>
+    <p>Указание <code>Restart=always</code> таит скрытую угрозу. Если администратор или автоматика деплоя намеренно отправляет процессу сигнал завершения, а код из-за бага завершается с ненулевым статусом или, напротив, падает в бесконечный цикл рестартов при фатальной ошибке в конфигурации, <code>always</code> заставит Systemd непрерывно перезапускать сломанный процесс, сжигая CPU и спамя в логи.</p>
+<p>Если же приложение завершается с кодом <code>0</code> (<code>os.Exit(0)</code>), Systemd при <code>Restart=on-failure</code> справедливо решит, что задача успешно выполнена, и не будет инициировать рестарт. Применяйте <code>Restart=on-failure</code>: перезапуск произойдет только при аварийном завершении по сигналу (<code>SIGSEGV</code>, <code>SIGABRT</code>) или ненулевом коде возврата (<code>exit code != 0</code>).</p>
   </div>
 </div>
 
-<h2 id="typenotify-idealnyy-graceful-startup">Type=notify: Идеальный Graceful Startup</h2>
+<hr />
+<h2 id="3-typenotify-idealnyy-graceful-startup-bez-poteri-zaprosov">3. Type=notify: Идеальный Graceful Startup без потери запросов</h2>
 
-<p>Самый частый тип сервиса — <code>Type=simple</code>. Systemd считает процесс запущенным сразу после вызова <code>fork()</code> и <code>exec()</code>. Но что, если вашему Go-бэкенду нужно 5 секунд на прогрев кэшей и установку соединений с БД, прежде чем он сможет принимать трафик? При <code>Type=simple</code> балансировщик начнет слать запросы еще не готовому приложению.</p>
-<p>Решение — <code>Type=notify</code>. В этом режиме Systemd ждет, что процесс сам отправит ему уведомление "Я готов".</p>
-<p>В Go для этого существует официальная библиотека от создателей Systemd (RedHat):</p>
+<p>По умолчанию Systemd использует <code>Type=simple</code>. В этом режиме Systemd считает сервис готовым сразу после того, как родительский процесс выполнил системные вызовы <code>fork()</code> и <code>exec()</code>.</p>
+<p>Однако реальному Go-бэкенду требуется время на прогрев:<br />
+* Чтение и валидация конфигурации.<br />
+* Инициализация пула соединений с PostgreSQL или Redis.<br />
+* Применение миграций схемы данных.<br />
+* Прогрев внутренних in-memory кэшей.</p>
+<p>Если балансировщик нагрузки (nginx, HAProxy) или зависимые сервисы начнут направлять трафик сразу после перехода сервиса в статус <code>active (running)</code>, клиенты получат пачку ошибок <code>502 Bad Gateway</code> или <code>Connection Refused</code>.</p>
+<p>Решение — <code>Type=notify</code>. При таком подходе Systemd переводит юнит в активный статус <strong>только после явного уведомления от самого Go-приложения</strong>. Связь осуществляется через UNIX-сокет датаграмм, путь к которому Systemd передает в переменной окружения <code>NOTIFY_SOCKET</code> (или <code>NotificationSocket=/run/myapp-notify.sock</code>).</p>
+<p>Для взаимодействия с Systemd используется официальная библиотека от создателей Systemd (RedHat) — <code>github.com/coreos/go-systemd/v22/daemon</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2265,8 +2325,13 @@ WantedBy=multi-user.target
   <pre class="language-go"><code class="language-go">package main
 
 import (
+    &quot;context&quot;
+    &quot;errors&quot;
     &quot;log&quot;
     &quot;net/http&quot;
+    &quot;os&quot;
+    &quot;os/signal&quot;
+    &quot;syscall&quot;
     &quot;time&quot;
 
     &quot;github.com/coreos/go-systemd/v22/daemon&quot;
@@ -2275,39 +2340,65 @@ import (
 func main() {
     mux := http.NewServeMux()
     mux.HandleFunc(&quot;/&quot;, func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
         w.Write([]byte(&quot;Hello, Systemd!&quot;))
     })
 
-    srv := &amp;http.Server{Addr: &quot;:8080&quot;, Handler: mux}
+    srv := &amp;http.Server{
+        Addr:    &quot;:8080&quot;,
+        Handler: mux,
+    }
 
-    // Имитация долгой инициализации (прогрев кэша, миграции)
+    // 1. Долгая инициализация: прогрев кэшей, проверка базы данных
     log.Println(&quot;Warming up cache...&quot;)
     time.Sleep(3 * time.Second)
 
+    // 2. Запуск HTTP-сервера в отдельной горутине
     go func() {
-        if err := srv.ListenAndServe(); err != nil &amp;&amp; err != http.ErrServerClosed {
+        if err := srv.ListenAndServe(); err != nil &amp;&amp; !errors.Is(err, http.ErrServerClosed) {
             log.Fatalf(&quot;Server failed: %v&quot;, err)
         }
     }()
 
-    // Отправляем уведомление Systemd! Теперь порт считается доступным.
+    // 3. Отправляем сигнал READY=1 в сокет Systemd. Теперь сервис официально готов!
     sent, err := daemon.SdNotify(false, daemon.SdNotifyReady)
     if err != nil {
         log.Printf(&quot;Failed to notify systemd: %v&quot;, err)
-    }
-    if sent {
+    } else if sent {
         log.Println(&quot;Systemd notified: service is ready&quot;)
     }
 
-    // ... код ожидания SIGTERM для Graceful Shutdown ...
+    // 4. Ожидание сигнала Graceful Shutdown от Systemd
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+    sig := &lt;-quit
+    log.Printf(&quot;Received signal %s, starting graceful shutdown...&quot;, sig)
+
+    // Уведомляем Systemd, что мы начали процесс остановки
+    daemon.SdNotify(false, daemon.SdNotifyStopping)
+
+    ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+    defer cancel()
+
+    if err := srv.Shutdown(ctx); err != nil {
+        log.Printf(&quot;HTTP server forced to shutdown: %v&quot;, err)
+    }
+
+    log.Println(&quot;Service cleanly stopped&quot;)
 }
 </code></pre>
 </div>
 
-<h2 id="systemd-socket-activation-nulevoe-vremya-prostoya-zero-downtime">Systemd Socket Activation: Нулевое время простоя (Zero-downtime)</h2>
+<hr />
+<h2 id="4-systemd-socket-activation-nulevoy-prostoy-zero-downtime">4. Systemd Socket Activation: Нулевой простой (Zero-downtime)</h2>
 
-<p>Самая мощная, но редко используемая фича Systemd — <strong>Socket Activation</strong>. Идея позаимствована у <code>inetd</code> из старого Unix: Systemd (PID 1) открывает сокет (например, порт 8080) <em>до</em> запуска вашего приложения.</p>
-<p>Когда приходит первый HTTP-запрос, ядро ставит его в очередь SYN/ACCEPT на сокете, открытом Systemd. Systemd видит активность, запускает ваш Go-бинарник и передает ему файловый дескриптор этого сокета через переменную окружения (<code>LISTEN_PID</code> и <code>LISTEN_FDS</code>). Go подхватывает соединение и начинает обработку.</p>
+<p>Одна из самых мощных концепций Unix, восходящая к классическому демону <code>inetd</code>, — <strong>активация по сокету (Socket Activation)</strong>.</p>
+<p>В стандартной модели приложение само вызывает <code>socket()</code>, <code>bind()</code> и <code>listen()</code>. В модели Socket Activation сетевой сокет открывает сам <strong>Systemd</strong> (PID 1) на этапе загрузки операционной системы. </p>
+<p>Когда внешний клиент инициирует TCP-соединение (отправляет пакет <code>TCP SYN</code>):<br />
+1. Ядро Linux помещает входящее соединение в очередь ожидания сокета (<code>SYN backlog</code>), удерживаемого Systemd.<br />
+2. Systemd мгновенно запускает Go-бинарник.<br />
+3. Systemd передает открытый файловый дескриптор сокета новому процессу по наследству через переменные окружения <code>LISTEN_PID</code> и <code>LISTEN_FDS</code>.<br />
+4. Go-рантайм через пакет <code>net</code> оборачивает полученный файловый дескриптор в <code>net.Listener</code> и начинает обработку запросов.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2331,14 +2422,85 @@ E --&gt;|&quot;3\. Чтение запроса&quot;| F[&quot;HTTP Handler&quot;
 </div>
 
 
-<p><strong>Зачем это нужно бэкендеру?</strong><br />
-1. <strong>Мгновенный старт</strong>: Сокет открыт всегда. Пока ваше приложение стартует, запросы копятся в буфере ядра (TCP backlog). Клиенты получают задержку, но не ошибку <code>Connection Refused</code>.<br />
-2. <strong>Dynamic Scaling</strong>: Можно настроить Systemd так, чтобы он запускал несколько инстансов вашего Go-приложения при росте нагрузки на сокет (хотя в эпоху K8s это делается реже).</p>
-<p>В Go пакет <code>net</code> умеет "из коробки" подхватывать FD от Systemd через <code>net.Listen()</code> с использованием <code>systemd.ListenFDs</code>.</p>
-<h2 id="systemd-cgroups-i-gomemlimit">Systemd, Cgroups и GOMEMLIMIT</h2>
+<h3 id="preimushchestva-socket-activation-dlya-bekendera">Преимущества Socket Activation для бэкендера:</h3>
+<ol>
+<li><strong>Мгновенный старт и нулевой downtime:</strong> Сокет открыт всегда. Пока ваше приложение стартует или перезапускается, запросы копятся в буфере ядра (TCP backlog). Клиенты не получают ошибку <code>Connection Refused</code>.</li>
+<li><strong>Dynamic Scaling:</strong> Можно настроить Systemd так, чтобы он запускал несколько инстансов приложения при росте нагрузки на сокет.</li>
+</ol>
+<p>В Go пакет <code>net</code> умеет "из коробки" подхватывать FD от Systemd через <code>net.Listen()</code> с использованием <code>systemd.ListenFDs</code> или библиотеки <code>github.com/coreos/go-systemd/v22/activation</code>:</p>
 
-<p>В предыдущей статье мы упоминали, что Docker использует Cgroups для ограничения памяти. Systemd делает то же самое. Директива <code>MemoryMax=512M</code> в unit-файле создаст Cgroup, и ядро Linux убьет ваш Go-процесс (OOM Kill), если он превысит 512 МБ.</p>
-<p>Но есть нюанс. До версии Go 1.19 сборщик мусора (GC) не знал о лимитах Cgroups. Он видел всю память хоста и думал: "Памяти еще вагон, можно не торопиться с очисткой". В итоге процесс аллоцировал память до упора и получал SIGKILL.</p>
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;log&quot;
+    &quot;net&quot;
+    &quot;net/http&quot;
+
+    &quot;github.com/coreos/go-systemd/v22/activation&quot;
+)
+
+func main() {
+    listeners, err := activation.Listeners()
+    if err != nil {
+        log.Fatalf(&quot;Failed to retrieve listeners: %v&quot;, err)
+    }
+
+    var l net.Listener
+    if len(listeners) &gt; 0 {
+        // Подхватили сокет от Systemd!
+        l = listeners[0]
+        log.Printf(&quot;Running via Systemd Socket Activation on %s&quot;, l.Addr())
+    } else {
+        // Локальный запуск без Systemd (для разработки)
+        l, err = net.Listen(&quot;tcp&quot;, &quot;:8080&quot;)
+        if err != nil {
+            log.Fatalf(&quot;Failed to listen: %v&quot;, err)
+        }
+        log.Printf(&quot;Running standalone on %s&quot;, l.Addr())
+    }
+    defer l.Close()
+
+    http.Serve(l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        w.Write([]byte(&quot;Handled via socket activation!&quot;))
+    }))
+}
+</code></pre>
+</div>
+
+<p>Для этого создается парный юнит <code>/etc/systemd/system/myapp.socket</code>:</p>
+
+<div class="code-block" data-lang="ini">
+  <div class="code-header">
+    <span class="code-lang-tag">INI</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-ini"><code class="language-ini">[Unit]
+Description=Socket for My Awesome Go Backend
+
+[Socket]
+ListenStream=8080
+
+[Install]
+WantedBy=sockets.target
+</code></pre>
+</div>
+
+<hr />
+<h2 id="5-systemd-cgroups-i-gomemlimit">5. Systemd, Cgroups и GOMEMLIMIT</h2>
+
+<p>Systemd опирается на подсистему контрольных групп ядра (<strong>Cgroups</strong>). Директива <code>MemoryMax=512M</code> в unit-файле создаст Cgroup, и ядро Linux убьет ваш Go-процесс (OOM Kill), если он превысит 512 МБ.</p>
+<p>Но есть нюанс. До версии Go 1.19 сборщик мусора (GC) не знал о лимитах Cgroups. Он видел всю оперативную память хоста и думал: "Памяти еще вагон, можно не торопиться с очисткой". В итоге процесс аллоцировал память до упора и получал SIGKILL.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2349,23 +2511,74 @@ E --&gt;|&quot;3\. Чтение запроса&quot;| F[&quot;HTTP Handler&quot;
   </div>
 </div>
 
-<h2 id="zhurnalirovanie-journald-i-strukturirovannye-logi">Журналирование (Journald) и Структурированные логи</h2>
+<hr />
+<h2 id="6-zhurnalirovanie-journald-i-strukturirovannye-logi">6. Журналирование (Journald) и Структурированные логи</h2>
 
-<p>Когда вы пишете в <code>stdout</code> или <code>stderr</code> из Go-приложения под Systemd, данные перехватываются демоном <code>systemd-journald</code>. Это значит, что вам не нужно настраивать ротацию логов (logrotate) вручную — Journald сделает это сам.</p>
-<p>Однако, текстовые логи неудобно парсить системам мониторинга (Loki, ELK). Systemd поддерживает запись структурированных логов в формате JSON, что идеально ложится на пакет <code>log/slog</code> в Go (начиная с версии 1.21).</p>
-<p>Для записи JSON прямо в Journald с правильными полями можно использовать библиотеку <code>github.com/coreos/go-systemd/v22/journal</code>. </p>
+<p>Когда вы пишете в <code>stdout</code> или <code>stderr</code> из Go-приложения под Systemd, данные автоматически перехватываются демоном <code>systemd-journald</code>. Это значит, что вам не нужно настраивать ротацию логов (logrotate) вручную — Journald сделает это сам: сжимает архивы, ротирует по размеру и времени.</p>
+<p>Однако текстовые логи неудобно парсить системам мониторинга (Loki, ELK). Systemd поддерживает запись структурированных логов в формате JSON, что идеально ложится на пакет <code>log/slog</code> в Go (начиная с версии 1.21).</p>
+<p>Для прямой записи логов в Journald с правильными системными полями и приоритетами можно использовать библиотеку <code>github.com/coreos/go-systemd/v22/journal</code>.</p>
+<p>Пример структурированного логирования через стандартный <code>log/slog</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;log/slog&quot;
+    &quot;os&quot;
+)
+
+func main() {
+    // Вывод JSON в stdout — идеальный формат для Systemd journald
+    logger := slog.New(slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{
+        Level: slog.LevelInfo,
+    }))
+    slog.SetDefault(logger)
+
+    slog.Info(&quot;Service started successfully&quot;, 
+        &quot;module&quot;, &quot;payment&quot;, 
+        &quot;workers&quot;, 16,
+    )
+}
+</code></pre>
+</div>
+
+<p>Просмотр логов в реальном времени:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">journalctl -u myapp.service -f -o json-pretty
+</code></pre>
+</div>
+
+<hr />
+<h2 id="7-tonkosti-graceful-shutdown-i-signaly">7. Тонкости Graceful Shutdown и сигналы</h2>
+
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как Graceful Shutdown в Go связан с директивами <code>KillMode</code> и <code>TimeoutStopSec</code> в Systemd?<br />
-<strong>Ответ:</strong> Когда вы выполняете <code>systemctl restart myapp</code>, Systemd отправляет сигнал, указанный в <code>KillSignal</code> (по умолчанию <code>SIGTERM</code>). <br />
-При <code>KillMode=mixed</code> (рекомендуется): SIGTERM отправляется только главному процессу (Control Group). Если процесс не завершится за <code>TimeoutStopSec</code> (обычно 90с по умолчанию), Systemd отправит <code>SIGKILL</code> всей Cgroup. Ваш код на Go должен успеть завершить HTTP-обработчики и закрыть БД за это время. В Go <code>http.Server.Shutdown</code> как раз и нужен для того, чтобы процесс завершился до жесткого <code>SIGKILL</code> от Systemd. Если время остановки велико, вы можете увеличить <code>TimeoutStopSec=30s</code> в unit-файле.</p>
+    <p><strong>Вопрос:</strong> Как Graceful Shutdown в Go связан с директивами <code>KillMode</code> и <code>TimeoutStopSec</code> в Systemd?</p>
+<p><strong>Ответ:</strong> Когда вы выполняете <code>systemctl restart myapp</code> (или <code>systemctl stop myapp</code>), Systemd отправляет сигнал, указанный в <code>KillSignal</code> (по умолчанию <code>SIGTERM</code>).</p>
+<p>При <code>KillMode=mixed</code> (рекомендуется): <code>SIGTERM</code> отправляется только главному процессу (Control Group). Если процесс не завершится за <code>TimeoutStopSec</code> (обычно 90с по умолчанию), Systemd отправит <code>SIGKILL</code> всей Cgroup. Ваш код на Go должен успеть завершить HTTP-обработчики и закрыть БД за это время. В Go <code>http.Server.Shutdown</code> как раз и нужен для того, чтобы процесс завершился до жесткого <code>SIGKILL</code> от Systemd. Если время остановки велико, вы можете настроить <code>TimeoutStopSec=30</code> или увеличить <code>TimeoutStopSec=30s</code> в unit-файле.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
@@ -2403,7 +2616,7 @@ E --&gt;|&quot;3\. Чтение запроса&quot;| F[&quot;HTTP Handler&quot;
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#ot-demonizatsii-k-systemd">От демонизации к Systemd</a></li><li class="toc-item toc-h2"><a href="#anatomiya-unit-fayla">Анатомия Unit-файла</a></li><li class="toc-item toc-h2"><a href="#typenotify-idealnyy-graceful-startup">Type=notify: Идеальный Graceful Startup</a></li><li class="toc-item toc-h2"><a href="#systemd-socket-activation-nulevoe-vremya-prostoya-zero-downtime">Systemd Socket Activation: Нулевое время простоя (Zero-downtime)</a></li><li class="toc-item toc-h2"><a href="#systemd-cgroups-i-gomemlimit">Systemd, Cgroups и GOMEMLIMIT</a></li><li class="toc-item toc-h2"><a href="#zhurnalirovanie-journald-i-strukturirovannye-logi">Журналирование (Journald) и Структурированные логи</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-ot-klassicheskoy-demonizatsii-k-deklarativnomu-upravleniyu">1. От классической демонизации к декларативному управлению</a></li><li class="toc-item toc-h3"><a href="#pochemu-v-go-demonizatsiya-opasnyy-antipattern">Почему в Go демонизация — опасный антипаттерн?</a></li><li class="toc-item toc-h2"><a href="#2-anatomiya-etalonnogo-unit-fayla-dlya-go-servisa">2. Анатомия эталонного Unit-файла для Go-сервиса</a></li><li class="toc-item toc-h2"><a href="#3-typenotify-idealnyy-graceful-startup-bez-poteri-zaprosov">3. Type=notify: Идеальный Graceful Startup без потери запросов</a></li><li class="toc-item toc-h2"><a href="#4-systemd-socket-activation-nulevoy-prostoy-zero-downtime">4. Systemd Socket Activation: Нулевой простой (Zero-downtime)</a></li><li class="toc-item toc-h3"><a href="#preimushchestva-socket-activation-dlya-bekendera">Преимущества Socket Activation для бэкендера:</a></li><li class="toc-item toc-h2"><a href="#5-systemd-cgroups-i-gomemlimit">5. Systemd, Cgroups и GOMEMLIMIT</a></li><li class="toc-item toc-h2"><a href="#6-zhurnalirovanie-journald-i-strukturirovannye-logi">6. Журналирование (Journald) и Структурированные логи</a></li><li class="toc-item toc-h2"><a href="#7-tonkosti-graceful-shutdown-i-signaly">7. Тонкости Graceful Shutdown и сигналы</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

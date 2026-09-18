@@ -2169,29 +2169,22 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Stateful приложения</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статьях <a href="2-pod-deployment-service.html" class="wikilink">2. Pod, Deployment, Service</a> и <a href="5-scaling-i-autoscaling.html" class="wikilink">5. Scaling и autoscaling</a> мы рассматривали Go-микросервисы как идеальные stateless-приложения: нет состояния — нет проблем при масштабировании и пересоздании. Но бэкенд — это не только API. Это базы данных (PostgreSQL, MongoDB), брокеры сообщений (Kafka, RabbitMQ) и распределенные кэши (Redis Cluster). </p>
-<p>Попытка запустить такие системы в K8s с помощью Deployment неизбежно приведет к катастрофе. Для stateful-нагрузок Kubernetes предоставляет специальный объект — <strong>StatefulSet</strong>.</p>
-<h2 id="pochemu-deployment-ne-podkhodit-dlya-state">Почему Deployment не подходит для State?</h2>
+            <h1>6. Stateful приложения в Kubernetes: StatefulSet, Headless Service и распределенный консенсус в Go</h1>
+<p>В предыдущих главах (<a href="2-pod-deployment-service.html" class="wikilink">2. Pod, Deployment, Service</a> и <a href="5-scaling-i-autoscaling.html" class="wikilink">5. Scaling и autoscaling</a>) мы рассматривали мир микросервисов глазами разработчика stateless-приложений. В этой идеализированной модели поды эфемерны, легковесны и взаимозаменяемы: их можно уничтожать, перезапускать на других серверах и масштабировать сотнями за считанные секунды. В системном администрировании этот подход называют принципом «Cattle, not Pets» (скот, а не домашние любимцы) — если одна овца в стаде заболела, пастух берет другую без малейших сожалений.</p>
+<p>Но бэкенд не состоит из одного лишь stateless API. Рано или поздно любой прикладной код упирается в хранилище данных: реляционные СУБД (PostgreSQL, MySQL), распределенные документные базы (MongoDB), брокеры сообщений (Apache Kafka, RabbitMQ) или кэширующие кластеры (Redis Cluster).</p>
+<p>Каждая нода в таком кластере — это именно «Pet» (персональный питомец). У нее есть уникальное имя, своя выделенная порция данных на диске, своя роль в репликации (Master или Replica, Leader или Follower). Попытка развернуть такую систему с помощью стандартного <code>Deployment</code> приведет к немедленной катастрофе и порче данных.</p>
+<p>Для управления приложениями, обладающими состоянием, в Kubernetes существует специализированный контроллер — <strong>StatefulSet</strong>.</p>
+<hr />
+<h2 id="1-pochemu-deployment-ne-podkhodit-dlya-state">1. Почему Deployment не подходит для State?</h2>
 
-<p>Представьте, что вы пытаетесь запустить кластер PostgreSQL из 3 нод с помощью Deployment.<br />
-1. <strong>Эфемерные имена</strong>: Поды называются <code>postgres-a1b2</code>, <code>postgres-c3d4</code>. При пересоздании они получают случайные имена. База данных не может понять, кто из них Master, а кто Replica, если их имена меняются при каждом рестарте.<br />
-2. <strong>Эфемерные IP-адреса</strong>: При пересоздании Поды получают новые IP. Другим микросервисам нужно знать стабильный адрес лидера кластера.<br />
-3. <strong>Разделяемое хранилище</strong>: В Deployment все реплики будут использовать один и тот же PersistentVolumeClaim (PVC). Если три процесса Postgres начнут писать в одни и те же файлы на диске одновременно, файловая система разрушится (data corruption).</p>
-<h2 id="statefulset-identichnost-v-mire-khaosa">StatefulSet: Идентичность в мире хаоса</h2>
-
-<p>StatefulSet решает эти проблемы, гарантируя <strong>строгую идентичность</strong> (Sticky Identity) для каждого Пода.</p>
-<ol>
-<li><strong>Стабильные имена</strong>: Поды получают имена с порядковым индексом: <code>postgres-0</code>, <code>postgres-1</code>, <code>postgres-2</code>. Если <code>postgres-1</code> умрет, K8s создаст новый Под с тем же именем <code>postgres-1</code>.</li>
-<li><strong>Стабильный сетевой ID</strong>: В связке с Headless Service (о котором ниже), каждый Под получает предсказуемое DNS-имя: <code>postgres-0.postgres.default.svc.cluster.local</code>.</li>
-<li><strong>Стабильное хранилище</strong>: StatefulSet использует <code>volumeClaimTemplates</code>. При создании Пода <code>postgres-0</code> K8s автоматически создает PVC <code>data-postgres-0</code>. Если Под будет пересоздан, K8s привяжет его к <em>тому же самому</em> PVC.</li>
-</ol>
+<p>Представьте, что наивный инженер попытался запустить отказоустойчивый кластер PostgreSQL из 3 узлов обычным манифестом <code>Deployment</code>:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2206,35 +2199,130 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;StatefulSet - postgres&quot;] --&gt; B[&quot;Pod postgres-0&lt;br&gt;PVC data-postgres-0&quot;]
-A --&gt; C[&quot;Pod postgres-1&lt;br&gt;PVC data-postgres-1&quot;]
-A --&gt; D[&quot;Pod postgres-2&lt;br&gt;PVC data-postgres-2&quot;]
-B --&gt; E[&quot;PV - Диск на ноде A&quot;]
-C --&gt; F[&quot;PV - Диск на ноде B&quot;]
-D --&gt; G[&quot;PV - Диск на ноде C&quot;]
+subgraph BadDeployment[&quot;Deployment: Катастрофа со State&quot;]
+Dep[&quot;Deployment: postgres (replicas: 3)&quot;] --&gt; P1[&quot;Pod: postgres-9f8b2&quot;]
+Dep --&gt; P2[&quot;Pod: postgres-k3x1a&quot;]
+Dep --&gt; P3[&quot;Pod: postgres-7d2q0&quot;]
 
-H[&quot;Headless Service - postgres-hl&quot;] --&gt; I[&quot;A-запись: postgres-0.postgres-hl&quot;]
-H --&gt; J[&quot;A-запись: postgres-1.postgres-hl&quot;]
-H --&gt; K[&quot;A-запись: postgres-2.postgres-hl&quot;]
+P1 --&gt; PVC[&quot;Единый PVC (data-disk)&quot;]
+P2 --&gt; PVC
+P3 --&gt; PVC
+PVC -.-&gt; Corrupt[&quot;💥 Data Corruption!&lt;br&gt;3 процесса пишут в одну ФС!&quot;]
+end
   </pre>
 </div>
 
 
+<p>Что пойдет не так?<br />
+1. <strong>Эфемерные имена подов:</strong> Контроллер Deployment генерирует случайные хэш-суффиксы: поды называются <code>postgres-a1b2</code>, <code>postgres-c3d4</code>. При любом рестарте или падении ноды под пересоздается с совершенно новым случайным именем. Кластер СУБД не способен понять, кто из них Master, а кто Replica, если идентификаторы непрерывно меняются.<br />
+2. <strong>Эфемерные сетевые IP-адреса:</strong> Поды получают новые динамические IP-адреса. Реплика не знает, к кому подключаться для потоковой репликации WAL.<br />
+3. <strong>Разделяемое дисковое хранилище (Катастрофа ФС):</strong> В спецификации Deployment все три реплики ссылаются на один и тот же <code>PersistentVolumeClaim</code> (PVC). Если три независимых процесса PostgreSQL одновременно примонтируют один и тот же блочный том и начнут параллельно модифицировать системные файлы каталога <code>$PGDATA</code>, файловая система разрушится (Data Corruption) за секунды.</p>
+<hr />
+<h2 id="2-statefulset-identichnost-v-mire-khaosa">2. StatefulSet: Идентичность в мире хаоса</h2>
+
+<p>Контроллер <strong>StatefulSet</strong> радикально меняет правила игры, гарантируя <strong>строгую идентичность (Sticky Identity)</strong> для каждого пода на протяжении всей его жизни.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph SS[&quot;StatefulSet: postgres&quot;]
+SS_Ctrl[&quot;StatefulSet Controller&quot;] --&gt; P0[&quot;Pod: postgres-0&quot;]
+SS_Ctrl --&gt; P1[&quot;Pod: postgres-1&quot;]
+SS_Ctrl --&gt; P2[&quot;Pod: postgres-2&quot;]
+
+P0 --&gt; PVC0[&quot;PVC: data-postgres-0&quot;]
+P1 --&gt; PVC1[&quot;PVC: data-postgres-1&quot;]
+P2 --&gt; PVC2[&quot;PVC: data-postgres-2&quot;]
+
+PVC0 --&gt; D0[&quot;PV 0 (Dedicated EBS/NVMe)&quot;]
+PVC1 --&gt; D1[&quot;PV 1 (Dedicated EBS/NVMe)&quot;]
+PVC2 --&gt; D2[&quot;PV 2 (Dedicated EBS/NVMe)&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Ключевые гарантии StatefulSet:<br />
+1. <strong>Стабильные детерминированные имена:</strong> Поды получают строго фиксированные имена с порядковым нулевым индексом: <code>postgres-0</code>, <code>postgres-1</code>, <code>postgres-2</code>. Если под <code>postgres-1</code> падает или нода сгорает, Kubernetes пересоздаст под именно с именем <code>postgres-1</code>.<br />
+2. <strong>Стабильное хранилище (<code>volumeClaimTemplates</code>):</strong> В отличие от Deployment, в StatefulSet описывается не статическая ссылка на диск, а шаблон клейма <code>volumeClaimTemplates</code>. Для каждого пода <code>postgres-N</code> создается свой персональный PVC <code>data-postgres-N</code>. При рестарте пода на любой другой ноде кластера Kubernetes гарантированно примонтирует к нему <em>ровно его собственный старый диск</em>.<br />
+3. <strong>Строгая очередность запуска и удаления:</strong> <br />
+   Поды разворачиваются последовательно: <code>0</code> -&gt; <code>1</code> -&gt; <code>2</code>. Под <code>postgres-1</code> не начнет создаваться до тех пор, пока <code>postgres-0</code> не перейдет в статус <code>Running</code> и успешно не пройдет <code>Readiness Probe</code>. Удаление при масштабировании вниз (Scale Down) происходит в строго обратном порядке: <code>2</code> -&gt; <code>1</code> -&gt; <code>0</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Жизненный цикл и распределенный консенсус</span>
   </div>
   <div class="callout-body">
-    <p>В StatefulSet lifecycle (жизненный цикл) строго упорядочен. Поды создаются последовательно: сначала <code>0</code>, затем <code>1</code>, затем <code>2</code>. Удаление происходит в обратном порядке. K8s не запустит <code>postgres-1</code>, пока <code>postgres-0</code> не перейдет в статус <code>Running</code> и не пройдет Readiness Probe. Это критично для распределенных систем (например, Raft-кластеров), где узлы должны инициализировать кворум по очереди.</p>
+    <p>Строгая очередность запуска жизненно необходима для распределенных баз данных и консенсусных протоколов (Raft, Paxos, Zookeeper). Первому узлу (<code>node-0</code>) необходимо инициализировать кластер и корневые структуры метаданных. Последующие узлы при старте обязаны обнаружить уже работающего лидера, чтобы подключиться к кворуму.</p>
   </div>
 </div>
 
-<h2 id="headless-service-setevoy-yakor">Headless Service: Сетевой якорь</h2>
+<hr />
+<h2 id="3-headless-service-setevoy-yakor-i-pryamoy-dostup-k-nodam">3. Headless Service: Сетевой якорь и прямой доступ к нодам</h2>
 
-<p>Чтобы сделать DNS-имена Подов StatefulSet разрешимыми, необходимо создать Service с полем <code>clusterIP: None</code>. Это называется <strong>Headless Service</strong>.</p>
-<p>Обычный Service балансирует трафик между всеми Подами случайным образом и возвращает один виртуальный IP (ClusterIP). Headless Service <em>не выделяет IP</em>. Когда ваше Go-приложение делает DNS-запрос к <code>postgres-1.postgres-hl</code>, CoreDNS возвращает <em>прямой IP-адрес Пода <code>postgres-1</code></em>.</p>
-<p>Это позволяет вашему Go-коду обращаться к конкретному экземпляру БД напрямую, что необходимо для записи (только Master) или чтения со специфической реплики.</p>
+<p>Обычный Kubernetes Service агрегирует поды за единым виртуальным IP-адресом (<code>ClusterIP</code>) и случайным образом раскидывает трафик. Но как нашему Go-приложению отправить запрос на запись строго в Master-ноду <code>postgres-0</code>, а тяжелые аналитические <code>SELECT</code> запросы распределить по репликам <code>postgres-1</code> и <code>postgres-2</code>?</p>
+<p>Для этого создается специальный сервис без виртуального IP — <strong>Headless Service</strong> (задается директивой <code>clusterIP: None</code>):</p>
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-hl
+spec:
+  clusterIP: None # Ключевой признак Headless Service
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    name: postgresql
+</code></pre>
+</div>
+
+<p>В связке со StatefulSet внутренний DNS-сервер Kubernetes (CoreDNS) начинает генерировать индивидуальные A/AAAA-записи для каждого пода по предсказуемому шаблону:<br />
+<code>&lt;pod-name&gt;.&lt;service-name&gt;.&lt;namespace&gt;.svc.cluster.local</code></p>
+<p>Например:<br />
+* <code>postgres-0.postgres-hl.default.svc.cluster.local</code> -&gt; отдает прямой IP-адрес пода <code>postgres-0</code>.<br />
+* <code>postgres-1.postgres-hl.default.svc.cluster.local</code> -&gt; отдает прямой IP-адрес пода <code>postgres-1</code>.<br />
+* <code>postgres-2.postgres-hl.default.svc.cluster.local</code> -&gt; отдает прямой IP-адрес пода <code>postgres-2</code>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+GoClient[&quot;Go Backend Client&quot;] --&gt;|&quot;DNS query: postgres-0.postgres-hl&quot;| CoreDNS[&quot;CoreDNS&quot;]
+CoreDNS --&gt;|&quot;A-record: 10.244.1.45 (Pod Direct IP)&quot;| GoClient
+GoClient --&gt;|&quot;Прямой коннект: порт 5432&quot;| Pod0[&quot;Pod: postgres-0 (Master)&quot;]
+  </pre>
+</div>
+
+
+<p>Теперь в коде на Go мы можем явно настроить пулы соединений для записи и чтения:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2244,64 +2332,147 @@ H --&gt; K[&quot;A-запись: postgres-2.postgres-hl&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// В Go мы можем явно подключаться к Master-узлу
-db, err := sql.Open(&quot;pgx&quot;, &quot;postgres://user:pass@postgres-0.postgres-hl:5432/mydb?sslmode=disable&quot;)
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;database/sql&quot;
+    &quot;log&quot;
+    _ &quot;github.com/jackc/pgx/v5/stdlib&quot;
+)
+
+func main() {
+    // Прямое подключение к мастер-узлу через DNS-имя Headless Service
+    masterDSN := &quot;postgres://user:pass@postgres-0.postgres-hl:5432/mydb?sslmode=disable&quot;
+    dbMaster, err := sql.Open(&quot;pgx&quot;, masterDSN)
+    if err != nil {
+        log.Fatalf(&quot;failed to connect to master: %v&quot;, err)
+    }
+    defer dbMaster.Close()
+
+    // Реплика для чтения отчетов
+    replicaDSN := &quot;postgres://user:pass@postgres-1.postgres-hl:5432/mydb?sslmode=disable&quot;
+    dbReplica, err := sql.Open(&quot;pgx&quot;, replicaDSN)
+    if err != nil {
+        log.Fatalf(&quot;failed to connect to replica: %v&quot;, err)
+    }
+    defer dbReplica.Close()
+
+    log.Println(&quot;Успешное разделение потоков чтения и записи!&quot;)
+}
 </code></pre>
 </div>
 
-<h2 id="go-i-raft-pishem-svoy-stateful-servis">Go и Raft: Пишем свой Stateful-сервис</h2>
+<hr />
+<h2 id="4-go-i-raft-pishem-svoy-sobstvennyy-raspredelennyy-servis">4. Go и Raft: Пишем свой собственный распределенный сервис</h2>
 
-<p>Для Go-разработчиков StatefulSet особенно актуален. Go идеально подходит для написания распределенных систем (Distributed Systems) с использованием алгоритма консенсуса <strong>Raft</strong> (библиотеки <code>hashicorp/raft</code>, <code>etcd-io/raft</code>). </p>
-<p>Если вы пишете сервис (например, in-memory key-value store с персистентностью), ему требуются:<br />
-1. Стабильные идентификаторы узлов для конфигурации кластера (Raft требует жестко заданный список пиров при старте).<br />
-2. Персистентный WAL (Write-Ahead Log) на диске, который нельзя терять при пересоздании Пода.</p>
-<p>В этом случае Deployment совершенно бесполезен. Вы описываете StatefulSet, передаете список пиров в Go-код через env vars (например, <code>RAFT_PEERS=raft-0.raft-hl,raft-1.raft-hl,raft-2.raft-hl</code>), и используете <code>volumeClaimTemplates</code> для хранения WAL логов.</p>
-<h2 id="lovushki-statefulset-v-production">Ловушки StatefulSet в Production</h2>
+<p>Язык Go стал признанным стандартом для создания распределенных систем высокой надежности: Kubernetes, etcd, CockroachDB, Consul, HashiCorp Vault — все они написаны на Go.</p>
+<p>Сердцем большинства этих систем является алгоритм распределенного консенсуса <strong>Raft</strong> (реализованный в виде библиотек <code>hashicorp/raft</code> или <code>etcd-io/raft</code>). Если вы разрабатываете отказоустойчивое хранилище на Go, вам неизбежно потребуется запускать его в Kubernetes как StatefulSet.</p>
 
-<p>Управление StatefulSet гораздо сложнее, чем Deployment. K8s не будет автоматически чинить всё за вас.</p>
-<h3 id="1-rolling-updates-i-poter">1. Rolling Updates и потер</h3>
-<p>я Кворума<br />
-По умолчанию стратегия обновления StatefulSet — <code>RollingUpdate</code>. K8s обновит <code>postgres-2</code>, затем <code>postgres-1</code>, затем <code>postgres-0</code>.<br />
-Если в вашем Raft-кластере из 3 нод новая версия бинарника не стартует (падает с паникой), после обновления <code>postgres-2</code> и <code>postgres-1</code> кластер потеряет кворум (жив только <code>postgres-0</code>). Вся база данных станет недоступна для записи.</p>
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph RaftCluster[&quot;Raft Cluster (3 узла)&quot;]
+R0[&quot;raft-0\n(Leader)&quot;] &lt;--&gt;|&quot;AppendEntries / Heartbeat&quot;| R1[&quot;raft-1\n(Follower)&quot;]
+R0 &lt;--&gt;|&quot;AppendEntries / Heartbeat&quot;| R2[&quot;raft-2\n(Follower)&quot;]
+
+R0 --&gt; WAL0[(&quot;Write-Ahead Log\n(data-raft-0)&quot;)]
+R1 --&gt; WAL1[(&quot;Write-Ahead Log\n(data-raft-1)&quot;)]
+R2 --&gt; WAL2[(&quot;Write-Ahead Log\n(data-raft-2)&quot;)]
+end
+  </pre>
+</div>
+
+
+<p>Почему именно StatefulSet?<br />
+1. <strong>Жесткий список пиров при инициализации:</strong> Библиотекам Raft требуется статический список адресов участников для формирования первоначального кворума. Мы передаем его через переменные окружения:<br />
+<code>RAFT_PEERS=raft-0.raft-hl,raft-1.raft-hl,raft-2.raft-hl</code>.<br />
+2. <strong>Персистентность Write-Ahead Log (WAL):</strong> Все изменения состояния сначала сериализуются на диск в журнал упреждающей записи (Write-Ahead Log). Потеря диска при перезапуске пода означает потерю локальной истории коммитов и необходимость долгой передачи снапшота от лидера по сети. <code>volumeClaimTemplates</code> гарантирует, что том с WAL останется привязанным к тому же пиру.</p>
+<hr />
+<h2 id="5-lovushki-statefulset-v-production-o-chem-molchit-dokumentatsiya">5. Ловушки StatefulSet в Production: О чем молчит документация</h2>
+
+<p>Эксплуатация StatefulSet в боевых условиях требует железной дисциплины: здесь ошибки конфигурации не прощаются планировщиком.</p>
+<h3 id="5-1-rolling-updates-i-poterya-kvoruma">5.1. Rolling Updates и потеря Кворума</h3>
+<p>По умолчанию стратегия обновления StatefulSet — <code>RollingUpdate</code>. Контроллер начинает последовательное обновление с пода с наибольшим индексом: обновляет <code>postgres-2</code>, дожидается готовности, затем переходит к <code>postgres-1</code>, и наконец к <code>postgres-0</code>.</p>
+<p>Представьте, что в новую версию бинарника закралась ошибка (паника в <code>main.go</code>). <br />
+* Под <code>postgres-2</code> обновляется и падает в <code>CrashLoopBackOff</code>.<br />
+* Если автоматика продолжит обновление и уронит <code>postgres-1</code>, в кластере из 3 нод живой останется лишь одна нода (<code>postgres-0</code>). <br />
+* В распределенных системах большинство (кворум) вычисляется по формуле $\lfloor N/2 \rfloor + 1$. Для 3 нод кворум равен 2. Потеря двух нод означает полную потерю кворума: кластер мгновенно блокирует все операции записи!</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Защита кворума при обновлениях</span>
   </div>
   <div class="callout-body">
-    <p>Для обновления Stateful-приложений часто используют стратегию <code>OnDelete</code> (вы обновляете образ в манифесте, но K8s <em>не перезапускает</em> Поды автоматически) или <code>RollingUpdate</code> с параметром <code>partition</code>. Partition позволяет обновить только часть Подов (canary), не трогая стабильное ядро кластера.</p>
+    <p>Для критических систем используйте стратегию <code>OnDelete</code> (манифест обновляется, но Kubernetes не трогает работающие поды до тех пор, пока инженер вручную не удалит конкретный под) либо директиву <code>partition</code> в <code>RollingUpdate</code>:</p>
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 2
+</code></pre>
+</div>
+
+<p>При <code>partition: 2</code> контроллер обновит исключительно под с индексом 2 (канареечный запуск — canary). Поды с индексами 0 и 1 останутся на старой стабильной версии. Вы сможете проверить работу новой версии под нагрузкой, не рискуя кворумом.</p>
   </div>
 </div>
 
-<h3 id="2-persistentvolume-reclaim-policy">2. PersistentVolume Reclaim Policy</h3>
-<p>Когда вы удаляете StatefulSet, K8с удаляет Поды, но <strong>не удаляет PVC</strong> (PersistentVolumeClaims). Это защита от случайной потери данных. Однако, диски в облаке стоят денег. <br />
-Если вы удаляете namespace целиком, PVC удалятся, и сработает политика <code>Reclaim Policy</code> (обычно <code>Delete</code> для StorageClass по умолчанию). Ваши данные испарятся.</p>
+<h3 id="5-2-persistentvolume-reclaim-policy-kuda-ischezayut-diski">5.2. PersistentVolume Reclaim Policy: Куда исчезают диски?</h3>
+<p>Когда вы удаляете объект StatefulSet командой <code>kubectl delete statefulset postgres</code>, Kubernetes удаляет поды, но <strong>намеренно оставляет нетронутыми PVC</strong> (<code>PersistentVolumeClaim</code>). Это сделано для предотвращения случайного уничтожения данных.</p>
+<p>Однако если администратор удаляет весь namespace, или в StorageClass установлена политика <code>Reclaim Policy: Delete</code>, облачный провайдер немедленно форматирует и удаляет блочные диски (EBS тома в AWS). Для баз данных всегда настраивайте <code>Reclaim Policy: Retain</code>, чтобы физические диски оставались в облаке даже при ошибочном удалении манифестов.</p>
 <h3 id="3-udalenie-poda-so-slomannoy-nodoy">3. Удаление Пода со "сломанной" нодой</h3>
-<p>Если нода (сервер) падает (отключилось питание), K8s обычно не может удалить Pod с этой ноды (он зависнет в статусе <code>Terminating</code> навсегда, так как Kubelet мертв и не отсоединяет том). <br />
-StatefulSet не создаст новый Под на другой ноде, пока старый полностью не будет удален (иначе два Пода будут писать в один диск — split-brain).</p>
-<p>Администратору придется вручную удалять Под с флагом <code>--force --grace-period=0</code>, а затем принудительно отсоединять Volume от упавшей ноды в облаке, прежде чем K8s сможет примонтировать его на новую ноду.</p>
+<p>Если физический сервер внезапно обесточился, <code>kubelet</code> на этой ноде умирает. Kubernetes видит потерю связи, но <strong>не имеет права</strong> автоматически пересоздать под StatefulSet на другом сервере. </p>
+<p>Почему? Потому что K8s не знает, действительно ли сервер мертв, или произошла изоляция сети (сетевой раскол — network partition). Если под с тем же именем и тем же диском запустится на другой ноде, пока старый под все еще пишет на диск, произойдет непоправимый раскол мозга (<strong>split-brain</strong>).</p>
+<p>Под зависает в статусе <code>Terminating</code>. Чтобы вернуть кластер к жизни, инженеру приходится:<br />
+1. Физически удостовериться, что старый сервер выключен.<br />
+2. Принудительно удалить под командой:<br />
+<code>kubectl delete pod postgres-1 --force --grace-period=0</code>.<br />
+3. В облачной панели принудительно отсоединить том от зависшей виртуальной машины.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос для собеседования: Безопасный Scale Down базы данных</span>
   </div>
   <div class="callout-body">
     <p><strong>Вопрос:</strong> Как безопасно уменьшить (scale down) размер StatefulSet с 5 до 3 реплик?<br />
-<strong>Ответ:</strong> При scale down StatefulSet удаляет Поды с <em>наибольшими индексами</em> (<code>4</code>, затем <code>3</code>). Но соответствующие им PVC (<code>data-postgres-4</code>, <code>data-postgres-3</code>) <strong>не удаляются</strong>. Если позже вы сделаете scale up обратно до 5, новые Поды <code>postgres-4</code> и <code>postgres-3</code> подхватят старые диски. <br />
-Для баз данных это фатально: старые данные на дисках могут не совпадать с текущим состоянием кластера (<em>replication lag</em>). Перед scale down необходимо вывести узлы из кластера БД программно (через API БД), очистить данные, и только после этого удалить PVC вручную.</p>
+<strong>Ответ:</strong> При масштабировании вниз контроллер удаляет поды с <em>наибольшими порядковыми номерами</em> (<code>4</code>, затем <code>3</code>). Однако связанные с ними диски (<code>data-postgres-4</code>, <code>data-postgres-3</code>) <strong>не удаляются</strong>.</p>
+<p>Если через неделю нагрузка вырастет, и вы вернете <code>replicas: 5</code>, вновь созданные поды подключат эти старые диски со старыми данными недельной давности! Из-за отставания репликации (<em>replication lag</em>) и рассинхронизации журналов база данных выдаст фатальную ошибку репликации.</p>
+<p><strong>Правильный протокол:</strong><br />
+1. Программно исключить узлы 4 и 3 из топологии кластера БД через команды самой СУБД (дерегистрация ноды).<br />
+2. Снизить <code>replicas: 3</code> в манифесте StatefulSet.<br />
+3. Вручную удалить отвязавшиеся PVC <code>data-postgres-4</code> и <code>data-postgres-3</code>.</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>StatefulSet</strong> гарантирует уникальные имена, DNS-идентичность и стабильное прикрепление дисков для каждого Пода.</li>
-<li><strong>volumeClaimTemplates</strong> создает изолированный диск для каждого инстанса, предотвращая data corruption.</li>
-<li><strong>Headless Service</strong> позволяет Go-приложениям напрямую обращаться к конкретным узлам (например, к Master БД).</li>
-<li><strong>Go и Raft</strong>: Написание распределенных систем на Go требует глубокого понимания StatefulSet, так как алгоритмы консенсуса не работают в хаосе Deployment.</li>
-<li><strong>Опасность Updates</strong>: Автоматические Rolling Updates могут убить кворум. Используйте <code>OnDelete</code> или <code>partition</code>.</li>
+<li><strong>Deployment vs StatefulSet:</strong> Deployment предназначен для взаимозаменяемых stateless-подов. StatefulSet необходим для сервисов с состоянием, требующих стабильных сетевых имен и персональных томов.</li>
+<li><strong>Гарантия идентичности:</strong> Имена подов индексируются (<code>0, 1, 2...</code>), поды запускаются и удаляются в строгом порядке, а <code>volumeClaimTemplates</code> привязывает выделенный PVC к конкретному индексу.</li>
+<li><strong>Headless Service (<code>clusterIP: None</code>):</strong> Дает Go-приложениям возможность получать прямые IP-адреса конкретных нод кластера через CoreDNS для разделения операций чтения и записи.</li>
+<li><strong>Go и алгоритмы консенсуса:</strong> Разработка отказоустойчивых сервисов на базе Raft (<code>hashicorp/raft</code>, <code>etcd-io/raft</code>) опирается на стабильные DNS-имена и персистентность WAL в StatefulSet.</li>
+<li><strong>Осторожность с обновлениями:</strong> Обновления могут нарушить кворум. Используйте стратегию <code>partition</code> или <code>OnDelete</code> для безопасного развертывания.</li>
 </ol>
-<p>Stateful-приложения жестко привязаны к дисковому IO и сети. Если сеть между Pod'ами в StatefulSet начнет терять пакеты, Raft-кластер развалится. В следующей статье мы разберем фундаментальную проблему сетевой связности в K8s и то, как она решается: <a href="7-networking-v-kubernetes.html" class="wikilink">7. Networking в Kubernetes</a>.</p>
+<p>Stateful-приложения невероятно чувствительны к сетевым задержкам и разрывам связи. Если межподовая сеть начнет терять UDP/TCP пакеты, Raft-кворум расколется. В следующей главе мы досконально разберем сетевую архитектуру Kubernetes: оверлейные сети, CNI-плагины и eBPF: <a href="7-networking-v-kubernetes.html" class="wikilink">7. Networking в Kubernetes</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2329,7 +2500,7 @@ StatefulSet не создаст новый Под на другой ноде, п
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pochemu-deployment-ne-podkhodit-dlya-state">Почему Deployment не подходит для State?</a></li><li class="toc-item toc-h2"><a href="#statefulset-identichnost-v-mire-khaosa">StatefulSet: Идентичность в мире хаоса</a></li><li class="toc-item toc-h2"><a href="#headless-service-setevoy-yakor">Headless Service: Сетевой якорь</a></li><li class="toc-item toc-h2"><a href="#go-i-raft-pishem-svoy-stateful-servis">Go и Raft: Пишем свой Stateful-сервис</a></li><li class="toc-item toc-h2"><a href="#lovushki-statefulset-v-production">Ловушки StatefulSet в Production</a></li><li class="toc-item toc-h3"><a href="#1-rolling-updates-i-poter">1. Rolling Updates и потер</a></li><li class="toc-item toc-h3"><a href="#2-persistentvolume-reclaim-policy">2. PersistentVolume Reclaim Policy</a></li><li class="toc-item toc-h3"><a href="#3-udalenie-poda-so-slomannoy-nodoy">3. Удаление Пода со &quot;сломанной&quot; нодой</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-pochemu-deployment-ne-podkhodit-dlya-state">1. Почему Deployment не подходит для State?</a></li><li class="toc-item toc-h2"><a href="#2-statefulset-identichnost-v-mire-khaosa">2. StatefulSet: Идентичность в мире хаоса</a></li><li class="toc-item toc-h2"><a href="#3-headless-service-setevoy-yakor-i-pryamoy-dostup-k-nodam">3. Headless Service: Сетевой якорь и прямой доступ к нодам</a></li><li class="toc-item toc-h2"><a href="#4-go-i-raft-pishem-svoy-sobstvennyy-raspredelennyy-servis">4. Go и Raft: Пишем свой собственный распределенный сервис</a></li><li class="toc-item toc-h2"><a href="#5-lovushki-statefulset-v-production-o-chem-molchit-dokumentatsiya">5. Ловушки StatefulSet в Production: О чем молчит документация</a></li><li class="toc-item toc-h3"><a href="#5-1-rolling-updates-i-poterya-kvoruma">5.1. Rolling Updates и потеря Кворума</a></li><li class="toc-item toc-h3"><a href="#5-2-persistentvolume-reclaim-policy-kuda-ischezayut-diski">5.2. PersistentVolume Reclaim Policy: Куда исчезают диски?</a></li><li class="toc-item toc-h3"><a href="#3-udalenie-poda-so-slomannoy-nodoy">3. Удаление Пода со &quot;сломанной&quot; нодой</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

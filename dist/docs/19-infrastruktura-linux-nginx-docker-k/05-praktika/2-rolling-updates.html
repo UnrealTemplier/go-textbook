@@ -2169,47 +2169,22 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~13 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. Rolling updates</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В статье <a href="1-ci-cd-i-deploy.html" class="wikilink">1. CI/CD и деплой</a> мы настроили пайплайн, который собирает Docker-образ и обновляет манифесты. Но что происходит в кластере Kubernetes в момент применения этого манифеста? </p>
-<p>Если K8s просто удалит старые Pod'ы и запустит новые (стратегия <code>Recreate</code>), пользователи, чьи запросы обрабатывались в этот момент, получат ошибки 502/503. Даунтайм неприемлем. Стандартом де-факто для обновления Stateless-бэкендов является <strong>Rolling Update (Плавное обновление)</strong>.</p>
-<h2 id="kak-rabotaet-rolling-update-pod-kapotom">Как работает Rolling Update под капотом</h2>
+            <h1>2. Rolling Updates: Анатомия плавного обновления без даунтайма</h1>
+<p>В предыдущей статье (<a href="1-ci-cd-i-deploy.html" class="wikilink">1. CI/CD и деплой</a>) мы построили конвейер непрерывной интеграции, собирающий кристально чистые Docker-образы и доставляющий свежие манифесты в кластер Kubernetes. Но что физически происходит внутри серверов в момент, когда новый манифест применяется контроллером?</p>
+<p>Наивный подход к развертыванию — стратегия <code>Recreate</code>: выключить старую версию сервиса, дождаться ее полного завершения и запустить новую. В эпоху монолитов на выделенных серверах это было привычным делом: пользователям показывали заглушку «Технические работы на 15 минут». потерей корзин покупателей и разорванными банковскими транзакциями.</p>
+<p>Индустриальным стандартом для обновления stateless-приложений в Kubernetes является стратегия <strong>Rolling Update (Плавное скользящее обновление)</strong>. На бумаге она выглядит элементарно: по очереди заменяем один старый под на один новый. Но за этой видимой простотой скрываются сложнейшие гонки сетевого стека ядра Linux, о которых обязан знать каждый бэкенд-инженер.</p>
+<hr />
+<h2 id="1-kak-rabotaet-rolling-update-pod-kapotom">1. Как работает Rolling Update под капотом</h2>
 
-<p>В Kubernetes Pod'ы <strong>иммутабельны (неизменяемы)</strong>. Вы не можете "обновить" бинарник внутри запущенного Pod'а. При обновлении образа в Deployment, K8s создает <strong>новый ReplicaSet</strong>, который начинает запускать новые Pod'ы, параллельно масштабируя вниз старый ReplicaSet.</p>
-<p>Управляет этим процессом Deployment Controller, который использует два критических параметра: <code>maxSurge</code> и <code>maxUnavailable</code>.</p>
-
-<div class="code-block" data-lang="yaml">
-  <div class="code-header">
-    <span class="code-lang-tag">YAML</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-yaml"><code class="language-yaml">spec:
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 25%       # Сколько новых Подов можно создать сверх желаемого количества
-      maxUnavailable: 0   # Сколько старых Подов можно убить одновременно
-</code></pre>
-</div>
-
-<h3 id="matematika-rolling-update">Математика Rolling Update</h3>
-
-<p>Допустим, у вас <code>replicas: 4</code>, <code>maxSurge: 1</code> (25%), <code>maxUnavailable: 0</code>.<br />
-K8s гарантирует, что в любой момент времени у вас будет работать <em>не меньше</em> 4 Pod'ов (так как unavailable = 0), и <em>не больше</em> 5 Pod'ов одновременно (4 + 1 surge).</p>
-<ol>
-<li>K8с создает 1 новый Pod (с новой версией Go-бинарника). Всего в кластере 5 Pod'ов.</li>
-<li>Новый Pod проходит Readiness Probe. K8с добавляет его в Endpoints Service'а.</li>
-<li>K8с убивает 1 старый Pod. В кластере снова 4 Pod'а (3 старых, 1 новый).</li>
-<li>Цикл повторяется, пока все 4 Pod'а не станут новыми.</li>
-</ol>
+<p>Фундаментальный принцип Kubernetes гласит: <strong>Поды иммутабельны (неизменяемы)</strong>. Вы не можете «на лету» заменить бинарный файл внутри работающего контейнера или подменить его образ. </p>
+<p>Когда вы обновляете образ контейнера в объекте <code>Deployment</code>, контроллер <code>kube-controller-manager</code> не модифицирует существующие поды. Вместо этого он создает совершенно <strong>новый объект ReplicaSet</strong>, который начинает постепенно разворачивать поды версии V2, одновременно отдавая команды на плавное сворачивание старого ReplicaSet версии V1.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2223,50 +2198,23 @@ K8s гарантирует, что в любой момент времени у 
     </button>
   </div>
   <pre class="mermaid">
-flowchart LR
-A[&quot;ReplicaSet V1 - 4 Пода&quot;] --&gt;|&quot;maxUnavailable=0&lt;br&gt;Нельзя убивать пока не готов новый&quot;| B[&quot;Создание 1 Пода V2&quot;]
-B --&gt; C[&quot;Всего 5 Подов - maxSurge=1&quot;]
-C --&gt;|&quot;V2 Ready&quot;| D[&quot;Убийство 1 Пода V1&quot;]
-D --&gt; E[&quot;Всего 4 Пода - 3 старых и 1 новый&quot;]
-E --&gt;|&quot;Цикл повторяется&quot;| F[&quot;ReplicaSet V2 - 4 Пода&quot;]
+flowchart TD
+subgraph Deployment[&quot;Deployment: go-api (v1 -&gt; v2)&quot;]
+RS1[&quot;ReplicaSet V1\n(Старая версия: 4 -&gt; 3 -&gt; 0)&quot;]
+RS2[&quot;ReplicaSet V2\n(Новая версия: 0 -&gt; 1 -&gt; 4)&quot;]
+end
+
+RS1 --&gt; PodOld1[&quot;Pod V1&quot;]
+RS1 --&gt; PodOld2[&quot;Pod V1&quot;]
+RS2 --&gt; PodNew1[&quot;Pod V2 (Ready)&quot;]
+RS2 --&gt; PodNew2[&quot;Pod V2 (Creating)&quot;]
   </pre>
 </div>
 
 
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Почему <code>maxUnavailable: 0</code> — это must-have для фронтендов и внешних API? Потому что при <code>maxUnavailable: 1</code> K8с может сначала убить старый Pod, а потом начать создавать новый. В этот момент у вас на 1 реплику меньше, и оставшиеся Pod'ы должны принять на себя весь трафик. Если они были близки к лимиту CPU, начнется Throttling и каскадный отказ.</p>
-  </div>
-</div>
-
-<h2 id="samaya-strashnaya-gonka-race-condition-poterya-trafika">Самая страшная гонка (Race Condition): Потеря трафика</h2>
-
-<p>Даже при <code>maxUnavailable: 0</code>, во время Rolling Update вы можете получить пачку 502 ошибок. Причина кроется в асинхронности K8s и архитектуре сети.</p>
-<p>Когда K8с решает убить старый Pod, происходит следующее:<br />
-1. Kubelet отправляет процессу сигнал <code>SIGTERM</code>.<br />
-2. K8с асинхронно удаляет IP этого Пода из объекта Endpoints.<br />
-3. Kube-proxy на <em>каждой ноде</em> кластера должен заметить изменение Endpoints и обновить правила <code>iptables</code> / <code>IPVS</code>.<br />
-4. Ваше Go-приложение получает SIGTERM, завершает Graceful Shutdown и умирает.</p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p>Шаг 3 (обновление iptables на всех нодах) может занимать от 2 до 10 секунд! <br />
-Если ваше Go-приложение при получении SIGTERM сразу закрывает HTTP-сервер, оно перестает принимать соединения. Но на других нодах кластера Kube-proxy <em>ещё не обновил правила</em>, и Ingress/другие сервисы продолжают слать трафик на IP мертвого Пода. Результат: <code>Connection Refused</code> (502).</p>
-<p><strong>Решение (обязательный паттерн):</strong> Использовать <code>preStop</code> хук и правильный Graceful Shutdown в Go.</p>
-  </div>
-</div>
-
-<h3 id="pravilnyy-shutdown-dlya-rolling-update">Правильный Shutdown для Rolling Update</h3>
-
-<p>Вы должны дать K8s время вычистить ваш IP из балансировщиков, прежде чем закрывать сервер.</p>
-<p><strong>1. Манифест K8s (Pod Spec):</strong></p>
+<p>Темпом и безопасностью этой рокировки управляют два критически важных параметра в блоке <code>strategy.rollingUpdate</code>:<br />
+* <code>maxSurge</code>: Сколько подов разрешено создать <strong>сверх</strong> целевого количества реплик на время обновления (в абсолютных числах или процентах).<br />
+* <code>maxUnavailable</code>: Сколько старых подов разрешено вывести из строя (сделать недоступными) в процессе деплоя.</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2276,15 +2224,162 @@ E --&gt;|&quot;Цикл повторяется&quot;| F[&quot;ReplicaSet V2 - 4 
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">lifecycle:
-  preStop:
-    exec:
-      command: [&quot;/bin/sh&quot;, &quot;-c&quot;, &quot;sleep 10&quot;] # Спим 10 секунд, ожидая обновления iptables
-terminationGracePeriodSeconds: 30 # Даем время на сон + shutdown
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+spec:
+  replicas: 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%       # Разрешено создать +1 под сверх лимита (25% от 4)
+      maxUnavailable: 0   # Строгий запрет на уменьшение доступных подов!
 </code></pre>
 </div>
 
-<p><strong>2. Go-код:</strong></p>
+<h3 id="matematika-rolling-update">Математика Rolling Update</h3>
+
+<p>Представьте кластер под высокой нагрузкой: <code>replicas: 4</code>, <code>maxSurge: 1</code> (25%), <code>maxUnavailable: 0</code>.</p>
+<p>Параметр <code>maxUnavailable: 0</code> дает железную гарантию: в любой момент времени кластер обязан иметь <strong>не менее 4</strong> полностью работоспособных подов. Параметр <code>maxSurge: 1</code> ограничивает максимальный размер пула <strong>не более чем 5</strong> подов одновременно.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant K8s as Deployment Controller
+participant RS1 as ReplicaSet V1 (Old)
+participant RS2 as ReplicaSet V2 (New)
+participant Svc as Endpoints / Service
+
+Note over RS1: Работают 4 пода V1 (нагрузка 100%)
+K8s-&gt;&gt;RS2: Создать 1 новый Pod V2 (всего 5 подов в кластере)
+RS2--&gt;&gt;Svc: Pod V2 проходит Readiness Probe -&gt; Добавлен в Endpoints!
+K8s-&gt;&gt;RS1: Удалить 1 старый Pod V1 (осталось 4 пода: 3 старых + 1 новый)
+Note over K8s: Повторение цикла для оставшихся 3 подов...
+Note over RS2: Работают 4 пода V2 (Деплой завершен без потери емкости!)
+  </pre>
+</div>
+
+
+<ol>
+<li>Контроллер отдает команду <code>ReplicaSet V2</code> создать 1 новый под. В кластере становится 5 подов (4 старых + 1 новый).</li>
+<li>Новый под стартует, инициализирует Go-рантайм и успешно отвечает на <code>Readiness Probe</code>. Только после этого контроллер включает его IP в список <code>Endpoints</code> сервиса.</li>
+<li>Контроллер отдает команду <code>ReplicaSet V1</code> уничтожить 1 старый под. В кластере снова 4 пода (3 старых, 1 новый).</li>
+<li>Шаги циклически повторяются до тех пор, пока <code>ReplicaSet V1</code> не сожмется до 0, а <code>ReplicaSet V2</code> не вырастет до 4.</li>
+</ol>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Почему maxUnavailable: 0 критичен для продакшена</span>
+  </div>
+  <div class="callout-body">
+    <p>Если в погоне за скоростью вы выставите <code>maxUnavailable: 25%</code> (1 под из 4), Kubernetes сначала принудительно убьет один старый под, и лишь затем начнет создавать новый.<br />
+В этот промежуток времени ваш сервис будет работать всего на 3 подах (75% от необходимой емкости). Оставшиеся три пода получат на 33% больше входящего трафика. Если они и без того работали на грани лимитов, мгновенно сработает CFS Throttling процессора, вырастут очереди запросов и начнется лавинообразный каскадный отказ. Для публичных API <code>maxUnavailable: 0</code> — закон.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="2-samaya-strashnaya-setevaya-gonka-otkuda-berutsya-502-oshibki">2. Самая страшная сетевая гонка: Откуда берутся 502 ошибки?</h2>
+
+<p>Большинство разработчиков считают: «Если я выставил <code>maxUnavailable: 0</code> и реализовал graceful shutdown в Go, потеря трафика математически невозможна». Это опаснейшая иллюзия.</p>
+<p>Дело в том, что Kubernetes — это <strong>асинхронная распределенная система</strong>. В ней нет глобальной распределенной транзакции, которая могла бы одновременно сказать и приложению: «Завершайся», и сетевой подсистеме: «Перестань слать туда трафик».</p>
+<p>Когда планировщик решает уничтожить старый под, запускаются два совершенно независимых параллельных процесса:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+DeleteEvent[&quot;K8s решает удалить Pod&quot;]
+
+subgraph AppTrack[&quot;Ветка приложения (Локальная нода)&quot;]
+Kubelet[&quot;Kubelet шлет SIGTERM Go-процессу&quot;]
+GoProc[&quot;Go-сервер получает сигнал и закрывает сокет&quot;]
+AppTrackEnd[&quot;💥 Сервер больше не слушает порт!&quot;]
+Kubelet --&gt; GoProc --&gt; AppTrackEnd
+end
+
+subgraph NetTrack[&quot;Сетевая ветка (Все ноды кластера)&quot;]
+APIServer[&quot;API Server обновляет Endpoints&quot;]
+KubeProxy[&quot;Kube-proxy на 50 нодах замечает событие&quot;]
+IPTables[&quot;Пересчет и запись правил iptables / IPVS&quot;]
+NetTrackEnd[&quot;Трафик прекращает поступать на старый IP&quot;]
+APIServer --&gt; KubeProxy --&gt; IPTables --&gt; NetTrackEnd
+end
+
+DeleteEvent --&gt; AppTrack
+DeleteEvent --&gt; NetTrack
+  </pre>
+</div>
+
+
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Временной лаг iptables и обрыв соединений</span>
+  </div>
+  <div class="callout-body">
+    <p>Сетевая ветка требует физического времени. Демоны <code>kube-proxy</code> на десятках нод опрашивают API Server, пересчитывают цепочки правил и синхронизируют их в ядре Linux. Это занимает <strong>от 2 до 10 секунд</strong>!</p>
+<p>Если ваше Go-приложение при получении сигнала <code>SIGTERM</code> сразу закрывает слушающий HTTP-сокет (<code>srv.Close()</code>), оно мгновенно перестает принимать новые TCP-пакеты. Но балансировщики Ingress и другие микросервисы еще в течение нескольких секунд <em>продолжают слать входящий трафик на старый IP</em>!</p>
+<p>Ядро Linux на ноде с умирающим подом видит приходящий пакет на закрытый порт и отвечает безжалостным пакетом <code>TCP RST</code>. Клиенты в браузере получают ошибки <code>502 Bad Gateway</code> или <code>Connection Refused</code>.</p>
+  </div>
+</div>
+
+<h3 id="spasitelnyy-retsept-prestop-hook-plavnoe-zavershenie">Спасительный рецепт: preStop Hook + Плавное завершение</h3>
+
+<p>Чтобы победить эту сетевую гонку, мы обязаны искусственно задержать смерть Go-процесса, дав сетевому стеку Linux фору на вычищение таблиц маршрутизации.</p>
+<h4 id="1-spetsifikatsiya-poda-v-manifeste-deployment">1. Спецификация пода в манифесте Deployment:</h4>
+
+
+<div class="code-block" data-lang="yaml">
+  <div class="code-header">
+    <span class="code-lang-tag">YAML</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-api
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        image: registry.example.com/go-api:v2.0.0
+        lifecycle:
+          preStop:
+            exec:
+              # КРИТИЧЕСКИ ВАЖНО: спим 10 секунд, пока iptables обновляется на всех нодах!
+              command: [&quot;/bin/sh&quot;, &quot;-c&quot;, &quot;sleep 10&quot;]
+      # Даем достаточно времени на preStop (10с) + честный Go shutdown (15с)
+      terminationGracePeriodSeconds: 30
+</code></pre>
+</div>
+
+<h4 id="2-promyshlennaya-realizatsiya-graceful-shutdown-v-go">2. Промышленная реализация Graceful Shutdown в Go:</h4>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2294,43 +2389,91 @@ terminationGracePeriodSeconds: 30 # Даем время на сон + shutdown
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// При получении SIGTERM (который придет ПОСЛЕ выполнения preStop хука)
-ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-defer stop()
+  <pre class="language-go"><code class="language-go">package main
 
-&lt;-ctx.Done() // Блокируемся до SIGTERM
+import (
+    &quot;context&quot;
+    &quot;errors&quot;
+    &quot;log&quot;
+    &quot;net/http&quot;
+    &quot;os&quot;
+    &quot;os/signal&quot;
+    &quot;syscall&quot;
+    &quot;time&quot;
+)
 
-log.Println(&quot;Shutting down gracefully...&quot;)
-shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-defer cancel()
+func main() {
+    mux := http.NewServeMux()
+    mux.HandleFunc(&quot;/api/v1/ping&quot;, func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte(&quot;pong&quot;))
+    })
 
-// Останавливаем сервер, дожидаясь активных запросов
-if err := srv.Shutdown(shutdownCtx); err != nil {
-    log.Printf(&quot;Server shutdown error: %v&quot;, err)
+    srv := &amp;http.Server{
+        Addr:    &quot;:8080&quot;,
+        Handler: mux,
+    }
+
+    // Запускаем сервер в фоновой горутине
+    go func() {
+        if err := srv.ListenAndServe(); err != nil &amp;&amp; !errors.Is(err, http.ErrServerClosed) {
+            log.Fatalf(&quot;listen error: %v&quot;, err)
+        }
+    }()
+
+    // Подписываемся на сигналы завершения ОС
+    // ВАЖНО: SIGTERM придет в контейнер только ПОСЛЕ того, как отработает preStop hook (sleep 10)!
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+    defer stop()
+
+    &lt;-ctx.Done() // Блокируемся до получения сигнала от Kubelet
+    log.Println(&quot;Получен сигнал завершения. Начинаем плавную остановку...&quot;)
+
+    // Создаем контекст с таймаутом на доработку активных запросов
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+
+    // Shutdown перестает принимать новые соединения и ждет завершения текущих горутин
+    if err := srv.Shutdown(shutdownCtx); err != nil {
+        log.Printf(&quot;Принудительное завершение сервера по таймауту: %v&quot;, err)
+    } else {
+        log.Println(&quot;Все активные запросы успешно завершены. Сервер чисто остановлен.&quot;)
+    }
 }
 </code></pre>
 </div>
 
-<h2 id="mechanical-sympathy-potreblenie-resursov-pri-obnovlenii">Mechanical Sympathy: Потребление ресурсов при обновлении</h2>
+<p>Благодаря связке <code>preStop: sleep 10</code> и <code>srv.Shutdown()</code> сетевые таблицы гарантированно обновятся до того, как Go-сервер закроет сокет. Ноль потерянных клиентских запросов!</p>
+<hr />
+<h2 id="3-mechanical-sympathy-resursnyy-golod-pri-obnovlenii">3. Mechanical Sympathy: Ресурсный голод при обновлении</h2>
 
-<p>Rolling Update требует <strong>свободных ресурсов</strong> в кластере. Параметр <code>maxSurge</code> означает, что на время деплоя у вас будет работать <em>больше</em> Pod'ов, чем обычно.</p>
-<p>Если ваши ноды забиты под завязку (CPU/RAM requests = 100% capacity), новый Pod перейдет в статус <code>Pending</code>, потому что Scheduler не найдет для него места. Rolling Update встанет намертво. Старые Pod'ы не будут удаляться (так как <code>maxUnavailable: 0</code>), а новые не смогут стартовать.</p>
+<p>Параметр <code>maxSurge</code> требует свободных аппаратных ресурсов. Если у вас было 4 пода с запросом <code>requests: cpu: "2"</code>, то в момент обновления <code>maxSurge: 1</code> потребует от кластера суммарно не 8, а <strong>10 ядер CPU</strong>!</p>
+<p>Если все физические серверы в кластере уже утилизированы на 100%, планировщик Kubernetes (<code>kube-scheduler</code>) не сможет назначить новый под ни на один узел. Под застрянет в мучительном статусе <strong><code>Pending</code></strong>.</p>
+<p>Что произойдет с деплоем? Он намертво зависнет!<br />
+* Старые поды не будут удаляться (ведь действует директива <code>maxUnavailable: 0</code>).<br />
+* Новый под не может запуститься (не хватает процессорных ресурсов).<br />
+* Инженеры смотрят на зависший CI/CD пайплайн.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Вопрос для собеседования: Деплой при нехватке ресурсов</span>
   </div>
   <div class="callout-body">
     <p><strong>Вопрос:</strong> Как безопасно обновить Go-сервис, если в кластере нет свободных ресурсов для <code>maxSurge</code>?<br />
-<strong>Ответ:</strong> Можно использовать стратегию <code>Recreate</code> (сначала убить старые, потом создать новые), но это даунтайм. Правильный инфраструктурный путь — использовать <strong>Cluster Autoscaler (CA)</strong>. Когда Pod переходит в <code>Pending</code>, CA автоматически заказывает у облака новые сервера (ноды), деплой продолжается на них, а после завершения обновления CA удалит пустые ноды. Но это удлиняет время деплоя на минуты (время поднятия новой EC2-инстанса).</p>
+<strong>Ответ:</strong> <br />
+1. Наивный путь: использовать стратегию <code>Recreate</code> или временно разрешить <code>maxUnavailable: 1</code>, но это приведет либо к простою сервиса, либо к риску перегрузки оставшихся подов.<br />
+2. Промышленный путь: использовать <strong>Cluster Autoscaler (CA)</strong> или <strong>Karpenter</strong>. Планировщик видит под в статусе <code>Pending</code>, Cluster Autoscaler мгновенно запрашивает у облачного провайдера дополнительную виртуальную машину (Node), под разворачивается на ней, деплой успешно финиширует, а затем пустая старая нода аккуратно удаляется.</p>
   </div>
 </div>
 
-<h2 id="rollback-otkat-nazad">Rollback: Откат назад</h2>
+<hr />
+<h2 id="4-rollback-mgnovennyy-otkat-pri-sboyakh">4. Rollback: Мгновенный откат при сбоях</h2>
 
-<p>Если новая версия Go-бинарника имеет баг (например, паничит при старте), новые Pod'ы никогда не пройдут Readiness Probe. <br />
-В этом случае Deployment Controller остановит Rolling Update (ReplicaSet V2 не вырастет), а старые Pod'ы (ReplicaSet V1) продолжат работать и принимать трафик. Это защита K8s по умолчанию.</p>
-<p>Если баг коварный (утечка памяти, которая проявляется через час), и вы хотите откатиться вручную, K8s хранит историю ReplicaSets:</p>
+<p>Даже самый качественный CI-пайплайн с тестами и линтерами не гарантирует 100% отсутствие багов. Что делать, если новая версия Go-бинарника падает с паникой из-за непредвиденного формата входящих данных?</p>
+<h3 id="avtomaticheskaya-zashchita-kubernetes">Автоматическая защита Kubernetes</h3>
+<p>Если новые поды версии V2 падают при старте или не могут пройти <code>Readiness Probe</code>, Deployment Controller немедленно останавливает обновление! Он никогда не убьет оставшиеся здоровые поды версии V1. Кластер продолжит обслуживать трафик на старой стабильной версии.</p>
+<h3 id="ruchnoy-otkat-v-odin-klik">Ручной откат в один клик</h3>
+<p>Kubernetes бережно сохраняет историю предыдущих объектов ReplicaSet (по умолчанию глубина истории <code>revisionHistoryLimit: 10</code>). Для мгновенного отката на предыдущую версию достаточно выполнить команду:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2344,17 +2487,18 @@ if err := srv.Shutdown(shutdownCtx); err != nil {
 </code></pre>
 </div>
 
-<p>K8с просто поменяет шаблон Pod'а на предыдущую версию и запустит обратный Rolling Update. Это происходит мгновенно, так как старый ReplicaSet всё ещё существует, а старые образы лежат на нодах (не нужно скачивать из Registry).</p>
-<h2 id="itog">Итог</h2>
+<p>Kubernetes мгновенно запустит обратный процесс Rolling Update. Поскольку образы старой стабильной версии уже закэшированы на дисках серверов, откат происходит за считанные секунды без необходимости повторной сборки и скачивания образов.</p>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li><strong>Rolling Update</strong> — стандарт беспроблемного обновления, использующий создание новых Pod'ов и плавное удаление старых.</li>
-<li><strong><code>maxSurge</code> и <code>maxUnavailable</code></strong> настраивают скорость и безопасность деплоя. Для публичных API используйте <code>maxUnavailable: 0</code>.</li>
-<li><strong>Race Condition с iptables</strong>: Всегда используйте <code>preStop</code> хук с <code>sleep</code>, чтобы дать Kube-proxy обновить маршрутизацию, иначе получите 502 ошибки.</li>
-<li><strong>Ресурсы</strong>: Для <code>maxSurge</code> нужны свободные ресурсы в кластере, иначе деплой зависнет в <code>Pending</code>.</li>
-<li><strong>Откат</strong>: K8s автоматически блокирует обновление, если новые Pod'ы не проходят Readiness, и позволяет мгновенно откатиться командой <code>undo</code>.</li>
+<li><strong>Иммутабельность подов:</strong> Rolling Update обновляет приложение не модификацией контейнеров, а плавным созданием нового ReplicaSet параллельно со сворачиванием старого.</li>
+<li><strong>Параметры <code>maxSurge</code> и <code>maxUnavailable</code>:</strong> Для критических публичных API всегда используйте <code>maxUnavailable: 0</code>, чтобы не допустить просадки пропускной способности кластера.</li>
+<li><strong>Победа над 502 ошибками:</strong> Сетевые таблицы <code>iptables</code>/<code>IPVS</code> обновляются с задержкой в несколько секунд. Для ликвидации гонки соединений обязательно используйте <code>preStop: sleep 10</code> в связке с <code>srv.Shutdown()</code> в Go.</li>
+<li><strong>Ресурсный баланс:</strong> Всегда учитывайте потребность <code>maxSurge</code> в свободных мощностях кластера или настраивайте Cluster Autoscaler для динамического заказа нод при зависании подов в <code>Pending</code>.</li>
+<li><strong>Rollback:</strong> Защита от сбоев встроена в K8s по умолчанию, а команда <code>kubectl rollout undo</code> обеспечивает мгновенный возврат к предыдущей рабочей ревизии.</li>
 </ol>
-<p>Rolling Update отлично работает, когда вы уверены, что новая версия на 100% совместима со старой. Но что, если вы меняете схему БД или радикально меняете API? В таких случаях требуются более сложные стратегии. В следующей статье мы разберем: <a href="3-canary-i-blue-green-deploy.html" class="wikilink">3. Canary и blue green deploy</a>.</p>
+<p>Стратегия Rolling Update идеальна, когда новая версия обратно совместима со старой. Но что делать, если вы кардинально переписали API, изменили контракты данных или хотите проверить новую версию всего на 5% пользователей перед полным релизом? В следующей статье мы разберем продвинутые техники: <a href="3-canary-i-blue-green-deploy.html" class="wikilink">3. Canary и blue green deploy</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2382,7 +2526,7 @@ if err := srv.Shutdown(shutdownCtx); err != nil {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#kak-rabotaet-rolling-update-pod-kapotom">Как работает Rolling Update под капотом</a></li><li class="toc-item toc-h3"><a href="#matematika-rolling-update">Математика Rolling Update</a></li><li class="toc-item toc-h2"><a href="#samaya-strashnaya-gonka-race-condition-poterya-trafika">Самая страшная гонка (Race Condition): Потеря трафика</a></li><li class="toc-item toc-h3"><a href="#pravilnyy-shutdown-dlya-rolling-update">Правильный Shutdown для Rolling Update</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-potreblenie-resursov-pri-obnovlenii">Mechanical Sympathy: Потребление ресурсов при обновлении</a></li><li class="toc-item toc-h2"><a href="#rollback-otkat-nazad">Rollback: Откат назад</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-kak-rabotaet-rolling-update-pod-kapotom">1. Как работает Rolling Update под капотом</a></li><li class="toc-item toc-h3"><a href="#matematika-rolling-update">Математика Rolling Update</a></li><li class="toc-item toc-h2"><a href="#2-samaya-strashnaya-setevaya-gonka-otkuda-berutsya-502-oshibki">2. Самая страшная сетевая гонка: Откуда берутся 502 ошибки?</a></li><li class="toc-item toc-h3"><a href="#spasitelnyy-retsept-prestop-hook-plavnoe-zavershenie">Спасительный рецепт: preStop Hook + Плавное завершение</a></li><li class="toc-item toc-h4"><a href="#1-spetsifikatsiya-poda-v-manifeste-deployment">1. Спецификация пода в манифесте Deployment:</a></li><li class="toc-item toc-h4"><a href="#2-promyshlennaya-realizatsiya-graceful-shutdown-v-go">2. Промышленная реализация Graceful Shutdown в Go:</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-resursnyy-golod-pri-obnovlenii">3. Mechanical Sympathy: Ресурсный голод при обновлении</a></li><li class="toc-item toc-h2"><a href="#4-rollback-mgnovennyy-otkat-pri-sboyakh">4. Rollback: Мгновенный откат при сбоях</a></li><li class="toc-item toc-h3"><a href="#avtomaticheskaya-zashchita-kubernetes">Автоматическая защита Kubernetes</a></li><li class="toc-item toc-h3"><a href="#ruchnoy-otkat-v-odin-klik">Ручной откат в один клик</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

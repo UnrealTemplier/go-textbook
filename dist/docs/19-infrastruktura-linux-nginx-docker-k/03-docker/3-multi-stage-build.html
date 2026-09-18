@@ -2169,19 +2169,24 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 19</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Multi stage build</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущей статье мы обсуждали кэширование слоев и флаги компилятора. Но какую бы оптимизацию мы ни применяли в одноэтапной сборке, финальный Docker-образ всегда будет содержать компилятор Go, исходный код, тестовые файлы и инструменты сборки. В продакшене всё это — мертвый груз, который увеличивает время скачивания образа (pull time) и расширяет поверхность для атаки.</p>
-<p>В мире компилируемых языков (C++, Rust, Go) среда сборки и среда выполнения кардинально отличаются. Go требует сотен мегабайт для сборки, но для запуска статического бинарника нужна только голая ОС (или даже просто ядро Linux).</p>
-<h2 id="kontseptsiya-multi-stage-build">Концепция Multi-Stage Build</h2>
+            <h1>Многоэтапная сборка (Multi-Stage Build): От гигабайтных билдеров к минимальным образам</h1>
+<p>В предыдущей статье мы исследовали кэширование слоев и тонкую настройку флагов компилятора. Однако какая бы виртуозная оптимизация ни применялась в рамках одноэтапного Dockerfile, итоговый образ неизбежно останется перегруженным. </p>
+<p>Если в Dockerfile используется единственная инструкция <code>FROM golang:1.22</code>, то в продакшен-образ гарантированно попадут компилятор Go, исходные файлы, тесты, ассемблер, утилиты линковки и системный пакетный менеджер. Всё это — чистый «мертвый груз» весом в сотни мегабайт. В боевой среде такой балласт замедляет выкачивание образов (Pull Time) в кластере и катастрофически расширяет поверхность для потенциальных атак.</p>
+<p>В компилируемых языках — Си, C++, Rust и Go — <strong>среда сборки (Build Environment)</strong> и <strong>среда исполнения (Runtime Environment)</strong> кардинально различаются. Сборка требует богатого набора инструментов, но для выполнения полностью статического Go-бинарника не нужна даже операционная система — достаточно лишь ядра Linux.</p>
+<hr />
+<h2 id="1-arkhitekturnaya-kontseptsiya-multi-stage-build">1. Архитектурная концепция Multi-Stage Build</h2>
 
-<p>Docker поддерживает директиву <code>FROM</code> несколько раз в одном Dockerfile. Каждый новый <code>FROM</code> начинает <strong>новый этап сборки (stage)</strong> с чистого листа, ничего не зная о предыдущих этапах, за исключением того, что вы явно скопируете сами.</p>
-<p>Это позволяет использовать тяжелые образы с компиляторами на этапе сборки (Builder), а затем перенести только артефакты (бинарник) в легковесный образ для запуска (Runner).</p>
+<p>Движок Docker позволяет объявлять инструкцию <code>FROM</code> <strong>несколько раз внутри одного Dockerfile</strong>. Каждая последующая директива <code>FROM</code> начинает <strong>новый этап сборки (Stage)</strong> с абсолютно чистого листа, отсекая все слои и временные файлы предыдущих этапов.</p>
+<p>Это фундаментальное решение породило классический паттерн:<br />
+1. <strong>Этап сборщика (Builder Stage):</strong> Тяжелый образ с компилятором, где скачиваются зависимости и компилируется бинарник.<br />
+2. <strong>Этап выполнения (Runner Stage):</strong> Минимальный чистый образ, в который копируется <strong>только один скомпилированный бинарный файл</strong> и необходимые статические сертификаты.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2215,16 +2220,19 @@ C --&gt;|&quot;COPY --from=builder&quot;| E
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Изоляция этапов сборки в BuildKit</span>
   </div>
   <div class="callout-body">
-    <p>Когда Docker видит несколько <code>FROM</code>, он не объединяет их в одно дерево слоев OverlayFS. Он создает изолированные временные контейнеры для каждого этапа. Инструкция <code>COPY --from=...</code> работает на уровне демона Docker: он монтирует файловую систему указанного этапа, извлекает нужный файл и пакует его в новый слой финального образа. Промежуточные образы-сборщики (Builder) удаляются из кэша сборки (build cache), если вы не сохраняете их намеренно.</p>
+    <p>Когда Docker встречает несколько инструкций <code>FROM</code>, он не склеивает их в единый бутерброд слоев OverlayFS.</p>
+<p>Сборочный движок (BuildKit) создает полностью изолированные временные контейнеры для каждого этапа. Инструкция <code>COPY --from=...</code> (например, <code>COPY --from=builder</code>) обращается к файловой системе завершенного этапа сборщика как к внешнему источнику: сборщик монтирует образ этапа <code>builder</code>, вычитывает запрошенный файл <code>/myapp</code> и сохраняет его в единственный компактный слой финального образа.</p>
+<p>Все промежуточные слои этапа <code>builder</code> (кэш компилятора, исходники, временные файлы) отбрасываются и не попадают в реестр контейнеров.</p>
   </div>
 </div>
 
-<h2 id="idealnyy-multi-stage-dockerfile-dlya-go">Идеальный Multi-Stage Dockerfile для Go</h2>
+<hr />
+<h2 id="2-idealnyy-production-ready-multi-stage-dockerfile-dlya-go">2. Идеальный production-ready Multi-Stage Dockerfile для Go</h2>
 
-<p>Соберем воедино всё, что мы знаем о Go, безопасности и кэшировании:</p>
+<p>Соберем воедино все передовые инженерные практики: именованные этапы, кэширование зависимостей, статическую сборку, работу от непривилегированного пользователя и системные сертификаты:</p>
 
 <div class="code-block" data-lang="dockerfile">
   <div class="code-header">
@@ -2234,80 +2242,150 @@ C --&gt;|&quot;COPY --from=builder&quot;| E
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-dockerfile"><code class="language-dockerfile"># Названия этапов (builder, runner) улучшают читаемость
-# вместо использования номеров (0, 1)
+  <pre class="language-dockerfile"><code class="language-dockerfile"># -------------------------------------------------------------
+# ЭТАП 1: Сборка (Builder)
+# Именование этапа через 'AS builder' улучшает читаемость
+# -------------------------------------------------------------
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-# Кэширование зависимостей
+# Шаг 1: Кэширование зависимостей
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Копируем исходный код
+# Шаг 2: Копирование исходного кода
 COPY . .
 
-# Статическая сборка с оптимизациями
+# Шаг 3: Статическая компиляция под Linux x86_64
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags=&quot;-s -w -X main.buildVersion=$(cat version.txt)&quot; \
     -trimpath -o /myapp .
 
-# --- Финальный этап ---
+# -------------------------------------------------------------
+# ЭТАП 2: Эксплуатация (Runner)
+# -------------------------------------------------------------
 FROM alpine:latest AS runner
 
-# Устанавливаем CA-сертификаты и timezone данные (важно для HTTPS и времени)
-# Делаем это до добавления непривилегированного пользователя
+# Устанавливаем корневые CA-сертификаты и данные о часовых поясах (tzdata)
+# Это критично для корректной работы исходящих HTTPS-запросов и time.LoadLocation
 RUN apk --no-cache add ca-certificates tzdata
 
 WORKDIR /app
 
-# Создаем непривилегированного пользователя и группу
+# Создаем системную группу и непривилегированного пользователя
 RUN addgroup -S appgroup &amp;&amp; adduser -S appuser -G appgroup
 
-# Копируем бинарник из этапа builder
-# Важно: --chown меняет владельца, так как COPY от root
+# Копируем бинарник из этапа builder с немедленной сменой владельца (--chown)
 COPY --from=builder --chown=appuser:appgroup /myapp /app/myapp
 
-# Переключаемся на безопасного пользователя
+# Переключаемся на непривилегированного пользователя
 USER appuser
 
+# Запуск приложения
 ENTRYPOINT [&quot;/app/myapp&quot;]
 </code></pre>
 </div>
 
-<h2 id="vybor-bazovogo-obraza-dlya-runnera">Выбор базового образа для Runner'а</h2>
+<hr />
+<h2 id="3-vybor-bazovogo-obraza-dlya-runner-scratch-distroless-ili-alpine">3. Выбор базового образа для Runner: scratch, distroless или alpine?</h2>
 
-<p>Выбор второго <code>FROM</code> — это архитектурное решение. В Go есть три основных пути:</p>
-<h3 id="1-scratch-absolyutnyy-nul">1. `scratch` (Абсолютный нуль)</h3>
-<p>В образе <code>scratch</code> нет вообще ничего. Ни оболочки (shell), ни пакетного менеджера, ни <code>/etc/passwd</code>.<br />
-*   <strong>Плюсы:</strong> Размер образа равен размеру бинарника (часто &lt; 10 МБ). Максимальная безопасность — нечего взламывать.<br />
-*   <strong>Минусы:</strong> Нельзя зайти в контейнер через <code>docker exec -it ... sh</code> для дебага. Отсутствуют CA-сертификаты (ваши исходящие HTTPS-запросы упадут с ошибкой <code>x509: certificate signed by unknown authority</code>). Отсутствуют файлы временных зон (<code>time.LoadLocation</code> вернет ошибку).</p>
-<h3 id="2-distroless-rekomenduemyy-standart-ot-google">2. `distroless` (Рекомендуемый стандарт от Google)</h3>
-<p>Образы <code>gcr.io/distroless/static-debian12</code> содержат минимум для работы: базовые CA-сертификаты, файлы timezone, базовые утилиты (но без оболочки shell). <br />
-*   <strong>Плюсы:</strong> Решает проблемы <code>scratch</code> с сертификатами и временем. Всё ещё невероятно маленький. Нет shell, что защищает от злоумышленников, пытающихся выполнить команды при взломе.<br />
-*   <strong>Минусы:</strong> Отладка через <code>exec</code> по-прежнему невозможна (нет <code>sh</code>).</p>
-<h3 id="3-alpine-kompromiss-dlya-debaga">3. `alpine` (Компромисс для дебага)</h3>
-<p>Alpine Linux весит около 5 МБ и содержит BusyBox (минималистичную оболочку <code>sh</code>).<br />
-*   <strong>Плюсы:</strong> Можно зайти в запущенный контейнер (<code>docker exec -it &lt;id&gt; sh</code>), установить <code>curl</code>, <code>wget</code> для диагностики сети прямо на лету.<br />
-*   <strong>Минусы:</strong> Использует <code>musl libc</code> вместо <code>glibc</code>. Как мы обсуждали в <a href="1-konteynerizatsiya-osnovy.html" class="wikilink">1. Контейнеризация. Основы</a>, это может привести к падениям (segfault) или ошибкам линковки, если ваш Go-код использует CGO и был собран на этапе Builder на базе <code>glibc</code> (в образе <code>golang:1.22</code>).</p>
+<p>Выбор базового образа для финального этапа — это стратегический компромисс между максимальной безопасностью, минимальным размером и удобством диагностики инцидентов:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Характеристика</th>
+<th style="text-align: center;"><code>scratch</code></th>
+<th style="text-align: center;"><code>distroless</code> (Google)</th>
+<th style="text-align: center;"><code>alpine</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Размер образа</strong></td>
+<td style="text-align: center;">10–20 МБ (только бинарник)</td>
+<td style="text-align: center;">~25–30 МБ</td>
+<td style="text-align: center;">~30–35 МБ</td>
+</tr>
+<tr>
+<td><strong>Командный шелл (<code>sh</code>/<code>bash</code>)</strong></td>
+<td style="text-align: center;">❌ Отсутствует</td>
+<td style="text-align: center;">❌ Отсутствует</td>
+<td style="text-align: center;">✅ Присутствует (BusyBox)</td>
+</tr>
+<tr>
+<td><strong>CA-сертификаты (<code>ca-certificates</code>)</strong></td>
+<td style="text-align: center;">❌ Нужно копировать вручную</td>
+<td style="text-align: center;">✅ Включены из коробки</td>
+<td style="text-align: center;">✅ Доступны через <code>apk</code></td>
+</tr>
+<tr>
+<td><strong>Временные зоны (<code>tzdata</code>)</strong></td>
+<td style="text-align: center;">❌ Нужно копировать вручную</td>
+<td style="text-align: center;">✅ Включены из коробки</td>
+<td style="text-align: center;">✅ Доступны через <code>apk</code></td>
+</tr>
+<tr>
+<td><strong>Возможность <code>docker exec</code></strong></td>
+<td style="text-align: center;">❌ Невозможна</td>
+<td style="text-align: center;">❌ Невозможна</td>
+<td style="text-align: center;">✅ Возможна</td>
+</tr>
+<tr>
+<td><strong>Уровень защищенности от эксплойтов</strong></td>
+<td style="text-align: center;">⭐️⭐️⭐️ Максимальный</td>
+<td style="text-align: center;">⭐️⭐️⭐️ Максимальный</td>
+<td style="text-align: center;">⭐️⭐️ Высокий</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="1-obraz-scratch-absolyutnyy-vakuum">1. Образ `scratch` (Абсолютный вакуум)</h3>
+<p>В образе <code>scratch</code> нет вообще ничего — ни одного файла, ни оболочки shell, ни директории <code>/etc/passwd</code>.<br />
+* <strong>Плюсы:</strong> Минимальный физический размер. Абсолютная защита: злоумышленник физически не может запустить шелл-скрипт или скачать вредоносный бинарник.<br />
+* <strong>Минусы:</strong> Нельзя зайти в контейнер через <code>docker exec -it ... sh</code> для дебага. Отсутствуют CA-сертификаты (ваши исходящие HTTPS-запросы упадут с ошибкой <code>x509: certificate signed by unknown authority</code>). Отсутствуют файлы временных зон (<code>time.LoadLocation</code> вернет ошибку).<br />
+* <em>Решение:</em> Скопировать сертификаты и tzdata на этапе <code>builder</code>:<br />
+<code>dockerfile
+  COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/</code></p>
+<h3 id="2-obrazy-google-distroless-zolotoy-korporativnyy-standart">2. Образы Google `distroless` (Золотой корпоративный стандарт)</h3>
+<p>Линейка образов <code>gcr.io/distroless/static-debian12</code> специально спроектирована инженерами Google для статических приложений.<br />
+* <strong>Плюсы:</strong> Образ содержит корневые сертификаты, базу таймзон <code>/usr/share/zoneinfo</code>, файл <code>/etc/passwd</code> с дефолтным пользователем <code>nonroot</code> (UID 65532), но <strong>не содержит командной оболочки shell</strong>. Это гарантирует непробиваемость перед атаками типа Command Injection при нулевых затратах на ручную конфигурацию.<br />
+* <strong>Минусы:</strong> Отладка через <code>exec</code> по-прежнему невозможна (нет <code>sh</code>).</p>
+<h3 id="3-obraz-alpine-pragmatichnyy-vybor-dlya-razrabotki">3. Образ `alpine` (Прагматичный выбор для разработки)</h3>
+<ul>
+<li><strong>Плюсы:</strong> Наличие минималистичного шелла BusyBox позволяет в критической ситуации подключиться к контейнеру командой <code>docker exec -it &lt;id&gt; sh</code> и запустить сетевую диагностику через <code>netstat</code> или <code>wget</code>.</li>
+<li><strong>Минусы:</strong> Использует стандартную библиотеку языка Си <strong><code>musl libc</code></strong> вместо <code>glibc</code>.</li>
+</ul>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Конфликт glibc и musl при использовании CGO</span>
   </div>
   <div class="callout-body">
-    <p>Никогда не собирайте бинарник в <code>golang:1.22</code> (которая основана на Debian/glibc) с включенным CGO (<code>CGO_ENABLED=1</code>), а затем не запускайте его в <code>alpine</code> (которая использует musl). При запуске вы получите <code>standard init_linux.go:228: exec user process caused: no such file or directory</code>. Это ошибка ELF-линковщика — бинарник ищет <code>/lib64/ld-linux-x86-64.so.2</code> (glibc), которого нет в Alpine.<br />
-Если вам <em>жизненно необходим</em> Alpine на этапе runner, используйте <code>FROM golang:1.22-alpine AS builder</code>.</p>
+    <p>Самая частая ошибка начинающих: компилировать проект в образе <code>golang:1.22</code> (основанном на Debian с <code>glibc</code>) с включенным CGO (<code>CGO_ENABLED=1</code>), а затем копировать бинарник в финальный образ <code>alpine</code> (работающий на <code>musl</code>).</p>
+<p>При попытке запустить контейнер вы получите пугающую ошибку ядра:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">standard init_linux.go:228: exec user process caused: no such file or directory
+</code></pre>
+</div>
+
+<p>Разработчик в панике проверяет: файл <code>/app/myapp</code> на месте, права <code>chmod +x</code> выданы, почему «no such file»?</p>
+<p>Дело в том, что системный загрузчик Linux (ELF interpreter) ищет динамический компоновщик <code>glibc</code> по пути <code>/lib64/ld-linux-x86-64.so.2</code>. В Alpine его нет — там живет <code>/lib/ld-musl-x86_64.so.1</code>. Ядро Linux сообщает об отсутствии именно файла динамического линкера!</p>
+<p><strong>Правило:</strong> Либо всегда отключайте CGO (<code>CGO_ENABLED=0</code>), либо собирайте код в том же дистрибутиве, где будете запускать (например, <code>FROM golang:1.22-alpine AS builder</code>).</p>
   </div>
 </div>
 
+<hr />
 <h2 id="copy-chown-izyashchnoe-vladenie-faylami">`COPY --chown`: Изящное владение файлами</h2>
 
-<p>В классических (одноэтапных) Dockerfile файлы, скопированные через <code>COPY</code>, принадлежат root. Чтобы сменить владельца для <code>USER appuser</code>, приходилось делать дополнительный шаг <code>RUN chown -R appuser:appgroup /app</code>, который создавал новый слой, дублирующий все скопированные файлы (нарушение принципа CoW и раздувание образа).</p>
-<p>В Multi-Stage сборках флаг <code>--chown</code> внутри <code>COPY --from=builder --chown=appuser:appgroup</code> меняет владельца "на лету" при копировании из этапа сборки. Это сохраняет финальный образ минимальным.</p>
-<h2 id="inektsiya-otladochnykh-instrumentov-delve">Инъекция отладочных инструментов (Delve)</h2>
-
-<p>На стадии разработки и профилирования вам может понадобиться отладчик Delve или утилита pprof. Добавлять их в production-образ нельзя. Multi-stage позволяет создавать отладочные цели:</p>
+<p>В классическом одноэтапном подходе файлы, скопированные в образ, автоматически принадлежат пользователю <code>root</code>. Чтобы перевести их на <code>appuser</code>, разработчики выполняли:</p>
 
 <div class="code-block" data-lang="dockerfile">
   <div class="code-header">
@@ -2317,40 +2395,84 @@ ENTRYPOINT [&quot;/app/myapp&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-dockerfile"><code class="language-dockerfile"># Отладочный этап
-FROM runner AS debug
-# Меняем пользователя обратно на root для установки пакетов
-USER root
-RUN go install github.com/go-delve/delve/cmd/dlv@latest
-# Возвращаем непривилегированного пользователя
-USER appuser
+  <pre class="language-dockerfile"><code class="language-dockerfile">COPY /myapp /app/myapp
+RUN chown -R appuser:appgroup /app
 </code></pre>
 </div>
 
-<p>Затем в Docker Compose или K8s вы можете собирать образ с <code>target: debug</code>, получая всё необходимое для инспекции, не меняя основной Dockerfile.</p>
+<p>Вспомним механизм Copy-on-Write (CoW) из лекции <a href="1-konteynerizatsiya-osnovy.html" class="wikilink">1. Контейнеризация. Основы</a>: команда <code>RUN chown</code> не модифицирует файл на месте, а <strong>копирует его целиком в новый слой OverlayFS</strong>, фактически удваивая вес бинарника в итоговом образе!</p>
+<p>Флаг <code>--chown</code> в директиве <code>COPY</code>:</p>
+
+<div class="code-block" data-lang="dockerfile">
+  <div class="code-header">
+    <span class="code-lang-tag">DOCKERFILE</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-dockerfile"><code class="language-dockerfile">COPY --from=builder --chown=appuser:appgroup /myapp /app/myapp
+</code></pre>
+</div>
+
+<p>назначает корректного владельца непосредственно в момент записи файла в слой контейнера, не создавая лишних мегабайт в снимках файловой системы.</p>
+<hr />
+<h2 id="5-rasshirennyy-pattern-inektsiya-otladochnykh-instrumentov-delve">5. Расширенный паттерн: Инъекция отладочных инструментов (Delve)</h2>
+
+<p>Что делать, если в тестовом окружении или на staging-стенде требуется подключиться к живому Go-процессу интерактивным отладчиком <strong>Delve (<code>dlv</code>)</strong> или снять профили через pprof, но тащить тяжелые отладочные пакеты в продакшен строго запрещено?</p>
+<p>Многоэтапная сборка позволяет формировать альтернативные сборочные цели (<strong>Build Targets</strong>):</p>
+
+<div class="code-block" data-lang="dockerfile">
+  <div class="code-header">
+    <span class="code-lang-tag">DOCKERFILE</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-dockerfile"><code class="language-dockerfile"># Базовый образ выполнения
+FROM alpine:latest AS runner
+WORKDIR /app
+COPY --from=builder --chown=appuser:appgroup /myapp /app/myapp
+USER appuser
+ENTRYPOINT [&quot;/app/myapp&quot;]
+
+# Альтернативная отладочная цель
+FROM runner AS debug
+USER root
+# Устанавливаем отладчик Delve и сетевые утилиты
+RUN go install github.com/go-delve/delve/cmd/dlv@latest &amp;&amp; \
+    apk --no-cache add curl bind-tools
+USER appuser
+ENTRYPOINT [&quot;/go/bin/dlv&quot;, &quot;--listen=:40000&quot;, &quot;--headless=true&quot;, &quot;--api-version=2&quot;, &quot;exec&quot;, &quot;/app/myapp&quot;]
+</code></pre>
+</div>
+
+<p>В файле <code>docker-compose.yaml</code> для локальной разработки достаточно указать директиву <code>target: debug</code>, в то время как боевой CI/CD соберет легковесный <code>target: runner</code>.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Инспекция продакшен-контейнера distroless без шелла</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Ваш Go-сервис работает в продакшене в <code>distroless</code> контейнере. Как вы будете отлаживать панику или зависание, если у вас нет shell (<code>sh</code>) и вы не можете сделать <code>docker exec</code>?<br />
-<strong>Ответ:</strong> <br />
-1. Правильный Go-подход: Использовать встроенный HTTP-сервер <code>net/http/pprof</code>. При зависании вы делаете <code>curl</code> к эндпоинту <code>/debug/pprof/goroutine?debug=2</code> снаружи (если порт открыт), получая дамп стеков.<br />
-2. Подход инфраструктуры: Использовать <code>kubectl debug</code> (в K8s 1.18+), который позволяет добавить контейнер с инструментами (Ephemeral Container) в тот же Pod, разделяя его Network и PID namespaces с зависшим контейнером.<br />
-3. eBPF: Инструменты вроде BCC/bpftrace на хост-машине могут трассировать системные вызовы и функции внутри контейнера без изменения самого контейнера.</p>
+    <p><strong>Вопрос:</strong> Ваш Go-сервис развернут в production в минимальном контейнере <code>distroless</code>. Процесс завис в deadlock'е или течет память. Командного шелла (<code>sh</code>) в контейнере нет, команда <code>docker exec</code> бессильна. Как провести диагностику инцидента?</p>
+<p><strong>Ответ:</strong> <br />
+1. <strong>Встроенный пакет <code>net/http/pprof</code>:</strong> Высококлассные Go-сервисы всегда открывают внутренний административный порт (на localhost или отдельной подсети), где активен сервер <code>net/http/pprof</code>. Достаточно пробросить порт наружу и выполнить <code>curl http://localhost:6060/debug/pprof/goroutine?debug=2</code> для получения полного дампа всех стеков горутин.<br />
+2. <strong>Механизм <code>kubectl debug</code> (Ephemeral Containers):</strong> Начиная с Kubernetes 1.18+, администратор может на лету добавить в работающий Pod временный отладочный контейнер с полным набором утилит (Alpine/Ubuntu), подключив его к общим пространствам имен <strong>Process (PID)</strong> и <strong>Network (NET)</strong> зависшего пода.<br />
+3. <strong>Трассировка через eBPF с хостовой ноды:</strong> С помощью утилит <code>bpftrace</code> или BCC на физическом сервере можно отслеживать системные вызовы процесса, сетевые пакеты и латентность функций Go без модификации и перезапуска контейнера.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Multi-Stage Build</strong> разделяет среду компиляции и среду исполнения, уменьшая размер production-образа с сотен мегабайт до десятков.</li>
-<li><strong>Выбор базового образа (Runner)</strong> — это баланс между безопасностью (<code>scratch</code>, <code>distroless</code>) и удобством отладки (<code>alpine</code>). Для продакшена <code>distroless</code> — золотой стандарт.</li>
-<li><strong>Флаг <code>--chown</code></strong> в <code>COPY</code> решает проблему раздувания образов из-за <code>RUN chown</code>.</li>
-<li><strong>Совместимость libc</strong>: Сборка на Debian (<code>golang</code>) и запуск на Alpine (<code>musl</code>) с CGO — гарантированный краш при запуске.</li>
+<li><strong>Multi-Stage Build</strong> кардинально разделяет среду компиляции и среду исполнения, уменьшая размер продакшен-образов Go с сотен мегабайт до компактных 15–25 МБ.</li>
+<li><strong>Выбор Runner:</strong> <code>distroless</code> — эталон безопасности для боевого продакшена; <code>alpine</code> — удобный компромисс для сервисов, требующих оперативной ручной диагностики; <code>scratch</code> — предельный минимализм, требующий ручной подкладки сертификатов.</li>
+<li><strong><code>COPY --chown</code>:</strong> Исключает раздувание слоев OverlayFS за счет атомарного назначения прав при копировании артефактов.</li>
+<li><strong>Совместимость libc:</strong> При сборке с CGO среда компилятора (<code>glibc</code> vs <code>musl</code>) обязана строго совпадать со средой выполнения во избежание сбоев динамического компоновщика.</li>
 </ol>
-<p>Ваш Go-контейнер теперь изолирован, минимален и безопасен. Но контейнеры редко работают в вакууме — им нужно общаться с базами данных, другими сервисами и внешним миром. В следующей статье мы разберем, как Docker управляет сетевой изоляцией и маршрутизацией: <a href="4-docker-networking.html" class="wikilink">4. Docker networking</a>.</p>
+<p>Контейнер упакован, оптимизирован и надежно изолирован. Однако современные распределенные системы состоят из десятков взаимодействующих контейнеров, которым требуется защищенная и быстрая сетевая связность. В следующей лекции мы погрузимся в сетевую подсистему Docker: <a href="4-docker-networking.html" class="wikilink">4. Docker networking</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2378,7 +2500,7 @@ USER appuser
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#kontseptsiya-multi-stage-build">Концепция Multi-Stage Build</a></li><li class="toc-item toc-h2"><a href="#idealnyy-multi-stage-dockerfile-dlya-go">Идеальный Multi-Stage Dockerfile для Go</a></li><li class="toc-item toc-h2"><a href="#vybor-bazovogo-obraza-dlya-runnera">Выбор базового образа для Runner&#x27;а</a></li><li class="toc-item toc-h3"><a href="#1-scratch-absolyutnyy-nul">1. scratch (Абсолютный нуль)</a></li><li class="toc-item toc-h3"><a href="#2-distroless-rekomenduemyy-standart-ot-google">2. distroless (Рекомендуемый стандарт от Google)</a></li><li class="toc-item toc-h3"><a href="#3-alpine-kompromiss-dlya-debaga">3. alpine (Компромисс для дебага)</a></li><li class="toc-item toc-h2"><a href="#copy-chown-izyashchnoe-vladenie-faylami">COPY --chown: Изящное владение файлами</a></li><li class="toc-item toc-h2"><a href="#inektsiya-otladochnykh-instrumentov-delve">Инъекция отладочных инструментов (Delve)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-arkhitekturnaya-kontseptsiya-multi-stage-build">1. Архитектурная концепция Multi-Stage Build</a></li><li class="toc-item toc-h2"><a href="#2-idealnyy-production-ready-multi-stage-dockerfile-dlya-go">2. Идеальный production-ready Multi-Stage Dockerfile для Go</a></li><li class="toc-item toc-h2"><a href="#3-vybor-bazovogo-obraza-dlya-runner-scratch-distroless-ili-alpine">3. Выбор базового образа для Runner: scratch, distroless или alpine?</a></li><li class="toc-item toc-h3"><a href="#1-obraz-scratch-absolyutnyy-vakuum">1. Образ scratch (Абсолютный вакуум)</a></li><li class="toc-item toc-h3"><a href="#2-obrazy-google-distroless-zolotoy-korporativnyy-standart">2. Образы Google distroless (Золотой корпоративный стандарт)</a></li><li class="toc-item toc-h3"><a href="#3-obraz-alpine-pragmatichnyy-vybor-dlya-razrabotki">3. Образ alpine (Прагматичный выбор для разработки)</a></li><li class="toc-item toc-h2"><a href="#copy-chown-izyashchnoe-vladenie-faylami">COPY --chown: Изящное владение файлами</a></li><li class="toc-item toc-h2"><a href="#5-rasshirennyy-pattern-inektsiya-otladochnykh-instrumentov-delve">5. Расширенный паттерн: Инъекция отладочных инструментов (Delve)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
