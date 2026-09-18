@@ -2169,28 +2169,33 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~15 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Оптимизация структур данных</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях (<a href="1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a> и <a href="4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>) мы научились контролировать <em>количество</em> выделяемой памяти и жизненный цикл объектов. Но не менее важно то, как именно эти объекты располагаются в оперативной памяти физически. </p>
-<p>В языках с виртуальными машинами (Java, C#) расположение полей в объекте часто оптимизируется самой VM (например, JIT-компилятором) во время выполнения. В Go структура в памяти выглядит ровно так, как вы описали её в коде. Компилятор не меняет порядок полей за вас. И это возлагает ответственность за <strong>Data Structure Optimization</strong> на плечи разработчика.</p>
-<p>Неправильный порядок полей в структуре может привести к потере 30-40% оперативной памяти "в никуда" и замедлению работы из-за неэффективного использования кэшей процессора.</p>
+            <h2 id="optimizatsiya-struktur-dannykh-vyravnivanie-padding-i-magiya-nulevykh-struktur">Оптимизация структур данных: выравнивание, паддинг и магия нулевых структур</h2>
+
+<p>В предыдущих главах (<a href="1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a> и <a href="4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>) мы научились жестко контролировать <em>количество</em> выделяемой памяти и жизненный цикл объектов в куче. Однако существует не менее важный аспект, напрямую определяющий аппаратную производительность сервиса: <strong>то, как именно поля структур физически упакованы в оперативной памяти</strong>.</p>
+<p>В языках с виртуальными машинами (Java, C# с CLR) или динамических средах порядок полей объекта в памяти часто оптимизируется JIT-компилятором автоматически. В Go всё устроено предельно честно и бескомпромиссно: структура в памяти выглядит ровно так, как вы объявили её в исходном коде. Компилятор Go не переставляет поля местами ради вашей выгоды. И это возлагает полную ответственность за <strong>оптимизацию структур данных (Data Structure Optimization)</strong> на плечи инженера.</p>
+<p>Один небрежный порядок полей способен выбросить на свалку от 30% до 50% оперативной памяти процесса и замедлить доступ к данным в разы из-за расщепления машинных слов и промахов процессорного кэша.</p>
+<hr />
 <h2 id="mechanical-sympathy-vyravnivanie-pamyati-memory-alignment">Mechanical Sympathy: Выравнивание памяти (Memory Alignment)</h2>
 
-<p>Современные процессоры не читают оперативную память по одному байту. Они читают её "машинными словами" (Words). На 64-битной архитектуре (x86-64, ARM64) размер машинного слова равен 8 байтам.</p>
-<p>Представьте, что вы положили 8-байтное число (например, <code>int64</code>) по адресу, который не кратен 8 (например, начиная с 3-го байта). Чтобы прочитать это число, процессору придется сделать <strong>два</strong> обращения к оперативной памяти (прочитать первое слово, прочитать второе слово), отбросить лишнее, склеить нужные куски в регистре и только потом начать вычисления. Это называется <em>Unaligned Memory Access</em>. На некоторых архитектурах (например, старых ARM) это вообще вызывает аппаратную ошибку (Hardware Fault) и панику приложения.</p>
-<p>Чтобы избежать этого штрафа, компилятор Go делает <strong>Выравнивание памяти (Memory Alignment)</strong>. Он гарантирует, что переменные определенных типов всегда начинаются с адресов, кратных их размеру (или размеру машинного слова).<br />
-* <code>bool</code> (1 байт) — может лежать где угодно.<br />
-* <code>int32</code> (4 байта) — адрес должен быть кратен 4.<br />
-* <code>int64</code>, указатели, интерфейсы (8 байт) — адрес должен быть кратен 8.</p>
+<p>Современные процессоры не читают оперативную память по отдельным байтам. Они оперируют <strong>машинными словами (Words)</strong>. На 64-битных архитектурах (x86-64, ARM64) размер машинного слова составляет 8 байт (64 бита), и шина памяти перекачивает данные блоками, кратными 8 байтам.</p>
+<p>Представьте, что 8-байтное число (например, <code>int64</code>) оказалось записано по нечетному адресу, не кратному 8 (например, со смещения 3). Чтобы прочитать такое значение, процессору придется совершить два последовательных цикла чтения из памяти (прочитать первое 8-байтное слово, затем второе 8-байтное слово), после чего сдвигами и битовыми масками склеить половинки в целевом регистре. Это явление называется <strong>невыровненным доступом (Unaligned Memory Access)</strong>. На некоторых архитектурах (например, старых ревизиях ARM или MIPS) это вызывает аппаратное прерывание (Hardware Fault) и аварийный сбой программы.</p>
+<p>Чтобы исключить штрафные циклы процессора, компилятор Go выполняет <strong>выравнивание памяти (Memory Alignment)</strong>. Он гарантирует, что переменная каждого типа размещается по адресу, кратному ее базовому размеру:<br />
+- <code>bool</code>, <code>byte</code>, <code>uint8</code> (1 байт) — выравнивание 1 байт (может лежать по любому адресу).<br />
+- <code>int16</code>, <code>uint16</code> (2 байта) — адрес кратен 2.<br />
+- <code>int32</code>, <code>uint32</code>, <code>float32</code> (4 байта) — адрес кратен 4.<br />
+- <code>int64</code>, <code>uint64</code>, <code>float64</code>, указатели (<code>*T</code>), интерфейсы (<code>eface</code>/<code>iface</code>) — адрес обязан быть кратен 8 (на 64-битных платформах).</p>
+<hr />
 <h2 id="padding-zapolnenie-kuda-utekaet-pamyat">Padding (Заполнение): Куда утекает память</h2>
 
-<p>Чтобы соблюсти правила выравнивания при последовательном объявлении полей в структуре, компилятор вставляет между ними пустые "мертвые" байты — <strong>Padding</strong>.</p>
-<p>Посмотрим на классический пример неудачной структуры:</p>
+<p>Чтобы гарантировать выравнивание каждого поля при их последовательном размещении, компилятор вынужден вставлять между ними пустые байты-заполнители — <strong>Padding</strong>.</p>
+<p>Взглянем на классический пример неудачной компоновки:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2200,7 +2205,12 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import &quot;unsafe&quot;
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;fmt&quot;
+    &quot;unsafe&quot;
+)
 
 type BadStruct struct {
     IsActive bool    // 1 байт
@@ -2208,17 +2218,19 @@ type BadStruct struct {
     IsAdmin  bool    // 1 байт
 }
 
-// unsafe.Sizeof(BadStruct{}) вернет 24 байта!
+func main() {
+    fmt.Println(unsafe.Sizeof(BadStruct{})) // Напечатает: 24 байта!
+}
 </code></pre>
 </div>
 
-<p>Почему 24 байта, если полезных данных всего на 10 байт (1 + 8 + 1)?</p>
+<p>Полезных данных здесь всего 10 байт ($1 + 8 + 1$). Куда делись еще 14 байт?</p>
 <ol>
-<li><code>IsActive</code> занимает 1 байт.</li>
-<li>Следующее поле <code>Count</code> требует выравнивания по 8 байтам. Компилятор добавляет <strong>7 байт паддинга</strong>.</li>
-<li><code>Count</code> занимает свои 8 байт.</li>
-<li><code>IsAdmin</code> занимает 1 байт.</li>
-<li><em>Завершающий паддинг</em>: размер всей структуры также должен быть кратен размеру её самого большого поля (8 байт), чтобы при создании массива <code>[]BadStruct</code> элементы тоже были выровнены. Компилятор добавляет еще <strong>7 байт паддинга</strong> в конец.</li>
+<li><code>IsActive</code> занимает смещение 0 (1 байт).</li>
+<li>Следующее поле <code>Count</code> требует 8-байтного выравнивания. Компилятор не может положить его на смещение 1, поэтому вставляет <strong>7 байт паддинга</strong>.</li>
+<li><code>Count</code> ложится на смещения 8–15 (8 байт).</li>
+<li><code>IsAdmin</code> ложится на смещение 16 (1 байт).</li>
+<li><strong>Завершающий паддинг (Trailing Padding):</strong> Размер всей структуры обязан быть кратен размеру ее максимального поля (8 байт), чтобы при создании массива <code>[]BadStruct</code> элементы оставались выровненными. Компилятор добавляет еще <strong>7 байт паддинга</strong> в конец.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2233,25 +2245,36 @@ type BadStruct struct {
     </button>
   </div>
   <pre class="mermaid">
-flowchart LR
-subgraph BadStruct [&quot;BadStruct, Размер: 24 байта&quot;]
+flowchart TD
+subgraph BadVsGood [&quot;Сравнение компоновки структур в памяти (64-bit)&quot;]
+subgraph Bad [&quot;BadStruct: 24 байта (14 байт мусора)&quot;]
 direction LR
-A[&quot;IsActive&lt;br&gt;1 байт&quot;] --- P1[&quot;Padding&lt;br&gt;7 байт&quot;]
-P1 --- B[&quot;Count&lt;br&gt;8 байт&quot;]
-B --- C[&quot;IsAdmin&lt;br&gt;1 байт&quot;]
-C --- P2[&quot;Padding&lt;br&gt;7 байт&quot;]
-
-style P1 fill:#ffcccc,stroke:#ff0000,stroke-width:2px,color:#000
-style P2 fill:#ffcccc,stroke:#ff0000,stroke-width:2px,color:#000
+B1[&quot;IsActive&lt;br/&gt;1B&quot;] --- P1[&quot;Padding&lt;br/&gt;7B&quot;]
+P1 --- B2[&quot;Count&lt;br/&gt;8B&quot;]
+B2 --- B3[&quot;IsAdmin&lt;br/&gt;1B&quot;]
+B3 --- P2[&quot;Padding&lt;br/&gt;7B&quot;]
 end
+
+subgraph Good [&quot;GoodStruct: 16 байт (6 байт мусора)&quot;]
+direction LR
+G1[&quot;Count&lt;br/&gt;8B&quot;] --- G2[&quot;IsActive&lt;br/&gt;1B&quot;]
+G2 --- G3[&quot;IsAdmin&lt;br/&gt;1B&quot;]
+G3 --- P3[&quot;Padding&lt;br/&gt;6B&quot;]
+end
+end
+
+style P1 fill:#f43f5e,stroke:#9f1239,stroke-width:1px,color:#fff
+style P2 fill:#f43f5e,stroke:#9f1239,stroke-width:1px,color:#fff
+style P3 fill:#10b981,stroke:#047857,stroke-width:1px,color:#fff
   </pre>
 </div>
 
 
-<p>Если у вас в памяти висит кэш на 1 миллион таких объектов, вы впустую тратите <strong>14 Мегабайт</strong> оперативной памяти.</p>
+<p>Если в вашей системе хранится кэш на 10 миллионов таких структур, вы впустую расходуете <strong>140 Мегабайт</strong> оперативной памяти на хранение нулей!</p>
+<hr />
 <h2 id="pravilo-optimizatsii-sortirovka-po-ubyvaniyu-razmera">Правило оптимизации: Сортировка по убыванию размера</h2>
 
-<p>Решение проблемы элементарно — группируйте поля так, чтобы минимизировать пробелы. Самый простой и безотказный паттерн: <strong>Сортируйте поля по убыванию их размера</strong>.</p>
+<p>Решение проблемы элегантно: группируйте поля так, чтобы они плотно заполняли 8-байтные кванты памяти. Простое и безотказное инженерное правило: <strong>сортируйте поля структуры по убыванию их размера</strong>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2267,16 +2290,16 @@ end
     IsAdmin  bool    // 1 байт
 }
 
-// unsafe.Sizeof(GoodStruct{}) вернет 16 байт.
+// unsafe.Sizeof(GoodStruct{}) вернет ровно 16 байт!
 </code></pre>
 </div>
 
-<p>Как это ложится в память теперь?<br />
-1. <code>Count</code> (8 байт).<br />
-2. <code>IsActive</code> (1 байт).<br />
-3. <code>IsAdmin</code> (1 байт).<br />
-4. Завершающий паддинг для кратности 8 — добавляется <strong>6 байт</strong> в конец.</p>
-<p>Мы сэкономили 33% памяти простым переносом строки кода!</p>
+<p>Раскладка <code>GoodStruct</code> в памяти:<br />
+1. <code>Count</code> занимает смещения 0–7 (8 байт).<br />
+2. <code>IsActive</code> занимает смещение 8 (1 байт).<br />
+3. <code>IsAdmin</code> занимает смещение 9 (1 байт).<br />
+4. Завершающий паддинг для кратности 8 байтам — всего <strong>6 байт</strong> в конце (смещения 10–15).</p>
+<p>Простым перемещением строчки кода в файле мы сократили потребление памяти на <strong>33%</strong> и улучшили плотность упаковки данных в кэш-линиях CPU!</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2284,11 +2307,13 @@ end
   </div>
   <div class="callout-body">
     <p><strong>Вопрос:</strong> Нужно ли всегда маниакально сортировать поля во всех структурах проекта?<br />
-<strong>Ответ:</strong> Нет. Читаемость кода важнее микрооптимизаций. Сортировать поля имеет смысл только для тех структур, которые будут инстанцироваться в огромных количествах (сотни тысяч и миллионы объектов в слайсах или мапах). Для конфигурационных структур (которые создаются в единственном экземпляре при старте приложения) логическая группировка полей гораздо важнее экономии пары десятков байт.</p>
+<strong>Ответ:</strong> Нет. Читаемость кода важнее слепых микрооптимизаций. Сортировать поля имеет смысл только для структур, которые инстанцируются в гигантских количествах (сотни тысяч и миллионы экземпляров в слайсах, кэшах, кольцевых буферах). Для конфигурационных DTO или структур зависимостей сервиса логическая группировка полей несравнимо важнее экономии пары десятков байт.</p>
   </div>
 </div>
 
-<p>Для автоматизации этого процесса в экосистеме Go есть стандартный линтер. Вы можете проверить свои проекты утилитой <code>fieldalignment</code>:</p>
+<h3 id="avtomaticheskiy-audit-cherez-fieldalignment">Автоматический аудит через fieldalignment</h3>
+
+<p>Вам не нужно рассчитывать паддинги вручную с калькулятором. В официальном тулинге Go есть статический анализатор <code>fieldalignment</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2303,14 +2328,11 @@ fieldalignment ./...
 </code></pre>
 </div>
 
+<p>Анализатор находит неоптимальные структуры и с флагом <code>-fix</code> автоматически переставляет поля в коде.</p>
+<hr />
 <h2 id="magiya-struct-pustaya-struktura">Магия struct{} (Пустая структура)</h2>
 
-<p>Отдельного упоминания заслуживает тип <code>struct{}</code> (пустая структура). Её размер равен <strong>0 байт</strong>. Она не требует выравнивания, не занимает места в памяти и не генерирует мусор для GC.</p>
-<p>Это делает пустую структуру идеальным инструментом для двух паттернов:</p>
-<h3 id="1-signalnye-kanaly-semaphores-signals">1. Сигнальные каналы (Semaphores / Signals)</h3>
-<p>Если вам нужен канал исключительно для уведомления горутины о событии (например, <code>done chan struct{}</code>), использование <code>chan bool</code> или <code>chan int</code> будет тратить память на передачу ненужных значений. <code>chan struct{}</code> передает "ничто", сигнализируя самим фактом события.</p>
-<h3 id="2-realizatsiya-set-mnozhestva">2. Реализация Set (Множества)</h3>
-<p>В Go нет встроенного типа Set. Идиоматичный способ его реализации — использование <code>map[Type]struct{}</code>.</p>
+<p>Отдельного восхищения заслуживает тип <strong><code>struct{}</code> (пустая структура)</strong>. Ее размер равен строго <strong>0 байт</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2320,12 +2342,52 @@ fieldalignment ./...
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ХОРОШО: map как множество, значения не занимают память
-visited := make(map[string]struct{})
-visited[&quot;user_1&quot;] = struct{}{} // Вставка
-if _, exists := visited[&quot;user_1&quot;]; exists { ... } // Проверка
+  <pre class="language-go"><code class="language-go">unsafe.Sizeof(struct{}{}) // 0 байт
+</code></pre>
+</div>
 
-// ПЛОХО: Использование bool тратит 1 байт на каждое значение
+<p>Она не требует выравнивания, не занимает физического места в оперативной памяти и не создает нагрузки на сборщик мусора. Это делает пустую структуру идеальным строительным блоком для двух высоконагруженных паттернов:</p>
+<h3 id="1-signalnye-kanaly-semaphores-signals">1. Сигнальные каналы (Semaphores / Signals)</h3>
+
+<p>Если вам нужен канал исключительно для уведомления горутины о событии (например, <code>done chan struct{}</code>), использование <code>chan bool</code> или <code>chan int</code> будет тратить память на передачу ненужных значений. <code>chan struct{}</code> передает "ничто", сигнализируя самим фактом события:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// ХОРОШО: 0 байт на полезную нагрузку
+done := make(chan struct{})
+
+// Сигнал о завершении
+close(done) // или done &lt;- struct{}{}
+</code></pre>
+</div>
+
+<h3 id="2-realizatsiya-set-mnozhestva">2. Реализация Set (Множества)</h3>
+
+<p>Поскольку в стандартной библиотеке Go нет встроенного типа <code>Set</code>, каноническая реализация строится на базе <code>map[Type]struct{}</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// ХОРОШО: значения map не занимают памяти в бакетах
+visited := make(map[string]struct{})
+visited[&quot;user_1&quot;] = struct{}{} // Вставка элемента
+
+if _, exists := visited[&quot;user_1&quot;]; exists {
+    // Элемент присутствует
+}
+
+// ПЛОХО: Использование bool тратит 1 байт на каждое значение в бакете
 visitedBad := make(map[string]bool)
 </code></pre>
 </div>
@@ -2333,21 +2395,21 @@ visitedBad := make(map[string]bool)
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: переменная zerobase</span>
   </div>
   <div class="callout-body">
-    <p>Почему <code>struct{}{}</code> занимает 0 байт? Как рантайм понимает, где она лежит?<br />
-В исходниках рантайма Go (<code>runtime/malloc.go</code>) есть специальная глобальная переменная <code>zerobase</code> размером 8 байт. Все аллокации объектов нулевого размера (пустые структуры, пустые массивы <code>[0]int</code>) <strong>всегда</strong> возвращают указатель на эту единую переменную <code>zerobase</code>. </p>
+    <p>Как рантайм Go обращается к переменным нулевого размера, если они не занимают байтов?<br />
+В исходном коде рантайма (<code>runtime/malloc.go</code>) объявлена специальная глобальная статическая переменная <code>zerobase uintptr</code>. При любой аллокации в куче объекта размером 0 байт (пустые структуры <code>struct{}{}</code>, пустые массивы <code>[0]int</code>) рантайм всегда возвращает указатель на эту единственную системную переменную <code>zerobase</code>!</p>
   </div>
 </div>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: сравнение указателей на struct{}</span>
   </div>
   <div class="callout-body">
-    <p>Из-за механики <code>zerobase</code> возникает интересный корнер-кейс с указателями, который любят спрашивать на интервью уровня Middle/Senior:</p>
+    <p>Из-за существования <code>zerobase</code> возникает классический каверзный вопрос на собеседованиях:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2359,23 +2421,29 @@ visitedBad := make(map[string]bool)
   </div>
   <pre class="language-go"><code class="language-go">a := struct{}{}
 b := struct{}{}
-fmt.Println(&amp;a == &amp;b) 
+fmt.Println(&amp;a == &amp;b)
 </code></pre>
 </div>
 
-<p>Что выведет этот код? Спецификация Go говорит: <em>"Pointers to distinct zero-size variables may or may not be equal"</em>. <br />
-На практике, если переменные "утекают" в кучу (Escape Analysis), рантайм выдаст им одинаковый адрес <code>zerobase</code>, и сравнение вернет <code>true</code>. Но если компилятор оставит их на стеке, они могут получить разные адреса, и результат будет <code>false</code>! Никогда не завязывайте логику приложения на сравнение указателей пустых структур.</p>
+<p>Что выведет этот код? Спецификация Go прямо заявляет:<br />
+<em>"Pointers to distinct zero-size variables may or may not be equal"</em>.<br />
+Если переменные утекают в кучу (Escape Analysis), рантайм вернет для обеих адрес <code>zerobase</code>, и сравнение даст <code>true</code>. Если же переменные остаются на стеке функции, компилятор может выдать им разные смещения на стеке, и результат будет <code>false</code>!<br />
+<strong>Никогда не завязывайте бизнес-логику на сравнение адресов пустых структур.</strong></p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Порядок полей в структуре напрямую влияет на её размер из-за выравнивания памяти (Memory Alignment) и паддинга.</li>
-<li>Для структур, которые хранятся в памяти в больших количествах, применяйте правило: "поля сортируются от большего к меньшему".</li>
-<li>Используйте <code>struct{}</code> для сигнальных каналов и реализации структур данных типа Set, чтобы добиться Zero-allocation профиля по значениям.</li>
+<li><strong>Выравнивание памяти (Memory Alignment)</strong> — фундаментальное требование аппаратной части CPU, предотвращающее расщепление машинных слов при чтении.</li>
+<li><strong>Паддинг (Padding)</strong> — плата за выравнивание. Неправильный порядок полей может раздувать структуру на 30–50%.</li>
+<li><strong>Золотое правило компоновки:</strong> сортируйте поля от большего к меньшему (<code>int64</code>, указатели ──► <code>int32</code>, <code>float32</code> ──► <code>int16</code> ──► <code>bool</code>, <code>byte</code>).</li>
+<li><strong>Используйте утилиту <code>fieldalignment</code></strong> для аудита структур в CI/CD пайплайнах.</li>
+<li><strong>Пустая структура <code>struct{}</code> (0 байт)</strong> — идеальный инструмент для реализации множеств (Set) и сигнальных каналов без накладных расходов.</li>
 </ol>
-<p>Оптимизируя размер структуры, мы решаем проблему потребления RAM (Capacity). Но размер структуры — это лишь половина дела. То, как эта структура будет обрабатываться процессором при итерации по массивам, зависит от размера кэш-линий процессора и наличия False Sharing. Об этом — в нашей следующей статье: <a href="6-cache-friendly-struktury.html" class="wikilink">6. Cache friendly структуры</a>.</p>
+<p>Оптимизируя размер и выравнивание структуры, мы решили проблему объема памяти (Capacity). Но размер структуры — это лишь половина уравнения. То, как эти структуры размещаются в процессорном кэше и не вызывают ли они инвалидацию соседних ядер (False Sharing), определит скорость работы ваших параллельных алгоритмов.</p>
+<p>Об этом мы поговорим в следующей статье: <a href="6-cache-friendly-struktury.html" class="wikilink">6. Cache friendly структуры</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2403,7 +2471,7 @@ fmt.Println(&amp;a == &amp;b)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mechanical-sympathy-vyravnivanie-pamyati-memory-alignment">Mechanical Sympathy: Выравнивание памяти (Memory Alignment)</a></li><li class="toc-item toc-h2"><a href="#padding-zapolnenie-kuda-utekaet-pamyat">Padding (Заполнение): Куда утекает память</a></li><li class="toc-item toc-h2"><a href="#pravilo-optimizatsii-sortirovka-po-ubyvaniyu-razmera">Правило оптимизации: Сортировка по убыванию размера</a></li><li class="toc-item toc-h2"><a href="#magiya-struct-pustaya-struktura">Магия struct{} (Пустая структура)</a></li><li class="toc-item toc-h3"><a href="#1-signalnye-kanaly-semaphores-signals">1. Сигнальные каналы (Semaphores / Signals)</a></li><li class="toc-item toc-h3"><a href="#2-realizatsiya-set-mnozhestva">2. Реализация Set (Множества)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#optimizatsiya-struktur-dannykh-vyravnivanie-padding-i-magiya-nulevykh-struktur">Оптимизация структур данных: выравнивание, паддинг и магия нулевых структур</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-vyravnivanie-pamyati-memory-alignment">Mechanical Sympathy: Выравнивание памяти (Memory Alignment)</a></li><li class="toc-item toc-h2"><a href="#padding-zapolnenie-kuda-utekaet-pamyat">Padding (Заполнение): Куда утекает память</a></li><li class="toc-item toc-h2"><a href="#pravilo-optimizatsii-sortirovka-po-ubyvaniyu-razmera">Правило оптимизации: Сортировка по убыванию размера</a></li><li class="toc-item toc-h3"><a href="#avtomaticheskiy-audit-cherez-fieldalignment">Автоматический аудит через fieldalignment</a></li><li class="toc-item toc-h2"><a href="#magiya-struct-pustaya-struktura">Магия struct{} (Пустая структура)</a></li><li class="toc-item toc-h3"><a href="#1-signalnye-kanaly-semaphores-signals">1. Сигнальные каналы (Semaphores / Signals)</a></li><li class="toc-item toc-h3"><a href="#2-realizatsiya-set-mnozhestva">2. Реализация Set (Множества)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

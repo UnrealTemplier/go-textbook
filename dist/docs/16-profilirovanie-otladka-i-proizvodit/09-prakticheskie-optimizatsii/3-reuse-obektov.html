@@ -2169,19 +2169,52 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~18 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Reuse объектов</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье мы разобрали <a href="2-sync-pool.html" class="wikilink">2. sync Pool</a> — универсальный, потокобезопасный инструмент рантайма для кэширования объектов. Однако использование <code>sync.Pool</code> — это лишь вершина айсберга под названием «переиспользование памяти». </p>
-<p>Архитектурный подход <strong>Object Reuse (Переиспользование объектов)</strong> — это фундаментальный майндсет (mindset), при котором вы проектируете структуры данных и API таким образом, чтобы минимизировать саму <em>потребность</em> в выделении новой памяти. В отличие от языков вроде PHP или Python, где разработчик привык к концепции «создал -&gt; отдал Garbage Collector-у», в Go мы стремимся к паттерну «взял -&gt; использовал -&gt; очистил -&gt; использовал снова».</p>
-<p>В этой статье мы рассмотрим техники переиспользования памяти на уровне архитектуры приложения, структур данных и контрактов, которые позволят вашему бэкенду держать стабильный latency без скачков нагрузки на GC.</p>
+            <h2 id="reuse-obektov-arkhitekturnye-patterny-pereispolzovaniya-pamyati">Reuse объектов: архитектурные паттерны переиспользования памяти</h2>
+
+<p>В предыдущей главе мы разобрали <a href="2-sync-pool.html" class="wikilink">2. sync Pool</a> — универсальный, потокобезопасный системный инструмент рантайма для кэширования временных структур. Однако вызов <code>sync.Pool</code> — это лишь верхушка айсберга под названием «переиспользование памяти».</p>
+<p>Архитектурный подход <strong>Object Reuse (Переиспользование объектов)</strong> — это фундаментальный инженерный майндсет (mindset), при котором структуры данных, контракты функций и системные API проектируются так, чтобы свести к абсолютному нулю саму <em>потребность</em> в выделении новой динамической памяти.</p>
+<p>В языках со скрытым управлением памятью (вроде Python или PHP) программист привыкает к беззаботной парадигме «создал объект внутри функции ──► вернул наружу ──► забыл ──► пусть сборщик мусора разгребает». В высокопроизводительном Go мы исповедуем противоположный принцип: <strong>«выделил один раз при старте ──► заполнил in-place ──► обработал ──► очистил метаданные ──► переиспользовал снова»</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph ReusePatterns [&quot;Инженерные паттерны переиспользования памяти&quot;]
+P1[&quot;1. Контракт Caller-Allocates&lt;br/&gt;(Паттерн io.Reader, in-place мутация)&quot;]
+P2[&quot;2. Однопоточный Free List&lt;br/&gt;(Локальный lock-free список свободных блоков)&quot;]
+P3[&quot;3. Кольцевой буфер (Ring Buffer)&lt;br/&gt;(Непрерывный массив с битовой маской индекса)&quot;]
+P4[&quot;4. Арены памяти (Memory Arenas)&lt;br/&gt;(Региональное выделение и мгновенный Free)&quot;]
+end
+
+P1 --&gt; Stream[&quot;Стабильный Tail Latency&lt;br/&gt;Нулевая нагрузка на Garbage Collector&quot;]
+P2 --&gt; Stream
+P3 --&gt; Stream
+P4 --&gt; Stream
+  </pre>
+</div>
+
+
+<p>В этой статье мы рассмотрим техники переиспользования памяти на уровне архитектуры приложения, структур данных и контрактов, которые позволят вашему бэкенду держать монолитный latency без скачков нагрузки на GC.</p>
+<hr />
 <h2 id="1-dizayn-interfeysov-pattern-in-place-mutatsii">1. Дизайн интерфейсов: Паттерн In-place мутации</h2>
 
-<p>Вся стандартная библиотека Go пропитана идеей переиспользования. Самый яркий пример — интерфейс <code>io.Reader</code>.</p>
+<p>Вся стандартная библиотека Go пропитана идеей переиспользования. Самый выразительный пример — интерфейс <code>io.Reader</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2197,8 +2230,8 @@
 </code></pre>
 </div>
 
-<p>Вместо того чтобы метод возвращал новый слайс байт при каждом чтении (как это сделано, например, в методе <code>stream_get_contents</code> в PHP или <code>read()</code> в Python), <code>io.Reader</code> <strong>принимает</strong> буфер извне. Это перекладывает контроль за аллокациями на вызывающую сторону (caller).</p>
-<p>Вызывающая сторона может аллоцировать буфер один раз и переиспользовать его в цикле:</p>
+<p>Вместо того чтобы метод возвращал свежевыделенный слайс байтов при каждом чтении (как это сделано в методе <code>stream_get_contents</code> в PHP или <code>file.read()</code> в Python), метод <code>io.Reader</code> <strong>принимает</strong> буфер извне. Это перекладывает контроль за аллокациями на вызывающую сторону (caller).</p>
+<p>Вызывающая сторона может аллоцировать буфер ровно один раз при инициализации и циклически заполнять его миллионы раз:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2235,12 +2268,13 @@ func processStream(r io.Reader) error {
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему при передаче слайса <code>buf</code> в функцию <code>handleData(buf[:n])</code> мы не боимся, что старые данные (от предыдущих итераций) помешают логике?<br />
-<strong>Ответ:</strong> Потому что мы ограничиваем длину (len) слайса до <code>n</code> (количества реально прочитанных байт). За пределами <code>len</code>, но в пределах <code>capacity</code> лежат "грязные" данные с прошлой итерации, но идиоматичный Go-код никогда не читает за пределами <code>len</code>. Мы перезаписываем память "поверх" (in-place).</p>
+    <p><strong>Вопрос:</strong> Почему при передаче среза слайса <code>buf</code> в функцию <code>handleData(buf[:n])</code> мы не боимся, что старые данные (от предыдущих итераций) помешают логике?<br />
+<strong>Ответ:</strong> Потому что мы ограничиваем длину (<code>len</code>) слайса значением <code>n</code> (количеством реально прочитанных байт в текущей операции). За пределами индекса <code>len</code>, но в пределах полной емкости <code>capacity</code>, продолжают лежать "грязные" байты с прошлых итераций, но идиоматичный Go-код никогда не читает за пределами <code>len</code>. Новые данные записываются поверх старых (in-place перезапись).</p>
   </div>
 </div>
 
-<p>При проектировании собственных API микросервисов старайтесь следовать этому паттерну: передавайте структуры для заполнения по указателю, вместо того чтобы возвращать новые инстансы.</p>
+<p>При проектировании собственных сервисных слоев и внутренних пакетов следуйте этому каноническому правилу: <strong>передавайте структуры для заполнения по указателю или слайсы в качестве аргументов</strong>, вместо порождения новых объектов в теле функций.</p>
+<hr />
 <h2 id="2-lokalnye-puly-i-free-lists-spiski-svobodnykh-blokov">2. Локальные пулы и Free Lists (Списки свободных блоков)</h2>
 
 <p>Как мы выяснили в <a href="2-sync-pool.html" class="wikilink">2. sync Pool</a>, стандартный пул использует атомарные операции и привязку к G-M-P для обеспечения потокобезопасности. Но что, если мы находимся в контексте одной горутины (например, обрабатываем длинный TCP-стрим клиента или пишем игровой цикл)? Использование <code>sync.Pool</code> здесь будет оверхедом (из-за boxing'а в <code>interface{}</code> и лишней логики рантайма).</p>
@@ -2285,6 +2319,7 @@ func (m *NodeManager) PutNode(n *Node) {
 </div>
 
 <p>Этот подход дает <strong>Zero-allocation</strong> профиль работы и выполняется за несколько процессорных инструкций, так как не содержит мьютексов и работает локально в кэше ядра CPU.</p>
+<hr />
 <h2 id="3-ring-buffers-koltsevye-bufery">3. Ring Buffers (Кольцевые буферы)</h2>
 
 <p>Когда мы работаем с непрерывным потоком данных (например, агрегация метрик, буферизация логов для батч-отправки в ClickHouse, стриминг видео), аллокация объектов под каждое сообщение убьет производительность.</p>
@@ -2303,31 +2338,45 @@ func (m *NodeManager) PutNode(n *Node) {
   </div>
   <pre class="mermaid">
 flowchart LR
-A[&quot;Ячейка 0&lt;br&gt;Head-чтение&quot;] --&gt; B[&quot;Ячейка 1&quot;]
+A[&quot;Ячейка 0&lt;br/&gt;Head (чтение)&quot;] --&gt; B[&quot;Ячейка 1&quot;]
 B --&gt; C[&quot;Ячейка 2&quot;]
-C --&gt; D[&quot;Ячейка 3&lt;br&gt;Tail-запись&quot;]
+C --&gt; D[&quot;Ячейка 3&lt;br/&gt;Tail (запись)&quot;]
 D --&gt; E[&quot;Ячейка N&quot;]
-E -.-&gt;|&quot;Перезапись старых данных&quot;| A
+E -.-&gt;|&quot;Перезапись старых данных по кругу&quot;| A
   </pre>
 </div>
 
 
 <p><strong>Преимущества Ring Buffer:</strong><br />
 1. <strong>Единоразовая аллокация</strong>: Мы один раз выделяем память при старте приложения (например, <code>make([]Event, 100000)</code>).<br />
-2. <strong>Сверхбыстрый доступ</strong>: Вычисление индекса ячейки происходит через битовое "И" (если размер массива — степень двойки: <code>index = counter &amp; (size - 1)</code>), что выполняется за 1 такт CPU.<br />
-3. <strong>Отсутствие фрагментации</strong>: Вся память лежит одним непрерывным блоком, что максимально дружелюбно к префетчеру процессора (Prefetcher).</p>
+2. <strong>Сверхбыстрый доступ</strong>: Вычисление индекса ячейки происходит через битовое "И" (если размер массива — степень двойки: <code>index = counter &amp; (size - 1)</code>), что выполняется за 1 такт CPU без деления.<br />
+3. <strong>Отсутствие фрагментации</strong>: Вся память лежит одним непрерывным блоком, что максимально дружелюбно к префетчеру процессора (Prefetcher) и L1/L2 кэшам.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Утечка памяти через висячие указатели</span>
   </div>
   <div class="callout-body">
-    <p>При реализации кольцевых буферов (да и вообще при переиспользовании структур) обязательно обнуляйте указатели на вложенные объекты перед перезаписью ячейки! <br />
-Если структура содержит указатель (например, <code>Data *Payload</code>), и вы просто перезаписываете индекс кольцевого буфера, старый <code>Payload</code> останется в памяти, так как кольцевой буфер всё еще будет держать на него ссылку. Это приведет к катастрофической утечке памяти (Memory Leak).<br />
-Обнуляйте явно: <code>buffer[i].Data = nil</code>.</p>
+    <p>При реализации кольцевых буферов (да и вообще при переиспользовании структур) обязательно обнуляйте указатели на вложенные объекты перед перезаписью ячейки!</p>
+<p>Если структура содержит указатель (например, <code>Data *Payload</code>), и вы просто перезаписываете индекс кольцевого буфера новым событием, старый <code>Payload</code> останется в куче навечно, пока ячейку не перезапишут снова. Если буфер большой (100 000 элементов), гигабайты старых объектов будут удерживаться от очистки сборщиком мусора!</p>
+<p><strong>Всегда обнуляйте вложенные ссылки явно:</strong></p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">buffer[i].Data = nil
+</code></pre>
+</div>
+
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-reispolzovanie-ukazateley-vs-ploskikh-dannykh">Mechanical Sympathy: Реиспользование указателей vs Плоских данных</h2>
 
 <p>Важно понимать, <em>что именно</em> вы переиспользуете, так как это напрямую влияет на работу сборщика мусора и производительность CPU.</p>
@@ -2337,6 +2386,7 @@ E -.-&gt;|&quot;Перезапись старых данных&quot;| A
 1. GC вынужден сканировать весь ваш кэш/пул, чтобы построить граф достижимости. Чем больше ваш Free List, тем дольше длится сканирование.<br />
 2. При каждой перезаписи указателя внутри вашей переиспользуемой структуры рантайм вызывает специальный механизм (подробнее в <a href="../05-garbage-collector/5-write-barriers.html" class="wikilink">5. Write barriers</a>). Этот барьер записи добавляет накладные расходы к каждой операции присваивания, чтобы гарантировать корректность работы конкурентного сборщика мусора.</p>
 <p><strong>Правило хардкорной инженерии:</strong> Лучший объект для переиспользования — это плоский кусок памяти (<code>[]byte</code> или структуры из простых типов). Если вам нужно создать пул сложных объектов — старайтесь "расплющить" их, избавившись от вложенных указателей (используйте ID или индексы массивов вместо указателей на другие структуры).</p>
+<hr />
 <h2 id="4-pamyat-aren-memory-arenas-eksperiment-go-1-20">4. Память Арен (Memory Arenas) — Эксперимент Go 1.20+</h2>
 
 <div class="callout callout-info">
@@ -2352,13 +2402,15 @@ E -.-&gt;|&quot;Перезапись старых данных&quot;| A
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <p>Переиспользование объектов — это не просто вызов пула. Это архитектурное решение.<br />
-1. Проектируйте API так, чтобы caller передавал буфер для записи (паттерн <code>io.Reader</code>).<br />
-2. Для структур внутри одного потока/горутины используйте легковесные списки свободных блоков (Free Lists) вместо <code>sync.Pool</code>.<br />
-3. Для потоковых данных используйте Ring Buffers, чтобы избежать аллокаций в принципе.<br />
-4. Помните про обнуление указателей в структурах при их переиспользовании, чтобы не обмануть GC и не создать утечку памяти.</p>
+1. <strong>Проектируйте API так, чтобы caller передавал буфер для записи</strong> (канонический паттерн <code>io.Reader</code>).<br />
+2. <strong>Для структур внутри одной горутины используйте легковесные Free Lists</strong> вместо <code>sync.Pool</code>, исключая накладные расходы на pinning и <code>interface{}</code>.<br />
+3. <strong>Для потоковых данных используйте Ring Buffers</strong>, обеспечивая единоразовую аллокацию и вычисление индексов через битовые маски.<br />
+4. <strong>Обязательно обнуляйте вложенные указатели (<code>buffer[i].Data = nil</code>)</strong> при перезаписи ячеек, чтобы не блокировать работу Garbage Collector.<br />
+5. <strong>Отдавайте предпочтение плоским структурам без указателей</strong>, избавляя сборщик мусора от сканирования памяти и срабатывания Write Barriers.</p>
 <p>Мы разобрали, как переиспользовать память, чтобы минимизировать аллокации. В следующей статье мы рассмотрим логичное продолжение этой темы — как правильно запрашивать память у рантайма и ОС изначально, чтобы её в принципе было что переиспользовать и мы не тратили время на ресайзинг: <a href="4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>.</p>
           </div>
 
@@ -2387,7 +2439,7 @@ E -.-&gt;|&quot;Перезапись старых данных&quot;| A
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-dizayn-interfeysov-pattern-in-place-mutatsii">1. Дизайн интерфейсов: Паттерн In-place мутации</a></li><li class="toc-item toc-h2"><a href="#2-lokalnye-puly-i-free-lists-spiski-svobodnykh-blokov">2. Локальные пулы и Free Lists (Списки свободных блоков)</a></li><li class="toc-item toc-h2"><a href="#3-ring-buffers-koltsevye-bufery">3. Ring Buffers (Кольцевые буферы)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-reispolzovanie-ukazateley-vs-ploskikh-dannykh">Mechanical Sympathy: Реиспользование указателей vs Плоских данных</a></li><li class="toc-item toc-h2"><a href="#4-pamyat-aren-memory-arenas-eksperiment-go-1-20">4. Память Арен (Memory Arenas) — Эксперимент Go 1.20+</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#reuse-obektov-arkhitekturnye-patterny-pereispolzovaniya-pamyati">Reuse объектов: архитектурные паттерны переиспользования памяти</a></li><li class="toc-item toc-h2"><a href="#1-dizayn-interfeysov-pattern-in-place-mutatsii">1. Дизайн интерфейсов: Паттерн In-place мутации</a></li><li class="toc-item toc-h2"><a href="#2-lokalnye-puly-i-free-lists-spiski-svobodnykh-blokov">2. Локальные пулы и Free Lists (Списки свободных блоков)</a></li><li class="toc-item toc-h2"><a href="#3-ring-buffers-koltsevye-bufery">3. Ring Buffers (Кольцевые буферы)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-reispolzovanie-ukazateley-vs-ploskikh-dannykh">Mechanical Sympathy: Реиспользование указателей vs Плоских данных</a></li><li class="toc-item toc-h2"><a href="#4-pamyat-aren-memory-arenas-eksperiment-go-1-20">4. Память Арен (Memory Arenas) — Эксперимент Go 1.20+</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2169,31 +2169,22 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Предвыделение памяти</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущей статье <a href="3-reuse-obektov.html" class="wikilink">3. Reuse объектов</a> мы говорили о том, как переиспользовать уже выделенную память. Но прежде чем что-то переиспользовать, эту память нужно правильно запросить у операционной системы и рантайма. </p>
-<p>Главный враг предсказуемой производительности (и причина резких скачков Tail Latency) — это <strong>динамическое изменение размеров структур данных</strong> (Dynamic Resizing) в процессе работы приложения. </p>
-<p>В языках высокого уровня (PHP, Python, JS) разработчики привыкли "просто добавлять" элементы в массив или словарь, не задумываясь о том, как это работает. В Go, если вы целитесь на уровень Senior/Lead, вы обязаны понимать механику роста коллекций и использовать <strong>Предвыделение памяти (Preallocation)</strong> везде, где максимальный размер данных известен или может быть предсказан.</p>
+            <h2 id="predvydelenie-pamyati-ustranenie-skrytykh-zaderzhek-dinamicheskogo-rosta">Предвыделение памяти: устранение скрытых задержек динамического роста</h2>
+
+<p>В предыдущей статье <a href="3-reuse-obektov.html" class="wikilink">3. Reuse объектов</a> мы исследовали архитектурные паттерны переиспользования памяти. Но прежде чем память станет кандидатом на повторное использование, её необходимо запросить у рантайма и операционной системы. И именно в этот момент многие разработчики закладывают мину замедленного действия в архитектуру своего приложения.</p>
+<p>Главный скрытый враг предсказуемой производительности и первопричина внезапных скачков хвостовых задержек (Tail Latency P99/P99.9) — это <strong>динамическое изменение размеров структур данных (Dynamic Resizing)</strong> в процессе обработки сетевых запросов.</p>
+<p>В скриптовых языках (Python, PHP, JavaScript) программист привыкает беззаботно наполнять массивы и словари вызовами <code>.append()</code> или <code>.push()</code>, перекладывая заботу о выделении памяти на плечи интерпретатора. В Go инженерное мастерство требует глубокого понимания механики роста коллекций и применения <strong>Предвыделения памяти (Preallocation)</strong> везде, где объем данных известен заранее или может быть разумно спрогнозирован.</p>
+<hr />
 <h2 id="mechanical-sympathy-tsena-dinamicheskogo-rosta">Mechanical Sympathy: Цена динамического роста</h2>
 
-<p>Когда вы добавляете элемент в массив, под капотом которого нет свободного места, процессор не может просто "докинуть" байты в конец. Память за пределами массива может быть уже занята другими объектами.</p>
-<p>Чтобы коллекция выросла, рантайм должен:<br />
-1. Вызвать аллокатор <code>runtime.mallocgc</code> для выделения нового, более крупного непрерывного куска памяти.<br />
-2. Использовать низкоуровневую функцию <code>memmove</code> для побайтового копирования старых данных в новый блок.<br />
-3. Оставить старый блок памяти "умирать", создавая работу для фазы Mark сборщика мусора.<br />
-4. <strong>Уничтожить кэш-линии (Cache invalidation):</strong> CPU уже загрузил старый массив в L1/L2 кэш. Перемещение данных в новую область памяти означает, что следующие операции чтения приведут к кэш-промахам (Cache Misses).</p>
-<p>Рассмотрим, как это происходит в главных встроенных типах Go.</p>
-<hr />
-<h2 id="1-slaysy-i-kovarstvo-runtime-growslice">1. Слайсы и коварство runtime.growslice</h2>
-
-<p>Слайс в Go — это структура из трех полей (24 байта на x64): указатель на базовый массив <code>array</code>, текущая длина <code>len</code> и вместимость <code>cap</code>.</p>
-<p>При вызове <code>append</code>, рантайм проверяет: <code>len &lt; cap</code>. Если это так, элемент просто записывается в ячейку памяти по смещению, а <code>len</code> инкрементируется. Это операция $O(1)$, стоящая пару тактов процессора.</p>
-<p>Но если <code>len == cap</code>, компилятор вставляет вызов функции <code>runtime.growslice</code>.</p>
+<p>Когда вы добавляете элемент в массив, под капотом которого исчерпана емкость (<code>capacity</code>), процессор не может просто «дописать» байты в конец существующего блока: пространство за пределами буфера в куче уже занято другими переменными или соседними <code>mspan</code>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2208,12 +2199,50 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;append-elem-&quot;] --&gt; B{&quot;len &lt; cap?&quot;}
-B -- &quot;Да&quot; --&gt; C[&quot;Вставка элемента O-от-1&quot;]
+subgraph ResizingCost [&quot;Анатомия накладных расходов при Dynamic Resizing&quot;]
+R1[&quot;1. runtime.mallocgc&lt;br/&gt;Поиск mspan в куче или вызов mmap&quot;]
+R2[&quot;2. memmove&lt;br/&gt;Побайтовое копирование старого буфера в новый&quot;]
+R3[&quot;3. Мусор для GC&lt;br/&gt;Старый массив бросается в куче (Mark &amp; Sweep)&quot;]
+R4[&quot;4. Cache Invalidation&lt;br/&gt;Сброс горячих строк L1/L2 кэша CPU (Cache Misses)&quot;]
+end
+
+R1 --&gt; R2 --&gt; R3 --&gt; R4
+  </pre>
+</div>
+
+
+<p>Чтобы коллекция выросла, рантайм вынужден выполнить четыре тяжелые аппаратные операции:<br />
+1. Вызвать аллокатор <code>runtime.mallocgc</code> для выделения нового, более крупного непрерывного куска памяти в куче.<br />
+2. Использовать низкоуровневую инструкцию <code>memmove</code> для побайтового копирования старых данных в новый блок.<br />
+3. Оставить старый блок памяти "умирать", создавая паразитный объем работы для фаз Mark и Sweep сборщика мусора.<br />
+4. <strong>Уничтожить кэш-линии (Cache Invalidation):</strong> Процессор уже прогрел старый массив в быстром L1/L2 кэше. Перенос данных в новую область виртуальной памяти гарантирует серию болезненных кэш-промахов (Cache Misses) при последующих обращениях.</p>
+<p>Рассмотрим, как этот механизм работает в ключевых встроенных типах Go.</p>
+<hr />
+<h2 id="1-slaysy-i-kovarstvo-runtime-growslice">1. Слайсы и коварство runtime.growslice</h2>
+
+<p>Слайс в Go — это сверхлегковесная структура из трех полей (24 байта на 64-битной архитектуре): указатель на базовый массив <code>array</code>, текущая длина <code>len</code> и предельная вместимость <code>cap</code>.</p>
+<p>При вызове встроенной функции <code>append</code>, рантайм проверяет условие: <code>len &lt; cap</code>. Если свободное место есть, элемент записывается по смещению базового массива, а <code>len</code> инкрементируется за 1–2 такта процессора ($O(1)$).</p>
+<p>Но как только <code>len == cap</code>, компилятор генерирует переход на системную функцию рантайма <code>runtime.growslice</code>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+A[&quot;append(slice, elem)&quot;] --&gt; B{&quot;len &lt; cap?&quot;}
+B -- &quot;Да&quot; --&gt; C[&quot;Запись по смещению array[len++]&lt;br/&gt;(O(1), 1-2 такта CPU)&quot;]
 B -- &quot;Нет&quot; --&gt; D[&quot;Вызов runtime.growslice&quot;]
-D --&gt; E[&quot;Вычисление нового capacity&quot;]
-E --&gt; F[&quot;Вызов mallocgc-аллокация в Heap-&quot;]
-F --&gt; G[&quot;Копирование данных -memmove-&quot;]
+D --&gt; E[&quot;Вычисление нового capacity&lt;br/&gt;(функция nextslicecap)&quot;]
+E --&gt; F[&quot;Вызов mallocgc (Аллокация в Heap)&quot;]
+F --&gt; G[&quot;Копирование данных (memmove)&quot;]
 G --&gt; C
   </pre>
 </div>
@@ -2222,16 +2251,19 @@ G --&gt; C
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: эволюция алгоритма nextslicecap</span>
   </div>
   <div class="callout-body">
-    <p>До версии Go 1.18 алгоритм роста был жестким: если элементов меньше 1024, <code>cap</code> удваивается (x2). Если больше — растет на 25% (x1.25). <br />
-<strong>Начиная с Go 1.18</strong> алгоритм сделали более плавным (функция <code>nextslicecap</code>). Переход от x2 к x1.25 стал постепенным для размеров от 256 элементов. Это было сделано, чтобы уменьшить фрагментацию и перерасход памяти (Over-allocation) при создании больших слайсов.</p>
+    <p>До версии Go 1.18 действовало жесткое ступенчатое правило: если емкость среза меньше 1024 элементов, <code>cap</code> удваивался ($x2$). Если больше — емкость увеличивалась на 25% ($x1.25$). Это приводило к резким ступенькам и избыточному потреблению памяти (Over-allocation).</p>
+<p><strong>Начиная с Go 1.18</strong>, внедрен сглаженный алгоритм в функции <code>nextslicecap</code>: переход от удваивания к коэффициенту $~1.25$ происходит плавно в диапазоне от 256 элементов по формуле:<br />
+$$\text{newcap} = \text{oldcap} + \frac{\text{oldcap} + 3 \times 256}{4}$$<br />
+Это существенно снизило фрагментацию памяти при работе с большими слайсами.</p>
   </div>
 </div>
 
-<p><strong>Как применять:</strong><br />
-Если вы знаете итоговый размер (например, делаете <code>map</code> по слайсу пользователей), <strong>всегда</strong> указывайте <code>capacity</code>.</p>
+<h3 id="prakticheskoe-primenenie">Практическое применение</h3>
+
+<p>Если итоговый размер коллекции известен заранее, <strong>всегда</strong> передавайте третьим аргументом емкость <code>capacity</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2241,7 +2273,7 @@ G --&gt; C
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХО: O-от-N аллокаций и копирований
+  <pre class="language-go"><code class="language-go">// ПЛОХО: O(N) скрытых аллокаций и постоянные memmove при заполнении
 func getUserIDs(users []User) []int64 {
     var ids []int64
     for _, u := range users {
@@ -2250,7 +2282,7 @@ func getUserIDs(users []User) []int64 {
     return ids
 }
 
-// ХОРОШО: 1 аллокация, 0 копирований массивов
+// ХОРОШО: Ровно 1 аллокация, 0 лишних копирований памяти
 func getUserIDs(users []User) []int64 {
     ids := make([]int64, 0, len(users)) // Предвыделение cap
     for _, u := range users {
@@ -2264,10 +2296,10 @@ func getUserIDs(users []User) []int64 {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: путаница между len и cap</span>
   </div>
   <div class="callout-body">
-    <p>Одна из самых частых ошибок на код-ревью — перепутать <code>len</code> и <code>cap</code> при предвыделении.</p>
+    <p>Классическая ошибка, регулярно встречающаяся на код-ревью:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2278,29 +2310,65 @@ func getUserIDs(users []User) []int64 {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">// ОШИБКА:
-ids := make([]int64, len(users)) // создает слайс, где len И cap равны N. Все элементы = 0.
+ids := make([]int64, len(users)) // создает слайс, где len И cap равны N. Все элементы = 0!
 for _, u := range users {
     ids = append(ids, u.ID) // append добавит элементы В КОНЕЦ, начиная с индекса N!
 }
 </code></pre>
 </div>
 
-<p>Вы получите слайс длиной <code>2 * N</code>, где первая половина — нули. Правильно: <code>make([]T, 0, expectedCapacity)</code> для <code>append</code>, или <code>make([]T, expectedLen)</code> если вы пишете по индексам <code>ids[i] = u.ID</code>. Писать по индексам, кстати, чуть-чуть быстрее, чем <code>append</code>, так как убираются проверки границ (bounds checking).</p>
+<p>В результате функция вернет слайс длиной <code>2 * N</code>, первая половина которого заполнена нулями.<br />
+<strong>Правило:</strong><br />
+- Для использования с <code>append</code> пишите: <code>make([]T, 0, expectedCapacity)</code>.<br />
+- Для прямой записи по индексам (<code>ids[i] = u.ID</code>) пишите: <code>make([]T, expectedLen)</code>. Прямая индексация работает даже быстрее <code>append</code>, так как компилятор часто полностью элиминирует bounds checking.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="2-mapy-maps-i-dorogaya-evakuatsiya">2. Мапы (Maps) и дорогая эвакуация</h2>
 
-<p>Структура <code>map</code> в Go (внутри это <code>hmap</code>) — это хеш-таблица, массив "бакетов" (<code>bmap</code>), каждый из которых вмещает до 8 пар ключ-значение.</p>
-<p>Когда мапа заполняется, рантайм отслеживает метрику <strong>Load Factor</strong> (коэффициент заполнения). В Go критический порог Load Factor равен <strong>6.5</strong> (в среднем 6.5 элементов на каждый бакет). Как только порог превышен, рантайм запускает <strong>Эвакуацию (Evacuation)</strong>.</p>
-<p>Эвакуация — это катастрофа для latency:<br />
-1. Выделяется новый массив бакетов, в 2 раза превышающий старый.<br />
-2. В старом массиве ставится флаг эвакуации.<br />
-3. При каждом последующем чтении/записи (insert/delete/update) рантайм берет 1-2 бакета из старой памяти, пересчитывает хеши всех их ключей и перемещает в новую память (Incremental Evacuation).</p>
-<p>Это сделано инкрементально, чтобы избежать огромных Stop-The-World пауз, но это "размазывает" деградацию производительности (CPU throttle) на множество операций.</p>
-<p><strong>Как применять:</strong><br />
-Функция <code>make</code> для мапы принимает второй аргумент — ожидаемое количество элементов (hint). </p>
+<p>Внутреннее устройство <code>map</code> в Go (структура <code>hmap</code>) представляет собой хеш-таблицу, состоящую из массива бакетов (<code>bmap</code>). Каждый бакет фиксированно вмещает ровно 8 пар «ключ-значение».</p>
+<p>Когда в мапу добавляются новые записи, рантайм отслеживает средний коэффициент заполнения — <strong>Load Factor</strong>. В Go критический порог Load Factor строго зафиксирован константой и равен <strong>6.5</strong> (в среднем 6.5 элементов на один бакет). Как только порог превышен (или количество переполняющих overflow-бакетов становится избыточным), рантайм запускает процедуру <strong>Эвакуации (Evacuation)</strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph OldTable [&quot;Старый массив бакетов (hmap.oldbuckets)&quot;]
+B0[&quot;Бакет 0 (8 пар)&quot;]
+B1[&quot;Бакет 1 (8 пар)&quot;]
+end
+
+subgraph NewTable [&quot;Новый массив x2 (hmap.buckets)&quot;]
+NB0[&quot;Новый бакет 0&quot;]
+NB1[&quot;Новый бакет 1&quot;]
+NB2[&quot;Новый бакет 2&quot;]
+NB3[&quot;Новый бакет 3&quot;]
+end
+
+B0 -.-&gt;|&quot;Инкрементальный пересчет хешей&quot;| NB0
+B0 -.-&gt;|&quot;и миграция данных&quot;| NB2
+  </pre>
+</div>
+
+
+<p>Эвакуация — это тяжелейший процесс для хвостовых задержек:<br />
+1. Выделяется новый массив бакетов, ровно в 2 раза превышающий исходный.<br />
+2. Текущий массив бакетов помечается как <code>oldbuckets</code>.<br />
+3. При каждой последующей операции мутации (вставка, перезапись, удаление) рантайм эвакуирует 1–2 бакета из старой памяти в новую (Incremental Evacuation).</p>
+<p>Хотя инкрементальный перенос спасает от полной остановки мира (Stop-The-World), он размазывает деградацию производительности (CPU Throttling) на тысячи последующих HTTP-запросов.</p>
+<h3 id="prakticheskoe-primenenie">Практическое применение</h3>
+
+<p>Второй аргумент функции <code>make</code> для мапы задает подсказку размера (hint):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2310,10 +2378,10 @@ for _, u := range users {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХО: Неизвестно сколько элементов, будет эвакуация
+  <pre class="language-go"><code class="language-go">// ПЛОХО: Размер неизвестен, мапа будет многократно удваиваться с эвакуацией
 m := make(map[string]User)
 
-// ХОРОШО: Рантайм выделит правильное количество бакетов СРАЗУ
+// ХОРОШО: Рантайм выделит правильный массив бакетов СРАЗУ
 m := make(map[string]User, 10000)
 </code></pre>
 </div>
@@ -2321,21 +2389,22 @@ m := make(map[string]User, 10000)
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: вычисление бакетов из hint</span>
   </div>
   <div class="callout-body">
-    <p>Обратите внимание: <code>10000</code> в <code>make(map, hint)</code> — это <strong>не количество бакетов</strong>. Это количество <strong>элементов</strong>, которое вы собираетесь туда положить. Рантайм сам разделит это число на 6.5 и найдет ближайшую степень двойки, чтобы выделить нужное количество памяти под бакеты, гарантируя, что при вставке 10000 элементов эвакуация не произойдет.</p>
+    <p>Число <code>10000</code> в <code>make(map, hint)</code> — это <strong>не количество бакетов</strong>, а количество элементов, которое вы планируете сохранить. Рантайм делит это число на целевой Load Factor (6.5) и вычисляет степень двойки $2^B$, необходимую для размещения бакетов без единой эвакуации.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="3-strings-builder-i-bytes-buffer">3. strings.Builder и bytes.Buffer</h2>
 
-<p>Конкатенация строк через оператор <code>+</code> — известная проблема. Так как строки в Go иммутабельны, операция <code>str3 := str1 + str2</code> всегда выделяет новую память размером <code>len(str1) + len(str2)</code> и копирует туда обе строки. В цикле это дает сложность $O(N^2)$ и лавину мусора.</p>
-<p>Для эффективной конкатенации используют <code>strings.Builder</code>. Под капотом у него обычный слайс байт <code>[]byte</code>, который мутируется, а при вызове <code>String()</code> возвращается через <code>unsafe</code> преобразование (без аллокаций копирования).</p>
-<p>Но слайс внутри <code>strings.Builder</code> тоже растет через <code>growslice</code>! Если вы собираете большой JSON или SQL-запрос руками, <code>Builder</code> будет постоянно реаллоцировать свой буфер.</p>
-<p><strong>Как применять:</strong><br />
-Используйте метод <code>Grow()</code>, который сразу выделяет нужный <code>capacity</code> под капотом.</p>
+<p>Так как строки в Go абсолютно иммутабельны, наивная конкатенация через оператор <code>+</code> (например, <code>str3 := str1 + str2</code>) всегда выделяет новую память размером <code>len(str1) + len(str2)</code> и копирует туда обе строки. В цикле это дает квадратичную сложность $O(N^2)$ и лавину мусора.</p>
+<p>Для эффективной конструирования строк используется <code>strings.Builder</code>. Под капотом он инкапсулирует обычный байтовый срез <code>[]byte</code>, который мутируется in-place, а при вызове <code>String()</code> возвращает строку через zero-copy <code>unsafe</code>-преобразование.</p>
+<p>Однако слайс внутри <code>strings.Builder</code> также растет через системный <code>growslice</code>! Если вы генерируете объемный JSON, HTML-шаблон или SQL-запрос, <code>Builder</code> будет тратить время на реаллокации.</p>
+<h3 id="prakticheskoe-primenenie-metod-grow">Практическое применение: метод Grow()</h3>
+
+<p>Всегда оценивайте максимальный размер формируемой строки и вызывайте метод <code>Grow()</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2349,12 +2418,12 @@ m := make(map[string]User, 10000)
     var sb strings.Builder
 
     // Предвычисляем примерный размер (экономим аллокации в цикле)
-    expectedSize := len(table) + 30 // Базовый запрос
+    expectedSize := len(table) + 30 // Базовый запрос &quot;SELECT ... FROM table&quot;
     for _, col := range columns {
         expectedSize += len(col) + 2 // Столбцы + запятые
     }
 
-    // Предвыделение
+    // Предвыделение буфера одним куском
     sb.Grow(expectedSize) 
 
     sb.WriteString(&quot;SELECT &quot;)
@@ -2378,8 +2447,8 @@ m := make(map[string]User, 10000)
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В чем разница между <code>strings.Builder</code> и <code>bytes.Buffer</code>, и почему первый предпочтительнее для сборки строк?<br />
-<strong>Ответ:</strong> Вызов <code>bytes.Buffer.String()</code> выполняет аллокацию и копирует весь <code>[]byte</code> в новую иммутабельную строку. <code>strings.Builder</code> спроектирован так, чтобы его метод <code>String()</code> возвращал строку zero-copy (с помощью <code>unsafe</code>), заимствуя базовый массив байт. Но расплата за это — <code>Builder</code> запрещено копировать по значению (возникнет паника из-за механизма защиты <code>noCopy</code>).</p>
+    <p><strong>Вопрос:</strong> В чем принципиальная разница между <code>strings.Builder</code> и <code>bytes.Buffer</code>, и почему для генерации строк предпочтителен именно первый?<br />
+<strong>Ответ:</strong> Метод <code>bytes.Buffer.String()</code> выполняет полноценную аллокацию памяти и побайтовое копирование слайса <code>[]byte</code> в новую иммутабельную строку. В отличие от него, <code>strings.Builder.String()</code> выполняет zero-copy приведение через <code>unsafe.String</code>, заимствуя базовый байтовый массив без единой аллокации. Платой за это является защита от копирования: структура <code>strings.Builder</code> содержит защитное поле <code>noCopy</code>, и попытка скопировать инстанс билдера по значению после начала записи вызовет немедленную панику.</p>
   </div>
 </div>
 
@@ -2387,12 +2456,12 @@ m := make(map[string]User, 10000)
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Предвыделение (<code>make</code> с <code>capacity</code>) — самый дешевый и эффективный способ ускорить код. Он требует только знания бизнес-логики и нуля внешних зависимостей.</li>
-<li>Не путайте <code>len</code> и <code>cap</code> при инициализации слайсов (передавайте <code>0</code> вторым аргументом для <code>append</code>).</li>
-<li>Для <code>map</code> второй аргумент в <code>make</code> указывает ожидаемое число ключей. Это защищает приложение от процессорного голодания из-за инкрементальной эвакуации.</li>
-<li>Используйте <code>Grow(n)</code> для <code>strings.Builder</code> и <code>bytes.Buffer</code>.</li>
+<li><strong>Предвыделение памяти (<code>make</code> с <code>capacity</code>)</strong> — самый дешевый, чистый и эффективный способ ускорить Go-код без усложнения архитектуры.</li>
+<li><strong>Не путайте <code>len</code> и <code>cap</code>:</strong> для наполнения через <code>append</code> инициализируйте слайс как <code>make([]T, 0, cap)</code>.</li>
+<li><strong>Всегда передавайте hint в <code>make(map[K]V, hint)</code>:</strong> это исключает катастрофическую эвакуацию бакетов и перехеширование под нагрузкой.</li>
+<li><strong>Используйте <code>Grow(n)</code> в <code>strings.Builder</code> и <code>bytes.Buffer</code>:</strong> предварительное бронирование буфера гарантирует нулевые реаллокации при сборке длинных строк.</li>
 </ol>
-<p>Знание о том, как аллоцируется память — это база. Однако, сама форма данных, которые мы аллоцируем, играет не менее важную роль. Как расположение полей в структуре может сэкономить 30% оперативной памяти и ускорить выполнение в разы за счет кэшей процессора? Об этом поговорим в следующей статье: <a href="5-optimizatsiya-struktur-dannykh.html" class="wikilink">5. Оптимизация структур данных</a>.</p>
+<p>Знание о том, как аллоцируется память — это фундамент. Однако сама форма данных, которые мы размещаем в памяти, играет не менее важную роль. Как правильный порядок полей в структуре способен сэкономить до 30% оперативной памяти и устранить промахи кэша процессора? Разберем в следующей главе: <a href="5-optimizatsiya-struktur-dannykh.html" class="wikilink">5. Оптимизация структур данных</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2420,7 +2489,7 @@ m := make(map[string]User, 10000)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-dinamicheskogo-rosta">Mechanical Sympathy: Цена динамического роста</a></li><li class="toc-item toc-h2"><a href="#1-slaysy-i-kovarstvo-runtime-growslice">1. Слайсы и коварство runtime.growslice</a></li><li class="toc-item toc-h2"><a href="#2-mapy-maps-i-dorogaya-evakuatsiya">2. Мапы (Maps) и дорогая эвакуация</a></li><li class="toc-item toc-h2"><a href="#3-strings-builder-i-bytes-buffer">3. strings.Builder и bytes.Buffer</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#predvydelenie-pamyati-ustranenie-skrytykh-zaderzhek-dinamicheskogo-rosta">Предвыделение памяти: устранение скрытых задержек динамического роста</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-dinamicheskogo-rosta">Mechanical Sympathy: Цена динамического роста</a></li><li class="toc-item toc-h2"><a href="#1-slaysy-i-kovarstvo-runtime-growslice">1. Слайсы и коварство runtime.growslice</a></li><li class="toc-item toc-h3"><a href="#prakticheskoe-primenenie">Практическое применение</a></li><li class="toc-item toc-h2"><a href="#2-mapy-maps-i-dorogaya-evakuatsiya">2. Мапы (Maps) и дорогая эвакуация</a></li><li class="toc-item toc-h3"><a href="#prakticheskoe-primenenie">Практическое применение</a></li><li class="toc-item toc-h2"><a href="#3-strings-builder-i-bytes-buffer">3. strings.Builder и bytes.Buffer</a></li><li class="toc-item toc-h3"><a href="#prakticheskoe-primenenie-metod-grow">Практическое применение: метод Grow()</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

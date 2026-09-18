@@ -2169,20 +2169,80 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Уменьшение аллокаций</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В мире высоконагруженного бэкенда на Go производительность приложения часто упирается не в сложность алгоритмов (CPU bound), а в работу с памятью (Memory/IO bound). Процессор большую часть времени простаивает в ожидании данных из оперативной памяти. Каждая лишняя аллокация в куче (Heap) — это двойной удар по производительности. </p>
-<p>Во-первых, вы тратите процессорное время прямо сейчас (на поиск свободного <code>mspan</code> в <code>mcache</code>, а иногда и на запросы к ядру ОС). Во-вторых, вы берете "кредит", который будет отдавать Garbage Collector, тратя такты CPU на фазы Mark и Sweep (и неизбежно увеличивая Tail Latency).</p>
+            <h2 id="umenshenie-allokatsiy-prakticheskie-priemy-upravleniya-pamyatyu-v-go">Уменьшение аллокаций: практические приемы управления памятью в Go</h2>
+
+<p>В мире высоконагруженного бэкенда на Go производительность приложения часто упирается не в сложность алгоритмов (CPU bound), а в работу с памятью (Memory/IO bound). Процессор большую часть времени простаивает в ожидании данных из оперативной памяти. Каждая лишняя аллокация в куче (Heap) — это двойной удар по производительности.</p>
+<p>Во-первых, вы тратите процессорное время прямо сейчас: на вызов аллокатора, поиск свободного <code>mspan</code> в локальном кэше потока <code>mcache</code> (а при его исчерпании — в <code>mcentral</code> и <code>mheap</code>), а иногда и на системные вызовы к ядру ОС. Во-вторых, вы берете «кредит», который неизбежно придется отдавать сборщику мусора (Garbage Collector), сжигая 25% ресурсов CPU на фазы Mark и Sweep и увеличивая хвостовые задержки (Tail Latency).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph AllocChoice [&quot;Выбор места размещения данных&quot;]
+Compiler{&quot;Escape Analysis&lt;br/&gt;(Анализ времени жизни)&quot;}
+
+subgraph StackAlloc [&quot;Стек (Stack): Скорость кремния&quot;]
+SP[&quot;Сдвиг регистра SP&lt;br/&gt;(1 машинный такт)&quot;]
+L1[&quot;Горячий L1/L2 кэш CPU&lt;br/&gt;(Доступ 1–3 нс)&quot;]
+FreeStack[&quot;Мгновенное освобождение&lt;br/&gt;при возврате из функции&quot;]
+SP --&gt; L1 --&gt; FreeStack
+end
+
+subgraph HeapAlloc [&quot;Куча (Heap): Бюрократия рантайма&quot;]
+Malloc[&quot;runtime.mallocgc&lt;br/&gt;(mcache, mspan, mcentral)&quot;]
+Misses[&quot;Кэш-промахи DRAM&lt;br/&gt;(Доступ 50–100 нс)&quot;]
+GC[&quot;Сборщик мусора (GC)&lt;br/&gt;(Mark, Sweep, Pacer, STW)&quot;]
+Malloc --&gt; Misses --&gt; GC
+end
+end
+
+Compiler -- &quot;Переменная не покидает функцию&quot; --&gt; StackAlloc
+Compiler -- &quot;Указатель &#x27;утекает&#x27; наружу&quot; --&gt; HeapAlloc
+  </pre>
+</div>
+
+
+<p>В этой статье мы разберем практические приемы написания кода, позволяющие компилятору оставлять данные на быстром стеке, сводя работу рантайма и аллокатора к абсолютному минимуму.</p>
+<hr />
 <h2 id="mechanical-sympathy-stoimost-allokatsii">Mechanical Sympathy: Стоимость аллокации</h2>
-<p>С точки зрения железа, стек (Stack) — это исключительно быстрая память, так как она практически всегда "прогрета" и находится в L1/L2 кэше процессора (о механике кэшей мы говорили в <a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>). Аллокация на стеке — это сдвиг указателя <code>SP</code> (Stack Pointer) на несколько байт. Это выполняется за одну ассемблерную инструкцию. Освобождение — обратный сдвиг. Нулевая нагрузка на GC.</p>
+
+<p>С точки зрения железа, стек (Stack) — это исключительно быстрая память, так как она практически всегда "прогрета" и находится в L1/L2 кэше процессора (о механике кэшей мы говорили в <a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>). Аллокация на стеке — это сдвиг указателя <code>SP</code> (Stack Pointer) на несколько байт. Это выполняется за одну ассемблерную инструкцию (<code>SUBQ $24, SP</code>). Освобождение — обратный сдвиг (<code>ADDQ $24, SP</code>). Нулевая нагрузка на GC, нулевая фрагментация.</p>
 <p>Аллокация в куче — это вызов сложной функции рантайма <code>runtime.mallocgc</code>. <br />
-Даже если <code>mcache</code> (локальный кэш аллокатора текущего потока <code>M</code>) имеет свободные блоки нужного размера, это всё равно десятки инструкций. А если объект "переживет" текущую горутину, доступ к нему будет разбросан по памяти, что приведет к кэш-промахам (Cache Misses) при чтении.</p>
-<p>В этой статье мы разберем практические приемы, как писать код так, чтобы компилятор оставлял данные на стеке, а рантайм не делал лишней работы.</p>
+Даже если <code>mcache</code> (локальный кэш аллокатора текущего потока <code>M</code>) имеет свободные блоки нужного размера, это всё равно десятки инструкций:<br />
+1. Вычисление подходящего размерного класса (<code>sizeclass</code>).<br />
+2. Извлечение свободного слота из битовой карты <code>mspan</code>.<br />
+3. Очистка памяти нулями (<code>memclrNoHeapPointersChunk</code>).<br />
+4. Назначение барьеров записи, если объект содержит указатели.</p>
+<p>А если объект "переживет" текущую горутину, доступ к нему будет разбросан по памяти, что приведет к кэш-промахам (Cache Misses) при чтении из DRAM.</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: размерные классы runtime.mallocgc</span>
+  </div>
+  <div class="callout-body">
+    <p>Аллокатор Go делит объекты на три категории:<br />
+1. <strong>Tiny-аллокации (&lt; 16 байт без указателей):</strong> Упаковываются по нескольку штук в единый 16-байтный блок внутри <code>mcache.tiny</code>.<br />
+2. <strong>Small-аллокации (до 32 КБ):</strong> Выделяются из преднарезанных блоков <code>mspan</code> одного из 67 размерных классов без глобальных блокировок.<br />
+3. <strong>Large-аллокации (&gt; 32 КБ):</strong> Выделяются напрямую через <code>mheap</code> с захватом глобального мьютекса кучи, что создает ощутимую задержку.</p>
+  </div>
+</div>
+
 <hr />
 <h2 id="1-znacheniya-protiv-ukazateley-mif-o-proizvoditelnosti">1. Значения против Указателей: Миф о производительности</h2>
 
@@ -2197,7 +2257,12 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// ПЛОХО: Заставляет User аллоцироваться в куче
+  <pre class="language-go"><code class="language-go">type User struct {
+    ID   int
+    Name string
+}
+
+// ПЛОХО: Заставляет User аллоцироваться в куче
 func NewUser(id int, name string) *User {
     return &amp;User{ID: id, Name: name} 
 }
@@ -2225,9 +2290,10 @@ func NewUser(id int, name string) User {
 
 <p>Когда вы добавляете элементы в <code>slice</code> через <code>append</code>, рантайм проверяет, есть ли место (<code>capacity</code>). Если места нет, вызывается функция <code>runtime.growslice</code>. </p>
 <p>Что делает <code>growslice</code>:<br />
-1. Аллоцирует новый, более крупный массив в памяти.<br />
-2. Копирует старые данные в новый массив (<code>memmove</code>).<br />
-3. Бросает старый массив на растерзание Garbage Collector-у.</p>
+1. Вычисляет новую вместимость (в Go 1.18+ для малых слайсов удваивает, для больших плавно растет с коэффициентом ~1.25x).<br />
+2. Аллоцирует новый, более крупный массив в памяти кучи.<br />
+3. Копирует старые данные в новый массив (<code>memmove</code>).<br />
+4. Бросает старый массив на растерзание Garbage Collector-у.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2242,12 +2308,12 @@ func NewUser(id int, name string) User {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;append-slice, elem-&quot;] --&gt; B{&quot;len &lt; cap?&quot;}
-B -- &quot;Да&quot; --&gt; C[&quot;Вставка элемента на место len&quot;]
+A[&quot;append(slice, elem)&quot;] --&gt; B{&quot;len &lt; cap?&quot;}
+B -- &quot;Да&quot; --&gt; C[&quot;Вставка элемента на позицию len++&quot;]
 B -- &quot;Нет&quot; --&gt; D[&quot;Вызов runtime.growslice&quot;]
-D --&gt; E[&quot;Аллокация x2 памяти в Heap&quot;]
-E --&gt; F[&quot;Копирование memmove&quot;]
-F --&gt; G[&quot;Старый массив становится мусором&quot;]
+D --&gt; E[&quot;Аллокация нового буфера в Heap&quot;]
+E --&gt; F[&quot;Битовое копирование memmove&quot;]
+F --&gt; G[&quot;Старый массив становится мусором для GC&quot;]
 G --&gt; C
   </pre>
 </div>
@@ -2272,7 +2338,7 @@ func getIDs(users []User) []int {
     return ids
 }
 
-// ХОРОШО: Одна аллокация, никакого копирования O-от-N
+// ХОРОШО: Одна аллокация, никакого копирования O(N)
 func getIDs(users []User) []int {
     ids := make([]int, 0, len(users)) // capacity = len(users)
     for _, u := range users {
@@ -2287,20 +2353,46 @@ func getIDs(users []User) []int {
 <hr />
 <h2 id="3-skrytye-allokatsii-v-interfeysakh-boxing">3. Скрытые аллокации в интерфейсах (Boxing)</h2>
 
-<p>Интерфейс в Go под капотом — это структура <code>eface</code> (empty interface) или <code>iface</code> (interface with methods), занимающая 16 байт на 64-битных системах. Она содержит два указателя:<br />
-1. <code>_type</code> (или <code>itab</code>) — указатель на метаданные типа.<br />
+<p>Интерфейс в Go под капотом — это структура <code>eface</code> (empty interface, <code>any</code>) или <code>iface</code> (interface with methods), занимающая 16 байт на 64-битных системах. Она содержит два указателя:<br />
+1. <code>_type</code> (для <code>eface</code>) или <code>itab</code> (для <code>iface</code>) — указатель на метаданные типа и таблицу виртуальных методов.<br />
 2. <code>data</code> — указатель на сами данные.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+classDiagram
+class eface {
++_type *rtype
++data unsafe.Pointer
+}
+class iface {
++tab *itab
++data unsafe.Pointer
+}
+  </pre>
+</div>
+
+
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Поскольку <code>data</code> в интерфейсе — это всегда указатель, передача значения по значению в интерфейс (например, <code>fmt.Println(42)</code>) заставляет рантайм аллоцировать место в куче для числа <code>42</code>, скопировать его туда, и передать указатель на эту память в поле <code>data</code> интерфейса. Этот процесс называется Boxing.</p>
+    <p>Поскольку <code>data</code> в интерфейсе — это всегда указатель, передача значения по значению в интерфейс (например, <code>fmt.Println(42)</code>) заставляет рантайм аллоцировать место в куче для числа <code>42</code>, скопировать его туда, и передать указатель на эту память в поле <code>data</code> интерфейса. Этот процесс называется Boxing. Исключение составляют лишь булевы значения и небольшие статические константы, для которых рантайм использует глобальные предвыделенные таблицы.</p>
   </div>
 </div>
 
-<p>Особенно больно это бьет по производительности в горячих циклах при логировании или работе с <code>reflect</code>.</p>
+<p>Особенно больно это бьет по производительности в горячих циклах при логировании или работе с пакетом <code>reflect</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2318,7 +2410,7 @@ func LogDebug(msg string, args ...any) { ... }
 </div>
 
 <p><strong>Как бороться?</strong><br />
-Если вы пишете высоконагруженный код, используйте строго типизированные API. Отличный пример — пакет <code>log/slog</code> или библиотека <code>zap</code>. Они используют строго типизированные поля вместо <code>interface{}</code>.</p>
+Если вы пишете высоконагруженный код, используйте строго типизированные API. Отличный пример — пакет <code>log/slog</code> или библиотека <code>zap</code>. Они используют строго типизированные поля вместо <code>interface{}</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2338,7 +2430,7 @@ logger.Info(&quot;user logged in&quot;, zap.Int(&quot;user_id&quot;, 123))
 
 <p>Строки в Go иммутабельны (неизменяемы). <code>[]byte</code> — мутабелен. Поэтому, когда вы делаете каст <code>[]byte(str)</code> или <code>string(bytes)</code>, Go <strong>обязан</strong> аллоцировать новую память и скопировать данные, чтобы гарантировать неизменяемость оригинальной строки.</p>
 <p>Но в высоконагруженных сетевых приложениях парсинг протоколов (например, HTTP или кастомных TCP-протоколов) постоянно требует чтения байт и сравнения их со строками.</p>
-<p>Начиная с Go 1.20, в пакете <code>unsafe</code> появились функции <code>String</code> и <code>SliceData</code> для zero-copy преобразований, которые работают мгновенно и без аллокаций.</p>
+<p>Начиная с Go 1.20, в пакете <code>unsafe</code> появились функции <code>String</code>, <code>StringData</code>, <code>Slice</code> и <code>SliceData</code> для zero-copy преобразований, которые работают мгновенно и без аллокаций.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2430,10 +2522,11 @@ func StringToBytes(s string) []byte {
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li>Понимание Escape Analysis — ваш главный инструмент. Не возвращайте указатели на мелкие структуры.</li>
-<li>Всегда используйте предвыделение памяти (<code>make(..., cap)</code>) для слайсов и мап.</li>
-<li>Избегайте использования <code>interface{}</code> в горячих путях, так как это вызывает boxing и аллокации.</li>
-<li>Осторожно используйте <code>unsafe</code> для конвертации строк, если уверены, что байты не будут изменены.</li>
+<li><strong>Понимание Escape Analysis</strong> — ваш главный инструмент. Не возвращайте указатели на мелкие структуры.</li>
+<li><strong>Всегда используйте предвыделение памяти (<code>make(..., cap)</code>)</strong> для слайсов и мап, предотвращая каскадные <code>growslice</code> и эвакуации бакетов.</li>
+<li><strong>Избегайте использования <code>interface{}</code> в горячих путях</strong>, так как упаковка примитивных типов вызывает boxing и аллокации. Используйте строго типизированные API (<code>slog.Attr</code>, <code>zap.Field</code>).</li>
+<li><strong>Осторожно используйте <code>unsafe</code> для zero-copy конвертации строк</strong>, если абсолютно уверены, что лежащий в основе слайс байтов не будет модифицирован.</li>
+<li><strong>Контролируйте замыкания:</strong> передавайте переменные в анонимные функции явно через параметры стека.</li>
 </ol>
 <p>Но что делать, если аллокаций избежать физически невозможно? Например, вы читаете сетевые пакеты неизвестного размера, обрабатываете JSON сложной структуры или парсите большие файлы? Постоянное выделение памяти "забьет" GC, даже если объекты короткоживущие.</p>
 <p>В этом случае мы должны не <em>уменьшать</em> количество необходимых нам объектов, а <em>переиспользовать</em> ту память, которую мы уже запросили у ОС. Механизм для такого переиспользования встроен в стандартную библиотеку. Подробно о нем — в следующей статье: <a href="2-sync-pool.html" class="wikilink">2. sync Pool</a>.</p>
@@ -2464,7 +2557,7 @@ func StringToBytes(s string) []byte {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mechanical-sympathy-stoimost-allokatsii">Mechanical Sympathy: Стоимость аллокации</a></li><li class="toc-item toc-h2"><a href="#1-znacheniya-protiv-ukazateley-mif-o-proizvoditelnosti">1. Значения против Указателей: Миф о производительности</a></li><li class="toc-item toc-h2"><a href="#2-predvaritelnaya-allokatsiya-preallocation">2. Предварительная аллокация (Preallocation)</a></li><li class="toc-item toc-h2"><a href="#3-skrytye-allokatsii-v-interfeysakh-boxing">3. Скрытые аллокации в интерфейсах (Boxing)</a></li><li class="toc-item toc-h2"><a href="#4-zero-copy-konvertatsii-mezhdu-string-i-byte">4. Zero-copy конвертации между string и []byte</a></li><li class="toc-item toc-h2"><a href="#5-zamykaniya-closures-i-zakhvat-peremennykh">5. Замыкания (Closures) и захват переменных</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#umenshenie-allokatsiy-prakticheskie-priemy-upravleniya-pamyatyu-v-go">Уменьшение аллокаций: практические приемы управления памятью в Go</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-stoimost-allokatsii">Mechanical Sympathy: Стоимость аллокации</a></li><li class="toc-item toc-h2"><a href="#1-znacheniya-protiv-ukazateley-mif-o-proizvoditelnosti">1. Значения против Указателей: Миф о производительности</a></li><li class="toc-item toc-h2"><a href="#2-predvaritelnaya-allokatsiya-preallocation">2. Предварительная аллокация (Preallocation)</a></li><li class="toc-item toc-h2"><a href="#3-skrytye-allokatsii-v-interfeysakh-boxing">3. Скрытые аллокации в интерфейсах (Boxing)</a></li><li class="toc-item toc-h2"><a href="#4-zero-copy-konvertatsii-mezhdu-string-i-byte">4. Zero-copy конвертации между string и []byte</a></li><li class="toc-item toc-h2"><a href="#5-zamykaniya-closures-i-zakhvat-peremennykh">5. Замыкания (Closures) и захват переменных</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

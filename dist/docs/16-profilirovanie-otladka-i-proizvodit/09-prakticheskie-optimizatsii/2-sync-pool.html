@@ -2169,21 +2169,26 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~17 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. sync Pool</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a> мы разобрали, как заставить компилятор оставлять объекты на стеке и почему аллокации в куче так сильно бьют по производительности. Но в реальном высоконагруженном бэкенде избежать выделения памяти в куче полностью невозможно. Чтение JSON-запросов, формирование HTTP-ответов, буферизация данных из БД — всё это требует динамической памяти.</p>
-<p>Если мы не можем избавиться от объектов, мы должны перестать создавать их заново и начать переиспользовать. И здесь на сцену выходит главный инструмент Go-разработчика для борьбы с нагрузкой на Garbage Collector — <code>sync.Pool</code>.</p>
+            <h2 id="sync-pool-anatomiya-i-mekhanicheskoe-sochuvstvie-k-pulu-obektov">sync.Pool: анатомия и механическое сочувствие к пулу объектов</h2>
+
+<p>В предыдущей статье <a href="1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a> мы выяснили, почему аллокации в куче так губительны для высоконагруженного бэкенда и как с помощью Escape Analysis заставить компилятор оставлять структуры на быстром стеке. Однако в реальных сетевых сервисах избежать динамической памяти невозможно в принципе: чтение JSON-тел запросов переменной длины, сборка gRPC-сообщений, буферизация потоков из баз данных — всё это требует памяти переменного размера.</p>
+<p>Если мы не можем полностью отказаться от выделения динамической памяти, инженерное решение очевидно: <strong>перестать аллоцировать память заново и научиться её переиспользовать</strong>.</p>
+<p>В экосистеме Go для этой цели существует специализированный системный примитив — <strong><code>sync.Pool</code></strong>.</p>
+<hr />
 <h2 id="chto-takoe-sync-pool">Что такое sync.Pool?</h2>
 
-<p><strong><code>sync.Pool</code></strong> — это потокобезопасный пул временных объектов, встроенный в стандартную библиотеку. Его главная цель — кэшировать выделенную, но уже не используемую память, чтобы избавить GC от необходимости её убирать, а аллокатор — от необходимости выделять новую.</p>
-<p>В отличие от классических пулов в C# или Java (где часто используют Thread-Local Storage или блокировки), <code>sync.Pool</code> тесно интегрирован с рантаймом Go, планировщиком горутин (G-M-P) и сборщиком мусора.</p>
+<p><strong><code>sync.Pool</code></strong> — это высокопроизводительный, потокобезопасный пул масштабируемых временных объектов, встроенный в стандартную библиотеку Go. Его миссия — кэшировать уже выделенные структуры данных и буферы, избавляя аллокатор от вызовов <code>runtime.mallocgc</code>, а сборщик мусора — от необходимости непрерывно утилизировать гигабайты короткоживущего мусора.</p>
+<p>В отличие от традиционных пулов объектов в Java или C++ (построенных на мьютексах или Thread-Local Storage), <code>sync.Pool</code> в Go тесно сопряжен с ядром рантайма, моделью планировщика G-M-P (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>) и фазами Garbage Collector.</p>
 <h3 id="bazovoe-ispolzovanie">Базовое использование</h3>
 
+<p>Канонический паттерн использования <code>sync.Pool</code> выглядит лаконично и строго:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2226,37 +2231,12 @@ func handleRequest(data []byte) {
 </code></pre>
 </div>
 
-<p>Казалось бы, всё просто. Но настоящая магия <code>sync.Pool</code> скрыта "под капотом". Если вы метите на позицию Senior/Lead, вы обязаны понимать механику его работы, иначе пул может стать причиной деградации производительности.</p>
+<p>Но за этой обманчиво простой сигнатурой скрывается сложнейшая инженерная конструкция, спроектированная с глубоким механическим сочувствием к процессору (Mechanical Sympathy).</p>
 <hr />
 <h2 id="mechanical-sympathy-kak-sync-pool-izbegaet-blokirovok">Mechanical Sympathy: Как sync.Pool избегает блокировок?</h2>
 
-<p>В конкурентной среде, когда тысячи горутин одновременно пытаются взять или положить объект в единый пул, классический <code>sync.Mutex</code> мгновенно стал бы узким местом (Bottleneck). Возник бы колоссальный Lock Contention.</p>
-<p>Рантайм Go решает эту проблему за счет знания о текущем процессоре (P) из модели <a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Внутри <code>sync.Pool</code> представляет собой не единую корзину, а массив локальных пулов <code>poolLocal</code>, размер которого равен <code>GOMAXPROCS</code> (количеству <code>P</code>). </p>
-<p>Когда горутина вызывает <code>Get()</code> или <code>Put()</code>, рантайм:<br />
-1. Вызывает <code>runtime_procPin()</code>. Эта функция привязывает текущую горутину к ее <code>P</code> и временно <strong>запрещает вытеснение</strong> (preemption). Это гарантирует, что пока горутина работает с пулом, ее не прервут и не перенесут на другой поток ОС.<br />
-2. Обращается к <code>poolLocal</code> конкретного <code>P</code>.<br />
-3. Вызывает <code>runtime_procUnpin()</code>, возвращая горутине обычный режим работы.</p>
-  </div>
-</div>
-
-<p>Каждый локальный пул (<code>poolLocal</code>) состоит из двух частей:<br />
-1. <strong><code>private</code></strong>: Одиночный объект. Доступ к нему имеет <strong>только</strong> текущий <code>P</code>. Это значит, что операции чтения и записи в <code>private</code> не требуют <em>вообще никаких</em> механизмов синхронизации или атомарных инструкций. Это буквально скорость работы с локальной переменной.<br />
-2. <strong><code>shared</code></strong>: Двусторонняя очередь (lock-free deque). Если <code>private</code> занят, объекты кладутся сюда. К <code>shared</code> текущего <code>P</code> могут обращаться <em>другие</em> <code>P</code> (механизм Work-stealing).</p>
-<h3 id="algoritm-raboty-bufpool-get">Алгоритм работы bufPool.Get():</h3>
-<ol>
-<li>Горутина "прибивается" к текущему <code>P</code>.</li>
-<li>Проверяется поле <code>private</code>. Если там есть объект, он забирается (мгновенно, без блокировок).</li>
-<li>Если <code>private</code> пуст, проверяется локальная очередь <code>shared</code>.</li>
-<li>Если <code>shared</code> тоже пуста, горутина пытается <strong>украсть</strong> (Steal) объект из хвоста очереди <code>shared</code> у <em>других</em> <code>P</code>.</li>
-<li>И только если все остальные пулы пусты (или это первый вызов), вызывается функция <code>New()</code>.</li>
-</ol>
+<p>Представьте себе веб-сервер, обрабатывающий 100 000 RPS на 32-ядерном сервере. Если бы <code>sync.Pool</code> защищался обычным мьютексом <code>sync.Mutex</code>, все 32 ядра процессора сгорели бы в бесконечных войнах за одну кэш-линию памяти (шторм когерентности кэшей MESI и чудовищный Lock Contention).</p>
+<p>Рантайм Go решает эту фундаментальную проблему, децентрализуя хранилище по логическим процессорам <code>P</code> планировщика Go.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2271,46 +2251,121 @@ func handleRequest(data []byte) {
   </div>
   <pre class="mermaid">
 flowchart TD
-Pool[&quot;sync.Pool&quot;] --&gt; P1[&quot;poolLocal для P0&quot;]
-Pool --&gt; P2[&quot;poolLocal для P1&quot;]
+Pool[&quot;sync.Pool&quot;] --&gt; P0[&quot;poolLocal для P0&quot;]
+Pool --&gt; P1[&quot;poolLocal для P1&quot;]
+Pool --&gt; PN[&quot;poolLocal для Pn...&quot;]
 
-P1 --&gt; Priv1[&quot;private-поле&lt;br&gt;Zero locks&quot;]
-P1 --&gt; Shared1[&quot;shared-очередь&lt;br&gt;Head доступен для P0&quot;]
+subgraph P0_Box [&quot;Ядро P0&quot;]
+P0 --&gt; Priv0[&quot;private: 1 объект&lt;br/&gt;(Zero locks, Zero atomics)&quot;]
+P0 --&gt; Shared0[&quot;shared: lock-free deque&lt;br/&gt;(Push/Pop с головы)&quot;]
+end
 
-P2 --&gt; Priv2[&quot;private-поле&lt;br&gt;Zero locks&quot;]
-P2 --&gt; Shared2[&quot;shared-очередь&lt;br&gt;Head доступен для P1&quot;]
+subgraph P1_Box [&quot;Ядро P1&quot;]
+P1 --&gt; Priv1[&quot;private: 1 объект&lt;br/&gt;(Zero locks, Zero atomics)&quot;]
+P1 --&gt; Shared1[&quot;shared: lock-free deque&lt;br/&gt;(Push/Pop с головы)&quot;]
+end
 
-Shared2 --&gt;|&quot;Tail доступен для кражи&quot;| Shared1
+Shared1 -.-&gt;|&quot;Work Stealing: кража с хвоста&quot;| P0
   </pre>
 </div>
 
 
-<p>Благодаря этой архитектуре, <code>sync.Pool</code> невероятно кэш-френдли. В большинстве случаев горутина получает память, которая недавно использовалась на этом же ядре процессора, а значит данные всё еще лежат в горячем L1/L2 кэше CPU!</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: устройство poolLocal</span>
+  </div>
+  <div class="callout-body">
+    <p>Внутри <code>sync.Pool</code> содержит не одну общую очередь, а массив структур <code>poolLocal</code>, размер которого строго равен <code>GOMAXPROCS</code> (числу логических процессоров <code>P</code>).</p>
+<p>Когда горутина вызывает <code>Get()</code> или <code>Put()</code>:<br />
+1. Вызывается внутренняя функция рантайма <code>runtime_procPin()</code>. Она привязывает исполняющуюся горутину к её текущему процессору <code>P</code> и <strong>запрещает вытеснение планировщиком</strong> (preemption). Это железно гарантирует, что горутина не мигрирует на другой поток ОС в середине операции.<br />
+2. Горутина мгновенно получает доступ к своей персональной структуре <code>poolLocal</code> без межъядерной синхронизации.<br />
+3. После завершения операции вызывается <code>runtime_procUnpin()</code>, возвращающий горутине стандартный режим вытесняющей многозадачности.</p>
+  </div>
+</div>
+
+<p>Каждый элемент <code>poolLocal</code> разделен на два уровня:<br />
+1. <strong><code>private</code> (unsafe.Pointer):</strong> Одиночный объект. Доступ к нему разрешен <strong>исключительно</strong> текущему логическому процессору <code>P</code>. Чтение и запись выполняются за 1 такт CPU — здесь нет ни мьютексов, ни атомарных инструкций (<code>atomic</code>), ни сброса конвейера CPU.<br />
+2. <strong><code>shared</code> (двусторонняя lock-free очередь):</strong> Кольцевой буфер объектов. Текущий процессор <code>P</code> добавляет и забирает объекты с головы очереди (<code>head</code>). Другие процессоры <code>P</code>, исчерпав свои запасы, имеют право воровать объекты с противоположного конца — хвоста очереди (<code>tail</code>).</p>
+<hr />
+<h3 id="algoritm-raboty-bufpool-get">Алгоритм работы bufPool.Get():</h3>
+
+<p>Когда горутина запрашивает объект через <code>Get()</code>, рантайм следует строгой 5-ступенчатой иерархии:</p>
+<ol>
+<li>Горутина "прибивается" к текущему <code>P</code> через <code>runtime_procPin()</code>.</li>
+<li><strong>Проверка <code>private</code>:</strong> Если слот <code>private</code> занят, объект забирается мгновенно (самый быстрый путь, 0 наносекунд на синхронизацию).</li>
+<li><strong>Локальный <code>shared</code>:</strong> Если <code>private</code> пуст, горутина выталкивает элемент из головы собственной очереди <code>shared</code>.</li>
+<li><strong>Work Stealing (Кража у соседей):</strong> Если локальная очередь пуста, горутина обходит структуры <code>poolLocal</code> соседних процессоров <code>P</code> и пытается украсть объект из хвоста их очередей <code>shared</code>.</li>
+<li><strong>Victim Cache и <code>New()</code>:</strong> Если ни у одного <code>P</code> ничего нет, проверяется жертвенный кэш <code>victim</code>. И лишь если весь пул абсолютно пуст, горутина вызывает пользовательскую функцию <code>New()</code>.</li>
+</ol>
+<p>Благодаря этой архитектуре данные в 90% случаев берутся из локального ядра, оставаясь в горячих L1/L2 кэшах процессора!</p>
 <hr />
 <h2 id="vzaimodeystvie-s-garbage-collector-victim-cache">Взаимодействие с Garbage Collector (Victim Cache)</h2>
 
-<p>Самый частый вопрос на собеседованиях: <em>"Сколько живут объекты в sync.Pool?"</em><br />
-Ответ: Их жизненный цикл строго контролируется сборщиком мусора (см. <a href="../05-garbage-collector/1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a>).</p>
-<p>Если бы объекты в пуле жили вечно, это привело бы к утечке памяти (Memory Leak) — приложение накапливало бы память под пиковую нагрузку и никогда не отдавало её ОС.</p>
-<p>До Go 1.13 пул полностью очищался перед каждым циклом работы GC (во время фазы Stop-The-World <code>poolCleanup</code>). Это вызывало проблему: если приложение генерировало мало мусора и GC запускался редко, пул был полезен. Но под высокой нагрузкой GC мог запускаться каждую секунду, сбрасывая все кэши пула в ноль и заставляя приложение снова аллоцировать память, что еще сильнее нагружало GC (получалась спираль смерти).</p>
-<p><strong>В Go 1.13 механику изменили, внедрив понятие Victim Cache:</strong><br />
-Внутри пула появилось два массива: <code>local</code> (основной) и <code>victim</code> (жертвенный).<br />
-1. При запуске <code>poolCleanup</code> (перед GC) текущий массив <code>local</code> не удаляется, а копируется в массив <code>victim</code>. Основной <code>local</code> очищается.<br />
-2. При вызове <code>Get()</code>, если <code>local</code> пуст, пул пытается найти объект в <code>victim</code>.<br />
-3. При следующем цикле GC, старый <code>victim</code> очищается полностью, а новый <code>local</code> снова переходит в <code>victim</code>.</p>
-<p><strong>Следствие:</strong> Объект, положенный в <code>sync.Pool</code>, гарантированно переживет как минимум <strong>один</strong> цикл сборки мусора (если его не заберут раньше). Это сглаживает скачки нагрузки и не позволяет пулу "обнуляться" мгновенно.</p>
+<p>Классический вопрос на технических собеседованиях: <em>"Сколько живут объекты в sync.Pool и когда они удаляются?"</em></p>
+<p>Ответ кроется в интеграции с жизненным циклом Garbage Collector (<a href="../05-garbage-collector/1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a>).</p>
+<p>Если бы объекты в <code>sync.Pool</code> жили бесконечно, пул превратился бы в неуправляемую утечку памяти (Memory Leak): приложение во время кратковременного всплеска нагрузки (spikes) выделило бы 10 ГБ буферов и удерживало их вечно.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph GC_Cycle_1 [&quot;Цикл GC №1&quot;]
+Local1[&quot;local (активный пул)&quot;] --&gt;|&quot;poolCleanup (STW)&quot;| Vic1[&quot;victim (кэш второго шанса)&quot;]
+end
+
+subgraph GC_Cycle_2 [&quot;Цикл GC №2&quot;]
+Vic1 --&gt;|&quot;Не востребован во 2-м цикле&quot;| Swept[&quot;Полное освобождение памяти GC&quot;]
+Local2[&quot;Новый local&quot;] --&gt;|&quot;poolCleanup&quot;| Vic2[&quot;Новый victim&quot;]
+end
+  </pre>
+</div>
+
+
+<h3 id="evolyutsiya-ot-zhestkoy-zachistki-do-victim-cache">Эволюция: от жесткой зачистки до Victim Cache</h3>
+<ul>
+<li><strong>До Go 1.13:</strong> Перед каждым запуском сборщика мусора во время короткой фазы Stop-The-World вызывалась функция <code>poolCleanup</code>, которая <strong>полностью обнуляла</strong> все объекты во всех пулах. При высокой нагрузке GC мог запускаться каждую секунду, превращая пул в решето: все кэши сбрасывались, сервису приходилось заново аллоцировать сотни мегабайт, что вызывало новый цикл GC (порочный круг троттлинга).</li>
+<li><strong>Начиная с Go 1.13 (Victim Cache):</strong> Внутрь <code>sync.Pool</code> ввели двухпоколенную модель — основной массив <code>local</code> и жертвенный массив <code>victim</code>.<br />
+  1. В момент фазы STW <code>poolCleanup</code> старый массив <code>victim</code> уничтожается, а объекты из текущего <code>local</code> перемещаются в <code>victim</code>. Сам <code>local</code> становится пустым.<br />
+  2. Если во время работы сервис обращается к <code>Get()</code>, он сначала ищет в <code>local</code>, а при промахе заглядывает в <code>victim</code>.<br />
+  3. Объект гарантированно переживает <strong>минимум один полный цикл GC</strong>. Это радикально сгладило провалы производительности при частых сборках мусора.</li>
+</ul>
 <hr />
+<h2 id="lovushki-i-podvodnye-kamni-gotchas">Ловушки и подводные камни (Gotchas)</h2>
+
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Утечка памяти через раздутый Capacity</span>
   </div>
   <div class="callout-body">
-    <p><strong>Утечка памяти через Capacity больших слайсов</strong><br />
-Представьте, что вы кэшируете <code>[]byte</code>. Большинство запросов весят 1 КБ, и буферы имеют <code>capacity</code> = 1024. Но вдруг приходит аномальный запрос размером 50 МБ.<br />
-<code>append</code> расширит буфер до 50 МБ. После обработки запроса вы вызываете <code>buf.Reset()</code> (который сбрасывает <code>len</code> в 0, но оставляет <code>capacity</code> 50MB!) и делаете <code>Put()</code>.<br />
-Теперь в вашем пуле лежит огромный кусок памяти, который никогда не вернется в ОС.</p>
-<p><strong>Решение:</strong> Всегда ограничивайте максимальный размер объекта при возврате в пул.</p>
+    <p>Представьте веб-сервер, переиспользующий байтовые слайсы <code>[]byte</code>. 99% запросов имеют размер до 2 КБ (<code>cap = 2048</code>).</p>
+<p>Но однажды приходит аномальный файл размером 64 МБ. Операция <code>append</code> или метод <code>buf.Write()</code> расширяет внутренний слайс до 64 МБ. После обработки запроса разработчик делает:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">buf.Reset() // Сбрасывает len в 0, но оставляет cap = 64 MB!
+bufPool.Put(buf)
+</code></pre>
+</div>
+
+<p>Теперь в пуле оседает гигантский кусок памяти в 64 МБ. Если таких буферов осядет десяток, сервис потребит гигабайты памяти вхолостую.</p>
+<p><strong>Инженерное решение:</strong> Фильтровать буферы по размеру перед возвратом в пул!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2321,8 +2376,8 @@ Shared2 --&gt;|&quot;Tail доступен для кражи&quot;| Shared1
     </button>
   </div>
   <pre class="language-go"><code class="language-go">defer func() {
-    // Возвращаем в пул только если буфер не раздуло до неприличных размеров
-    if buf.Cap() &lt;= 64*1024 { // 64 KB limit
+    const maxPoolCap = 64 * 1024 // 64 КБ жесткий лимит
+    if buf.Cap() &lt;= maxPoolCap {
         bufPool.Put(buf)
     }
 }()
@@ -2341,27 +2396,34 @@ Shared2 --&gt;|&quot;Tail доступен для кражи&quot;| Shared1
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Можно ли использовать <code>sync.Pool</code> для хранения TCP-соединений или подключений к БД (Database Connection Pool)?<br />
-<strong>Ответ:</strong> КАТЕГОРИЧЕСКИ НЕТ! <code>sync.Pool</code> хранит объекты без гарантии их существования. В любой момент (при сборке мусора) объекты могут быть удалены рантаймом в произвольном порядке. Если вы положите туда TCP-сокет, GC его уничтожит, соединение оборвется некорректно, а вы даже не сможете вызвать у него <code>Close()</code>. Для соединений используйте специализированные пулы, блокируемые мьютексами или каналами.</p>
+    <p><strong>Вопрос:</strong> Можно ли использовать <code>sync.Pool</code> для хранения пула TCP-соединений или коннектов к базе данных (Database Connection Pool)?<br />
+<strong>Ответ:</strong> <strong>Категорически нет!</strong><br />
+<code>sync.Pool</code> хранит <em>временные, stateless</em> объекты без гарантии их выживания. Сборщик мусора может в любой момент очистить пул в фазе <code>poolCleanup</code>. Если положить туда TCP-сокет или транзакцию БД, рантайм уничтожит ссылку, сокет оборвется некорректно без вызова <code>Close()</code>, на стороне ОС утекут файловые дескрипторы, а на стороне БД зависнут открытые транзакции. Для сетевых ресурсов всегда используют долгоживущие пулы на каналах или мьютексах с контролируемым <code>MaxIdleTime</code>.</p>
   </div>
 </div>
 
-<h3 id="kogda-ispolzovat">Когда использовать:</h3>
+<h3 id="kogda-ispolzovat-sync-pool">Когда использовать `sync.Pool`:</h3>
 <ul>
-<li>Переиспользование байтовых буферов (<code>bytes.Buffer</code>, <code>[]byte</code>) для ввода/вывода (парсинг JSON, HTTP-тела).</li>
-<li>Переиспользование тяжелых, но stateless структур (например, контекстов парсеров, энкодеров/декодеров).</li>
-<li>Использование в высоконагруженных хендлерах, где профилировщик показывает значительное время, уходящее на <code>runtime.mallocgc</code>.</li>
+<li>Переиспользование байтовых буферов (<code>bytes.Buffer</code>, <code>[]byte</code>) в сетевом I/O (сериализация JSON/protobuf, HTTP-хэндлеры).</li>
+<li>Тяжелые, но строго <em>бесстейтовые</em> (stateless) вычислительные структуры (контексты компрессии gzip/zstd, структуры парсеров AST).</li>
+<li>Если профилировщик (<code>pprof</code>) отчетливо показывает высокое время выполнения <code>runtime.mallocgc</code> на короткоживущих объектах.</li>
 </ul>
 <h3 id="kogda-ne-ispolzovat">Когда НЕ использовать:</h3>
 <ul>
-<li>Для короткоживущих, мелких объектов. Накладные расходы на вызов <code>Get()</code> и <code>Put()</code> (атомарные операции, вызовы рантайма) могут оказаться дороже, чем простая аллокация на стеке.</li>
-<li>Для stateful-сущностей (сетевые соединения, открытые файлы, транзакции БД).</li>
-<li>Если вы не профилировали код. (См. <a href="../02-benchmarking/1-pochemu-nelzya-optimizirovat-bez-izmereniy.html" class="wikilink">1. Почему нельзя оптимизировать без измерений</a>).</li>
+<li><strong>Для мелких примитивных объектов:</strong> Вызов <code>Get()</code> и <code>Put()</code> (атомики, pinning потоков) может стоить дороже, чем 1 такт на сдвиг <code>SP</code> на стеке.</li>
+<li><strong>Для stateful-сущностей:</strong> Коннекты к БД, сокеты, файлы.</li>
+<li><strong>Без предварительного профилирования:</strong> Преждевременное добавление пулов усложняет код и повышает риск гонок данных без реального выигрыша (см. <a href="../02-benchmarking/1-pochemu-nelzya-optimizirovat-bez-izmereniy.html" class="wikilink">1. Почему нельзя оптимизировать без измерений</a>).</li>
 </ul>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Встраивание <code>sync.Pool</code> — это мощная оптимизация, которая на уровне рантайма использует все преимущества G-M-P архитектуры и локальности кэшей процессора. Однако это не серебряная пуля. Пул полезен только тогда, когда вы точно знаете, что объекты "утекают" в кучу (Heap) и создают высокое давление на GC.</p>
-<p>В следующей статье мы поговорим о том, как применять эти знания на практике при проектировании структур данных и рассмотрим другие способы повторного использования памяти без пулов: <a href="3-reuse-obektov.html" class="wikilink">3. Reuse объектов</a>.</p>
+<ul>
+<li><strong><code>sync.Pool</code></strong> — специализированный потокобезопасный пул временных объектов Go, оптимизированный под работу многоядерных систем.</li>
+<li><strong>Механическое сочувствие:</strong> Пул разделен на структуры <code>poolLocal</code> по числу <code>P</code>, используя lock-free доступ к полю <code>private</code> и алгоритм Work Stealing для очереди <code>shared</code>.</li>
+<li><strong>Victim Cache:</strong> Начиная с Go 1.13, двухпоколенная схема <code>local</code>/<code>victim</code> защищает пул от мгновенного опустошения при каждом срабатывании GC.</li>
+<li><strong>Главные правила безопасности:</strong> Обязательный <code>Reset()</code> состояния перед использованием и фильтрация по максимальному <code>Cap()</code> перед возвратом в пул.</li>
+</ul>
+<p>В следующей статье мы расширим тему переиспользования памяти и разберем практические приемы работы с долгоживущими буферами и кольцевыми структурами без участия <code>sync.Pool</code>: <a href="3-reuse-obektov.html" class="wikilink">3. Reuse объектов</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2389,7 +2451,7 @@ Shared2 --&gt;|&quot;Tail доступен для кражи&quot;| Shared1
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#chto-takoe-sync-pool">Что такое sync.Pool?</a></li><li class="toc-item toc-h3"><a href="#bazovoe-ispolzovanie">Базовое использование</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-sync-pool-izbegaet-blokirovok">Mechanical Sympathy: Как sync.Pool избегает блокировок?</a></li><li class="toc-item toc-h3"><a href="#algoritm-raboty-bufpool-get">Алгоритм работы bufPool.Get():</a></li><li class="toc-item toc-h2"><a href="#vzaimodeystvie-s-garbage-collector-victim-cache">Взаимодействие с Garbage Collector (Victim Cache)</a></li><li class="toc-item toc-h2"><a href="#patterny-i-antipatterny">Паттерны и Антипаттерны</a></li><li class="toc-item toc-h3"><a href="#kogda-ispolzovat">Когда использовать:</a></li><li class="toc-item toc-h3"><a href="#kogda-ne-ispolzovat">Когда НЕ использовать:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#sync-pool-anatomiya-i-mekhanicheskoe-sochuvstvie-k-pulu-obektov">sync.Pool: анатомия и механическое сочувствие к пулу объектов</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-sync-pool">Что такое sync.Pool?</a></li><li class="toc-item toc-h3"><a href="#bazovoe-ispolzovanie">Базовое использование</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-sync-pool-izbegaet-blokirovok">Mechanical Sympathy: Как sync.Pool избегает блокировок?</a></li><li class="toc-item toc-h3"><a href="#algoritm-raboty-bufpool-get">Алгоритм работы bufPool.Get():</a></li><li class="toc-item toc-h2"><a href="#vzaimodeystvie-s-garbage-collector-victim-cache">Взаимодействие с Garbage Collector (Victim Cache)</a></li><li class="toc-item toc-h3"><a href="#evolyutsiya-ot-zhestkoy-zachistki-do-victim-cache">Эволюция: от жесткой зачистки до Victim Cache</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-podvodnye-kamni-gotchas">Ловушки и подводные камни (Gotchas)</a></li><li class="toc-item toc-h2"><a href="#patterny-i-antipatterny">Паттерны и Антипаттерны</a></li><li class="toc-item toc-h3"><a href="#kogda-ispolzovat-sync-pool">Когда использовать sync.Pool:</a></li><li class="toc-item toc-h3"><a href="#kogda-ne-ispolzovat">Когда НЕ использовать:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
