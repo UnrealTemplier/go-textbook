@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~37 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. go test -bench под капотом</h1>
           </header>
@@ -2178,12 +2178,61 @@
           <div class="article-markdown">
             <h2 id="kak-go-test-bench-ustroen-vnutri">Как `go test -bench` устроен внутри</h2>
 
-<p>В <a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a> мы изучили практический синтаксис бенчмарков: функции <code>BenchmarkXxx</code>, адаптивный <code>b.N</code>, таймеры, <code>b.RunParallel</code>. Теперь настало время заглянуть под капот — понять, как именно фреймворк бенчмаркинга реализует эти механики внутри, как взаимодействует с рантаймом Go и операционной системой. Без этих знаний невозможно интерпретировать артефакты измерений, диагностировать нестабильность и строить достоверные бенчмарки.</p>
-<p>Рассматривать мы будем реализацию в <code>testing</code> пакете, код которого находится в <code>src/testing/benchmark.go</code> (для Go 1.21+). Внутренние механизмы тесно связаны с планировщиком горутин и сборщиком мусора, что делает бенчмаркинг в Go непохожим на аналоги в C или Java.</p>
+<p>В <a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a> мы освоили практическую сторону бенчмаркинга: написание функций <code>BenchmarkXxx</code>, использование флага <code>-benchmem</code>, работу с таймерами и запуск конкурентных замеров через <code>b.RunParallel</code>.</p>
+<p>Но для инженера уровня Senior и Lead инструмент не должен оставаться «черным ящиком». Если вы не понимаете внутреннюю механику <code>go test -bench</code>, вы неизбежно попадете в ловушку необъяснимых артефактов:<br />
+- Почему один и тот же бенчмарк на одной машине делает $10^7$ итераций, а на другой — $10^5$?<br />
+- Почему вызов <code>b.ResetTimer()</code> в середине функции может неожиданно завысить результаты?<br />
+- Каким образом <code>b.RunParallel</code> умудряется загружать все ядра процессора, не превращая сам счетчик итераций в бутылочное горлышко межъядерной синхронизации?</p>
+<p>Чтобы ответить на эти вопросы, мы снимем крышку с тестового раннера Go и совершим увлекательное погружение в исходный код стандартной библиотеки — в файл <code>src/testing/benchmark.go</code> (в современных версиях Go 1.21–1.24+).</p>
+<hr />
+<h2 id="anatomiya-struktury-testing-b">Анатомия структуры `testing.B`</h2>
+
+<p>Когда вы запускаете <code>go test -bench</code>, рантайм для каждого найденного бенчмарка инстанциирует внутреннюю структуру <code>testing.B</code>. Взглянем на ее ключевые поля в исходном коде <code>src/testing/benchmark.go</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">type B struct {
+    common                          // общие поля с testing.T (логирование, статус, мьютекс)
+    importPath       string         // путь к пакету
+    context          *benchContext  // контекст запуска бенчмарков
+    N                int            // текущее количество итераций целевого цикла!
+    previousN        int            // N на предыдущей калибровочной итерации
+    previousDuration time.Duration  // длительность предыдущего прогона
+    benchFunc        func(b *B)     // пользовательская функция BenchmarkXxx
+    benchTime        benchTimeFlag  // целевое время (флаг -benchtime, по умолчанию 1s)
+    bytes            int64          // объем обработанных байт (устанавливается через b.SetBytes)
+    missingBytes     bool
+    timerOn          bool           // флаг: включен ли секундомер прямо сейчас
+    showAllocResult  bool           // флаг: выводить ли B/op и allocs/op
+    result           BenchmarkResult// итоговые метрики после завершения
+    parallelism      int            // множитель горутин для RunParallel (по умолчанию 1)
+
+    // Внутренние таймеры и счетчики памяти:
+    start            time.Time      // временная метка последнего вызова StartTimer
+    duration         time.Duration  // суммарно накопленное чистое время
+    netAllocs        uint64         // дельта аллокаций памяти
+    netBytes         uint64         // дельта байт в куче
+}
+</code></pre>
+</div>
+
+<p>Каждый запуск бенчмарка — это серия управляемых экспериментов, в которых структура <code>B</code> передается в пользовательскую функцию, накапливает метрики и динамически корректирует поле <code>b.N</code>.</p>
+<hr />
 <h2 id="adaptivnyy-algoritm-opredeleniya-b-n">Адаптивный алгоритм определения `b.N`</h2>
 
-<p>Сердце бенчмарка — цикл автоматического подбора числа итераций, обеспечивающий измерение заданной длительности (по умолчанию 1 секунда, настраивается флагом <code>-benchtime</code>). Цель — минимизировать погрешность усреднения при сохранении разумного времени выполнения.</p>
-<p>Внутренняя логика, сильно упрощая, такова:</p>
+<p>Сердце фреймворка бенчмаркинга Go — адаптивный цикл подбора числа итераций. Его математическая задача — <strong>найти минимальное значение $b.N$, при котором суммарное время исполнения превысит целевой порог <code>-benchtime</code> (по умолчанию 1 секунда)</strong>.</p>
+<p>Почему выбрана именно 1 секунда?<br />
+Одна секунда — это достаточный интервал, чтобы:<br />
+1. Амортизировать накладные расходы на системный вызов чтения времени (<code>CLOCK_MONOTONIC</code>).<br />
+2. Сгладить случайные флуктуации от планировщика ОС и переключения контекстов.<br />
+3. Прогреть кэши L1/L2/L3 процессора и дать аппаратному префетчеру выйти на стабильный режим работы.</p>
+<p>Взглянем на внутренний алгоритм калибровки:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2198,137 +2247,339 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Старт Benchmark&quot;] --&gt; B[&quot;Установить b.N = 1&lt;br&gt;benchTime = флаг -benchtime&quot;]
-B --&gt; C[&quot;Выполнить бенчмарк&lt;br&gt;с текущим b.N&quot;]
-C --&gt; D[&quot;Замерить время выполнения T&quot;]
-D --&gt; E{&quot;T &gt;= benchTime&lt;br&gt;или b.N достиг максимума?&quot;}
-E -- &quot;Да&quot; --&gt; F[&quot;Рассчитать ns/op = T / b.N&lt;br&gt;Завершить&quot;]
-E -- &quot;Нет&quot; --&gt; G[&quot;Экстраполировать новое b.N&lt;br&gt;из T и benchTime&quot;]
-G --&gt; H[&quot;Увеличить b.N до&lt;br&gt;рассчитанного значения&quot;]
-H --&gt; C
+Start[&quot;1. Инициализация:&lt;br&gt;b.N = 1, benchTime = 1s&quot;] --&gt; Launch[&quot;2. Запуск b.run1() / launch()&lt;br&gt;Вызов Benchmark(b)&quot;]
+Launch --&gt; CheckTime{&quot;3. Чистое время d &gt;= benchTime&lt;br&gt;или b.N &gt;= 1e9?&quot;}
+
+CheckTime -- &quot;Да (Стабилизировано)&quot; --&gt; Final[&quot;4. Фиксация результата:&lt;br&gt;ns/op = d.Nanoseconds() / b.N&lt;br&gt;Формирование отчета&quot;]
+CheckTime -- &quot;Нет (Слишком быстро)&quot; --&gt; Extrapolate[&quot;5. Математическая экстраполяция:&lt;br&gt;Предсказание нового b.N&quot;]
+
+Extrapolate --&gt; Clamp[&quot;6. Ограничение роста:&lt;br&gt;Защита от скачков и переполнения&quot;]
+Clamp --&gt; SetN[&quot;7. b.N = предсказанное N&lt;br&gt;Принудительный runtime.GC()&quot;]
+SetN --&gt; Launch
   </pre>
 </div>
 
 
-<p>В действительности логика уточнена:</p>
-<ul>
-<li>На первой итерации <code>b.N</code> = 1, производится прогон. Если время меньше <code>benchTime</code>, фреймворк предсказывает необходимое <code>b.N</code> по простой пропорции: <code>желаемое_N = round(float64(benchTime) / (T / b.N))</code>. Однако чтобы избежать слишком агрессивного роста, делается это с запасом — обычно умножается на 1.2–1.5.</li>
-<li>После нескольких итераций <code>b.N</code> стабилизируется; окончательное значение <code>b.N</code> гарантирует, что общее время выполнения последнего прогона &gt;= <code>benchTime</code> (по умолчанию 1 секунда).</li>
-<li>Если бенчмарк настолько быстр, что даже при <code>b.N</code> = 1 достигается <code>benchTime</code>, он так и остаётся с N=1.</li>
-</ul>
-<p>Этот подход означает, что <strong>количество итераций не фиксируется заранее</strong>, а зависит от скорости самой целевой операции. Поэтому один и тот же бенчмарк, выполняемый на разном железе, будет иметь разное <code>b.N</code> — но <code>ns/op</code> сохранит сопоставимость.</p>
+<h3 id="matematika-ekstrapolyatsii-kak-go-rasschityvaet-sleduyushchee-b-n">Математика экстраполяции: как Go рассчитывает следующее `b.N`</h3>
+
+<p>В ранних версиях Go итерации просто умножались на фиксированные коэффициенты (1, 2, 5, 10...). В современном рантайме в функции <code>testing.B.launch()</code> (ранее <code>runN</code>) используется адаптивная формула экстраполяции.</p>
+<p>Пусть текущий прогон выполнил $N_{cur}$ итераций за чистое время $T_{cur}$. Желаемое время замера равно $T_{target}$ (<code>benchTime</code>).<br />
+Ориентировочная скорость одной операции составляет:</p>
+<p>$$t_{op} = \frac{T_{cur}}{N_{cur}}$$</p>
+<p>Тогда необходимое число итераций для достижения целевого окна $T_{target}$ можно предсказать как:</p>
+<p>$$N_{pred} = \left\lfloor \frac{T_{target}}{t_{op}} \right\rfloor = \left\lfloor \frac{T_{target} \times N_{cur}}{T_{cur}} \right\rfloor$$</p>
+<p>Чтобы гарантированно перешагнуть границу $T_{target}$ на следующем шаге и не выполнять лишних промежуточных калибровок, рантайт закладывает коэффициент запаса в <strong>20%</strong> ($\times 1.2$):</p>
+<p>$$N_{next} = \left\lfloor N_{pred} \times 1.2 \right\rfloor$$</p>
+<p>Однако реальный мир нелинеен, поэтому в коде <code>src/testing/benchmark.go</code> действуют жесткие защитные ограничители (Clamping):<br />
+1. <strong>Нижний предел роста:</strong> $N$ обязано вырасти как минимум на единицу: $N_{next} \ge N_{cur} + 1$.<br />
+2. <strong>Верхний предел роста:</strong> $N$ не может вырасти более чем в <strong>100 раз</strong> за один шаг: $N_{next} \le N_{cur} \times 100$. Это защищает от ситуаций, когда случайная миллисекундная пауза ОС на первом шаге ($N=1$) привела бы к гигантскому перерасчету до миллиарда и зависанию бенчмарка.<br />
+3. <strong>Абсолютный потолок:</strong> Значение $b.N$ жестко ограничено константой <strong>$10^9$ (один миллиард)</strong>. Это гарантирует, что даже для пустых функций цикл никогда не уйдет в бесконечность.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Реализация в `src/testing/benchmark.go`</span>
   </div>
   <div class="callout-body">
-    <p>В исходном коде <code>testing.B.launch()</code> (до Go 1.21 использовался <code>runN</code>) есть счётчик циклов, контролирующий увеличение. Также отслеживается, чтобы не превысить максимальное количество итераций (1e9) и не уйти в бесконечный рост при чрезвычайно быстрых операциях.</p>
+    <p>В исходном коде рантайма Go функция <code>launch()</code> содержит предохранители, отслеживающие аномалии:<br />
+Если операция длилась настолько долго, что даже при $b.N = 1$ время превысило целевое (например, сложный криптографический расчет занял 2.5 секунды), раннер останавливается немедленно. Финальный результат будет зафиксирован с $N = 1$.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kak-rabotayut-taymery-resettimer-stoptimer-i-starttimer">Как работают таймеры: `ResetTimer`, `StopTimer` и `StartTimer`</h2>
 
-<p>Бенчмарк измеряет чистое время выполнения итераций, исключая подготовку и очистку. Это достигается через три метода, манипулирующих внутренними счётчиками времени и числа итераций.</p>
-<p>Внутри <code>testing.B</code> есть поля:</p>
-<ul>
-<li><code>duration</code> — накопленное чистое время выполнения.</li>
-<li><code>netAllocs</code> / <code>netBytes</code> — аллокации.</li>
-<li><code>timerOn</code> — флаг, указывающий, идёт ли сейчас замер.</li>
-</ul>
-<p>Механика:</p>
-<ul>
-<li><code>StartTimer()</code> — запускает таймер (вызывает <code>time.Now()</code> для стартовой метки). Если таймер уже был запущен, паникует.</li>
-<li><code>StopTimer()</code> — останавливает таймер, прибавляя прошедший с последнего старта интервал к <code>duration</code>, и сбрасывает флаг.</li>
-<li><code>ResetTimer()</code> — сбрасывает накопленное время <code>duration</code> и счётчик итераций в ноль, но <strong>не останавливает</strong> таймер, если он был запущен. Это эквивалентно <code>StopTimer()</code> затем сбросу, затем <code>StartTimer()</code>, но сделано атомарно для простоты использования.</li>
-</ul>
-<p>Важно: <code>b.N</code> не зависит от этих операций — он управляется внешним циклом адаптации. Таймеры лишь определяют, какой кусок времени попадёт в результат.</p>
+<p>Точность бенчмарка зависит от того, насколько чисто мы отделяем измеряемую работу от накладных расходов.</p>
+<p>Рассмотрим внутреннее устройство трех методов секундомера:</p>
+<h3 id="1-starttimer">1. `StartTimer()`</h3>
+
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func (b *B) StartTimer() {
+    if !b.timerOn {
+        b.start = time.Now()
+        b.timerOn = true
+    }
+}
+</code></pre>
+</div>
+
+<p>Метод фиксирует стартовую отметку времени <code>b.start</code> с помощью монотонных системных часов.</p>
+<h3 id="2-stoptimer">2. `StopTimer()`</h3>
+
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func (b *B) StopTimer() {
+    if b.timerOn {
+        b.duration += time.Since(b.start)
+        b.timerOn = false
+    }
+}
+</code></pre>
+</div>
+
+<p>Метод вычисляет интервал, прошедший с момента последнего старта, прибавляет его к накопительному полю <code>b.duration</code> и сбрасывает флаг активности секундомера <code>timerOn</code>.</p>
+<h3 id="3-resettimer">3. `ResetTimer()`</h3>
+
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func (b *B) ResetTimer() {
+    if b.timerOn {
+        b.start = time.Now()
+    }
+    b.duration = 0
+    b.netAllocs = 0
+    b.netBytes = 0
+}
+</code></pre>
+</div>
+
+<p>Обратите внимание на критическую деталь: <code>b.ResetTimer()</code> <strong>не останавливает</strong> таймер! Если секундомер был включен, он просто сбрасывает накопленный <code>duration</code>, зануляет счетчики памяти <code>netAllocs</code> / <code>netBytes</code> и перезаписывает <code>b.start = time.Now()</code>.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Секундомер тикает после `ResetTimer()`</span>
   </div>
   <div class="callout-body">
-    <p>Если вы после <code>b.ResetTimer()</code> оставите код, который всё же выполняет значительную работу (например, вызов внешнего API), то эта работа будет учтена, так как таймер идёт. <code>ResetTimer</code> не телепортирует вас в идеальное состояние; он лишь обнуляет накопленные метрики, но таймер продолжает тикать.</p>
+    <p>Распространеннейшая ошибка начинающих разработчиков:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func BenchmarkBad(b *testing.B) {
+    heavySetup()
+    b.ResetTimer() // Таймер сброшен, НО ОН ТИКАЕТ!
+
+    // ОШИБКА: Дополнительная подготовка, которая попадет в замер!
+    extraInit() 
+
+    for i := 0; i &lt; b.N; i++ {
+        targetWork()
+    }
+}
+</code></pre>
+</div>
+
+<p>Вызов <code>b.ResetTimer()</code> обязан стоять <strong>непосредственно перед ключевым словом <code>for</code></strong>! Любая строчка кода, оставленная между <code>ResetTimer()</code> и циклом, будет замерена и разделится на $b.N$, искажая наносекунды.</p>
   </div>
 </div>
 
+<p>Используйте <code>b.ResetTimer/StopTimer/StartTimer</code> строго по назначению: подготовку отделяйте через <code>ResetTimer()</code>, а паузы внутри цикла оборачивайте парой <code>StopTimer()</code> / <code>StartTimer()</code>.</p>
+<hr />
 <h2 id="vliyanie-sborshchika-musora">Влияние сборщика мусора</h2>
 
-<p>Go-рантайм может инициировать GC в любое время, если куча растёт. Внутри бенчмарка <code>testing.B</code> <strong>не изолирует GC</strong> — он работает в общем рантайме. Однако фреймворк пытается минимизировать его влияние на измерения:</p>
-<ul>
-<li>Перед началом каждого запуска бенчмарка (после определения <code>b.N</code>) принудительно вызывается <code>runtime.GC()</code> для стабилизации состояния кучи.</li>
-<li>Но в процессе выполнения итераций GC может случиться снова. Его работа будет включена в измеренное время, что добавит непредсказуемый «шум» и может завысить <code>ns/op</code>.</li>
-<li>Чтобы уменьшить шум, рекомендуется делать <code>b.ReportAllocs()</code> и отслеживать количество аллокаций. Высокое число аллокаций на итерацию предсказывает больший вклад GC.</li>
-</ul>
-<p>В <a href="4-podvodnye-kamni-benchmark-testov.html" class="wikilink">4. Подводные камни benchmark тестов</a> мы разберём, как GC может полностью исказить результаты и как этого избежать.</p>
+<p>Сборщик мусора в Go — полноправный участник любого процесса. Внутри <code>testing.B</code> сборщик мусора <strong>не отключается и не изолируется</strong>.</p>
+<p>Однако авторы рантайма Go внедрили тонкий механизм минимизации взаимного влияния:<br />
+1. Перед началом каждого прогона калибровки (перед запуском функции с новым значением <code>b.N</code>) раннер принудительно вызывает <code>runtime.GC()</code>. Это очищает кучу от мусора, оставленного предыдущим прогоном калибровки, и возвращает аллокатор в предсказуемое состояние.<br />
+2. Но в процессе выполнения самого цикла <code>for i := 0; i &lt; b.N</code> сборщик мусора работает в обычном конкурентном режиме. Если измеряемый код активно аллоцирует память, сборщик мусора неизбежно проснется прямо во время замера.<br />
+3. Время пауз Stop-The-World (STW) и процессорные такты фоновых потоков GC mark workers <strong>будут честно включены в накопленный <code>duration</code></strong>, увеличивая результирующее значение <code>ns/op</code>.</p>
+<p>Именно поэтому бенчмарк всегда следует запускать с флагом <code>-benchmem</code> и вызывать <code>b.ReportAllocs()</code>:<br />
+- Если <code>allocs/op == 0</code>, вы измеряете чистый процессорный алгоритм, и GC не влияет на результат.<br />
+- Если <code>allocs/op &gt; 0</code>, помните: показанные наносекунды отражают не только скорость вашего кода, но и налог на работу сборщика мусора. В <a href="4-podvodnye-kamni-benchmark-testov.html" class="wikilink">4. Подводные камни benchmark тестов</a> мы подробно разберем, как избавиться от этого шума.</p>
+<hr />
 <h2 id="monotonnye-chasy-i-time-now">Монотонные часы и `time.Now`</h2>
 
-<p><code>testing.B</code> использует стандартный <code>time.Now()</code>, который в Go с версии 1.9 опирается на монотонные часы ОС при измерении интервалов. Это означает, что расчёт длительности корректен даже при переводе системных часов. Однако <code>time.Now()</code> всё равно требует системного вызова (в Linux — <code>clock_gettime(CLOCK_MONOTONIC)</code>), и этот вызов входит в измеряемое время для быстрых операций. Именно поэтому для наносекундных бенчмарков стоит учитывать стоимость самого измерения.</p>
-<p>Внутри <code>benchmark.go</code> время замеряется до и после цикла, а разница делится на <code>b.N</code>. Таким образом, стоимость <code>time.Now()</code> амортизируется на все итерации, но при очень малом <code>b.N</code> может появиться систематическая погрешность.</p>
+<p>Вплоть до версии Go 1.9 системное время опиралось на астрономические часы, что приводило к сбоям бенчмарков при синхронизации NTP. Начиная с Go 1.9, вызов <code>time.Now()</code> возвращает составную структуру: астрономическое время для отображения и <strong>монотонное время (Monotonic Clock)</strong> для измерения интервалов (<code>time.Since()</code>).</p>
+<p>В операционных системах Linux монотонный отсчет базируется на системном интерфейсе <code>clock_gettime(CLOCK_MONOTONIC)</code> (или быстром механизме vDSO на базе регистра процессора <code>RDTSC</code>, не требующем переключения в Ring 0 ядра).</p>
+<p>Благодаря архитектуре <code>src/testing/benchmark.go</code>, системные часы опрашиваются всего дважды за прогон:<br />
+- Один раз при старте цикла <code>b.start = time.Now()</code>.<br />
+- Один раз при завершении цикла <code>time.Since(b.start)</code>.</p>
+<p>Полученная разница делится на миллионы итераций $b.N$. Это означает, что <strong>стоимость системного вызова <code>time.Now()</code> полностью амортизируется и стремится к нулю</strong>.</p>
+<hr />
 <h2 id="rabota-b-runparallel-iznutri">Работа `b.RunParallel` изнутри</h2>
 
-<p><code>b.RunParallel</code> — не просто запуск нескольких горутин. Его реализация обеспечивает равномерное распределение итераций между горутинами и корректный учёт параллельного времени.</p>
-<p>Упрощённая схема:</p>
-<ol>
-<li>Определяется <code>procs</code> = <code>GOMAXPROCS * b.parallelism</code> (по умолчанию <code>b.parallelism</code> = 1).</li>
-<li>Вычисляется целевое общее количество итераций <code>b.N</code>, как и для последовательного бенчмарка — адаптивным циклом, но с учётом параллелизма. Однако цикл адаптации работает последовательно: сначала фреймворк запускает бенчмарк в одногорутовом режиме для грубой оценки времени одной итерации, затем включает параллелизм и пересчитывает <code>b.N</code>.</li>
-<li>Создаётся <code>procs</code> горутин. Каждая горутина получает локальный счётчик итераций, распределённый через атомарный общий счётчик. Горутина вызывает пользовательскую функцию, передавая <code>*testing.PB</code>, у которого метод <code>Next()</code> атомарно декрементирует общий <code>b.N</code> и возвращает <code>true</code>, пока итерации не исчерпаны.</li>
-<li>Главная горутина ждёт завершения всех рабочих горутин, после чего останавливает таймер. Итоговое время — общее время выполнения <em>всех</em> горутин, делённое на <code>b.N</code>. Таким образом, <code>ns/op</code> означает среднее время одной итерации <em>в условиях параллелизма</em>, учитывающее contention и синхронизацию.</li>
-</ol>
+<p>Параллельные бенчмарки через <code>b.RunParallel</code> — шедевр инженерной мысли команды Go.</p>
+<p>Если бы разработчики рантайма реализовали <code>RunParallel</code> наивно, через общий счетчик <code>atomic.AddInt64(&amp;b.N, -1)</code> на каждой итерации, все ядра процессора мгновенно уперлись бы в катастрофическое аппаратное узкое место: постоянную инвалидацию кэш-линии счетчика по протоколу MESI (False Sharing и Bus Lock). Бенчмарк измерял бы не скорость вашего сервиса, а скорость шины межъядерной синхронизации!</p>
+<h3 id="genialnoe-reshenie-paketnyy-zakhvat-iteratsiy-v-testing-pb">Гениальное решение: Пакетный захват итераций в `testing.PB`</h3>
+
+<p>Посмотрим, как устроен тип <code>PB</code> (Parallel Benchmark) в <code>src/testing/benchmark.go</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">type PB struct {
+    globalN *atomic.Uint64 // указатель на общий счетчик оставшихся итераций
+    grain   uint64         // размер пачки итераций (Batch Size)
+    bN      uint64         // локальный лимит для текущей пачки
+    localN  uint64         // локальный счетчик итераций горутины
+}
+</code></pre>
+</div>
+
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+participant W1 as Горутина 1 (Core 0)
+participant W2 as Горутина 2 (Core 1)
+participant Global as atomic.Uint64 (Global b.N)
+
+Note over W1,W2: Запуск пула горутин (GOMAXPROCS)
+W1-&gt;&gt;Global: Захват пачки grain = 100 итераций
+Global--&gt;&gt;W1: Выделено [0..99]
+W2-&gt;&gt;Global: Захват пачки grain = 100 итераций
+Global--&gt;&gt;W2: Выделено [100..199]
+
+Note over W1: Крутит 100 итераций локально в регистрах CPU (0 обращений к памяти!)
+Note over W2: Крутит 100 итераций локально в регистрах CPU (0 обращений к памяти!)
+
+W1-&gt;&gt;Global: Пачка исчерпана: захват следующих 100
+Global--&gt;&gt;W1: Выделено [200..299]
+  </pre>
+</div>
+
+
+<p>Каждая рабочая горутина вызывает пользовательскую функцию, принимающую аргумент <code>*testing.PB</code>.<br />
+Когда горутина вызывает метод <code>pb.Next()</code>:<br />
+1. Она не лезет в общую память на каждом шаге! Она инкрементирует свой <strong>локальный регистровый счетчик <code>localN</code></strong>.<br />
+2. Только когда локальная пачка (<code>grain</code>, обычно от 100 до 1 000 итераций) полностью исчерпана, горутина выполняет единственную атомарную инструкцию <code>atomic.AddUint64(globalN, -grain)</code> для захвата следующей порции работы.<br />
+3. Это сводит contention за межъядерную шину практически к нулю!</p>
+<p>Число параллельных воркеров вычисляется по формуле <code>procs = GOMAXPROCS * b.parallelism</code> (по умолчанию <code>b.parallelism = 1</code>):</p>
+<p>$$\text{procs} = \text{GOMAXPROCS} \times b.parallelism$$</p>
+<p>Главная горутина бенчмарка ожидает завершения всех воркеров через внутренний барьер синхронизации, после чего останавливает секундомер. Итоговый <code>ns/op</code> представляет собой реальное совокупное процессорное время, деленное на $b.N$, честно отражая масштабируемость системы.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Накладные расходы `RunParallel` при одном ядре</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему <code>RunParallel</code> при <code>GOMAXPROCS=1</code> всё равно может дать результат, отличный от обычного бенчмарка?<br />
-<strong>Ответ:</strong> Даже при одном логическом процессоре <code>RunParallel</code> запускает одну горутину, но путь через <code>atomic</code> и планировщик добавляет накладные расходы. Также бенчмарк может быть быстрее или медленнее из-за другого порядка исполнения или эффектов кэша. Плюс адаптивный подбор <code>b.N</code> для параллельного варианта может выбрать другое N, что повлияет на амортизацию.</p>
+    <p><strong>Вопрос:</strong> Если мы запустим <code>b.RunParallel</code> на сервере с <code>GOMAXPROCS=1</code>, почему полученные цифры <code>ns/op</code> могут немного отличаться от обычного последовательного бенчмарка?</p>
+<p><strong>Ответ кандидата уровня Senior:</strong><br />
+1. В <code>RunParallel</code> даже при одном логическом процессоре $P$ вызов <code>pb.Next()</code> выполняет проверку границ локальной пачки и периодический атомарный вызов, что добавляет несколько дополнительных машинных инструкций в цикл.<br />
+2. Адаптивный подбор $b.N$ для параллельного запуска выполняет предварительный грубый замер для расчета гранулярности пачки (<code>grain</code>), поэтому результирующее число итераций $N$ может отличаться, что влияет на амортизацию.<br />
+3. Планировщик рантайма при наличии нескольких горутин задействует работу очередей <code>runq</code>, создавая микроскопический оверхед.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="sbor-profiley-vnutri-benchmarka">Сбор профилей внутри бенчмарка</h2>
 
-<p>Флаги <code>-cpuprofile</code>, <code>-memprofile</code>, <code>-blockprofile</code>, <code>-mutexprofile</code> инструктируют <code>testing</code> начать профилирование на время выполнения бенчмарка. Делается это с использованием <code>runtime/pprof</code>. Внутренне бенчмарк:</p>
-<ul>
-<li>Стартует профилировщик перед последним, стабилизированным запуском (когда <code>b.N</code> уже финальное).</li>
-<li>Останавливает профилировщик сразу после выполнения цикла.</li>
-<li>Записывает профиль в файл.</li>
-</ul>
-<p>Таким образом, профиль соответствует именно тому прогону, который дал финальные <code>ns/op</code>. Это позволяет соотнести горячие точки с измеряемым временем. Подробнее в <a href="7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>.</p>
-<h2 id="vliyanie-kesh-ierarkhii-i-optimizatsiy-kompilyatora">Влияние кэш-иерархии и оптимизаций компилятора</h2>
-
-<p>Бенчмарк в Go — это обычная Go-программа, выполняемая на реальном процессоре. Поэтому эффекты кэша, branch prediction и спекулятивного исполнения полностью влияют на результат. Например, если бенчмарк измеряет функцию, которая на малом размере данных помещается в L1, а при росте итераций данные выходят за его пределы, то адаптивный рост <code>b.N</code> может привести к переходу через границу кэша, и <code>ns/op</code> резко изменится. Это одна из причин, почему бенчмарк должен достичь насыщения по <code>b.N</code> — чтобы амортизировать как кэш-попадания, так и промахи.</p>
-<p>Компилятор Go может инлайнить функцию, константно сворачивать выражения и устранять мёртвый код. Если бенчмарк не сохраняет результат, DCE полностью удалит операцию — и время станет нулевым. Фреймворк бенчмаркинга <strong>не защищает</strong> от этого; это задача разработчика. Подробно об этом в <a href="4-podvodnye-kamni-benchmark-testov.html" class="wikilink">4. Подводные камни benchmark тестов</a>.</p>
+<p>Когда вы передаете флаги профилирования:<br />
+- <code>-cpuprofile=cpu.pprof</code><br />
+- <code>-memprofile=mem.pprof</code><br />
+- <code>-blockprofile=block.pprof</code><br />
+- <code>-mutexprofile=mutex.pprof</code></p>
+<p>Фреймворк <code>testing</code> не записывает профили на этапах калибровки (при малых $b.N = 1, 100$), иначе профиль был бы замусорен накладными расходами калибровочных вычислений.</p>
+<p>Профилировщик <code>runtime/pprof</code> активируется <strong>строго перед началом финального, стабилизированного прогона</strong>, когда значение $b.N$ уже окончательно зафиксировано! Сразу после выхода из измерительного цикла запись профиля останавливается и сбрасывается на диск. Это гарантирует 100% совпадение горячих точек в <code>pprof</code> с показаниями <code>ns/op</code> в консоли (<a href="7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>).</p>
+<hr />
 <h2 id="mekhanicheskaya-empatiya-otkuda-beryotsya-dispersiya">Механическая эмпатия: откуда берётся дисперсия</h2>
 
-<p>Даже если бенчмарк идеально написан, повторные запуски показывают разброс. Причины:</p>
-<ul>
-<li><strong>Планировщик горутин.</strong> Go-рантайм может мигрировать бенчмарк-горутину между ядрами, что приводит к потере прогретого кэша. Это проявляется как всплески времени при первом касании данных после миграции.</li>
-<li><strong>Прерывания и обработка прерываний.</strong> Сетевые пакеты, таймеры, дисковые прерывания крадут такты CPU. В Linux можно изолировать ядро через <code>isolcpus</code> и <code>taskset</code>.</li>
-<li><strong>DVFS (динамическое масштабирование частоты).</strong> Процессор меняет частоту в зависимости от нагрузки и температуры. Для стабильных замеров фиксируют частоту (<code>cpupower frequency-set -g performance</code>) или отключают Turbo Boost.</li>
-<li><strong>ASLR и выравнивание стека/кучи.</strong> Расположение данных в памяти случайно, что влияет на ассоциативность кэша и частоту конфликтов.</li>
-<li><strong>GC и асинхронные задачи рантайма.</strong> Например, периодический опрос сети (netpoll) или запись трейсов.</li>
-</ul>
-<p>Понимание этих факторов необходимо для <a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>.</p>
-<h2 id="sravnenie-s-benchmarkami-v-drugikh-yazykakh">Сравнение с бенчмарками в других языках</h2>
+<p>Даже если тестовый код математически идеален, запуск одного и того же бинарника пять раз подряд даст пять слегка различающихся чисел: <code>112 ns/op</code>, <code>118 ns/op</code>, <code>109 ns/op</code>, <code>125 ns/op</code>...</p>
+<p>С точки зрения кремниевой архитектуры (Mechanical Sympathy), дисперсию создают следующие физические факторы:<br />
+1. <strong>Динамическое масштабирование частоты процессора (DVFS):</strong><br />
+   Технологии Intel Turbo Boost и AMD Precision Boost непрерывно регулируют тактовую частоту ядра в зависимости от температуры кристалла и энергопотребления. Первый прогон на «холодном» кристалле разгоняется до 4.8 ГГц, а к десятому прогону процессор нагревается, снижает частоту до 4.1 ГГц и за замедление кода выдает нагрев радиатора!<br />
+2. <strong>Миграция потоков планировщиком ядра Linux:</strong><br />
+   Ядро операционной системы может вытеснить поток $M$ на другое физическое ядро. В этот момент полностью теряется горячий кэш L1/L2, вызывая лавину Cache Misses при первом чтении данных.<br />
+3. <strong>Аппаратные прерывания ядра:</strong><br />
+   Сетевая карта, таймер операционной системы или контроллер NVMe вызывают аппаратные прерывания (IRQ). Ядро процессора переключается на обработчик прерывания, крадя сотни тактов у бенчмарка.<br />
+4. <strong>Рандомизация адресного пространства (ASLR):</strong><br />
+   При каждом новом запуске операционная система размещает стек и кучу по новым случайным адресам памяти. Это приводит к разной частоте конфликтов в кэшах прямого отображения (Cache Set Associativity).</p>
+<p>Для подавления этих факторов на специализированных тестовых серверах фиксируют частоту процессора через <code>cpupower frequency-set -g performance</code>, изолируют процессорные ядра через системные утилиты <code>taskset</code> и <code>isolcpus</code> и отключают Turbo Boost (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>).</p>
+<hr />
+<h2 id="sravnenie-s-benchmarkami-v-drugikh-ekosistemakh">Сравнение с бенчмарками в других экосистемах</h2>
 
-<ul>
-<li><strong>Java (JMH):</strong> JMH изолирует прогревочные итерации, обрабатывает dead code с помощью возврата значений через «чёрные дыры» (Blackhole), и активно борется с влиянием JIT-компиляции. В Go AOT-компиляция избавляет от эффектов JIT, но проблемы с DCE и прогревом кэша/GC остаются.</li>
-<li><strong>C/C++ (Google Benchmark):</strong> Там тоже адаптивный подбор итераций, но меньше проблем с GC. Зато больше контроля над выравниванием, inlining и ассемблером.</li>
-<li><strong>C# (BenchmarkDotNet):</strong> Мощный фреймворк, автоматически изолирующий GC, прогревающий Tiered Compilation и предоставляющий статистику. Go-бенчмарк проще, но требует большей ручной дисциплины.</li>
-</ul>
+<p>Понимание архитектурных компромиссов Go становится особенно наглядным при сравнении с альтернативными платформами:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Характеристика</th>
+<th>Go (<code>testing.B</code>)</th>
+<th>Java (<code>JMH</code>)</th>
+<th>C++ (<code>Google Benchmark</code>)</th>
+<th>C# (<code>BenchmarkDotNet</code>)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Модель компиляции</strong></td>
+<td>AOT (Ahead-of-Time)</td>
+<td>JIT (HotSpot C1/C2)</td>
+<td>AOT (GCC / Clang)</td>
+<td>JIT (Tiered Compilation)</td>
+</tr>
+<tr>
+<td><strong>Проблема прогрева компилятора</strong></td>
+<td>Отсутствует (код уже скомпилирован в машинный)</td>
+<td>Колоссальная (требуются тысячи warm-up итераций)</td>
+<td>Отсутствует</td>
+<td>Требуется прогрев JIT</td>
+</tr>
+<tr>
+<td><strong>Борьба с Dead Code</strong></td>
+<td>Ручная (пакетные переменные / <code>KeepAlive</code>)</td>
+<td>Автоматическая (механизм <code>Blackhole</code>)</td>
+<td>Встроенная (<code>DoNotOptimize</code>)</td>
+<td>Встроенная (возврат значений)</td>
+</tr>
+<tr>
+<td><strong>Интеграция с GC</strong></td>
+<td>GC работает параллельно; <code>ReportAllocs</code></td>
+<td>Изоляция аллокаций, замер GC pressure</td>
+<td>GC отсутствует (ручной <code>malloc</code>)</td>
+<td>Автоматический мониторинг Gen0/1/2</td>
+</tr>
+<tr>
+<td><strong>Калибровка итераций</strong></td>
+<td>Адаптивная по времени (<code>-benchtime</code>)</td>
+<td>Адаптивная по эпохам и квантилям</td>
+<td>Адаптивная по времени</td>
+<td>Адаптивная по времени</td>
+</tr>
+</tbody>
+</table></div>
+<p>Бенчмаркинг в Go подкупает своей простотой, феноменальной скоростью запуска и отсутствием капризных эффектов JIT-компиляции. Однако он требует высокой инженерной дисциплины разработчика в части управления памятью и защиты от оптимизаций компилятора.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li>Внутренний алгоритм <code>go test -bench</code> адаптивно подбирает <code>b.N</code>, добиваясь стабильного среднего времени операции при заданном бюджете <code>-benchtime</code>.</li>
-<li>Таймеры <code>b.ResetTimer</code>/<code>StopTimer</code>/<code>StartTimer</code> управляют накоплением чистого времени, исключая инициализацию.</li>
-<li><code>b.RunParallel</code> детально распределяет итерации через атомарный счётчик, обеспечивая корректный замер конкурентной производительности.</li>
-<li>Профилирование (<code>-cpuprofile</code>, <code>-memprofile</code>) включается на финальном стабильном прогоне, что даёт точное соответствие профиля и метрик.</li>
-<li>Результаты бенчмарков подвержены влиянию GC, планировщика, кэш-эффектов и частотного масштабирования — инженер обязан это учитывать и стабилизировать окружение.</li>
-<li>Понимание «подкапотной» механики отличает Senior-разработчика, способного спроектировать бенчмарк, который не лжёт.</li>
+<li>Фреймворк <code>go test -bench</code> опирается на адаптивный калибровочный цикл в <code>src/testing/benchmark.go</code>, экстраполирующий $b.N$ с коэффициентом 1.2 и ограничением шага до 100×.</li>
+<li>Методы таймеров <code>b.ResetTimer/StopTimer/StartTimer</code> манипулируют внутренними полями <code>duration</code>, <code>netAllocs</code> и флагом <code>timerOn</code>, полностью амортизируя стоимость монотонного времени <code>CLOCK_MONOTONIC</code>.</li>
+<li>Секундомер продолжает тикать после <code>ResetTimer()</code>: вызывайте сброс непосредственно перед входом в измерительный цикл.</li>
+<li><code>b.RunParallel</code> использует высокоэффективную схему пакетного захвата итераций (<code>PB.grain</code>), устраняя конкуренцию за атомарный счетчик и ложное разделение кэш-линий между ядрами.</li>
+<li>Запись профилей (<code>-cpuprofile</code>, <code>-memprofile</code>) активируется только на финальном стабилизированном прогоне, гарантируя идеальное соответствие профиля и наносекундных метрик.</li>
+<li>Аппаратная дисперсия (DVFS, троттлинг, миграции ядер) нейтрализуется многократными прогонами (<code>-count=10</code>) и статистическим анализом через <code>benchstat</code>.</li>
 </ul>
-<p>Дальше мы рассмотрим врага номер один любого бенчмарка — <a href="4-podvodnye-kamni-benchmark-testov.html" class="wikilink">4. Подводные камни benchmark тестов</a>: как компилятор обнуляет ваши измерения, почему GC «плывёт» и как не стать жертвой собственных тестов.</p>
+<p>Теперь, когда механика <code>testing.B</code> раскрыта до последнего бита, мы готовы перейти к исследованию скрытых мин и коварных ловушек: в следующей лекции <a href="4-podvodnye-kamni-benchmark-testov.html" class="wikilink">4. Подводные камни benchmark тестов</a> мы разберем, как оптимизаторы компилятора превращают ваши замеры в мираж и как писать бенчмарки с математической честностью.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2356,7 +2607,7 @@ H --&gt; C
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#kak-go-test-bench-ustroen-vnutri">Как go test -bench устроен внутри</a></li><li class="toc-item toc-h2"><a href="#adaptivnyy-algoritm-opredeleniya-b-n">Адаптивный алгоритм определения b.N</a></li><li class="toc-item toc-h2"><a href="#kak-rabotayut-taymery-resettimer-stoptimer-i-starttimer">Как работают таймеры: ResetTimer, StopTimer и StartTimer</a></li><li class="toc-item toc-h2"><a href="#vliyanie-sborshchika-musora">Влияние сборщика мусора</a></li><li class="toc-item toc-h2"><a href="#monotonnye-chasy-i-time-now">Монотонные часы и time.Now</a></li><li class="toc-item toc-h2"><a href="#rabota-b-runparallel-iznutri">Работа b.RunParallel изнутри</a></li><li class="toc-item toc-h2"><a href="#sbor-profiley-vnutri-benchmarka">Сбор профилей внутри бенчмарка</a></li><li class="toc-item toc-h2"><a href="#vliyanie-kesh-ierarkhii-i-optimizatsiy-kompilyatora">Влияние кэш-иерархии и оптимизаций компилятора</a></li><li class="toc-item toc-h2"><a href="#mekhanicheskaya-empatiya-otkuda-beryotsya-dispersiya">Механическая эмпатия: откуда берётся дисперсия</a></li><li class="toc-item toc-h2"><a href="#sravnenie-s-benchmarkami-v-drugikh-yazykakh">Сравнение с бенчмарками в других языках</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#kak-go-test-bench-ustroen-vnutri">Как go test -bench устроен внутри</a></li><li class="toc-item toc-h2"><a href="#anatomiya-struktury-testing-b">Анатомия структуры testing.B</a></li><li class="toc-item toc-h2"><a href="#adaptivnyy-algoritm-opredeleniya-b-n">Адаптивный алгоритм определения b.N</a></li><li class="toc-item toc-h3"><a href="#matematika-ekstrapolyatsii-kak-go-rasschityvaet-sleduyushchee-b-n">Математика экстраполяции: как Go рассчитывает следующее b.N</a></li><li class="toc-item toc-h2"><a href="#kak-rabotayut-taymery-resettimer-stoptimer-i-starttimer">Как работают таймеры: ResetTimer, StopTimer и StartTimer</a></li><li class="toc-item toc-h3"><a href="#1-starttimer">1. StartTimer()</a></li><li class="toc-item toc-h3"><a href="#2-stoptimer">2. StopTimer()</a></li><li class="toc-item toc-h3"><a href="#3-resettimer">3. ResetTimer()</a></li><li class="toc-item toc-h2"><a href="#vliyanie-sborshchika-musora">Влияние сборщика мусора</a></li><li class="toc-item toc-h2"><a href="#monotonnye-chasy-i-time-now">Монотонные часы и time.Now</a></li><li class="toc-item toc-h2"><a href="#rabota-b-runparallel-iznutri">Работа b.RunParallel изнутри</a></li><li class="toc-item toc-h3"><a href="#genialnoe-reshenie-paketnyy-zakhvat-iteratsiy-v-testing-pb">Гениальное решение: Пакетный захват итераций в testing.PB</a></li><li class="toc-item toc-h2"><a href="#sbor-profiley-vnutri-benchmarka">Сбор профилей внутри бенчмарка</a></li><li class="toc-item toc-h2"><a href="#mekhanicheskaya-empatiya-otkuda-beryotsya-dispersiya">Механическая эмпатия: откуда берётся дисперсия</a></li><li class="toc-item toc-h2"><a href="#sravnenie-s-benchmarkami-v-drugikh-ekosistemakh">Сравнение с бенчмарками в других экосистемах</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

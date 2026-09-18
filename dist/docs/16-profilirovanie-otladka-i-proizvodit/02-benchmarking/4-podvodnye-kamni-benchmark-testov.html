@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Подводные камни benchmark тестов</h1>
           </header>
@@ -2178,9 +2178,12 @@
           <div class="article-markdown">
             <h2 id="vvedenie-kogda-benchmark-lzhyot">Введение: когда бенчмарк лжёт</h2>
 
-<p>В предыдущих статьях мы освоили синтаксис бенчмарков (<a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>) и разобрали их внутреннее устройство (<a href="3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a>). Мы знаем, как адаптируется <code>b.N</code>, как работают таймеры и параллельные прогоны. Но весь этот инструментарий обесценивается, если бенчмарк содержит логическую ошибку и выдаёт цифры, не имеющие отношения к реальной производительности.</p>
-<p>Практика показывает: написать <strong>правильный</strong> бенчмарк намного сложнее, чем кажется. Компилятор Go становится умнее с каждым релизом и агрессивно удаляет «бесполезный» код. Рантайм подбрасывает GC в самый неподходящий момент. Процессорный кэш и планировщик создают иллюзию быстродействия, которая исчезает под нагрузкой. Принимая решения на основе искажённых данных, вы рискуете внедрить «оптимизацию», которая на проде ухудшит и latency, и throughput.</p>
-<p>В этой статье собраны главные подводные камни бенчмарков Go: от компиляторной элиминации до скрытого влияния GC. Для каждой ловушки — пример, объяснение и способ защиты.</p>
+<p>В предыдущих главах мы освоили практический синтаксис фреймворка бенчмаркинга (<a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>) и разобрали его внутреннюю анатомию (<a href="3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a>). Мы знаем, как калибруется счетчик <code>b.N</code>, как работают методы таймеров и как распределяются итерации в <code>b.RunParallel</code>.</p>
+<p>Но весь этот арсенал превращается в опасную иллюзию, если сам бенчмарк написан с методологической ошибкой.</p>
+<p>Практика показывает суровую истину: <strong>написать корректный, правдивый бенчмарк часто сложнее, чем написать сам тестируемый алгоритм</strong>. </p>
+<p>Современный компилятор Go с каждым релизом становится умнее, агрессивнее удаляя «бесполезный» с его точки зрения код. Фоновый сборщик мусора рантайма способен вмешаться в замер в самый случайный момент. Процессорные кэши L1/L2 и механизмы предсказания ветвлений создают мираж фантастической скорости, который мгновенно рассеивается под реальной боевой нагрузкой.</p>
+<p>Если инженер принимает архитектурные решения на основе искаженных данных, он внедряет «оптимизацию», которая в продакшене не просто не дает выигрыша, а катастрофически обрушивает и latency, и throughput сервиса.</p>
+<p>В этой лекции мы препарируем <strong>главные подводные камни бенчмарков в Go</strong>: от компиляторной элиминации до коварных эффектов кэшей и пулов памяти. Для каждой ловушки мы разберем физическую причину, покажем пример ошибки и предоставим надежный способ защиты.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2191,9 +2194,11 @@
   </div>
 </div>
 
+<hr />
 <h2 id="1-dead-code-elimination-udalenie-myortvogo-koda">1. Dead Code Elimination (удаление мёртвого кода)</h2>
 
-<p>Самая распространённая ловушка. Если результат вычислений не используется, компилятор имеет право удалить всю вычисляющую логику. Бенчмарк покажет 0.25 нс/оп, потому что измеряет только пустой цикл.</p>
+<p>Самая массовая и коварная ловушка в микротестах производительности.</p>
+<p>Если функция производит вычисления, но возвращаемый результат нигде дальше не читается и не имеет побочных эффектов (не пишет в сокет, файл, канал или глобальную память), оптимизирующий компилятор Go на стадии SSA (Static Single Assignment) признает эти инструкции <strong>мертвым кодом (Dead Code)</strong> и полностью вырезает их из результирующего бинарника!</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2203,7 +2208,7 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// НЕВЕРНО: компилятор выбросит вызов expensiveFunc
+  <pre class="language-go"><code class="language-go">// НЕВЕРНО: компилятор выбросит вызов expensiveFunc!
 func BenchmarkDeadCode(b *testing.B) {
     for i := 0; i &lt; b.N; i++ {
         expensiveFunc()
@@ -2212,11 +2217,36 @@ func BenchmarkDeadCode(b *testing.B) {
 </code></pre>
 </div>
 
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+AST[&quot;AST: Вызов expensiveFunc()&quot;] --&gt; SSA[&quot;SSA: Анализ графа потока данных (Use-Def Chains)&quot;]
+SSA --&gt; Check{&quot;Результат функции&lt;br&gt;используется?&quot;}
+Check -- &quot;Нет побочных эффектов&lt;br&gt;и нет читателей&quot; --&gt; Eliminate[&quot;❌ Dead Code Elimination:&lt;br&gt;Тело функции вырезано!&quot;]
+Check -- &quot;Запись в глобальную переменную&lt;br&gt;или KeepAlive&quot; --&gt; Keep[&quot;✅ Инструкции сохранены в машинном коде&quot;]
+Eliminate --&gt; Result[&quot;Замер: 0.24 ns/op (Пустой цикл)&quot;]
+  </pre>
+</div>
+
+
+<p>Разработчик запускает тест и видит ошеломляющие <code>0.24 ns/op</code>. Ему кажется, что алгоритм работает со сверхсветовой скоростью, тогда как процессор крутит пустой регистровый цикл <code>DEC/JNZ</code>, вообще не вызывая функцию!</p>
 <h3 id="kak-zashchititsya">Как защититься</h3>
 
-<ul>
-<li>Присвоить результат переменной уровня пакета, недоступной для анализа компилятору:</li>
-</ul>
+<ol>
+<li><strong>Присвоить результат переменной уровня пакета:</strong><br />
+   Компилятор компилирует пакет как независимую единицу. Он не может доказать, что глобальная экспортируемая или неэкспортируемая переменная пакета не будет прочитана другим кодом или тестом, и вынужден честно сгенерировать машинные инструкции вычисления:</li>
+</ol>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2226,33 +2256,40 @@ func BenchmarkDeadCode(b *testing.B) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">var result int32
+  <pre class="language-go"><code class="language-go">// Глобальная переменная уровня пакета
+var result int32
 
 func BenchmarkKeepAlive(b *testing.B) {
+    var r int32
     for i := 0; i &lt; b.N; i++ {
-        result = expensiveFunc()
+        r = expensiveFunc()
     }
+    // Сохраняем финальный результат в пакетную переменную ПОСЛЕ цикла
+    result = r
 }
 </code></pre>
 </div>
 
-<ul>
-<li>Использовать <code>runtime.KeepAlive</code> (Go 1.14+), хотя чаще применяют первый способ.</li>
-<li>В бенчмарках параллельных операций — использовать атомарное сохранение результатов в глобальную переменную.</li>
-</ul>
+<ol start="2">
+<li><strong>Использовать функцию <code>runtime.KeepAlive</code>:</strong><br />
+   Вызов <code>runtime.KeepAlive(&amp;result)</code> (доступен начиная с Go 1.14) явно сообщает компилятору и сборщику мусора, что объект по указателю обязан оставаться достижимым вплоть до этой точки программы.</li>
+<li><strong>В параллельных бенчмарках (<code>RunParallel</code>):</strong><br />
+   Для агрегации результатов используйте атомарные операции (<code>atomic.StoreInt32</code>, <code>atomic.AddInt64</code>) или локальные переменные внутри горутины, сбрасываемые в глобальную переменную по завершении воркера.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Фаза deadcode в компиляторе Go</span>
   </div>
   <div class="callout-body">
-    <p>Компилятор Go выполняет dead code elimination на уровне SSA-представления. Если инструкция не участвует ни в одной цепочке до выхода из функции (return, запись в память вне стека функции), она выкидывается. Глобальная переменная является видимой для всего пакета точкой выхода, поэтому операция сохраняется.</p>
+    <p>В дереве компилятора Go (<code>cmd/compile/internal/ssa</code>) фаза <code>deadcode</code> обходит граф управления потоком (Control Flow Graph). Каждое значение, не имеющее исходящих ребер использования (use-def chains) и не помеченное как обладающее побочным эффектом (memory store, syscall), исключается из финального ассемблерного листинга. Запись в глобальную переменную генерирует инструкцию <code>MOV</code>, адресующую статическую секцию данных <code>.data</code> / <code>.bss</code>, что делает удаление вычисления невозможным.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="2-nevernaya-rabota-s-taymerami">2. Неверная работа с таймерами</h2>
 
-<p>Часто дорогую подготовку или очистку оставляют внутри цикла, завышая <code>ns/op</code>. Или забывают <code>b.ResetTimer()</code> после инициализации.</p>
+<p>Вторая по частоте ошибка — смешивание подготовительной фазы с измеряемой нагрузкой, либо некорректное использование методов секундомера <code>testing.B</code>.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2265,14 +2302,16 @@ func BenchmarkKeepAlive(b *testing.B) {
   <pre class="language-go"><code class="language-go">// НЕВЕРНО: инициализация входит в замер
 func BenchmarkSliceAppend(b *testing.B) {
     for i := 0; i &lt; b.N; i++ {
-        s := make([]int, 1000000) // дорого!
-        s = append(s, 1)
+        s := make([]int, 1000000) // Дорогая аллокация кучи на каждом шаге!
+        s = append(s, 1)          // Мы хотели измерить только append!
     }
 }
 </code></pre>
 </div>
 
-<p>Решение: использовать <code>b.ResetTimer()</code> или <code>b.StopTimer()</code>/<code>b.StartTimer()</code>.</p>
+<p>В таком тесте 99.9% времени будет занимать системный вызов ядра <code>mmap</code> и очистка страниц оперативной памяти, а не целевая операция добавления элемента.</p>
+<h3 id="ispravlenie-s-pomoshchyu-b-resettimer">Исправление с помощью `b.ResetTimer()`</h3>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2284,7 +2323,7 @@ func BenchmarkSliceAppend(b *testing.B) {
   </div>
   <pre class="language-go"><code class="language-go">func BenchmarkSliceAppendFixed(b *testing.B) {
     s := make([]int, 1000000)
-    b.ResetTimer()
+    b.ResetTimer() // Сбрасываем накопленное время и аллокации
     for i := 0; i &lt; b.N; i++ {
         s = append(s, 1)
     }
@@ -2295,16 +2334,18 @@ func BenchmarkSliceAppend(b *testing.B) {
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: `ResetTimer()` не сбрасывает `b.N`</span>
   </div>
   <div class="callout-body">
     <p><code>b.ResetTimer()</code> обнуляет накопленное время, но <strong>не обнуляет <code>b.N</code></strong>. Это значит, что первая итерация всё равно будет учтена в замере. Если первый вызов существенно медленнее (холодный кэш, ленивая инициализация), результат окажется смещённым. Для таких случаев делают «прогревочный» проход вне таймера.</p>
   </div>
 </div>
 
+<p>Если внутри самого цикла требуется производить периодические накладные действия, используйте <code>b.StopTimer()</code> / <code>b.StartTimer()</code>, однако помните: эти вызовы стоят десятки наносекунд и в сверхкоротких циклах сами вносят искажения.</p>
+<hr />
 <h2 id="3-vliyanie-gc-i-allokatsiy">3. Влияние GC и аллокаций</h2>
 
-<p>Даже если код написан правильно, сборщик мусора может сработать в середине прогона и добавить миллисекунды к измерению. Особенно сильно это проявляется в бенчмарках с интенсивными аллокациями.</p>
+<p>Рантайм Go не изолирует бенчмарк от фонового сборщика мусора. Если измеряемая функция активно порождает мусор в куче, сборщик мусора гарантированно вмешается в замер.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2326,48 +2367,100 @@ func BenchmarkSliceAppend(b *testing.B) {
 </code></pre>
 </div>
 
-<p>На первый взгляд всё честно. Но <code>strings.Builder</code> внутри растёт, аллоцируя слайсы. При достаточно большом <code>b.N</code> кучa наполняется, запускается GC, и <code>ns/op</code> внезапно подскакивает. Среднее время оказывается не репрезентативным для короткоживущего запроса, где GC мог вовсе не сработать.</p>
+<p>На первых шагах адаптации ($b.N = 1, 100$) куча чиста, сборщик мусора спит, и время операции кажется великолепным. Но когда $b.N$ доходит до $100\,000$, куча переполняется, триггерится фаза Concurrent Mark и паузы Stop-The-World. Результирующий <code>ns/op</code> внезапно подскакивает в 3–5 раз!</p>
 <h3 id="kak-zashchititsya">Как защититься</h3>
 
-<ul>
-<li>Всегда смотреть <code>-benchmem</code> — высокие B/op и allocs/op предупреждают о вмешательстве GC.</li>
-<li>Принудительно вызывать <code>runtime.GC()</code> перед циклом, чтобы состояние кучи было детерминированным.</li>
-<li>В реальных сценариях оптимизировать аллокации (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>), чтобы GC не влиял на хвосты (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</li>
-</ul>
+<ol>
+<li><strong>Всегда запускать с флагом <code>-benchmem</code>:</strong> высокие показатели <code>B/op</code> и <code>allocs/op</code> — первый маркер того, что в ваши наносекунды подмешана работа GC.</li>
+<li><strong>Принудительный вызов <code>runtime.GC()</code>:</strong> вызов <code>runtime.GC()</code> перед входом в цикл стабилизирует начальное состояние кучи.</li>
+<li><strong>Оптимизировать аллокации:</strong> использовать предвыделение емкости слайсов (<code>make([]T, 0, cap)</code>), пулы буферов (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) для минимизации нагрузки на сборщик и снижения хвостовых задержек (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</li>
+</ol>
+<hr />
 <h2 id="4-ignorirovanie-progreva-kesha">4. Игнорирование прогрева кэша</h2>
 
-<p>Бенчмарк в Go стартует с «холодным» кэшем. Первая порция итераций тратит такты на прогрузку данных в L1/L2. Если <code>b.N</code> невелико (быстрая операция, <code>-benchtime=100ms</code>), кэш-промахи доминируют в результате. На реальном сервере, обрабатывающем тысячи запросов, структуры данных горячие, и такой эффект пропадает.</p>
-<p>Обратная ситуация: бенчмарк настолько долог, что данные полностью прогреваются, а в production-коде между вызовами кэш вымывается другими операциями. Тогда бенчмарк покажет лучшее время, чем реальность.</p>
-<p><strong>Защита:</strong> использовать <code>-benchtime</code> не менее 1 секунды (по умолчанию), анализировать дисперсию между запусками (<code>-count</code>), и при необходимости добавлять ручной прогрев перед <code>b.ResetTimer()</code>.</p>
+<p>Аппаратные кэши процессора (L1/L2/L3) работают по принципу прогрева:<br />
+- Первый проход по массиву неизбежно вызывает аппаратные промахи (<strong>Cache Misses</strong>), заставляя ядро ожидать данные из оперативной памяти DDR (~80 нс).<br />
+- Последующие итерации работают с горячими данными прямо из кэша L1 (~1 нс).</p>
+<p>Если бенчмарк запускается с коротким интервалом (например, <code>-benchtime=100ms</code>), фаза холодного кэша исказит среднее время в худшую сторону.<br />
+Обратный эффект: если массив в бенчмарке имеет размер 16 КБ, он целиком помещается в сверхбыстрый кэш L1D. На проде данные будут иметь размер 16 МБ, вылетая в медленную RAM, и реальная задержка окажется в 50 раз хуже показаний бенчмарка!</p>
+<p><strong>Правило:</strong> Задавать <code>-benchtime</code> не менее 1 секунды (по умолчанию), отслеживать дисперсию через <code>-count=10</code> и тестировать структуры данных боевого объема.</p>
+<hr />
 <h2 id="5-lovushki-parallelnykh-benchmarkov-runparallel">5. Ловушки параллельных бенчмарков (`RunParallel`)</h2>
 
-<p><code>b.RunParallel</code> запускает <code>GOMAXPROCS</code> горутин. Но разработчик может неверно интерпретировать результат:</p>
-<ul>
-<li><strong>Неверно:</strong> считать, что <code>ns/op</code> — время одной операции одной горутины. На деле это общее время выполнения всех горутин, делённое на общее количество итераций. Contention и синхронизация уже зашиты в эту цифру.</li>
-<li><strong>Ожидать линейного ускорения.</strong> Если бенчмарк упирается в контеншн на атомарной переменной или false sharing (<a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>), добавление горутин через <code>b.SetParallelism</code> может даже снизить пропускную способность.</li>
-<li><strong>Забывать о прогреве горутин.</strong> Первые итерации после старта <code>RunParallel</code> включают разогрев локальных кэшей горутин и стартовые барьеры. Иногда стоит сделать холостой прогон перед измеряемым.</li>
-</ul>
+<p>Метод <code>b.RunParallel</code> создает <code>GOMAXPROCS</code> параллельных горутин. Однако разработчики часто неверно трактуют его механику:</p>
+<ol>
+<li><strong>Заблуждение о метрике:</strong> <code>ns/op</code> в <code>RunParallel</code> — это не задержка одного потока! Это <strong>суммарное реальное время, затраченное всеми ядрами, деленное на общее число выполненных операций</strong>. В эту цифру уже заложены накладные расходы на конкуренцию и блокировки.</li>
+<li><strong>Иллюзия линейной масштабируемости:</strong> Если алгоритм страдает от ложного разделения кэш-линий (<strong>False Sharing</strong>, см. <a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>) или упирается в мьютекс, увеличение параллелизма через <code>b.SetParallelism</code> приведет не к ускорению, а к обрушению пропускной способности.</li>
+<li><strong>Холодный старт горутин:</strong> Первые такты после пробуждения пула воркеров тратятся на раскачку кэшей и вытеснение потоков планировщиком ядра ОС.</li>
+</ol>
+<hr />
 <h2 id="6-odnobokost-nepravilnyy-razmer-vkhodnykh-dannykh">6. Однобокость: неправильный размер входных данных</h2>
 
-<p>Микробенчмарк, измеряющий конкатенацию трёх строк, не предсказывает поведение на 10000 строк. Бенчмарк хеш-таблицы на 10 ключах не показывает, что на 10 миллионах начнутся эвакуации бакетов (рост <code>map</code>, см. внутреннее устройство мап).</p>
-<p><strong>Правило:</strong> тестировать на нескольких реалистичных размерах (небольшие, средние, большие), а также при необходимости на искусственно вырожденных случаях (пустые, максимальные). Сравнивать тренды, а не одиночные точки.</p>
+<p>Никогда не делайте глобальных архитектурных выводов на основе замера единственного размера данных:<br />
+- Конкатенация трех строк через <code>+</code> работает быстрее, чем через <code>strings.Builder</code>.<br />
+- Но на 1 000 строк <code>strings.Builder</code> опережает <code>+</code> в 40 раз!<br />
+- Вставка в <code>map</code> на 10 элементах происходит мгновенно, а на $10^7$ элементов вызывает цепную реакцию аллокаций бакетов и эвакуации хэш-таблицы.</p>
+<p><strong>Правило:</strong> Всегда проектируйте параметризованные бенчмарки (Table-Driven Benchmarks с <code>b.Run</code>) на малых, средних и предельных боевых объемах данных.</p>
+<hr />
 <h2 id="7-ne-raspoznavanie-statisticheskoy-prirody">7. Не-(рас)познавание статистической природы</h2>
 
-<p>Один прогон бенчмарка — это выборка из распределения возможных времён выполнения, зашумлённого ОС, GC и планировщиком. Принимать решение по одному запуску — грубая ошибка. Всегда использовать <code>-count=10</code> или больше и анализировать <code>benchstat</code> (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>). Разброс может быть асимметричным: p50 стабильно, а p99 плавает из-за GC. Тогда среднее <code>ns/op</code> не ловит хвост.</p>
+<p>Одиночный запуск команды <code>go test -bench</code> в консоли не имеет доказательной силы:<br />
+- Операционная система в любой момент может отвлечься на фоновые задачи (индексацию, сетевой стек, планировщик Linux CFS).<br />
+- Нагрев процессора включает динамический троттлинг частоты (DVFS).</p>
+<p>Принимать решение об оптимизации на основе разницы в 3% между двумя одиночными запусками — статистическое преступление. Всегда используйте флаг многократных повторов <code>-count=10</code> и математический анализатор <code>benchstat</code> (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>).</p>
+<hr />
 <h2 id="8-nepravilnoe-ispolzovanie-benchtime">8. Неправильное использование `-benchtime`</h2>
 
-<p>По умолчанию <code>-benchtime=1s</code>. Для очень быстрых операций (например, atomic.Add) этого хватает для миллиарда итераций, и бенчмарк может упереться в <code>b.N</code>=1e9. Для очень медленных (секунды на операцию) <code>b.N</code> останется 1, и погрешность <code>time.Now()</code> станет заметной. В таких случаях задают фиксированное число итераций: <code>-benchtime=100x</code>.</p>
-<p>Но форсирование малого количества итераций чревато недостоверной статистикой и влиянием выбросов. Прежде чем фиксировать N, убедитесь, что понимаете, зачем это делаете.</p>
+<p>По умолчанию фреймворк бенчмаркинга использует временной порог <code>-benchtime=1s</code>.<br />
+- Для сверхбыстрых операций (например, атомарный инкремент) одной секунды хватает, чтобы счетчик итераций достиг максимума $b.N = 10^9$.<br />
+- Для тяжелых операций (например, криптографический расчет или генерация ключей), длящихся по 800 мс, раннер завершится на $b.N = 1$, что дает слишком грубую оценку, а погрешность системного вызова <code>time.Now()</code> становится заметной. В таких ситуациях явно задают фиксированное количество итераций флагом вида <code>-benchtime=100x</code>.</p>
+<p>Однако фиксация слишком малого $N$ чревата сильным влиянием случайных выбросов. Прежде чем фиксировать $N$, убедитесь, что вы понимаете погрешности <code>time.Now()</code>. Подбирайте <code>-benchtime</code> осознанно.</p>
+<hr />
 <h2 id="9-vliyanie-inlayninga-i-optimizatsiy-kompilyatora">9. Влияние инлайнинга и оптимизаций компилятора</h2>
 
-<p>Компилятор может заинлайнить функцию, и бенчмарк покажет производительность, которая в реальном коде (где инлайнинг не произошёл из-за размера функции или escape analysis) не достигается. И наоборот: флаг <code>-gcflags="-N -l"</code> отключает инлайнинг и делает замеры пессимистичными.</p>
-<p><strong>Рекомендация:</strong> бенчмарки запускать с оптимизациями по умолчанию (production-режим). При анализе смотреть ассемблер (<code>-gcflags="-S"</code>) или <code>go tool compile -S</code>, чтобы понять, что реально попало в замер.</p>
-<h2 id="10-sokrytie-allokatsiy-cherez-puly">10. Сокрытие аллокаций через пулы</h2>
+<p>Оптимизатор компилятора Go агрессивно встраивает (инлайнит) небольшие функции в точку вызова:<br />
+- В бенчмарке короткая функция встраивается в цикл, избавляясь от накладных расходов вызова <code>CALL/RET</code>.<br />
+- На проде эта же функция вызывается через интерфейс или из другого пакета, инлайнинг не срабатывает, и производительность падает на 20–30%.</p>
+<p>И обратная крайность: запуск бенчмарков с флагом отладки <code>-gcflags="-N -l"</code> полностью отключает оптимизации и инлайнинг, превращая результаты в бесполезные пессимистичные цифры.<br />
+<strong>Рекомендация:</strong> Всегда запускайте замеры со стандартными флагами оптимизации (production-режим) и периодически анализируйте ассемблерный листинг через <code>go tool compile -S</code> или флаг сборки <code>-gcflags="-S"</code>.</p>
+<hr />
+<h2 id="10-sokrytie-allokatsiy-cherez-puly-sync-pool">10. Сокрытие аллокаций через пулы (`sync.Pool`)</h2>
 
-<p>Использование <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) внутри бенчмарка без его очистки между итерациями может симулировать несуществующую эффективность: если пул не опустошается, он возвращает объекты без аллокаций, что соответствует идеальному сценарию. На практике под нагрузкой пул может опустошаться или, наоборот, накапливать слишком много объектов.</p>
-<p><strong>Защита:</strong> между итерациями бенчмарка сбрасывать пул до реалистичного состояния, либо измерять и холодный, и горячий путь отдельно.</p>
+<p>Использование <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) внутри наивного бенчмарка создает опаснейшую иллюзию:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph BenchmarkLoop[&quot;Бенчмарк в 1 поток&quot;]
+Put1[&quot;pool.Put(obj)&quot;] --&gt; Get1[&quot;pool.Get() -&gt; Тот же obj!&quot;]
+Get1 --&gt; Hit[&quot;100% попадание в L1D кэш&lt;br&gt;0 allocs/op | Идеальная скорость&quot;]
+end
+
+subgraph ProductionReality[&quot;Продакшен (64 ядра, 10 000 RPS)&quot;]
+ManyP[&quot;Много потоков M и процессоров P&quot;] --&gt; Contention[&quot;Конкуренция за poolLocal&lt;br&gt;Work-stealing между пулами&quot;]
+Contention --&gt; Miss[&quot;Вымывание из кэша CPU&lt;br&gt;Очистка пула сборщиком GC&quot;]
+end
+  </pre>
+</div>
+
+
+<p>В однопоточном синтетическом цикле объект, возвращенный через <code>Put()</code>, немедленно извлекается следующим <code>Get()</code> из приватного слота процессора <code>poolLocal.private</code>. Вы видите 0 аллокаций и идеальное попадание в кэш L1.<br />
+В продакшене под нагрузкой горутины будут работать на разных ядрах, провоцируя межпроцессорные кражи объектов, а сборщик мусора на каждой фазе STW будет опустошать пул.<br />
+<strong>Защита:</strong> Очищайте состояние пула или замеряйте как горячий, так и холодный путь работы.</p>
+<hr />
 <h2 id="primer-kompleksnogo-chestnogo-benchmarka">Пример комплексного «честного» бенчмарка</h2>
 
+<p>Соберем все защитные техники воедино в образцовом бенчмарке чтения данных из потока:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2377,39 +2470,62 @@ func BenchmarkSliceAppend(b *testing.B) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">var globalResult []byte
+  <pre class="language-go"><code class="language-go">package io_bench_test
+
+import (
+    &quot;bytes&quot;
+    &quot;io&quot;
+    &quot;testing&quot;
+)
+
+// Глобальная переменная предотвращает Dead Code Elimination
+var globalResult []byte
 
 func BenchmarkReadFull(b *testing.B) {
-    data := make([]byte, 4096)
-    reader := bytes.NewReader(bytes.Repeat([]byte(&quot;x&quot;), 4096))
+    // 1. Подготовка эталонных неизменяемых данных вне таймера
+    sourceData := bytes.Repeat([]byte(&quot;x&quot;), 4096)
+    buf := make([]byte, 4096)
+    reader := bytes.NewReader(sourceData)
 
+    // 2. Включение детального учета аллокаций
+    b.ReportAllocs()
+
+    // 3. Сброс секундомера непосредственно перед входом в цикл
     b.ResetTimer()
+
     for i := 0; i &lt; b.N; i++ {
-        reader.Reset(bytes.Repeat([]byte(&quot;x&quot;), 4096)) // Reset внутри, чтобы исключить подготовку
-        n, _ := io.ReadFull(reader, data)
-        globalResult = data[:n]
+        // Сброс ридера включен в замер как честная часть боевого сценария
+        reader.Reset(sourceData)
+
+        n, err := io.ReadFull(reader, buf)
+        if err != nil {
+            b.Fatalf(&quot;неожиданная ошибка чтения: %v&quot;, err)
+        }
+
+        // Надежная защита от вырезания вычислений компилятором
+        globalResult = buf[:n]
     }
 }
 </code></pre>
 </div>
 
-<p>Здесь мы:<br />
-- Используем глобальную переменную, чтобы избежать dead code elimination.<br />
-- Сбрасываем reader внутри цикла после <code>ResetTimer</code> (подготовка включена). Мораль: иногда подготовка неизбежна, тогда её включают в замер как часть реалистичного сценария.<br />
-- Всегда указываем <code>-benchmem</code> для контроля аллокаций.</p>
+<p>В этом эталонном примере:<br />
+- Подготовка памяти выполнена до <code>b.ResetTimer()</code>.<br />
+- Вызов <code>b.ReportAllocs()</code> гарантирует вывод метрик <code>B/op</code> и <code>allocs/op</code>.<br />
+- Проверка ошибок через <code>b.Fatalf</code> защищает от некорректного выполнения.<br />
+- Фиксация результата в <code>globalResult</code> исключает удаление кода оптимизатором.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<p>Подводные камни бенчмарков в Go — не экзотика, а повседневная реальность. Dead code elimination, GC, кэш-эффекты, contention, неверная обработка таймеров и статистическая небрежность превращают измерения в самообман. Senior-разработчик обязан знать каждую из этих ловушек и методично отрабатывать их:</p>
 <ul>
-<li>Сохранять результат глобально.</li>
-<li>Управлять таймерами осознанно.</li>
-<li>Контролировать аллокации (<code>-benchmem</code>).</li>
-<li>Прогревать кэш и стабилизировать окружение.</li>
-<li>Запускать с разными размерами входных данных и анализировать распределение.</li>
-<li>Сверяться с ассемблером, чтобы убедиться, что измеряется именно то, что задумано.</li>
+<li><strong>Бенчмарк без защиты от Dead Code Elimination</strong> измеряет пустой цикл процессора; сохраняйте результат в глобальную переменную пакета или используйте <code>runtime.KeepAlive</code>.</li>
+<li><strong>Секундомер <code>testing.B</code> требует дисциплины:</strong> вызов <code>b.ResetTimer()</code> обязан стоять непосредственно перед циклом <code>for i := 0; i &lt; b.N</code>.</li>
+<li><strong>Флаг <code>-benchmem</code> — обязательный стандарт:</strong> неконтролируемые аллокации в куче искажают наносекунды скрытой работой сборщика мусора.</li>
+<li><strong>Одиночный замер — это случайность:</strong> используйте серию <code>-count=10</code> и математический анализ <code>benchstat</code> для отсечения аппаратного шума.</li>
+<li><strong><code>b.RunParallel</code></strong> тестирует масштабируемость системы; помните о накладных расходах на синхронизацию и ложном разделении кэш-линий (<strong>False Sharing</strong>).</li>
+<li><strong>Проверяйте ассемблерный листинг (<code>go tool compile -S</code>):</strong> настоящий инженер всегда знает, какие машинные инструкции процессор выполняет в измерительном цикле.</li>
 </ul>
-<p>Только такой подход превращает бенчмарк из генератора цифр в надёжный фундамент для принятия инженерных решений.</p>
-<p>Мы разобрали, как не наступить на грабли. Теперь предстоит понять, когда бенчмарк уместен, а когда нужны более широкие измерения. Об этом — следующая статья: <a href="5-microbenchmarks-vs-macrobenchmarks.html" class="wikilink">5. microbenchmarks vs macrobenchmarks</a>.</p>
+<p>В следующей статье <a href="5-microbenchmarks-vs-macrobenchmarks.html" class="wikilink">5. microbenchmarks vs macrobenchmarks</a> мы поднимемся на уровень выше и разберем архитектурную дилемму: когда микроскопический замер отдельной функции полезен, а когда объективную истину способны показать только сквозные макро-бенчмарки и сквозное нагрузочное тестирование.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2437,7 +2553,7 @@ func BenchmarkReadFull(b *testing.B) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vvedenie-kogda-benchmark-lzhyot">Введение: когда бенчмарк лжёт</a></li><li class="toc-item toc-h2"><a href="#1-dead-code-elimination-udalenie-myortvogo-koda">1. Dead Code Elimination (удаление мёртвого кода)</a></li><li class="toc-item toc-h3"><a href="#kak-zashchititsya">Как защититься</a></li><li class="toc-item toc-h2"><a href="#2-nevernaya-rabota-s-taymerami">2. Неверная работа с таймерами</a></li><li class="toc-item toc-h2"><a href="#3-vliyanie-gc-i-allokatsiy">3. Влияние GC и аллокаций</a></li><li class="toc-item toc-h3"><a href="#kak-zashchititsya">Как защититься</a></li><li class="toc-item toc-h2"><a href="#4-ignorirovanie-progreva-kesha">4. Игнорирование прогрева кэша</a></li><li class="toc-item toc-h2"><a href="#5-lovushki-parallelnykh-benchmarkov-runparallel">5. Ловушки параллельных бенчмарков (RunParallel)</a></li><li class="toc-item toc-h2"><a href="#6-odnobokost-nepravilnyy-razmer-vkhodnykh-dannykh">6. Однобокость: неправильный размер входных данных</a></li><li class="toc-item toc-h2"><a href="#7-ne-raspoznavanie-statisticheskoy-prirody">7. Не-(рас)познавание статистической природы</a></li><li class="toc-item toc-h2"><a href="#8-nepravilnoe-ispolzovanie-benchtime">8. Неправильное использование -benchtime</a></li><li class="toc-item toc-h2"><a href="#9-vliyanie-inlayninga-i-optimizatsiy-kompilyatora">9. Влияние инлайнинга и оптимизаций компилятора</a></li><li class="toc-item toc-h2"><a href="#10-sokrytie-allokatsiy-cherez-puly">10. Сокрытие аллокаций через пулы</a></li><li class="toc-item toc-h2"><a href="#primer-kompleksnogo-chestnogo-benchmarka">Пример комплексного «честного» бенчмарка</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#vvedenie-kogda-benchmark-lzhyot">Введение: когда бенчмарк лжёт</a></li><li class="toc-item toc-h2"><a href="#1-dead-code-elimination-udalenie-myortvogo-koda">1. Dead Code Elimination (удаление мёртвого кода)</a></li><li class="toc-item toc-h3"><a href="#kak-zashchititsya">Как защититься</a></li><li class="toc-item toc-h2"><a href="#2-nevernaya-rabota-s-taymerami">2. Неверная работа с таймерами</a></li><li class="toc-item toc-h3"><a href="#ispravlenie-s-pomoshchyu-b-resettimer">Исправление с помощью b.ResetTimer()</a></li><li class="toc-item toc-h2"><a href="#3-vliyanie-gc-i-allokatsiy">3. Влияние GC и аллокаций</a></li><li class="toc-item toc-h3"><a href="#kak-zashchititsya">Как защититься</a></li><li class="toc-item toc-h2"><a href="#4-ignorirovanie-progreva-kesha">4. Игнорирование прогрева кэша</a></li><li class="toc-item toc-h2"><a href="#5-lovushki-parallelnykh-benchmarkov-runparallel">5. Ловушки параллельных бенчмарков (RunParallel)</a></li><li class="toc-item toc-h2"><a href="#6-odnobokost-nepravilnyy-razmer-vkhodnykh-dannykh">6. Однобокость: неправильный размер входных данных</a></li><li class="toc-item toc-h2"><a href="#7-ne-raspoznavanie-statisticheskoy-prirody">7. Не-(рас)познавание статистической природы</a></li><li class="toc-item toc-h2"><a href="#8-nepravilnoe-ispolzovanie-benchtime">8. Неправильное использование -benchtime</a></li><li class="toc-item toc-h2"><a href="#9-vliyanie-inlayninga-i-optimizatsiy-kompilyatora">9. Влияние инлайнинга и оптимизаций компилятора</a></li><li class="toc-item toc-h2"><a href="#10-sokrytie-allokatsiy-cherez-puly-sync-pool">10. Сокрытие аллокаций через пулы (sync.Pool)</a></li><li class="toc-item toc-h2"><a href="#primer-kompleksnogo-chestnogo-benchmarka">Пример комплексного «честного» бенчмарка</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2169,26 +2169,69 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~50 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Профилирование внутри benchmark</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="zachem-sovmeshchat-benchmark-i-profilirovshchik">Зачем совмещать бенчмарк и профилировщик</h2>
+            <h1>Профилирование внутри benchmark: рентген узких мест</h1>
+<blockquote>
+<p><em>"Premature optimization is the root of all evil. But when the time comes to optimize, do not guess — use a profiler."</em><br />
+— Перефразируя Дональда Кнута</p>
+</blockquote>
+<p>Секундомер — полезный инструмент. Если спринтер пробежал дистанцию за 12 секунд вместо 10, секундомер честно зафиксирует отставание. Но секундомер нем как рыба: он не способен сказать, почему спортсмен замедлился — подвернул ли он лодыжку, ошибся со стартовыми колодками или у него сбилось дыхание.</p>
+<p>Бенчмарк <code>go test -bench</code> без профилировщика — это точно такой же секундомер. Он выдает сухие числа <code>ns/op</code>, <code>B/op</code> и <code>allocs/op</code>. Вы видите, что новый алгоритм работает на 35% медленнее старого, но понятия не имеете, <em>где именно внутри функции</em> сгорают драгоценные процессорные такты. Вызвана ли задержка лишними аллокациями, скрытым копированием слайсов, ожиданием в мьютексе или промахами мимо кэша процессора?</p>
+<p>К счастью, инженеры Go встроили в испытательный стенд полноценный диагностический рентген. Флаги <code>-cpuprofile</code>, <code>-memprofile</code>, <code>-blockprofile</code> и <code>-mutexprofile</code> позволяют снять послойный анатомический срез работы программы прямо во время исполнения бенчмарка. В этой лекции мы разберем, как активировать этот арсенал, как устроен механизм снятия профилей в рантайме Go и как превратить сухой стек вызовов в очевидный план оптимизации кода.</p>
+<hr />
+<h2 id="zachem-sovmeshchat-benchmark-i-profilirovshchik">Зачем совмещать бенчмарк и профилировщик</h2>
 
-<p>В предыдущих статьях мы освоили бенчмаркинг как изолированный инструмент измерения времени и аллокаций (<a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>), узнали его внутреннее устройство (<a href="3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a>) и научились стабилизировать результаты (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>). Однако <code>ns/op</code> и <code>B/op</code> отвечают на вопрос «насколько?», но молчат о «почему». Почему функция A на 30% медленнее функции B? Где внутри неё узкое место? Какие строки нагружают GC?</p>
-<p>Именно здесь на сцену выходит <strong>профилирование внутри бенчмарка</strong> — способ снять CPU-профиль, профиль памяти, блокировок или мьютексов одновременно с выполнением измеряемого цикла. Это превращает бенчмарк из градусника в полноценный диагностический аппарат. Вы не просто фиксируете факт регрессии, а сразу видите её анатомию.</p>
+<p>В предыдущих лекциях мы изучили основы бенчмаркинга (<a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>), погрузились во внутреннее устройство испытательного стенда (<a href="3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a>) и обуздали случайный шум измерений (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>). </p>
+<p>Однако классические метрики бенчмарка отвечают только на вопрос <em>«насколько быстро?»</em>, но упорно молчат о вопросе <em>«почему именно так?»</em>:<br />
+- Почему замена <code>map[string]int</code> на срез структур ускорила обработку втрое?<br />
+- Какие конкретно строки кода триггерят сборщик мусора <code>runtime.mallocgc</code>?<br />
+- Почему при добавлении ядер процессора в <code>b.RunParallel</code> производительность не растет, а падает?</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph BenchmarkOnly[&quot;Обычный бенчмарк (Секундомер)&quot;]
+B1[&quot;Запуск go test -bench&quot;] --&gt; B2[&quot;Вывод: 1450 ns/op, 128 B/op&quot;]
+B2 --&gt; B3[&quot;Инженер гадает: в чем причина?&quot;]
+end
+
+subgraph ProfilingBenchmark[&quot;Бенчмарк + Профилировщик (Рентген)&quot;]
+P1[&quot;go test -bench -cpuprofile -memprofile&quot;] --&gt; P2[&quot;Точный граф вызовов и аллокаций&quot;]
+P2 --&gt; P3[&quot;65% CPU в runtime.memmove (рост слайса)&quot;]
+P3 --&gt; P4[&quot;Мгновенное точечное исправление!&quot;]
+end
+  </pre>
+</div>
+
+
+<p>Совмещение бенчмарка и профилировщика дает инженеру идеальную тестовую лабораторию:<br />
+1. <strong>Стерильная повторяемость:</strong> Бенчмарк обеспечивает строго одинаковый цикл нагрузки <code>b.N</code>, изолированный от сетевых задержек и внешних баз данных.<br />
+2. <strong>Нулевой шум лишнего кода:</strong> В профиль попадает исключительно тестируемая функция, а не инициализация роутера HTTP или парсинг конфигов при старте сервиса.<br />
+3. <strong>Мгновенная локализация:</strong> Вы открываете flamegraph (<a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>) и сразу видите горячую строку кода, сжигающую 80% тактов.</p>
+<hr />
 <h2 id="kak-go-test-bench-zapuskaet-profilirovshchik">Как `go test -bench` запускает профилировщик</h2>
 
-<p>Механика, кратко затронутая в <a href="3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a>, такова: фреймворк не включает профилирование на всех итерациях адаптивного подбора <code>b.N</code>. Вместо этого он дожидается окончательной стабилизации <code>b.N</code>, и только на <strong>последнем, финальном прогоне</strong> активирует профилировщик. Это гарантирует, что профиль отражает именно ту нагрузку, которая дала итоговые <code>ns/op</code>, а не разогрев или короткие предварительные запуски.</p>
-<p>Управление профилированием происходит через стандартные флаги:<br />
-- <code>-cpuprofile &lt;file&gt;</code> — записывает CPU-профиль.<br />
-- <code>-memprofile &lt;file&gt;</code> — записывает профиль памяти (аллокации).<br />
-- <code>-blockprofile &lt;file&gt;</code> — профиль блокировок (ожидания на каналах, мьютексах, syscall).<br />
-- <code>-mutexprofile &lt;file&gt;</code> — профиль конкуренции на мьютексах.</p>
-<p>Все они работают одновременно с бенчмарком, и результирующие файлы можно анализировать через <code>go tool pprof</code>.</p>
+<p>Если вы читали <a href="3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a>, то помните, что рантайм Go не знает заранее, сколько итераций <code>b.N</code> потребуется для заполнения интервала <code>-benchtime</code>. Он начинает с <code>b.N = 1</code>, затем пробует 100, 10 000, 1 000 000, динамически подстраиваясь под скорость машины.</p>
+<p>Если бы профилировщик работал на всех этапах калибровки, возникли бы две фатальные проблемы:<br />
+1. Накладные расходы профилировщика исказили бы математику прогнозирования <code>b.N</code>.<br />
+2. Короткие калибровочные запуски с холодными кэшами загрязнили бы итоговый профиль мусорными данными прогрева.</p>
+<p>Поэтому механизм профилирования активируется исключительно на <strong>последнем, финальном прогоне</strong>:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2203,36 +2246,51 @@
   </div>
   <pre class="mermaid">
 sequenceDiagram
-participant Bench as go test -bench
-participant Adapt as Цикл адаптации b.N
-participant Final as Финальный прогон
-participant Prof as Профилировщик
+autonumber
+participant Runner as Тестовый раннер (go test)
+participant B as Бенчмарк (testing.B)
+participant Prof as Подсистема pprof / Runtime
 
-Bench-&gt;&gt;Adapt: Запуск с малым b.N
-Adapt--&gt;&gt;Bench: Итерации, пока T &lt; benchtime
-Bench-&gt;&gt;Final: b.N стабилизировано
-Final-&gt;&gt;Prof: Запуск профилировщика
-Prof--&gt;&gt;Final: Профилирование активно
-Final-&gt;&gt;Bench: Результат ns/op + профиль
+Runner-&gt;&gt;B: Калибровка b.N=1, b.N=100, b.N=10000...
+Note over B: Профилировщики ВЫКЛЮЧЕНЫ.&lt;br&gt;Идет прогрев и расчет скорости.
+B--&gt;&gt;Runner: b.N стабилизировано (например, 2 000 000)
+
+Runner-&gt;&gt;Prof: Активация: pprof.StartCPUProfile / SetBlockProfileRate
+Runner-&gt;&gt;B: Запуск ФИНАЛЬНОГО прогона (b.N = 2 000 000)
+Note over B,Prof: Идет запись сэмплов сигналов SIGPROF и аллокаций
+B--&gt;&gt;Runner: Финальный прогон завершен
+
+Runner-&gt;&gt;Prof: Остановка: pprof.StopCPUProfile / runtime.MemProfile
+Prof--&gt;&gt;Runner: Сохранение *.prof файлов на диск
+Runner--&gt;&gt;Runner: Печать итоговой строки ns/op, B/op
   </pre>
 </div>
 
 
+<p>Управление профилированием осуществляется через стандартные флаги CLI:<br />
+- <code>-cpuprofile &lt;file&gt;</code> — запись профиля активности процессора (CPU samples).<br />
+- <code>-memprofile &lt;file&gt;</code> — запись профиля использования динамической памяти (кучи).<br />
+- <code>-blockprofile &lt;file&gt;</code> — профиль блокировок горутин (ожидание каналов, мьютексов, системных вызовов).<br />
+- <code>-mutexprofile &lt;file&gt;</code> — профиль contention (конкуренции) за критические секции мьютексов.</p>
+<p>Все сгенерированные файлы бинарно совместимы со стандартным анализатором <code>go tool pprof</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>При использовании <code>-cpuprofile</code> фреймворк вызывает <code>pprof.StartCPUProfile</code>, перед циклом последнего прогона и <code>pprof.StopCPUProfile</code> сразу после него. Профиль памяти снимается через <code>runtime.MemProfile</code> после завершения всех итераций финального прогона, фиксируя итоговое состояние кучи (аллокации, накопленные за прогон). Блокировочный и мьютексный профили аналогично активируются через вызовы <code>runtime.SetBlockProfileRate</code> / <code>runtime.SetMutexProfileFraction</code> непосредственно перед стартом финального запуска.</p>
+    <p>При передаче флага <code>-cpuprofile</code> тестовый фреймворк вызывает функцию <code>pprof.StartCPUProfile</code> непосредственно перед телом финального запуска и <code>pprof.StopCPUProfile</code> сразу после его завершения. Под капотом рантайм настраивает таймер ядра <code>setitimer(ITIMER_PROF)</code>, который с частотой 100 Гц отправляет процессу сигнал <code>SIGPROF</code>. Обработчик сигнала инспектирует регистры <code>PC</code> (Program Counter) и <code>SP</code> (Stack Pointer) текущего потока <code>M</code>, сохраняя цепочку вызовов в буфер.<br />
+Профиль памяти снимается через вызов <code>runtime.MemProfile</code> после завершения всех итераций финального цикла. Блокировочный и мьютексный профили активируются вызовами <code>runtime.SetBlockProfileRate</code> и <code>runtime.SetMutexProfileFraction</code> прямо перед финальным стартом, заставляя рантайм сохранять стеки заснувших горутин в глобальные циклические буферы.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="cpu-profilirovanie-vnutri-benchmarka">CPU-профилирование внутри бенчмарка</h2>
 
-<p>Самый частый сценарий: бенчмарк показывает высокое <code>ns/op</code>, и нужно понять, на что уходит процессорное время.</p>
+<p>CPU-профиль — инструмент номер один при расследовании высоких задержек <code>ns/op</code>.</p>
 <h3 id="zapusk">Запуск</h3>
 
+<p>Снимем профиль для бенчмарка парсера JSON:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2246,7 +2304,9 @@ Final-&gt;&gt;Bench: Результат ns/op + профиль
 </code></pre>
 </div>
 
-<p>После выполнения получим файл <code>cpu.prof</code>. Открываем интерактивно:</p>
+<p>После завершения теста в текущем каталоге появится файл <code>cpu.prof</code>. Изучить его можно двумя путями:</p>
+<h4 id="1-interaktivnyy-terminalnyy-rezhim">1. Интерактивный терминальный режим</h4>
+
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2260,7 +2320,12 @@ Final-&gt;&gt;Bench: Результат ns/op + профиль
 </code></pre>
 </div>
 
-<p>Или сразу в веб-интерфейсе с flamegraph (<a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>):</p>
+<p>Внутри интерактивной консоли доступны команды:<br />
+- <code>top 10</code> — вывести 10 самых прожорливых функций по абсолютному времени (<code>flat</code>) и совокупному времени с учетом дочерних вызовов (<code>cum</code>).<br />
+- <code>list &lt;FunctionName&gt;</code> — построчный вывод исходного кода с указанием времени, потраченного на каждую инструкцию!<br />
+- <code>disasm &lt;FunctionName&gt;</code> — ассемблерный листинг функции с сопоставлением машинных инструкций и тактов.</p>
+<h4 id="2-veb-interfeys-s-grafami-i-flamegraph">2. Веб-интерфейс с графами и Flamegraph</h4>
+
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2274,23 +2339,79 @@ Final-&gt;&gt;Bench: Результат ns/op + профиль
 </code></pre>
 </div>
 
+<p>Браузер откроет интерактивный дашборд:<br />
+- <strong>Flamegraph (<a href="../03-cpu-profiling/3-flamegraph.html" class="wikilink">3. Flamegraph</a>):</strong> Наглядная «огненная» визуализация, где ширина блока пропорциональна времени нахождения CPU в функции.<br />
+- <strong>Top / Graph:</strong> Направленный граф вызовов с толщиной стрелок, отражающей нагрузку на ветви исполнения.<br />
+- <strong>Source:</strong> Построчный просмотр исходного кода с цветовой подсветкой горячих строк.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+RunBench[&quot;go test -bench=BenchmarkJSON -cpuprofile=cpu.prof&quot;] --&gt; ProfFile[&quot;cpu.prof (Сэмплы SIGPROF)&quot;]
+ProfFile --&gt; CLI[&quot;go tool pprof cpu.prof&lt;br&gt;(Команды top, list, disasm)&quot;]
+ProfFile --&gt; WebUI[&quot;go tool pprof -http=:8080 cpu.prof&lt;br&gt;(Flamegraph, Graph, Source)&quot;]
+  </pre>
+</div>
+
+
 <h3 id="interpretatsiya">Интерпретация</h3>
 
-<p>Профиль покажет, какие функции заняли больше всего процессорного времени. Если бенчмарк вызывал <code>json.Unmarshal</code>, а 60% времени ушло на <code>runtime.mallocgc</code>, значит проблема не в логике JSON, а в аллокациях, порождаемых десериализацией. Это может направить оптимизацию в русло переиспользования объектов (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) или замены декодера.</p>
+<p>Представьте, что бенчмарк <code>BenchmarkJSON</code> показал неожиданно плохой результат: 5000 <code>ns/op</code>. Вы открываете профиль и видите следующую картину:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) top 5
+Showing nodes accounting for 4.20s, 84.00% of 5.00s total
+      flat  flat%   sum%        cum   cum%
+     2.10s 42.00% 42.00%      2.10s 42.00%  runtime.mallocgc
+     1.20s 24.00% 66.00%      1.20s 24.00%  runtime.memmove
+     0.60s 12.00% 78.00%      4.50s 90.00%  encoding/json.Unmarshal
+     0.30s  6.00% 84.00%      0.30s  6.00%  runtime.scanobject
+</code></pre>
+</div>
+
+<p><strong>Инженерный вывод:</strong><br />
+Хотя бенчмарк вызывал <code>json.Unmarshal</code>, сам алгоритмический парсер JSON съел всего 12% времени! Львиная доля процессора — <strong>66% времени</strong> — сгорела в недрах рантайма:<br />
+- <code>runtime.mallocgc</code> (42%) — непрерывное выделение объектов в куче.<br />
+- <code>runtime.memmove</code> (24%) — копирование байт при расширении внутренних слайсов.</p>
+<p>Проблема кроется не в математике парсера, а в <strong>аллокациях</strong>. Оптимизация должна идти не по пути переписывания алгоритма, а по пути переиспользования буферов через <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) или перехода на zero-allocation кодогенераторы (например, <code>easyjson</code> или <code>sonic</code>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Бенчмарк показывает, что операция занимает 10 мкс. Вы сняли CPU-профиль, но <code>runtime.memmove</code> занимает 60% времени. Что делать?<br />
-<strong>Ответ:</strong> <code>runtime.memmove</code> — это копирование памяти (обычно при росте слайсов или присваивании больших структур). Нужно проверить, не происходит ли множественных копирований больших кусков данных, возможно, стоит перейти на указатели или <code>copy</code> в буфер. Также проверить, нет ли неявных копирований из-за передачи структур по значению. Посмотреть на <code>-benchmem</code>, чтобы подтвердить гипотезу об аллокациях.</p>
+    <p><strong>Вопрос:</strong> Бенчмарк показывает, что операция занимает 10 мкс. Вы сняли CPU-профиль и обнаружили, что функция <code>runtime.memmove</code> занимает 60% всего процессорного времени. Что это означает и как это исправить?</p>
+<p><strong>Ответ кандидата уровня Senior:</strong><br />
+Функция <code>runtime.memmove</code> отвечает за побайтовое копирование блоков памяти. Ее доминирование в топе CPU-профиля обычно указывает на три архитектурные проблемы:<br />
+1. <strong>Динамический рост слайсов:</strong> Вызовы <code>append()</code> к неинициализированному слайсу приводят к регулярному удвоению емкости и перекопированию старых элементов в новый массив. Решение: предвыделять емкость через <code>make([]T, 0, cap)</code>.<br />
+2. <strong>Передача крупных структур по значению:</strong> Передача <code>struct</code> размером в сотни байт через стек копирует данные на каждом вызове. Решение: передавать структуру по указателю <code>*MyStruct</code>.<br />
+3. <strong>Неэффективное использование буферов:</strong> Частое копирование байтовых массивов вместо срезов или вызовов <code>copy()</code>.<br />
+Следующим шагом я запущу бенчмарк с флагом <code>-benchmem</code>, чтобы подтвердить гипотезу об аллокациях, и посмотрю вывод команды <code>list</code> в <code>pprof</code>, чтобы найти точную строку, вызывающую копирование.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="profilirovanie-pamyati-benchmem-i-memprofile">Профилирование памяти: `-benchmem` и `-memprofile`</h2>
 
-<p>Флаг <code>-benchmem</code> даёт агрегированные цифры: <code>B/op</code> и <code>allocs/op</code>. Но он не говорит, <em>какие именно</em> строки кода аллоцируют. Для этого предназначен <code>-memprofile</code>.</p>
+<p>Флаг <code>-benchmem</code> сообщает агрегированные цифры: <code>B/op</code> (сколько байт выделено за итерацию) и <code>allocs/op</code> (сколько раз дергался аллокатор). Но он не способен показать, <strong>какая именно строчка вашего кода породила аллокацию</strong>.</p>
+<p>Для точной локализации используется флаг <code>-memprofile</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2301,24 +2422,56 @@ Final-&gt;&gt;Bench: Результат ns/op + профиль
     </button>
   </div>
   <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkConcat -memprofile=mem.prof
-go tool pprof -alloc_space mem.prof  # аллокации, а не «живущие» объекты
 </code></pre>
 </div>
 
-<p>Параметр <code>-alloc_space</code> показывает, где были выделены байты, даже если они давно освобождены. Альтернативно <code>-inuse_space</code> показывает объекты, живущие в куче на момент снятия профиля. Для бенчмарков обычно важнее первое — именно аллокации создают нагрузку на GC, а не долгоживущие объекты.</p>
+<p>При анализе файла <code>mem.prof</code> через <code>pprof</code> критически важно правильно выбрать режим отображения:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># Режим 1: Анализ суммарно выделенной памяти за время теста (РЕКОМЕНДУЕТСЯ ДЛЯ БЕНЧМАРКОВ)
+go tool pprof -alloc_space mem.prof
+
+# Режим 2: Анализ количества фактов выделения памяти
+go tool pprof -alloc_objects mem.prof
+
+# Режим 3: Анализ памяти, оставшейся в куче на момент завершения теста
+go tool pprof -inuse_space mem.prof
+
+# Режим 4: Количество живых объектов на момент завершения теста
+go tool pprof -inuse_objects mem.prof
+</code></pre>
+</div>
+
+<h3 id="raznitsa-mezhdu-allocspace-i-inusespace">Разница между `-alloc_space` и `-inuse_space`</h3>
+
+<p>В чем фундаментальное отличие?<br />
+- <code>-alloc_space</code> учитывает <strong>абсолютно все байты</strong>, когда-либо запрошенные у аллокатора за время теста, даже если через микросекунду эти объекты стали мусором и были уничтожены сборщиком мусора.<br />
+- <code>-inuse_space</code> показывает только те объекты, которые <strong>остались живыми в памяти</strong> в момент финализации профиля.</p>
+<p>Для микробенчмарков первостепенное значение имеет именно <code>-alloc_space</code>! Короткоживущие временные объекты создают колоссальное давление на GC, приводя к паузам и троттлингу, но в <code>-inuse_space</code> они не попадут, так как будут собраны еще до окончания теста.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Пустой профиль `-inuse_space`</span>
   </div>
   <div class="callout-body">
-    <p>Профиль памяти снимается <em>после</em> последней итерации финального прогона. Если объекты короткоживущие и GC уже подчистил их, <code>-inuse_space</code> покажет неполную картину. Поэтому для анализа аллокаций в бенчмарке всегда используйте <code>-alloc_space</code>.</p>
+    <p>Профиль памяти снимается рантаймом строго <em>после</em> завершения последней итерации финального прогона бенчмарка. Если вы тестируете функцию обработки временных буферов, все созданные объекты успеют освободиться. Открыв профиль в режиме по умолчанию (<code>-inuse_space</code>), вы увидите нулевое потребление памяти и можете ошибочно решить, что аллокаций нет!<br />
+<strong>Золотое правило бенчмаркинга памяти:</strong> всегда анализируйте профиль с флагом <code>-alloc_space</code> или <code>-alloc_objects</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="blokirovochnyy-profil-vnutri-benchmarka">Блокировочный профиль внутри бенчмарка</h2>
 
-<p>Конкурентные бенчмарки (<code>b.RunParallel</code>) часто страдают от ожиданий на каналах или мьютексах, которые не видны в CPU-профиле (там горутина «спит»). Решение: снять блокировочный профиль.</p>
+<p>Когда вы запускаете конкурентный бенчмарк с использованием <code>b.RunParallel</code> (<a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>), процессорный профиль может показать парадоксальную картину: утилизация CPU низкая, задержка <code>ns/op</code> огромная, а в топе функций нет явных лидеров.</p>
+<p>Это классический признак <strong>Off-CPU задержек</strong>: горутины не сжигают такты процессора, они <strong>спят в очереди</strong>, ожидая доступа к ресурсу!</p>
+<p>На помощь приходит блокировочный профиль (Block Profile):</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2333,14 +2486,36 @@ go tool pprof block.prof
 </code></pre>
 </div>
 
-<p>Профиль покажет, сколько времени горутины провели в состоянии <code>Waiting</code>:<br />
-- <code>select</code> на канале,<br />
-- ожидание <code>sync.Mutex.Lock</code>,<br />
-- <code>chan send/receive</code>.</p>
-<p>Анализ этих точек позволяет понять, где конкуренция разрушает параллелизм (см. <a href="../06-konkurentnost/7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>).</p>
+<p>Блокировочный профиль регистрирует совокупное время, которое горутины провели в состоянии <code>Waiting</code> (ожидание разблокировки):<br />
+- Ожидание на системном таймере или селекторе <code>select</code> на канале.<br />
+- Ожидание захвата блокировки <code>sync.Mutex.Lock</code> или <code>sync.RWMutex.RLock</code>.<br />
+- Ожидание отправки/получения в канале (<code>chan send/receive</code>), когда буфер полон или пуст.<br />
+- Блокирующие системные вызовы ядра (file I/O, network read/write).</p>
+<p>Команда <code>top</code> в <code>block.prof</code> мгновенно покажет, на какой строчке горутины проводят 90% своей жизни:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) top
+Showing nodes accounting for 12.50s, 95.00% of 13.15s total
+      flat  flat%   sum%        cum   cum%
+    10.20s 77.57% 77.57%     10.20s 77.57%  sync.(*Mutex).Lock
+     2.30s 17.49% 95.06%      2.30s 17.49%  runtime.chansend
+</code></pre>
+</div>
+
+<p>Здесь видно, что узким местом многопоточного кода является не процессорная логика, а жестокий <strong>Lock Contention</strong> на единственном мьютексе (<a href="../06-konkurentnost/7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>).</p>
+<hr />
 <h2 id="profil-myuteksov">Профиль мьютексов</h2>
 
-<p>Блокировочный профиль фиксирует <em>время ожидания</em>. Мьютексный профиль (флаг <code>-mutexprofile</code>) фиксирует <em>моменты конкуренции</em>, когда горутина пыталась захватить мьютекс, удерживаемый другой горутиной. Это более прямой индикатор contention, чем просто время блокировки.</p>
+<p>В чем разница между <code>-blockprofile</code> и <code>-mutexprofile</code>?<br />
+- <strong>Блокировочный профиль (<code>-blockprofile</code>)</strong> фиксирует <em>время задержки</em>: сколько наносекунд горутина провела во сне от момента вызова <code>Lock()</code> до момента получения блокировки.<br />
+- <strong>Мьютексный профиль (<code>-mutexprofile</code>)</strong> фиксирует <em>факт конкуренции (contention)</em>: он замеряет задержки, возникающие исключительно из-за того, что мьютекс уже удерживается другой горутиной.</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2355,10 +2530,14 @@ go tool pprof mutex.prof
 </code></pre>
 </div>
 
-<p>В выводе будет видно, какой мьютекс является «горячим», и какая горутина его удерживает. Это отправная точка для шардирования или перехода на lock-free алгоритмы.</p>
+<p>В выводе <code>mutex.prof</code> отображаются конкретные экземпляры мьютексов в коде, вызывающие столкновение потоков. Если мьютекс захватывается без борьбы (свободен), профиль мьютексов не регистрирует никакого события. Но как только две горутины сталкиваются лбами за одну критическую секцию, рантайм Go записывает стек вызова.</p>
+<p>Это главный инструмент для принятия архитектурных решений:<br />
+- Шардировать ли кэш на независимые корзины (<code>striped mutexes</code>).<br />
+- Переходить ли на lock-free структуры данных через атомики <code>sync/atomic</code>.</p>
+<hr />
 <h2 id="kombinirovanie-profiley-v-odnom-zapuske">Комбинирование профилей в одном запуске</h2>
 
-<p>Флаги можно комбинировать, получая полный диагностический снимок:</p>
+<p>Флаги профилирования можно передавать в команду <code>go test</code> одновременно. Это позволяет получить исчерпывающий, взаимно согласованный снимок всех подсистем рантайма:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2376,26 +2555,136 @@ go tool pprof mutex.prof
 </code></pre>
 </div>
 
-<p>Все профили будут сняты с одного и того же финального прогона, что гарантирует их взаимную согласованность. Анализируя их параллельно (например, открыв несколько вкладок <code>go tool pprof -http</code> на разных портах), вы можете коррелировать CPU-горячие точки с аллокациями и contention.</p>
+<p>Все четыре профиля будут сняты с одного и того же финального прогона одного запуска. Вы можете открыть их в соседних терминалах или на разных портах веб-интерфейса:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go tool pprof -http=:8081 cpu.prof &amp;
+go tool pprof -http=:8082 mem.prof &amp;
+go tool pprof -http=:8083 block.prof &amp;
+go tool pprof -http=:8084 mutex.prof &amp;
+</code></pre>
+</div>
+
+<p>Совместный анализ позволяет сопоставить:<br />
+1. Горячие циклы CPU (<code>cpu.prof</code>).<br />
+2. Места аллокаций памяти (<code>mem.prof</code>).<br />
+3. Точки блокировок потоков (<code>block.prof</code> и <code>mutex.prof</code>).</p>
+<hr />
 <h2 id="vliyanie-profilirovaniya-na-rezultaty-benchmarka">Влияние профилирования на результаты бенчмарка</h2>
 
-<p>Профилировщик — не бесплатный. CPU-профилирование с частотой 100 Гц (по умолчанию) добавляет небольшие накладные расходы (обычно 1–3%), но может изменить распределение времени, особенно для очень быстрых операций. Memory-профилирование практически не замедляет выполнение, но увеличивает потребление памяти, так как рантайм сохраняет учётные записи. Блокировочный и мьютексный профили дороже, так как требуют инструментирования каждого события блокировки/разблокировки.</p>
-<p><strong>Практический подход:</strong><br />
-- При сравнении версий кода снимайте профили только с одной из версий (или со всех, но не принимайте решения только по <code>ns/op</code> из профилированного прогона).<br />
-- Для чистых временных замеров используйте запуск без профилировщиков, а после включайте их для анализа.<br />
-- Если overhead значителен, уменьшайте частоту CPU-профилирования через <code>runtime.SetCPUProfileRate</code> (но стандартных флагов для этого нет, потребуется ручное управление в коде бенчмарка).</p>
+<p>Бесплатных абстракций и инструментов не существует. Любой профилировщик — это программный зонд, потребляющий аппаратные ресурсы:</p>
+<div class="table-container"><table>
+<thead>
+<tr>
+<th>Тип профилирования</th>
+<th>Механизм сбора</th>
+<th style="text-align: center;">Оценочные накладные расходы (Overhead)</th>
+<th>Влияние на замеры ns/op</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>CPU (<code>-cpuprofile</code>)</strong></td>
+<td>Сигналы <code>SIGPROF</code> ядра (100 Гц), раскрутка стека</td>
+<td style="text-align: center;">~1–3%</td>
+<td>Минимальное для длительных тестов, заметное для сверхбыстрых циклов (&lt; 10 нс)</td>
+</tr>
+<tr>
+<td><strong>Память (<code>-memprofile</code>)</strong></td>
+<td>Сэмплирование аллокаций каждые 512 КБ (<code>runtime.MemProfileRate</code>)</td>
+<td style="text-align: center;">&lt; 1% по времени, +память под профиль</td>
+<td>Практически не искажает замеры времени, но может увеличивать размер кучи</td>
+</tr>
+<tr>
+<td><strong>Блокировки (<code>-blockprofile</code>)</strong></td>
+<td>Трассировка пробуждения горутин через планировщик</td>
+<td style="text-align: center;">~3–8%</td>
+<td>Замедляет конкурентные бенчмарки с высокой частотой блокировок</td>
+</tr>
+<tr>
+<td><strong>Мьютексы (<code>-mutexprofile</code>)</strong></td>
+<td>Атомарный учет столкновений в семафорах мьютекса</td>
+<td style="text-align: center;">~2–5%</td>
+<td>Увеличивает задержки на высоконагруженных мьютексах</td>
+</tr>
+</tbody>
+</table></div>
+<h3 id="zolotye-pravila-raboty-s-profilirovshchikom">Золотые правила работы с профилировщиком:</h3>
+<ol>
+<li><strong>Разделяйте измерение и диагностику:</strong> Никогда не принимайте архитектурных решений о скорости кода на основе абсолютных цифр <code>ns/op</code>, полученных из профилированного прогона!</li>
+<li><strong>Двухэтапный рабочий процесс:</strong><br />
+   - <strong>Этап 1 (Метрология):</strong> Запустите чистый <code>go test -bench -count=10</code> без профилей. Получите достоверные базовые значения <code>ns/op</code> и <code>B/op</code>.<br />
+   - <strong>Этап 2 (Диагностика):</strong> Если обнаружена регрессия или неудовлетворительное время, запустите бенчмарк с флагами профилей для поиска виновника.</li>
+<li><strong>Регулировка частоты сэмплирования:</strong> Если CPU-профилирование искажает поведение сверхбыстрого кода, частоту сигналов можно понизить через программный вызов <code>runtime.SetCPUProfileRate</code> (по умолчанию 100 сэмплов в секунду), хотя для большинства типовых задач стандартных 100 Гц более чем достаточно.</li>
+</ol>
+<hr />
 <h2 id="mechanical-sympathy-chto-profili-govoryat-o-zheleze">Mechanical Sympathy: что профили говорят о «железе»</h2>
 
-<p>Профилировщик CPU показывает не только код, но и косвенно — поведение процессора. Например:<br />
-- Высокий процент в <code>runtime.memmove</code> или <code>runtime.memclr</code> — возможны частые переходы в RAM, вызывающие кэш-промахи.<br />
-- Много времени в <code>runtime.duffcopy</code> — большие копирования структур.<br />
-- Значительное время в <code>runtime.cgocall</code> — переходы в C-код, которые могут сбрасывать кэш и нарушать инлайнинг.<br />
-- Функции синхронизации (<code>runtime.lock</code>, <code>runtime.unlock</code>) в топе — contention на структурах рантайма (например, при частых аллокациях).</p>
-<p>Профиль памяти, особенно в разрезе <code>-alloc_space</code>, прямо связан с <a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a> и <a href="../04-memory-profiling/3-escape-analysis.html" class="wikilink">3. Escape analysis</a>: он показывает, какие переменные «убегают» в кучу.</p>
-<p>Блокировочный профиль, показывающий <code>epollwait</code> или <code>netpollblock</code>, указывает на IO-bound природу задачи (<a href="../01-fundament/3-cpu-bound-vs-io-bound-zadachi.html" class="wikilink">3. CPU bound vs IO bound задачи</a>).</p>
+<p>Опытный инженер читает профиль Go так же, как врач читает кардиограмму. За именами стандартных функций рантайма скрываются фундаментальные процессы взаимодействия софта и кремния:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph ProfileSymbols[&quot;Символы рантайма в CPU-профиле&quot;]
+S1[&quot;runtime.memmove / runtime.memclr&quot;]
+S2[&quot;runtime.duffcopy&quot;]
+S3[&quot;runtime.cgocall&quot;]
+S4[&quot;runtime.lock / runtime.unlock&quot;]
+S5[&quot;epollwait / netpollblock&quot;]
+end
+
+subgraph HardwareReality[&quot;Физическая реальность процессора и ядра&quot;]
+H1[&quot;Массивный сброс L1/L2 кэша в DRAM,&lt;br&gt;промахи шины памяти&quot;]
+H2[&quot;Копирование крупных структур данных&lt;br&gt;через развернутые ассемблерные петли&quot;]
+H3[&quot;Сброс конвейера CPU, смена стека,&lt;br&gt;потеря возможности инлайнинга в C&quot;]
+H4[&quot;Lock contention на структурах рантайма,&lt;br&gt;инвалидация кэш-линий между ядрами&quot;]
+H5[&quot;Ожидание ввода-вывода (IO-Bound задача),&lt;br&gt;процессор простаивает&quot;]
+end
+
+S1 --&gt; H1
+S2 --&gt; H2
+S3 --&gt; H3
+S4 --&gt; H4
+S5 --&gt; H5
+  </pre>
+</div>
+
+
+<ol>
+<li><strong><code>runtime.memmove</code> и <code>runtime.memclr</code>:</strong><br />
+   Показывают, что процессор тратит такты на заливку нулями новой памяти или перенос байт. Если они находятся на вершине профиля, шина памяти перегружена, а кэши L1/L2 непрерывно вымываются.</li>
+<li><strong><code>runtime.duffcopy</code>:</strong><br />
+   Особая оптимизация компилятора Go («устройство Даффа»): развернутый ассемблерный блок инструкций <code>MOV</code> для сверхбыстрого копирования структур среднего размера (от 64 до 256 байт) без организации цикла. Если <code>duffcopy</code> доминирует в профиле, вы передаете структуры по значению вместо использования указателей.</li>
+<li><strong><code>runtime.cgocall</code>:</strong><br />
+   Переход через границу Cgo в код на языке C. Требует сохранения всех регистров, переключения на стек операционной системы и блокировки потока ОС. Запрещает компилятору выполнять инлайнинг и вымывает предсказатель переходов.</li>
+<li><strong><code>runtime.lock</code> и <code>runtime.unlock</code>:</strong><br />
+   Внутренние спинлоки рантайма Go (защищающие аллокаторы <code>mcentral</code>/<code>mheap</code> или планировщик). Их появление на вершине CPU-профиля говорит о том, что потоки ядра непрерывно инвалидируют кэш-линии друг друга (<strong>cache line bounce</strong>), пытаясь захватить спинлок.</li>
+<li><strong><code>epollwait</code> и <code>netpollblock</code>:</strong><br />
+   Указывают на то, что задача является строго <strong>IO-Bound</strong> (<a href="../01-fundament/3-cpu-bound-vs-io-bound-zadachi.html" class="wikilink">3. CPU bound vs IO bound задачи</a>), и дальнейшая алгоритмическая оптимизация вычислений бессмысленна — нужно оптимизировать сетевой стек и работу с сокетами.</li>
+</ol>
+<hr />
 <h2 id="prakticheskiy-primer-ot-benchmarka-k-profilyu-i-obratno">Практический пример: от бенчмарка к профилю и обратно</h2>
 
-<p>Возьмём бенчмарк конкатенации строк:</p>
+<p>Разберем реальный практический кейс: оптимизацию функции склейки строк.</p>
+<h3 id="iskhodnaya-realizatsiya">Исходная реализация</h3>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2405,10 +2694,19 @@ go tool pprof mutex.prof
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">var globalResult string
+  <pre class="language-go"><code class="language-go">package bench_test
+
+import (
+    &quot;strings&quot;
+    &quot;testing&quot;
+)
+
+var globalResult string
 
 func BenchmarkConcatBuilder(b *testing.B) {
     parts := []string{&quot;Hello&quot;, &quot; &quot;, &quot;World&quot;, &quot;!&quot;, &quot; &quot;, &quot;Go&quot;}
+
+    b.ResetTimer()
     for i := 0; i &lt; b.N; i++ {
         var sb strings.Builder
         for _, p := range parts {
@@ -2420,24 +2718,207 @@ func BenchmarkConcatBuilder(b *testing.B) {
 </code></pre>
 </div>
 
-<p><code>-benchmem</code> показывает 0 allocs/op — отлично. Но CPU-профиль может выявить, что время уходит на <code>runtime.memmove</code> внутри <code>sb.WriteString</code>, когда буфер растёт. Это подскажет предвыделить <code>sb.Grow</code> нужного размера и срезать накладные расходы на копирование.</p>
-<p>Другой пример: параллельный бенчмарк инкремента счётчика <code>atomic.AddInt64</code> показывает 50 нс/оп при одном ядре и 200 нс/оп при восьми. Блокировочный профиль укажет на <code>runtime.lock</code> — contention на кэш-линии (false sharing, <a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>). После выравнивания счётчиков до 64 байт время возвращается.</p>
+<p>Запуск бенчмарка:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkConcatBuilder -benchmem
+</code></pre>
+</div>
+
+<p>Результат:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">BenchmarkConcatBuilder-8    18000000    65.4 ns/op    0 B/op    0 allocs/op
+</code></pre>
+</div>
+
+<p>Метрика <code>0 allocs/op</code> радует глаз — компилятор успешно выделил внутренний буфер на стеке. Но 65 наносекунд на 6 коротких строк кажутся завышенными. Снимем CPU-профиль:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkConcatBuilder -cpuprofile=cpu.prof
+go tool pprof cpu.prof
+</code></pre>
+</div>
+
+<p>Заглядываем в построчный листинг функции через команду <code>list BenchmarkConcatBuilder</code>:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) list BenchmarkConcatBuilder
+Total: 1.45s
+ROUTINE ======================== BenchmarkConcatBuilder
+...
+     .          .   152: for i := 0; i &lt; b.N; i++ {
+     .          .   153:     var sb strings.Builder
+ 320ms      320ms   154:     for _, p := range parts {
+ 850ms      850ms   155:         sb.WriteString(p) // &lt;--- ВОТ ОНО! 850ms в runtime.memmove!
+     .          .   156:     }
+ 280ms      280ms   157:     globalResult = sb.String()
+     .          .   158: }
+</code></pre>
+</div>
+
+<p><strong>Диагноз:</strong><br />
+Внутри <code>sb.WriteString</code> при каждом добавлении строки проверяется емкость буфера. Поскольку начальная емкость равна нулю, буфер растет ступенчато: 8 байт, 16 байт, 32 байта... Каждый рост вызывает вызов <code>runtime.memmove</code> для копирования ранее накопленных символов!</p>
+<h3 id="optimizirovannaya-realizatsiya">Оптимизированная реализация</h3>
+
+<p>Инженер применяет метод <code>sb.Grow</code>, заранее сообщая билдеру необходимый размер итоговой строки:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">func BenchmarkConcatBuilderOptimized(b *testing.B) {
+    parts := []string{&quot;Hello&quot;, &quot; &quot;, &quot;World&quot;, &quot;!&quot;, &quot; &quot;, &quot;Go&quot;}
+    totalLen := 0
+    for _, p := range parts {
+        totalLen += len(p)
+    }
+
+    b.ResetTimer()
+    for i := 0; i &lt; b.N; i++ {
+        var sb strings.Builder
+        // Предвыделяем емкость один раз: исключаем промежуточный memmove!
+        sb.Grow(totalLen)
+        for _, p := range parts {
+            sb.WriteString(p)
+        }
+        globalResult = sb.String()
+    }
+}
+</code></pre>
+</div>
+
+<p>Повторный запуск:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">BenchmarkConcatBuilderOptimized-8    38000000    29.2 ns/op    0 B/op    0 allocs/op
+</code></pre>
+</div>
+
+<p>Время выполнения сократилось более чем в <strong>2.2 раза</strong> (с 65.4 нс до 29.2 нс), а в новом CPU-профиле функция <code>runtime.memmove</code> полностью исчезла из горячего цикла!</p>
+<hr />
+<h3 id="eshche-odin-pokazatelnyy-keys-false-sharing-v-parallelnom-teste">Еще один показательный кейс: False Sharing в параллельном тесте</h3>
+
+<p>В параллельном бенчмарке инкремента глобального счетчика через атомик <code>atomic.AddInt64</code>:<br />
+- На 1 ядре (<code>-cpu=1</code>): операция занимает <strong>8 нс</strong>.<br />
+- На 8 ядрах (<code>-cpu=8</code>): задержка подскакивает до <strong>140 нс</strong>!</p>
+<p>Снятие блокировочного профиля и профиля мьютексов указывает на аппаратный contention за кэш-линию — эффект <strong>False Sharing</strong> (<a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>). Восемь ядер непрерывно инвалидируют одну и ту же 64-байтную строку кэша L1 через протокол MESI. Добавление отступа (padding) в структуру разносит переменные по разным кэш-линиям и возвращает наносекундную скорость на всех ядрах.</p>
+<hr />
 <h2 id="integratsiya-v-cicd">Интеграция в CI/CD</h2>
 
-<p>Профили, снятые в бенчмарках CI, можно сохранять как артефакты и сравнивать между сборками. Это позволяет не только фиксировать регрессии, но и сразу видеть их причину. Например, CI-задача:<br />
-1. Запускает бенчмарк с <code>-cpuprofile</code> и <code>-memprofile</code>.<br />
-2. Сохраняет профили с меткой версии.<br />
-3. При обнаружении регрессии разработчик скачивает профили, сравнивает через <code>go tool pprof -diff_base</code> и находит функцию-виновницу.</p>
+<p>В зрелых инженерных командах профили, снятые во время ночных прогонов бенчмарков в CI, сохраняются в качестве артефактов сборки (Build Artifacts).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+PR[&quot;Pull Request / Ночной билд&quot;] --&gt; BenchCI[&quot;Запуск go test -bench=. -cpuprofile=cpu.prof -memprofile=mem.prof&quot;]
+BenchCI --&gt; Store[&quot;Сохранение профилей в хранилище артефактов (S3 / MinIO)&quot;]
+Store --&gt; Check{&quot;Регрессия &gt; 5% обнаружена?&quot;}
+Check -- Нет --&gt; OK[&quot;Тесты пройдены успешно&quot;]
+Check -- Да --&gt; Diff[&quot;Автоматический вызов:&lt;br&gt;go tool pprof -diff_base=main.prof pr.prof&quot;]
+Diff --&gt; Report[&quot;Комментарий в PR со срезом регрессии и flamegraph!&quot;]
+  </pre>
+</div>
+
+
+<p>Когда система мониторинга CI фиксирует статистически достоверную деградацию производительности, разработчику не нужно вручную воспроизводить проблему на локальной машине. Он запускает команду дифференциального сравнения профилей:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># Сравнение профиля текущего PR с профилем базовой ветки main
+go tool pprof -diff_base=main_cpu.prof pr_cpu.prof
+</code></pre>
+</div>
+
+<p>Утилита <code>pprof</code> выведет дельту времени для каждой функции:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) top
+Showing nodes accounting for +1.20s, 100% of +1.20s total
+      flat  flat%   sum%        cum   cum%
+    +0.95s 79.17% 79.17%     +0.95s 79.17%  my/package.newCryptoEncoder
+    +0.25s 20.83%   100%     +0.25s 20.83%  runtime.mallocgc
+</code></pre>
+</div>
+
+<p>Разработчик за 3 секунды видит, что регрессия вызвана новым криптографическим энкодером, порождающим лишние аллокации.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ul>
-<li>Профилировщики (<code>-cpuprofile</code>, <code>-memprofile</code>, <code>-blockprofile</code>, <code>-mutexprofile</code>) встраиваются прямо в <code>go test -bench</code> и снимают данные на финальном стабильном прогоне.</li>
-<li>Они превращают бенчмарк из «таймера» в диагностический инструмент, показывающий не только «насколько», но и «почему».</li>
-<li>Каждый тип профиля нацелен на свой аспект: CPU — горячие функции, память — аллокации, блокировки — ожидания, мьютексы — contention.</li>
-<li>Профилирование добавляет overhead, поэтому важно понимать меру и не подменять чистое измерение диагностикой.</li>
-<li>Совместный анализ нескольких профилей даёт полную картину поведения кода на уровне рантайма и процессора.</li>
-</ul>
-<p>Получив срез производительности конкретной версии кода, мы готовы сравнивать его с другими версиями и отслеживать динамику изменений. Следующая статья: <a href="8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>.</p>
+<ol>
+<li><strong>Профилировщик превращает секундомер в рентген:</strong> Метрики <code>ns/op</code> и <code>B/op</code> констатируют факт изменения скорости, а встроенные профилировщики объясняют его глубинную анатомию.</li>
+<li><strong>Безопасная архитектура запуска:</strong> <code>go test -bench</code> активирует сбор профилей строго на <strong>финальном стабильном прогоне</strong>, не искажая адаптивную калибровку <code>b.N</code>.</li>
+<li><strong>Специализация инструментов:</strong><br />
+   - <code>-cpuprofile</code> — поиск горячих функций, съедающих такты процессора.<br />
+   - <code>-memprofile</code> (с обязательным анализом через <code>-alloc_space</code>) — поиск точных строк кода, порождающих мусор в куче.<br />
+   - <code>-blockprofile</code> — поиск точек засыпания горутин на каналах и семафорах.<br />
+   - <code>-mutexprofile</code> — обнаружение contention за разделяемые мьютексы.</li>
+<li><strong>Mechanical Sympathy:</strong> Доминирование функций рантайма (<code>runtime.memmove</code>, <code>runtime.mallocgc</code>, <code>runtime.duffcopy</code>) указывает на аппаратные проблемы: вымывание кэшей CPU, перегрузку шины памяти или избыточное копирование структур.</li>
+<li><strong>Разделение фаз:</strong> Замеры скорости и сбор профилей проводятся раздельно, чтобы накладные расходы профилировщика не искажали эталонные метрологические результаты.</li>
+</ol>
+<p>Теперь, когда мы научились измерять код, стабилизировать замеры и анатомировать узкие места профилировщиком, мы готовы перейти к завершающей теме блока: математически строгому сравнению двух версий кода и предотвращению регрессий. Следующая лекция: <a href="8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2465,7 +2946,7 @@ func BenchmarkConcatBuilder(b *testing.B) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#zachem-sovmeshchat-benchmark-i-profilirovshchik">Зачем совмещать бенчмарк и профилировщик</a></li><li class="toc-item toc-h2"><a href="#kak-go-test-bench-zapuskaet-profilirovshchik">Как go test -bench запускает профилировщик</a></li><li class="toc-item toc-h2"><a href="#cpu-profilirovanie-vnutri-benchmarka">CPU-профилирование внутри бенчмарка</a></li><li class="toc-item toc-h3"><a href="#zapusk">Запуск</a></li><li class="toc-item toc-h3"><a href="#interpretatsiya">Интерпретация</a></li><li class="toc-item toc-h2"><a href="#profilirovanie-pamyati-benchmem-i-memprofile">Профилирование памяти: -benchmem и -memprofile</a></li><li class="toc-item toc-h2"><a href="#blokirovochnyy-profil-vnutri-benchmarka">Блокировочный профиль внутри бенчмарка</a></li><li class="toc-item toc-h2"><a href="#profil-myuteksov">Профиль мьютексов</a></li><li class="toc-item toc-h2"><a href="#kombinirovanie-profiley-v-odnom-zapuske">Комбинирование профилей в одном запуске</a></li><li class="toc-item toc-h2"><a href="#vliyanie-profilirovaniya-na-rezultaty-benchmarka">Влияние профилирования на результаты бенчмарка</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-profili-govoryat-o-zheleze">Mechanical Sympathy: что профили говорят о «железе»</a></li><li class="toc-item toc-h2"><a href="#prakticheskiy-primer-ot-benchmarka-k-profilyu-i-obratno">Практический пример: от бенчмарка к профилю и обратно</a></li><li class="toc-item toc-h2"><a href="#integratsiya-v-cicd">Интеграция в CI/CD</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#zachem-sovmeshchat-benchmark-i-profilirovshchik">Зачем совмещать бенчмарк и профилировщик</a></li><li class="toc-item toc-h2"><a href="#kak-go-test-bench-zapuskaet-profilirovshchik">Как go test -bench запускает профилировщик</a></li><li class="toc-item toc-h2"><a href="#cpu-profilirovanie-vnutri-benchmarka">CPU-профилирование внутри бенчмарка</a></li><li class="toc-item toc-h3"><a href="#zapusk">Запуск</a></li><li class="toc-item toc-h4"><a href="#1-interaktivnyy-terminalnyy-rezhim">1. Интерактивный терминальный режим</a></li><li class="toc-item toc-h4"><a href="#2-veb-interfeys-s-grafami-i-flamegraph">2. Веб-интерфейс с графами и Flamegraph</a></li><li class="toc-item toc-h3"><a href="#interpretatsiya">Интерпретация</a></li><li class="toc-item toc-h2"><a href="#profilirovanie-pamyati-benchmem-i-memprofile">Профилирование памяти: -benchmem и -memprofile</a></li><li class="toc-item toc-h3"><a href="#raznitsa-mezhdu-allocspace-i-inusespace">Разница между -allocspace и -inusespace</a></li><li class="toc-item toc-h2"><a href="#blokirovochnyy-profil-vnutri-benchmarka">Блокировочный профиль внутри бенчмарка</a></li><li class="toc-item toc-h2"><a href="#profil-myuteksov">Профиль мьютексов</a></li><li class="toc-item toc-h2"><a href="#kombinirovanie-profiley-v-odnom-zapuske">Комбинирование профилей в одном запуске</a></li><li class="toc-item toc-h2"><a href="#vliyanie-profilirovaniya-na-rezultaty-benchmarka">Влияние профилирования на результаты бенчмарка</a></li><li class="toc-item toc-h3"><a href="#zolotye-pravila-raboty-s-profilirovshchikom">Золотые правила работы с профилировщиком:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-profili-govoryat-o-zheleze">Mechanical Sympathy: что профили говорят о «железе»</a></li><li class="toc-item toc-h2"><a href="#prakticheskiy-primer-ot-benchmarka-k-profilyu-i-obratno">Практический пример: от бенчмарка к профилю и обратно</a></li><li class="toc-item toc-h3"><a href="#iskhodnaya-realizatsiya">Исходная реализация</a></li><li class="toc-item toc-h3"><a href="#optimizirovannaya-realizatsiya">Оптимизированная реализация</a></li><li class="toc-item toc-h3"><a href="#eshche-odin-pokazatelnyy-keys-false-sharing-v-parallelnom-teste">Еще один показательный кейс: False Sharing в параллельном тесте</a></li><li class="toc-item toc-h2"><a href="#integratsiya-v-cicd">Интеграция в CI/CD</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

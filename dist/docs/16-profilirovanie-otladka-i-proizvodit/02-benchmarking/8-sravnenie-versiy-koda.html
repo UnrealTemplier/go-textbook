@@ -2169,38 +2169,109 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~20 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~43 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 5 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. Сравнение версий кода</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="zachem-sravnivat-versii">Зачем сравнивать версии</h2>
+            <h1>Сравнение версий кода: доказательная оптимизация и benchstat</h1>
+<blockquote>
+<p><em>"In God we trust. All others must bring data."</em><br />
+— Уильям Эдвардс Деминг  </p>
+<p><em>"A benchmark of a single version is an anecdote; a statistically verified comparison is engineering."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>Когда разработчик с гордостью заявляет в Pull Request: <em>«Я переписал этот модуль, теперь он работает на 20% быстрее!»</em> — опытный Senior-инженер всегда задает три неудобных вопроса:<br />
+1. <em>Быстрее по сравнению с чем именно?</em><br />
+2. <em>Каков доверительный интервал и какова вероятность того, что эти 20% — просто случайный шум разогретого процессора?</em><br />
+3. <em>Что произошло с аллокациями памяти и хвостовыми задержками?</em></p>
+<p>Одиночный замер производительности в отрыве от контекста не имеет никакого практического смысла. Скорость — понятие сугубо относительное. Завершающий и самый ответственный этап инженерного цикла <strong>Measure → Profile → Optimize → Verify</strong>, сформулированного в <a href="../01-fundament/1-obzor-razdela-kak-myslit-o-proizvoditelnosti.html" class="wikilink">1. Обзор раздела. Как мыслить о производительности</a>, — это <strong>доказательное сравнение двух состояний системы</strong>.</p>
+<p>Мы уже умеем писать надежные бенчмарки (<a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>), обходить коварные ловушки оптимизатора SSA (<a href="4-podvodnye-kamni-benchmark-testov.html" class="wikilink">4. Подводные камни benchmark тестов</a>), стабилизировать физическое окружение Linux (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>) и просвечивать код профилировщиком (<a href="7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>). В этой завершающей лекции блока мы замкнем контур: освоим математический аппарат доказательного сравнения, научимся читать дифференциальные профили <code>pprof -diff_base</code>, внедрим автоматический контроль регрессий в CI и разберемся, почему вердикт утилиты <code>benchstat</code> должен быть законом для любого разработчика.</p>
+<hr />
+<h2 id="zachem-sravnivat-versii">Зачем сравнивать версии</h2>
 
-<p>Бенчмарк, измеряющий одну версию кода, бесполезен без точки отсчёта. Производительность всегда относительна: «быстрее» или «медленнее» имеет смысл только по сравнению с предыдущим состоянием, эталоном или альтернативной реализацией. Сравнение версий — завершающий этап цикла Measure → Profile → Optimize → Verify, сформулированного в <a href="../01-fundament/1-obzor-razdela-kak-myslit-o-proizvoditelnosti.html" class="wikilink">1. Обзор раздела. Как мыслить о производительности</a>.</p>
-<p>Senior-инженер не просто фиксирует <code>ns/op</code>, а выносит вердикт: «изменение X дало ускорение на 15% ± 2% с достоверностью 99.9% и не увеличило хвостовые аллокации». Такой вывод требует методологии, статистики и инструментов, которые мы систематизируем в этой статье.</p>
-<p>Мы уже знаем, как писать бенчмарки (<a href="2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>), как избегать ловушек (<a href="4-podvodnye-kamni-benchmark-testov.html" class="wikilink">4. Подводные камни benchmark тестов</a>) и как стабилизировать результаты (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>). Теперь замкнём цикл: научимся корректно сравнивать две выборки и принимать обоснованные решения.</p>
+<p>Сравнение версий решает две фундаментальные задачи промышленной разработки:<br />
+1. <strong>Верификация оптимизаций:</strong> Доказать математически, что внедренное усложнение кода (например, переход на низкоуровневые указатели <code>unsafe</code> или пул <code>sync.Pool</code>) действительно приносит пользу, оправдывающую рост когнитивной сложности.<br />
+2. <strong>Предотвращение незаметных регрессий (Performance Regression):</strong> Защитить кодовую базу от случайной деградации, когда безобидный на первый взгляд рефакторинг в соседнем пакете роняет общую пропускную способность сервиса на 15%.</p>
+<p>Senior-инженер никогда не говорит: <em>«Мне кажется, стало быстрее»</em>. Он формулирует строгий метрологический вердикт:  </p>
+<blockquote>
+<p><em>«Изменение алгоритма в PR #412 дало ускорение на 17.89% ± 1.2% с доверительной вероятностью 99.9% (p = 0.000) и снизило аллокации памяти со 128 B/op до 0 B/op при n = 15+15»</em>.</p>
+</blockquote>
+<hr />
 <h2 id="bazovye-printsipy-sravneniya">Базовые принципы сравнения</h2>
 
-<p>Сравнение версий в бенчмаркинге Go строится на трёх аксиомах:</p>
+<p>Доказательный бенчмаркинг опирается на три непреложных закона научного эксперимента:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph P1[&quot;Аксиома 1: Ceteris Paribus (При прочих равных)&quot;]
+A1[&quot;Один код — одна переменная:&lt;br&gt;Меняется ТОЛЬКО тестируемый алгоритм.&lt;br&gt;Железо, ОС, компилятор и фоновая нагрузка тождественны.&quot;]
+end
+
+subgraph P2[&quot;Аксиома 2: Статистическая строгость&quot;]
+A2[&quot;Разница средних — не доказательство:&lt;br&gt;Обязателен расчет доверительного интервала (stddev)&lt;br&gt;и статистической значимости p-value через Welch / Mann-Whitney.&quot;]
+end
+
+subgraph P3[&quot;Аксиома 3: Полнота метрик&quot;]
+A3[&quot;Комплексный анализ системы:&lt;br&gt;Контролируем ns/op, B/op, allocs/op, размер бинарника&lt;br&gt;и влияние на хвостовые квантили (p99).&quot;]
+end
+
+P1 --&gt; P2 --&gt; P3
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>Один код — одна переменная.</strong> Сравниваются две версии, отличающиеся только целевым изменением. Если между замерами менялось ещё и окружение (версия компилятора, нагрузка на стенд, настройки ОС), выводы недостоверны.</li>
-<li><strong>Статистическая строгость.</strong> Разница средних — не повод для вывода. Нужно оценить доверительный интервал и вероятность того, что разница случайна (p-value).</li>
-<li><strong>Сравниваем не только среднее, но и распределение.</strong> Даже если среднее улучшилось, хвост (p99) мог ухудшиться. Туда смотрят макробенчмарки и метрики, но и в микро можно оценить стабильность через stddev (<a href="5-microbenchmarks-vs-macrobenchmarks.html" class="wikilink">5. microbenchmarks vs macrobenchmarks</a>).</li>
+<li><strong>Один код — одна переменная (Ceteris Paribus).</strong><br />
+   Сравниваются строго две версии бинарного файла, собранные одной и той же версией компилятора Go (<code>go version</code>), запущенные на одной и той же физической машине, с одинаковой фиксированной частотой процессора и губернатором <code>performance</code>. Если вы запустили базовый замер в пятницу на офисном сервере, а оптимизированный в понедельник на домашнем ноутбуке — ваши результаты можно сразу отправлять в мусорную корзину.</li>
+<li><strong>Статистическая строгость (Гипотеза $H_0$).</strong><br />
+   Разница средних арифметических — это иллюзия. Единственный научный критерий — проверка нулевой гипотезы $H_0$ («истинной разницы между версиями нет, а наблюдаемое отклонение вызвано случайным шумом»). Если вероятность случайности (p-value) превышает 0.05 (5%), изменение отвергается как статистически недостоверное.</li>
+<li><strong>Сравниваем не только среднее, но и распределение.</strong><br />
+   Улучшение среднего времени (p50) не гарантирует отсутствия деградации на хвостах (<a href="5-microbenchmarks-vs-macrobenchmarks.html" class="wikilink">5. microbenchmarks vs macrobenchmarks</a>). Если алгоритм в среднем стал быстрее, но стандартное отклонение выросло с 2% до 18% — в реальном продакшене это вызовет взрывной рост задержек на перцентилях p95 и p99 (<a href="../01-fundament/6-metriki-p50-p95-p99.html" class="wikilink">6. Метрики. p50, p95, p99</a>, <a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</li>
 </ol>
+<hr />
 <h2 id="instrumenty-sravneniya">Инструменты сравнения</h2>
+
+<p>Для сравнения версий в экосистеме Go существует специализированный стек инструментов:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+GoTest[&quot;go test -bench -count=N -benchmem&quot;] --&gt; RawFiles[&quot;Текстовые отчеты (old.txt, new.txt)&quot;]
+RawFiles --&gt; Benchstat[&quot;benchstat old.txt new.txt&lt;br&gt;(Статистический анализ дельты)&quot;]
+
+ProfTest[&quot;go test -bench -cpuprofile -memprofile&quot;] --&gt; ProfFiles[&quot;Профили (old.prof, new.prof)&quot;]
+ProfFiles --&gt; DiffPprof[&quot;go tool pprof -diff_base&lt;br&gt;(Анатомический дифференциальный анализ)&quot;]
+  </pre>
+</div>
+
 
 <h3 id="1-benchstat-osnovnoy-instrument">1. `benchstat` — основной инструмент</h3>
 
-<p>Утилита <code>benchstat</code> (из <code>golang.org/x/perf/cmd/benchstat</code>) сравнивает два набора результатов бенчмарков, вычисляя:</p>
-<ul>
-<li>Среднее изменение (delta %).</li>
-<li>Стандартное отклонение (σ).</li>
-<li>Доверительный интервал.</li>
-<li>p-значение (вероятность нулевой гипотезы «изменения нет»).</li>
-</ul>
-<p>Вход: текстовые файлы с выводом <code>go test -bench</code> (обычно с флагом <code>-count</code> для нескольких запусков).</p>
+<p>Официальный инструмент Go-сообщества для статистической оценки результатов бенчмарков — утилита <code>benchstat</code> (разрабатываемая в репозитории <code>golang.org/x/perf/cmd/benchstat</code>):</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2210,14 +2281,35 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go test -bench=. -count=10 &gt; old.txt
-# ... вносим изменение ...
+  <pre class="language-bash"><code class="language-bash"># Установка стабильной версии benchstat
+go install golang.org/x/perf/cmd/benchstat@latest
+</code></pre>
+</div>
+
+<p>Утилита принимает на вход два или более текстовых файла с выводом команды <code>go test -bench</code> (с обязательным флагом многократного запуска <code>-count</code>):</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># 1. Снимаем выборку старой версии (baseline)
+go test -bench=. -count=10 &gt; old.txt
+
+# 2. Вносим изменения в код...
+
+# 3. Снимаем выборку новой версии
 go test -bench=. -count=10 &gt; new.txt
+
+# 4. Проводим математический анализ
 benchstat old.txt new.txt
 </code></pre>
 </div>
 
-<p>Пример вывода:</p>
+<p>Пример вывода <code>benchstat</code>:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2233,19 +2325,26 @@ Bar-8         5.6µs ± 5%     5.8µs ± 6%   +3.57%  (p=0.234 n=10+10)
 </code></pre>
 </div>
 
-<ul>
-<li><code>Foo</code> — значимое улучшение: p &lt; 0.05, доверительный интервал не пересекает ноль.</li>
-<li><code>Bar</code> — изменение статистически незначимо: p=0.234, разницу списали на шум.</li>
-</ul>
-<p><code>benchstat</code> также умеет сравнивать несколько групп (старый, новый, вариант), выводить <code>B/op</code> и <code>allocs/op</code>.</p>
+<p>Разбор вердикта:<br />
+- <strong><code>Foo-8</code>:</strong> Статистически безупречная победа. Среднее время упало с 12.3 мкс до 10.1 мкс (<code>-17.89%</code>). Доверительные интервалы узки (<code>± 2%</code> и <code>± 1%</code>), а <code>p=0.000</code> свидетельствует о том, что вероятность случайного совпадения практически равна нулю. Изменение безоговорочно принимается!<br />
+- <strong><code>Bar-8</code>:</strong> Кажущееся замедление на 3.57% на самом деле является фикцией. <code>p=0.234</code> означает, что с вероятностью 23.4% эта дельта вызвана случайными колебаниями планировщика ОС или таймеров. Доверительный интервал включает нулевое изменение. Разницу списывают на шум, коммит не отклоняется и не принимается как замедление.</p>
+<p>Кроме процессорного времени <code>benchstat</code> автоматически анализирует таблицы памяти: <code>B/op</code> (выделенные байты) и <code>allocs/op</code> (число обращений к аллокатору).</p>
+<hr />
 <h3 id="2-go-test-bench-s-flagami-profilirovaniya">2. `go test -bench` с флагами профилирования</h3>
 
-<p>Помимо <code>benchstat</code>, для сравнения версий используются профилировщики, снятые на каждом варианте, и сравниваемые через <code>pprof -diff_base</code> (см. <a href="7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>). Это позволяет понять, <em>куда</em> ушло или откуда взялось время/память.</p>
+<p>Если <code>benchstat</code> констатирует факт изменения времени, то связка профилировщиков с флагом <code>pprof -diff_base</code> (<a href="7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>) вскрывает его анатомию. Вычитая базовый профиль из оптимизированного, инженер наглядно видит, в каких именно строках кода высвободились такты CPU или байты кучи.</p>
+<hr />
 <h3 id="3-sobstvennye-skripty-i-ci">3. Собственные скрипты и CI</h3>
 
-<p>В CI (<a href="../10-highload/5-performance-regression-detection.html" class="wikilink">5. Performance regression detection</a>) обычно автоматизируют связку: <code>go test -bench</code> → сохранение артефакта → <code>benchstat</code> против эталонного файла → алерт при превышении порога.</p>
+<p>В пайплайнах непрерывной интеграции (<a href="../10-highload/5-performance-regression-detection.html" class="wikilink">5. Performance regression detection</a>) автоматизируют полный цикл:<br />
+1. Запуск <code>go test -bench</code> на PR.<br />
+2. Сравнение с эталонным файлом из ветки <code>main</code>.<br />
+3. Автоматический расчет метрик через <code>benchstat</code>.<br />
+4. Блокировка мерджа (Quality Gate) при превышении допустимого порога регрессии.</p>
+<hr />
 <h2 id="poshagovaya-metodologiya-sravneniya">Пошаговая методология сравнения</h2>
 
+<p>Сравнение версий — это стандартизированный инженерный алгоритм, исключающий субъективные трактовки:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2260,24 +2359,22 @@ Bar-8         5.6µs ± 5%     5.8µs ± 6%   +3.57%  (p=0.234 n=10+10)
   </div>
   <pre class="mermaid">
 flowchart TD
-A[Собрать эталонные результаты] --&gt; B[Внести изменение в код]
-B --&gt; C[Запустить бенчмарки&lt;br&gt;с -count=10]
-C --&gt; D[Собрать новые результаты]
-D --&gt; E[benchstat old.txt new.txt]
-E --&gt; F{&quot;p &lt; 0.01?&quot;}
-F -- &quot;Да&quot; --&gt; G[Изменение значимо]
-F -- &quot;Нет&quot; --&gt; H[Изменение не значимо&lt;br&gt;либо увеличить -count]
-G --&gt; I{Дельта &gt; порога?}
-I -- &quot;Да, ухудшение&quot; --&gt; J[Отклонить изменение&lt;br&gt;или оптимизировать дальше]
-I -- &quot;Да, улучшение&quot; --&gt; K[Принять изменение]
-I -- &quot;Нет, в пределах шума&quot; --&gt; H
+A[&quot;1. Собрать эталонные результаты (baseline.txt)&lt;br&gt;go test -bench=. -count=10 -benchmem&quot;] --&gt; B[&quot;2. Внести изменение в код (feature branch)&quot;]
+B --&gt; C[&quot;3. Запустить бенчмарки в том же окружении&lt;br&gt;go test -bench=. -count=10 -benchmem &gt; optimized.txt&quot;]
+C --&gt; D[&quot;4. Запустить benchstat baseline.txt optimized.txt&quot;]
+D --&gt; E{&quot;p-value &lt; 0.01?&quot;}
+E -- &quot;Нет (p &gt;= 0.01)&quot; --&gt; F[&quot;Изменение статистически незначимо!&lt;br&gt;Увеличить -count до 20-30 или стабилизировать ОС&quot;]
+E -- &quot;Да (p &lt; 0.01)&quot; --&gt; G{&quot;Какова дельта времени / памяти?&quot;}
+G -- &quot;Ускорение (delta &lt; -3..5%)&quot; --&gt; H[&quot;✅ Успешная оптимизация!&lt;br&gt;Принять изменение&quot;]
+G -- &quot;Замедление (delta &gt; +3..5%)&quot; --&gt; I[&quot;❌ Регрессия производительности!&lt;br&gt;Отклонить PR или снять diff-профиль&quot;]
+G -- &quot;В пределах порога (±2%)&quot; --&gt; F
   </pre>
 </div>
 
 
 <h3 id="1-sbor-etalona">1. Сбор эталона</h3>
 
-<p>Эталон (baseline) — результат бенчмарков до изменений. Важно, чтобы он был получен в том же окружении, что и новый замер. В идеале — на одной машине, в рамках одного CI-джоба, с одной и той же нагрузкой от соседей.</p>
+<p>Эталонный замер (<strong>baseline</strong>) снимается на чистой исходной ветке (обычно <code>main</code> или коммит до рефакторинга).</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2287,14 +2384,17 @@ I -- &quot;Нет, в пределах шума&quot; --&gt; H
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">git stash  # или checkout на baseline-коммит
+  <pre class="language-bash"><code class="language-bash"># Прячем незакоммиченные изменения или переключаемся на main
+git stash
+
+# Запускаем серию из 10-15 прогонов с контролем памяти
 go test -bench=. -count=10 -benchmem &gt; baseline.txt
 </code></pre>
 </div>
 
 <h3 id="2-vnesenie-izmeneniya-i-zamer">2. Внесение изменения и замер</h3>
 
-<p>Применяем целевую оптимизацию и повторяем замер:</p>
+<p>Возвращаем оптимизированный код и повторяем запуск с абсолютно теми же аргументами:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2304,7 +2404,10 @@ go test -bench=. -count=10 -benchmem &gt; baseline.txt
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">git pop  # или переходим на новую версию
+  <pre class="language-bash"><code class="language-bash"># Возвращаем изменения
+git stash pop
+
+# Запускаем в точно таких же условиях
 go test -bench=. -count=10 -benchmem &gt; optimized.txt
 </code></pre>
 </div>
@@ -2324,17 +2427,25 @@ go test -bench=. -count=10 -benchmem &gt; optimized.txt
 </code></pre>
 </div>
 
-<h3 id="4-interpretatsiya">4. Интерпретация</h3>
+<h3 id="4-interpretatsiya-rezultatov">4. Интерпретация результатов</h3>
 
-<ul>
-<li>Если p &lt; 0.01 и дельта отрицательна (ускорение) и превышает, скажем, 3-5% — оптимизация успешна.</li>
-<li>Если p &lt; 0.01 и дельта положительна (замедление) — регресс, нужно разбираться.</li>
-<li>Если p &gt; 0.05 — результат статистически незначим. Надо либо увеличить <code>-count</code> до 20-30, либо стабилизировать окружение (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>), либо признать, что изменение в пределах шума.</li>
-<li>Если дельта велика, но stddev огромен (±15%), результат ненадёжен — сначала стабилизировать.</li>
-</ul>
+<p>При чтении отчета руководствуются строгими критериями:<br />
+1. <strong><code>p &lt; 0.01</code> и дельта отрицательна (ускорение &gt; 3–5%):</strong><br />
+   Оптимизация доказана и успешна. Код принимается.<br />
+2. <strong><code>p &lt; 0.01</code> и дельта положительна (замедление &gt; 3–5%):</strong><br />
+   Зафиксирована регрессия. Изменение блокируется, начинается профилирование.<br />
+3. <strong><code>p &gt;= 0.05</code>:</strong><br />
+   Результат статистически не отличим от нуля. Дельта утонула в шуме. Действия:<br />
+   - Либо увеличить выборку до <code>-count=20..30</code>.<br />
+   - Либо стабилизировать процессор (отключить Turbo Boost, см. <a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>).<br />
+   - Либо признать, что гипотеза об оптимизации не подтвердилась.<br />
+4. <strong>Высокая дисперсия (<code>stddev &gt; ±10%</code>):</strong><br />
+   Если в колонке разброса стоят двузначные числа, доверять результату нельзя независимо от значения <code>delta</code>. Среда измерения загрязнена сторонними процессами.</p>
+<hr />
 <h2 id="sravnenie-profiley-cpu-i-pamyati">Сравнение профилей CPU и памяти</h2>
 
-<p>Числа <code>ns/op</code> не показывают, за счёт чего произошло изменение. Для этого сравнивают профили:</p>
+<p>Когда <code>benchstat</code> сообщает об ускорении на 30%, мы хотим убедиться, что выигрыш получен именно там, где планировалось, и не вызвал скрытых проблем в других подсистемах.</p>
+<p>Для этого применяется <strong>дифференциальное профилирование</strong> (<code>-diff_base</code>):</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2344,15 +2455,56 @@ go test -bench=. -count=10 -benchmem &gt; optimized.txt
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkTarget -cpuprofile=cpu_old.prof  # на старом коде
-# меняем код
+  <pre class="language-bash"><code class="language-bash"># 1. Замер CPU-профиля на старой версии
+git checkout main
+go test -bench=BenchmarkTarget -cpuprofile=cpu_old.prof
+
+# 2. Замер CPU-профиля на новой версии
+git checkout feature-optimized
 go test -bench=BenchmarkTarget -cpuprofile=cpu_new.prof
+
+# 3. Визуализация разностного профиля в браузере
 go tool pprof -http=:8080 -diff_base=cpu_old.prof cpu_new.prof
 </code></pre>
 </div>
 
-<p>Флаг <code>-diff_base</code> вычитает старый профиль из нового. Flamegraph (<code>-http</code>) покажет красным функции, потребляющие больше CPU в новой версии, зелёным — те, что стали легче. Это позволяет сразу увидеть, что, например, время ушло из <code>json.Unmarshal</code> в <code>runtime.mallocgc</code> (намекая на лишние аллокации).</p>
-<p>Аналогично для памяти:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph DiffBase[&quot;Механика go tool pprof -diff_base&quot;]
+OldP[&quot;cpu_old.prof (Baseline)&quot;]
+NewP[&quot;cpu_new.prof (Optimized)&quot;]
+Sub[&quot;Вычитание: Delta = New - Old&quot;]
+OldP --&gt; Sub
+NewP --&gt; Sub
+end
+
+subgraph Visualization[&quot;Отображение в UI pprof&quot;]
+Red[&quot;Красный цвет (+Delta):&lt;br&gt;Функция стала потреблять БОЛЬШЕ времени/памяти&quot;]
+Green[&quot;Зеленый цвет (-Delta):&lt;br&gt;Функция стала потреблять МЕНЬШЕ ресурсов (Ускорение)&quot;]
+end
+
+Sub --&gt; Visualization
+  </pre>
+</div>
+
+
+<p>В интерактивном веб-интерфейсе <code>pprof</code> разностный граф и Flamegraph окрашиваются контрастными цветами:<br />
+- <strong>Красные узлы (<code>+</code>):</strong> Функции, которые стали тяжелее в новой версии (новые аллокации, дополнительные проверки).<br />
+- <strong>Зеленые узлы (<code>-</code>):</strong> Функции, где процессорное время или память сократились.</p>
+<p>Это позволяет сразу увидеть, куда переместились затраты: например, если время ушло из <code>json.Unmarshal</code> в <code>runtime.mallocgc</code> (сигнализируя о лишних аллокациях), или если в оптимизированной конкатенации зеленый блок <code>runtime.memmove</code> соседствует с красным узлом <code>runtime.mallocgc</code>.</p>
+<p>Аналогично сравниваются профили динамической памяти:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2366,46 +2518,128 @@ go tool pprof -http=:8080 -diff_base=cpu_old.prof cpu_new.prof
 </code></pre>
 </div>
 
-<p>Особый случай: если изменение снизило аллокации, <code>-alloc_space</code> покажет отрицательную дельту в соответствующих функциях.</p>
+<p>При использовании <code>-alloc_space</code> разностный профиль прямо укажет функции, сократившие давление на сборщик мусора.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> После оптимизации бенчмарк показывает ускорение на 20%, но pprof -diff_base не показывает значимых изменений в горячих функциях. Как это возможно?<br />
-<strong>Ответ:</strong> Возможно, изменение повлияло на инлайнинг или escape analysis. Компилятор мог начать размещать переменные на стеке вместо кучи (или наоборот), что не отражается в процентах одной функции, но снижает общее время из-за отсутствия аллокаций и GC. Стоит проверить <code>-benchmem</code> и вывод <code>go build -gcflags="-m"</code>.</p>
+    <p><strong>Вопрос:</strong> После оптимизации бенчмарк показал ускорение на 20%, но разностный профиль <code>pprof -diff_base</code> не выявил заметных сокращений времени ни в одной отдельной функции. За счет чего могло произойти ускорение?</p>
+<p><strong>Ответ кандидата уровня Senior:</strong><br />
+Это классическая ситуация, когда оптимизация затронула глобальные свойства компиляции, не привязанные к конкретной строке:<br />
+1. <strong>Инлайнинг (Function Inlining):</strong> Устранение границы вызова функции позволяет оптимизатору SSA выбросить пролог/эпилог стека и провести глубокую свертку констант. Накладные расходы исчезают равномерно по всему телу вызывающей функции.<br />
+2. <strong>Побег на стек (Escape Analysis):</strong> Если объект перестал убегать в кучу и разместился на стеке, исчезают не только миллисекунды в <code>runtime.mallocgc</code>, но и снижается общая частота срабатывания фонового сборщика мусора и фаз STW.<br />
+3. <strong>Локальность кэша процессора:</strong> Уменьшение размера структуры улучшило размещение в кэш-линиях L1D, снизив число аппаратных пауз конвейера (CPU stalls).<br />
+Чтобы подтвердить гипотезу, я сверю отчет <code>-benchmem</code>, проверю флаги компилятора <code>go build -gcflags="-m"</code> и проанализирую аппаратные счетчики CPU через <code>perf stat</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="chto-sravnivat-krome-vremeni-i-allokatsiy">Что сравнивать, кроме времени и аллокаций</h2>
 
-<p>Хотя бенчмарки традиционно фокусируются на <code>ns/op</code> и <code>B/op</code>, Senior может сравнивать и другие характеристики:</p>
-<ul>
-<li><strong>Размер бинарника:</strong> <code>go version -m &lt;binary&gt;</code> или <code>ls -l</code> после <code>go build</code>. Большие изменения могут сигнализировать о лишних зависимостях.</li>
-<li><strong>Число выполняемых инструкций:</strong> <code>perf stat -e instructions:u ./binary</code>. При равном времени меньшее число инструкций может означать более эффективный код.</li>
-<li><strong>Кэш-промахи:</strong> <code>perf stat -e cache-misses:u ./binary</code>. Оптимизация могла улучшить cache friendliness (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
-<li><strong>Число горутин и их состояния:</strong> через <code>runtime.NumGoroutine()</code> в контрольных точках бенчмарка или через execution tracer.</li>
-</ul>
-<p>Эти метрики обычно не автоматизируют, но применяют ad hoc при расследовании узких мест.</p>
+<p>Опытный бэкенд-инженер оценивает влияние изменений шире, чем банальные <code>ns/op</code> и <code>B/op</code>:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                  Инженерная матрица сравнения версий                    |
++------------------------------------+------------------------------------+
+| Метрика                            | Инструмент контроля                |
++------------------------------------+------------------------------------+
+| Время выполнения (ns/op)           | go test -bench, benchstat          |
+| Память и аллокации (B/op, allocs)  | go test -benchmem, memprofile      |
+| Размер бинарного файла             | ls -l, go version -m &lt;binary&gt;      |
+| Аппаратные инструкции (IPC)        | perf stat -e instructions:u        |
+| Кэш-промахи (Cache Misses)         | perf stat -e cache-misses:u        |
+| Количество горутин рантайма        | runtime.NumGoroutine(), trace      |
+| Хвостовые квантили (p95, p99)      | Сквозные макротесты (k6, vegeta)   |
++------------------------------------+------------------------------------+
+</code></pre>
+</div>
+
+<ol>
+<li><strong>Размер скомпилированного бинарника:</strong><br />
+   Агрессивный инлайнинг и кодогенерация могут раздуть бинарник на десятки мегабайт, что ухудшит утилизацию кэша инструкций <strong>L1I</strong>. Проверяйте размер исполняемого файла через <code>ls -l</code> или метаданные через <code>go version -m &lt;binary&gt;</code>.</li>
+<li><strong>Число выполненных инструкций CPU:</strong><br />
+   С помощью системной утилиты Linux <code>perf stat -e instructions:u ./binary</code> можно замерить чистое количество машинных команд. Если время выполнения осталось прежним, но число инструкций сократилось на 30%, это означает, что код стал чище, но уперся в задержку памяти (Memory Bound).</li>
+<li><strong>Промахи кэша процессора (Cache Misses):</strong><br />
+   Замер через <code>perf stat -e cache-misses:u ./binary</code> позволяет оценить дружественность структуры данных к аппаратному кэшу (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
+<li><strong>Конкурентные утечки:</strong><br />
+   Контроль количества горутин через <code>runtime.NumGoroutine()</code> до и после бенчмарка страхует от утечек фоновых горутин-зомби.</li>
+</ol>
+<hr />
 <h2 id="avtomatizatsiya-v-cicd">Автоматизация в CI/CD</h2>
 
-<p>Сравнение версий должно быть автоматическим, чтобы регрессии не просачивались в main. Типовой workflow (подробнее в <a href="../10-highload/5-performance-regression-detection.html" class="wikilink">5. Performance regression detection</a>):</p>
+<p>Ручное сравнение бенчмарков неизбежно забывается в суете спринтов. Надежный барьер против деградации — автоматический запуск <code>benchstat</code> в конвейере CI/CD (<a href="../10-highload/5-performance-regression-detection.html" class="wikilink">5. Performance regression detection</a>).</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+actor Dev as Разработчик
+participant Git as GitHub / GitLab
+participant CI as Выделенный Bare-Metal Runner
+participant Store as Хранилище эталонов (Git LFS / S3)
+
+Dev-&gt;&gt;Git: Push Pull Request
+Git-&gt;&gt;CI: Триггер Pipeline
+CI-&gt;&gt;Store: Загрузка baseline.txt для ветки main
+CI-&gt;&gt;CI: Сборка и запуск: go test -bench=. -count=10 &gt; pr.txt
+CI-&gt;&gt;CI: Расчет: benchstat baseline.txt pr.txt
+alt Обнаружена регрессия (delta &gt; +5%, p &lt; 0.01)
+CI--&gt;&gt;Git: ❌ Quality Gate FAILED: Регрессия в функции Foo!
+Git--&gt;&gt;Dev: Блокировка мерджа с публикацией diff-отчета
+else Производительность в норме или улучшена
+CI--&gt;&gt;Git: ✅ Quality Gate PASSED
+Git--&gt;&gt;Dev: Разрешение на слияние PR
+Note over Git,Store: При мерже в main файл baseline.txt обновляется
+end
+  </pre>
+</div>
+
+
+<h3 id="standartnyy-arkhitekturnyy-reglament-ci-benchmarkinga">Стандартный архитектурный регламент CI-бенчмаркинга:</h3>
 <ol>
-<li>В репозитории хранится файл <code>testdata/benchmarks/baseline.txt</code> (эталон для main).</li>
-<li>На каждый PR CI запускает <code>go test -bench=. -count=10 &gt; pr.txt</code>.</li>
-<li>Выполняется <code>benchstat baseline.txt pr.txt</code>.</li>
-<li>Если обнаружена статистически значимая регрессия (p &lt; 0.05 и дельта &gt; порога, например, +5%), CI пишет комментарий в PR или блокирует слияние.</li>
-<li>При мерже в main эталон обновляется результатами из PR (если изменения приемлемы).</li>
+<li>В репозитории (в каталоге <code>testdata/benchmarks/baseline.txt</code>) или внешнем S3-хранилище сохраняется утвержденный эталон производительности ветки <code>main</code>.</li>
+<li>Для каждого Pull Request изолированный раннер компилирует проект и снимает свежие результаты:<br />
+<code>go test -bench=. -count=10 &gt; pr.txt</code>.</li>
+<li>Запускается валидатор:<br />
+<code>benchstat testdata/benchmarks/baseline.txt pr.txt</code>.</li>
+<li>Если <code>benchstat</code> фиксирует деградацию ключевых функций более чем на <strong>5%</strong> при <code>p-value &lt; 0.05</code>, пайплайн падает с ошибкой, а в PR автоматически публикуется форматированная таблица изменений.</li>
+<li>При слиянии оптимизирующего PR в ветку <code>main</code> файл <code>testdata/benchmarks/baseline.txt</code> автоматически обновляется новыми эталонными замерами.</li>
 </ol>
-<p>Такая практика превращает производительность в контролируемую характеристику, не позволяя «тихо» деградировать.</p>
+<hr />
 <h2 id="mechanical-sympathy-pochemu-kontekst-okruzheniya-vazhen-pri-sravnenii">Mechanical Sympathy: почему контекст окружения важен при сравнении</h2>
 
-<p>Сравнение версий, полученных на разном железе или в разное время, ненадёжно. Процессор с другим размером кэша, другая версия ядра Linux, обновлённый планировщик Go — всё это меняет абсолютные показатели, но не должно влиять на <em>дельту</em> при честном сравнении. Поэтому золотой стандарт — сравнивать версии в рамках одного CI-джоба, на одном раннере, с фиксированной частотой и изоляцией (<a href="6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>).</p>
-<p>Если же вам принесли бенчмарки с чужой машины, будьте скептичны. Без контроля окружения никакая статистическая значимость не спасёт от систематической ошибки.</p>
+<p>Почему нельзя слепо верить числам, полученным на разных машинах?</p>
+<p>Микроархитектура современных чипов крайне чувствительна к контексту:<br />
+- <strong>Размер и топология кэшей:</strong> У процессора AMD Ryzen 7950X кэш L3 составляет 64 МБ, разделенных между двумя кристаллами CCD. У Intel Core i9-14900K — монолитный кэш L3 на 36 МБ с кольцевой шиной Ring Bus. Алгоритм, летающий на одном процессоре за счет огромного кэша, на другом чипе начнет массово выпадать в память.<br />
+- <strong>Выравнивание инструкций по границе 64 байт:</strong> Небольшое изменение в длине одной вспомогательной функции в начале файла может сдвинуть адреса горячего цикла в машинном коде. Если цикл случайно пересечет границу 64-байтной строки кэша инструкций <strong>L1I</strong>, процессор будет вынужден декодировать две кэш-линии вместо одной, замедлив выполнение на 5–10% на абсолютно идентичном коде!<br />
+- <strong>Версия рантайма Go:</strong> С каждым новым релизом (Go 1.21, 1.22, 1.23, 1.24) команда Go оптимизирует планировщик, структуру хэш-таблиц (Swiss Tables), инлайнер и GC. Сравнение кода на разных версиях компилятора сравнивает работу компилятора, а не ваш код.</p>
+<p>Золотое правило: <strong>Сравнивать допустимо только относительную дельту ($\Delta$) двух версий, полученную в едином, строго стабилизированном физическом эксперименте.</strong></p>
+<hr />
 <h2 id="primer-polnogo-tsikla-sravneniya">Пример полного цикла сравнения</h2>
 
-<p>Допустим, мы оптимизируем функцию копирования слайса. Эталонный бенчмарк:</p>
+<p>Разберем завершенный практический пример: оптимизацию функции копирования буферов.</p>
+<h3 id="1-etalonnaya-realizatsiya-s-postoyannymi-allokatsiyami">1. Эталонная реализация с постоянными аллокациями</h3>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2415,11 +2649,18 @@ go tool pprof -http=:8080 -diff_base=cpu_old.prof cpu_new.prof
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">var resultSlice []byte
+  <pre class="language-go"><code class="language-go">package bench_test
+
+import &quot;testing&quot;
+
+var resultSlice []byte
 
 func BenchmarkCopy(b *testing.B) {
     src := make([]byte, 4096)
+
+    b.ResetTimer()
     for i := 0; i &lt; b.N; i++ {
+        // ОШИБКА: Выделение нового слайса 4 КБ в куче на каждой итерации
         dst := make([]byte, len(src))
         copy(dst, src)
         resultSlice = dst
@@ -2428,7 +2669,7 @@ func BenchmarkCopy(b *testing.B) {
 </code></pre>
 </div>
 
-<p>Запуск эталона:</p>
+<p>Запуск замера базовой версии:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2438,11 +2679,45 @@ func BenchmarkCopy(b *testing.B) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go test -bench=Copy -count=15 -benchmem &gt; old.txt
+  <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkCopy -count=15 -benchmem &gt; old.txt
 </code></pre>
 </div>
 
-<p>После оптимизации (предвыделение буфера переиспользованием через <code>sync.Pool</code>) запускаем снова:</p>
+<h3 id="2-optimizirovannaya-versiya-s-pulom-buferov-sync-pool">2. Оптимизированная версия с пулом буферов `sync.Pool`</h3>
+
+<p>Инженер устраняет аллокации, переиспользуя буферы через пул памяти:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">var bufferPool = sync.Pool{
+    New: func() any {
+        b := make([]byte, 4096)
+        return &amp;b
+    },
+}
+
+func BenchmarkCopy(b *testing.B) {
+    src := make([]byte, 4096)
+
+    b.ResetTimer()
+    for i := 0; i &lt; b.N; i++ {
+        bufPtr := bufferPool.Get().(*[]byte)
+        dst := *bufPtr
+        copy(dst, src)
+        resultSlice = dst
+        bufferPool.Put(bufPtr)
+    }
+}
+</code></pre>
+</div>
+
+<p>Запуск замера оптимизированной версии:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2452,12 +2727,26 @@ func BenchmarkCopy(b *testing.B) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go test -bench=Copy -count=15 -benchmem &gt; new.txt
-benchstat old.txt new.txt
+  <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkCopy -count=15 -benchmem &gt; new.txt
 </code></pre>
 </div>
 
-<p>Результат:</p>
+<h3 id="3-matematicheskiy-arbitrazh-cherez-benchstat">3. Математический арбитраж через `benchstat`</h3>
+
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">benchstat old.txt new.txt
+</code></pre>
+</div>
+
+<p>Терминальный вывод утилиты:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2478,18 +2767,29 @@ Copy-8     1.00 ± 0%      0.00       -100.00%  (p=0.000 n=15+15)
 </code></pre>
 </div>
 
-<p>Вывод: оптимизация дала трёхкратное ускорение и полностью убрала аллокации. Изменение статистически значимо (p &lt; 0.001). Можно мержить.</p>
+<h3 id="matematicheskiy-verdikt">Математический вердикт:</h3>
+<ol>
+<li><strong>Время (<code>time/op</code>):</strong> Сократилось более чем в 3.4 раза (с 1.09 мкс до 0.32 мкс, выигрыш <code>-70.64%</code>).</li>
+<li><strong>Память (<code>alloc/op</code>):</strong> Выделение 4.10 КБ на операцию полностью сведено к <strong>0.00 KB</strong> (<code>-100.00%</code>).</li>
+<li><strong>Число аллокаций (<code>allocs/op</code>):</strong> Упало с 1 до <strong>0</strong>.</li>
+<li><strong>Статистическая надежность:</strong> Дисперсия внутри групп минимальна (<code>± 3%</code> и <code>± 4%</code>), а <code>p=0.000</code> при выборке <code>n=15+15</code> гарантирует абсолютную математическую достоверность.</li>
+</ol>
+<p>Этот Pull Request принимается в кодовую базу с наивысшим баллом инженерного качества.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ul>
-<li>Сравнение версий кода — обязательная часть цикла оптимизации; без него нельзя утверждать, что изменение принесло пользу.</li>
-<li>Основной инструмент — <code>benchstat</code>, который вычисляет дельту, доверительный интервал и p-value по многократным запускам бенчмарков.</li>
-<li>Профили (<code>-cpuprofile</code>, <code>-memprofile</code>) сравниваются через <code>pprof -diff_base</code> для понимания структурных сдвигов.</li>
-<li>Статистическая значимость (p &lt; 0.01) и низкая дисперсия (stddev &lt; 3-5%) — необходимые условия для принятия решения.</li>
-<li>Автоматизация сравнения в CI с эталонными результатами предотвращает деградацию производительности.</li>
-<li>Mechanical sympathy напоминает: сравнивать можно только результаты, полученные в одинаковых, строго контролируемых условиях.</li>
-</ul>
-<p>С этой статьёй мы закрываем подраздел «Benchmarking». Мы научились не только писать корректные бенчмарки, но и делать из них обоснованные выводы. Теперь мы переходим от «сколько» к «почему» — в следующий подраздел: «CPU profiling», где первой статьёй будет <a href="../03-cpu-profiling/1-pprof-vvedenie.html" class="wikilink">1. pprof. Введение</a>.</p>
+<ol>
+<li><strong>Сравнение версий — фундамент доказательной оптимизации:</strong> Одиночный замер — это непроверенная гипотеза; только парное сравнение с эталоном доказывает пользу инженерных изменений.</li>
+<li><strong><code>benchstat</code> — высший суд производительности:</strong> Инструмент автоматически рассчитывает средние, доверительные интервалы (stddev) и статистическую достоверность (p-value). Любые изменения с <code>p &gt;= 0.05</code> отвергаются как шум.</li>
+<li><strong>Дифференциальное профилирование (<code>pprof -diff_base</code>):</strong> Позволяет визуализировать точечный баланс изменений: куда сместились процессорные такты и аллокации памяти между двумя коммитами.</li>
+<li><strong>Комплексность метрик:</strong> Оценивайте не только наносекунды, но и аллокации (<code>B/op</code>, <code>allocs/op</code>), размер бинарного файла и поведение на хвостовых квантилях задержек (p99).</li>
+<li><strong>Автоматический барьер в CI:</strong> Включение тестов производительности в пайплайн CI с контролем относительно утвержденного файла эталонов навсегда закрывает дверь скрытым регрессиям.</li>
+</ol>
+<hr />
+<h3 id="zavershenie-podrazdela-02-benchmarking">Завершение подраздела «02. Benchmarking»</h3>
+
+<p>Этой лекцией мы полностью закрыли фундаментальный подраздел <strong>«Benchmarking»</strong>. Мы прошли путь от понимания физических законов измерений до тонкостей адаптивного подбора <code>b.N</code>, борьбы со случайным системным шумом, рентгеновской диагностики профилировщиком и строгой математической статистики <code>benchstat</code>.</p>
+<p>Теперь наш исследовательский чемодан укомплектован эталонными метрологическими инструментами. Мы переходим от вопроса <em>«сколько времени занимает код?»</em> к глубокому погружению в механизмы процессора: в следующий подраздел <strong>«03. CPU profiling»</strong>, где первой фундаментальной темой станет <a href="../03-cpu-profiling/1-pprof-vvedenie.html" class="wikilink">1. pprof. Введение</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2517,7 +2817,7 @@ Copy-8     1.00 ± 0%      0.00       -100.00%  (p=0.000 n=15+15)
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#zachem-sravnivat-versii">Зачем сравнивать версии</a></li><li class="toc-item toc-h2"><a href="#bazovye-printsipy-sravneniya">Базовые принципы сравнения</a></li><li class="toc-item toc-h2"><a href="#instrumenty-sravneniya">Инструменты сравнения</a></li><li class="toc-item toc-h3"><a href="#1-benchstat-osnovnoy-instrument">1. benchstat — основной инструмент</a></li><li class="toc-item toc-h3"><a href="#2-go-test-bench-s-flagami-profilirovaniya">2. go test -bench с флагами профилирования</a></li><li class="toc-item toc-h3"><a href="#3-sobstvennye-skripty-i-ci">3. Собственные скрипты и CI</a></li><li class="toc-item toc-h2"><a href="#poshagovaya-metodologiya-sravneniya">Пошаговая методология сравнения</a></li><li class="toc-item toc-h3"><a href="#1-sbor-etalona">1. Сбор эталона</a></li><li class="toc-item toc-h3"><a href="#2-vnesenie-izmeneniya-i-zamer">2. Внесение изменения и замер</a></li><li class="toc-item toc-h3"><a href="#3-statisticheskoe-sravnenie">3. Статистическое сравнение</a></li><li class="toc-item toc-h3"><a href="#4-interpretatsiya">4. Интерпретация</a></li><li class="toc-item toc-h2"><a href="#sravnenie-profiley-cpu-i-pamyati">Сравнение профилей CPU и памяти</a></li><li class="toc-item toc-h2"><a href="#chto-sravnivat-krome-vremeni-i-allokatsiy">Что сравнивать, кроме времени и аллокаций</a></li><li class="toc-item toc-h2"><a href="#avtomatizatsiya-v-cicd">Автоматизация в CI/CD</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-kontekst-okruzheniya-vazhen-pri-sravnenii">Mechanical Sympathy: почему контекст окружения важен при сравнении</a></li><li class="toc-item toc-h2"><a href="#primer-polnogo-tsikla-sravneniya">Пример полного цикла сравнения</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#zachem-sravnivat-versii">Зачем сравнивать версии</a></li><li class="toc-item toc-h2"><a href="#bazovye-printsipy-sravneniya">Базовые принципы сравнения</a></li><li class="toc-item toc-h2"><a href="#instrumenty-sravneniya">Инструменты сравнения</a></li><li class="toc-item toc-h3"><a href="#1-benchstat-osnovnoy-instrument">1. benchstat — основной инструмент</a></li><li class="toc-item toc-h3"><a href="#2-go-test-bench-s-flagami-profilirovaniya">2. go test -bench с флагами профилирования</a></li><li class="toc-item toc-h3"><a href="#3-sobstvennye-skripty-i-ci">3. Собственные скрипты и CI</a></li><li class="toc-item toc-h2"><a href="#poshagovaya-metodologiya-sravneniya">Пошаговая методология сравнения</a></li><li class="toc-item toc-h3"><a href="#1-sbor-etalona">1. Сбор эталона</a></li><li class="toc-item toc-h3"><a href="#2-vnesenie-izmeneniya-i-zamer">2. Внесение изменения и замер</a></li><li class="toc-item toc-h3"><a href="#3-statisticheskoe-sravnenie">3. Статистическое сравнение</a></li><li class="toc-item toc-h3"><a href="#4-interpretatsiya-rezultatov">4. Интерпретация результатов</a></li><li class="toc-item toc-h2"><a href="#sravnenie-profiley-cpu-i-pamyati">Сравнение профилей CPU и памяти</a></li><li class="toc-item toc-h2"><a href="#chto-sravnivat-krome-vremeni-i-allokatsiy">Что сравнивать, кроме времени и аллокаций</a></li><li class="toc-item toc-h2"><a href="#avtomatizatsiya-v-cicd">Автоматизация в CI/CD</a></li><li class="toc-item toc-h3"><a href="#standartnyy-arkhitekturnyy-reglament-ci-benchmarkinga">Стандартный архитектурный регламент CI-бенчмаркинга:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-kontekst-okruzheniya-vazhen-pri-sravnenii">Mechanical Sympathy: почему контекст окружения важен при сравнении</a></li><li class="toc-item toc-h2"><a href="#primer-polnogo-tsikla-sravneniya">Пример полного цикла сравнения</a></li><li class="toc-item toc-h3"><a href="#1-etalonnaya-realizatsiya-s-postoyannymi-allokatsiyami">1. Эталонная реализация с постоянными аллокациями</a></li><li class="toc-item toc-h3"><a href="#2-optimizirovannaya-versiya-s-pulom-buferov-sync-pool">2. Оптимизированная версия с пулом буферов sync.Pool</a></li><li class="toc-item toc-h3"><a href="#3-matematicheskiy-arbitrazh-cherez-benchstat">3. Математический арбитраж через benchstat</a></li><li class="toc-item toc-h3"><a href="#matematicheskiy-verdikt">Математический вердикт:</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li><li class="toc-item toc-h3"><a href="#zavershenie-podrazdela-02-benchmarking">Завершение подраздела «02. Benchmarking»</a></li>
   </ul>
 </aside>
 
