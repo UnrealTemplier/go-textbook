@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~43 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Zero copy подходы</h1>
@@ -2178,12 +2178,20 @@
           <div class="article-markdown">
             <h2 id="zero-copy-podkhody-kak-peredavat-dannye-ne-kasayas-ikh">Zero copy подходы: как передавать данные, не касаясь их</h2>
 
-<p>В предыдущих статьях мы разобрали стоимость системных вызовов (<a href="1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>), природу узких мест ввода-вывода (<a href="2-io-bottlenecks.html" class="wikilink">2. IO bottlenecks</a>) и асинхронный движок Go — netpoller (<a href="4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>). Все эти механизмы так или иначе крутятся вокруг одного действия: <strong>данные перемещаются между буферами</strong>. При традиционном вводе-выводе процессор занимается копированием байтов из kernel space в user space, из одного буфера в другой, тратя на это миллионы тактов и вымывая кэш.</p>
-<p><strong>Zero copy</strong> (нулевое копирование) — набор техник, позволяющих исключить эти лишние перекладывания данных. Для высоконагруженных Go-сервисов — файловых серверов, прокси, стриминговых платформ — применение zero copy может радикально снизить загрузку CPU и повысить пропускную способность, превращая сервер из «перекладчика байтов» в минималистичный мост между источником и приёмником.</p>
-<p>В этой статье мы разберём фундаментальные механизмы zero copy в Linux (sendfile, splice, mmap), их реализацию в Go, влияние на процессорный кэш и DMA, и научимся применять их там, где это даёт измеримый выигрыш. Это подготовит нас к разговору о переиспользовании буферов (<a href="6-buffer-reuse.html" class="wikilink">6. Buffer reuse</a>) и специфике файлового ввода-вывода (<a href="7-file-io-optimizatsiya.html" class="wikilink">7. File IO оптимизация</a>).</p>
+<p>В предыдущих статьях мы детально разобрали стоимость системных вызовов ядра (<a href="1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>), природу узких мест ввода-вывода (<a href="2-io-bottlenecks.html" class="wikilink">2. IO bottlenecks</a>) и асинхронный движок Go — netpoller (<a href="4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>). Все эти механизмы так или иначе крутятся вокруг одного фундаментального физического действия: <strong>данные непрерывно перемещаются между буферами памяти</strong>.</p>
+<p>При традиционном синхронном вводе-выводе центральный процессор превращается в банального «грузчика байтов». Он тратит миллионы драгоценных машинных тактов на механическое копирование байтов из системного пространства ядра (Kernel Space) в пользовательские слайсы Go (User Space), а затем обратно из пользовательского пространства в системный буфер сокета. При этом шина памяти перегружается бесполезным трафиком, а высокоскоростные кэши L1, L2 и L3 процессора беспощадно вымываются гигабайтами транзитных данных (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<p><strong>Zero copy</strong> (нулевое копирование) — это архитектурная парадигма и семейство системных технологий, позволяющих передавать потоки данных между устройствами хранения и сетевыми интерфейсами <strong>напрямую</strong>, исключая промежуточное перекладывание байтов через память пользовательского процесса. </p>
+<p>Для высоконагруженных Go-сервисов — статических файловых веб-серверов, API-шлюзов, прокси-серверов, брокеров сообщений и медиастриминговых платформ — применение zero copy позволяет снизить утилизацию CPU в разы и приблизить пропускную способность сервиса к физическому пределу сетевого интерфейса (Line Rate).</p>
+<p>В этой статье мы подробно разберем аппаратную природу zero copy в Linux (<code>sendfile</code>, <code>splice</code>, <code>mmap</code>), их внутреннюю реализацию в стандартной библиотеке Go, влияние на процессорный кэш и технологию Intel DDIO, а также разберем практические сценарии и подводные камни их применения. Это подготовит нас к разговору о переиспользовании буферов (<a href="6-buffer-reuse.html" class="wikilink">6. Buffer reuse</a>) и специфике оптимизации дискового ввода-вывода (<a href="7-file-io-optimizatsiya.html" class="wikilink">7. File IO оптимизация</a>).</p>
 <h2 id="pochemu-banalnoe-kopirovanie-vrag-proizvoditelnosti">Почему банальное копирование — враг производительности</h2>
 
-<p>В обычной логике отправки файла через HTTP (без zero copy) путь данных выглядит так:</p>
+<p>Представьте себе склад логистической компании. На дальнем стеллаже (накопитель на диске) лежит паллет с книгами, который требуется загрузить в ожидающую фуру (сетевой сокет).</p>
+<p>При традиционной схеме ввода-вывода (без zero copy) процесс выглядит абсурдно:<br />
+1. Водитель погрузчика привозит паллет со стеллажа в зону временного хранения склада (системный Page Cache ядра Linux через контроллер DMA).<br />
+2. Рабочий перегружает коробки с паллета в кузов служебного фургона и везет их через весь город в административный офис компании (пользовательское пространство процесса Go, системный вызов <code>read</code>).<br />
+3. В офисе программист выгружает коробки на свой рабочий стол, даже не открывая их (аллокация буфера <code>[]byte</code> в куче Go).<br />
+4. Затем те же самые нетронутые коробки загружаются обратно в фургон и везутся обратно на склад (системный вызов <code>write</code>).<br />
+5. На складе коробки выгружаются в буфер сетевого интерфейса ядра (<code>sk_buff</code>), откуда контроллер сетевой карты (NIC) забирает их по DMA и передает в сетевой провод.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2206,33 +2214,46 @@ SockBuf --&gt;|&quot;DMA в сетевую карту&quot;| NIC[&quot;Сете�
 </div>
 
 
-<p>Каждая стрелка «CPU» — это системный вызов <code>read</code> или <code>write</code>, который запускает <code>memmove</code>-подобное копирование. Процессор:<br />
-- Загружает строки кэша из page cache (возможно, из RAM).<br />
-- Копирует байты на стек или в выделенный Go-буфер (аллокация).<br />
-- Снова загружает кэш-линии при записи в буфер сокета.<br />
-- Теряет такты и вымывает полезные данные из L1/L2/L3 (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
-<p>Если файл велик, CPU может стать узким местом, даже если диск и сеть сами по себе не догружены. При этом сами данные приложению не нужны — оно всего лишь ретранслирует их. Zero copy как раз для таких сценариев.</p>
+<p>В этой классической цепочке:<br />
+- Происходят <strong>четыре переключения контекста</strong> (User Space ↔ Kernel Space): два на вызов <code>read()</code> и два на вызов <code>write()</code>.<br />
+- Данные копируются <strong>четыре раза</strong>: дважды аппаратно через DMA и дважды центральным процессором с помощью функций ядра <code>copy_to_user()</code> и <code>copy_from_user()</code> (аналог инструкции ассемблера <code>REP MOVSB</code> или <code>memmove</code>).<br />
+- Процессор вынужден загружать каждую 64-байтную кэш-линию передаваемого файла в свой L1/L2 кэш, вытесняя оттуда исполняемый код и полезные структуры данных приложения (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<p>При отдаче тяжелых файлов процессор на 100% утилизируется тупым копированием памяти, в то время как сеть и дисковая подсистема остаются недогруженными. Zero copy устраняет эту бессмысленную работу.</p>
 <h2 id="chto-takoe-zero-copy-filosofiya-i-sistemnye-vyzovy">Что такое Zero Copy: философия и системные вызовы</h2>
 
-<p>Zero copy — это передача данных между дескрипторами (файлами и сокетами) <strong>без прохождения через userspace</strong>. Ядро перемещает страницы памяти напрямую из одного буфера в другой, используя механизмы управления страницами и DMA.</p>
-<p>Ключевые системные вызовы в Linux:</p>
+<p>Философия <strong>Zero copy</strong> проста: передавать данные между дескрипторами источника и приемника <strong>без физического прохождения байтов через адресное пространство процесса (userspace)</strong>. Центральный процессор перестает быть курьером байтов и превращается в диспетчера, лишь настраивающего указатели и запускающего аппаратные DMA-транзакции.</p>
+<p>Ключевые системные вызовы в операционной системе Linux:</p>
 <ul>
-<li><strong><code>sendfile</code></strong> — передача данных из файла в сокет.</li>
-<li><strong><code>splice</code></strong> — перемещение данных между двумя дескрипторами произвольных типов (через промежуточный pipe).</li>
-<li><strong><code>mmap</code></strong> — отображение файла в память процесса, что позволяет избежать явных <code>read</code>.</li>
+<li><strong><code>sendfile</code></strong> — прямая передача данных из дескриптора файла в сетевой сокет.</li>
+<li><strong><code>splice</code></strong> — универсальное перемещение страниц данных между двумя произвольными дескрипторами через промежуточный системный канал (pipe).</li>
+<li><strong><code>mmap</code></strong> — проецирование дискового файла напрямую в виртуальное адресное пространство процесса, позволяющее обращаться к файлу без явных вызовов <code>read</code>.</li>
 </ul>
-<p>В macOS/BSD есть аналог <code>sendfile</code>, но работающий иначе (принимает заголовки/трейлеры). <code>splice</code> отсутствует, вместо него — <code>sendfile</code> между файлом и сокетом.</p>
+<p>В операционных системах семейства BSD и macOS существует свой вариант системного вызова <code>sendfile</code>, принимающий дополнительные структуры для передачи HTTP-заголовков и трейлеров. Вызов <code>splice</code> в BSD отсутствует, однако концепция прямой передачи страниц сохраняется.</p>
 <h2 id="sendfile-klassika-dlya-faylovogo-vvoda-vyvoda">sendfile: классика для файлового ввода-вывода</h2>
 
-<p>Системный вызов <code>sendfile(out_fd, in_fd, offset, count)</code> передаёт данные из <code>in_fd</code> (обычный файл) в <code>out_fd</code> (сокет) без копирования в userspace. Типичный сценарий — отдача статических файлов HTTP-сервером.</p>
+<p>Системный вызов <code>sendfile(out_fd, in_fd, offset, count)</code> был исторически первым и наиболее популярным решением проблемы раздачи статики в веб-серверах (Apache, Nginx):</p>
+
+<div class="code-block" data-lang="c">
+  <div class="code-header">
+    <span class="code-lang-tag">C</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-c"><code class="language-c">ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+</code></pre>
+</div>
+
+<p>Он пересылает <code>count</code> байт из дескриптора <code>in_fd</code> (открытый дисковый файл) в дескриптор <code>out_fd</code> (сетевой сокет) целиком внутри пространства ядра.</p>
 <h3 id="kak-rabotaet-sendfile-pod-kapotom">Как работает sendfile под капотом</h3>
 
 <ol>
-<li>Ядро проверяет, что <code>in_fd</code> — это файл, поддерживающий <code>mmap</code> (т.е. имеющий отображение в page cache).</li>
-<li>Находит страницы page cache, соответствующие запрашиваемому диапазону. Если страницы не в памяти, они загружаются с диска через DMA.</li>
-<li>Для каждой страницы создаётся структура sk_buff (буфер сокета), которая <strong>ссылается на ту же физическую страницу</strong>, а не копирует данные. Это достигается через механизм <strong>скаттер-гатер</strong> (scatter-gather) — sk_buff указывает на фрагменты страниц.</li>
-<li>После этого страницы помечаются как занятые (увеличивается счётчик ссылок), чтобы они не были вытеснены из page cache до завершения отправки.</li>
-<li>DMA-контроллер сетевой карты читает данные непосредственно из этих страниц (с возможной помощью DDIO — Data Direct I/O от Intel, когда данные проходят через кэш процессора, но не копируются CPU).</li>
+<li>Ядро проверяет валидность дескрипторов: <code>in_fd</code> должен поддерживать механизм отображения памяти (т.е. кэшироваться в системном Page Cache).</li>
+<li>Ядро находит в оперативной памяти страницы Page Cache, соответствующие запрашиваемому смещению файла. Если нужных страниц нет в RAM, контроллер диска по DMA загружает их в Page Cache.</li>
+<li>Сетевой стек Linux формирует дескрипторы сокета — структуры <code>struct sk_buff</code>. Однако вместо физического копирования байтов в буфер сокета, ядро задействует механизм <strong>scatter-gather DMA</strong>: структура <code>sk_buff</code> наполняется <strong>указателями на существующие физические страницы Page Cache</strong>!</li>
+<li>Для каждой задействованной страницы увеличивается счетчик ссылок (reference counter), гарантируя, что ядро не вытеснит и не перезапишет страницу до тех пор, пока отправка не завершится.</li>
+<li>Контроллер сетевой карты (NIC) с поддержкой scatter-gather считывает байты пакета напрямую из страниц Page Cache через DMA и отправляет их в физический кабель.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2255,24 +2276,41 @@ Sock --&gt;|&quot;DMA из страниц&quot;| NIC[&quot;Сетевая кар
 </div>
 
 
-<p>Обратите внимание: CPU вообще не касается данных. Он только настраивает DMA-дескрипторы и обрабатывает прерывания.</p>
+<p>В этой схеме:<br />
+- Происходит всего <strong>два переключения контекста</strong> (один системный вызов <code>sendfile</code>).<br />
+- Количество копирований процессором (CPU copy) равно <strong>абсолютному нулю</strong>! Данные перемещаются исключительно аппаратными блоками DMA.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>В ядре Linux <code>sendfile</code> реализован в <code>fs/read_write.c</code> и <code>fs/splice.c</code>. Он основан на механизме <code>sendpage</code>, который вызывает <code>splice_to_pipe</code> или напрямую передаёт страницы в TCP-стек с помощью <code>tcp_sendpage</code>. В старых ядрах использовался специальный буфер, сейчас — передача страниц через <code>pipe</code> (внутренний механизм), что фактически делает <code>sendfile</code> специализацией <code>splice</code>.</p>
+    <p>В ядре Linux реализация <code>sendfile</code> находится в файлах <code>fs/read_write.c</code> и <code>fs/splice.c</code>. Изначально он опирался на интерфейс <code>sendpage</code>, вызывавший специализированный метод драйвера <code>tcp_sendpage</code>. В современных версиях ядра Linux механизм <code>sendfile</code> унифицирован поверх инфраструктуры <code>splice</code>: ядро использует внутренний безымянный <code>pipe</code> для переброски страниц (<code>splice_to_pipe</code>), что делает <code>sendfile</code> оптимизированной специализацией вызова <code>splice</code>.</p>
   </div>
 </div>
 
 <h2 id="splice-universalnaya-magistral">splice: универсальная магистраль</h2>
 
-<p><code>splice(fd_in, off_in, fd_out, off_out, len, flags)</code> перемещает данные между двумя файловыми дескрипторами <strong>через канал</strong> (pipe), опять же не копируя в userspace. В отличие от <code>sendfile</code>, <code>fd_in</code> или <code>fd_out</code> может быть любым типом (сокет, файл, даже другой pipe), но <strong>ровно один из них должен быть pipe</strong>.</p>
-<p>На практике это означает двойной вызов:<br />
-1. <code>splice(socket_fd, NULL, pipe_write_fd, NULL, len, SPLICE_F_MOVE | SPLICE_F_MORE)</code> — переместить данные из сокета в pipe.<br />
-2. <code>splice(pipe_read_fd, NULL, file_fd, NULL, len, SPLICE_F_MOVE | SPLICE_F_MORE)</code> — переместить из pipe в файл.</p>
-<p>Или наоборот, для передачи от файла к сокету.</p>
+<p>Системный вызов <code>splice</code> (внедрен в Linux 2.6.17) пошел еще дальше. Если <code>sendfile</code> жестко ограничен передачей из файла в сокет, то <code>splice</code> умеет перемещать данные между любыми дескрипторами:</p>
+
+<div class="code-block" data-lang="c">
+  <div class="code-header">
+    <span class="code-lang-tag">C</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-c"><code class="language-c">ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out, 
+               size_t len, unsigned int flags);
+</code></pre>
+</div>
+
+<p>Единственное архитектурное ограничение: <strong>хотя бы один из двух дескрипторов (<code>fd_in</code> или <code>fd_out</code>) обязан быть системным каналом (pipe)</strong>.</p>
+<p>Для соединения двух произвольных сокетов (например, при реализации прозрачного TCP-прокси) <code>splice</code> вызывается дважды:<br />
+1. <code>splice(socket_fd, NULL, pipe_write_fd, NULL, len, SPLICE_F_MOVE | SPLICE_F_MORE)</code> — данные из входящего сокета перенаправляются в системный pipe.<br />
+2. <code>splice(pipe_read_fd, NULL, upstream_socket_fd, NULL, len, SPLICE_F_MOVE | SPLICE_F_MORE)</code> — данные из pipe перенаправляются в исходящий сокет на бэкенд.</p>
+<p>Флаг <code>SPLICE_F_MOVE</code> указывает ядру перемещать страницы памяти без копирования, а <code>SPLICE_F_MORE</code> сигнализирует сетевому стеку о наличии последующих данных (аналог <code>TCP_CORK</code>).</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2295,12 +2333,11 @@ Pipe --&gt;|&quot;splice: данные из pipe&quot;| Dst[Приёмник]
 
 <h3 id="kak-splice-rabotaet-vnutri">Как splice работает внутри</h3>
 
-<p>Внутренне <code>splice</code> оперирует <strong>указателями на страницы памяти</strong> (page references). Когда данные перемещаются из сокета в pipe, ядро извлекает страницы из буфера сокета и помещает их в кольцевой буфер pipe'а, <strong>не копируя байты</strong>. Приёмная сторона (<code>splice</code> из pipe в файл) делает обратную операцию. Это напоминает передачу владения страницами (page flipping).</p>
-<p>Для работы <code>splice</code> требуется, чтобы хотя бы один из дескрипторов поддерживал <code>splice_read</code>/<code>splice_write</code>. Сокеты поддерживают, обычные файлы — тоже (через page cache).</p>
+<p>Под капотом Linux системный канал (pipe) представляет собой кольцевой буфер структур <code>struct pipe_buffer</code>. В этой структуре хранятся не сырые байты, а <strong>указатели на физические страницы памяти</strong> (<code>struct page*</code>) вместе со смещением и длиной.</p>
+<p>Когда данные перенаправляются из сокета в pipe, ядро просто извлекает ссылки на страницы памяти из входящей очереди сетевого интерфейса и записывает эти указатели в кольцевой буфер pipe. Байт-в-байт копирования не происходит: осуществляется так называемый <strong>обмен страницами (page flipping)</strong>. Вызов <code>splice</code> из pipe в сокет-приемник делает обратную операцию. Для работы требуется, чтобы дескрипторы поддерживали методы <code>splice_read</code> и <code>splice_write</code>.</p>
 <h2 id="mmap-dostup-k-faylu-kak-k-pamyati">mmap: доступ к файлу как к памяти</h2>
 
-<p><code>mmap</code> отображает содержимое файла в виртуальное адресное пространство процесса. Теперь Go-программа может читать этот файл как обычный слайс байт. Это устраняет явный системный вызов <code>read</code> и копирование <code>read</code> → userspace. Однако при записи этого слайса в сокет всё равно происходит копирование userspace → socket, если не применять <code>sendfile</code> (но <code>sendfile</code> уже сам берёт данные из page cache). Тем не менее, <code>mmap</code> полезен, когда нужно обрабатывать данные на месте (парсинг, сжатие) или если ядро может более эффективно загружать страницы по требованию (page fault).</p>
-<p>В Go можно использовать <code>syscall.Mmap</code>:</p>
+<p>Системный вызов <code>mmap</code> проецирует содержимое дискового файла напрямую в виртуальное адресное пространство процесса. Для программы на Go отображенный файл выглядит как обычный непрерывный слайс байт <code>[]byte</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2310,33 +2347,40 @@ Pipe --&gt;|&quot;splice: данные из pipe&quot;| Dst[Приёмник]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">f, _ := os.Open(&quot;file.bin&quot;)
+  <pre class="language-go"><code class="language-go">f, err := os.Open(&quot;file.bin&quot;)
+if err != nil {
+    return
+}
 defer f.Close()
+
 fi, _ := f.Stat()
-data, err := syscall.Mmap(int(f.Fd()), 0, int(fi.Size()),
-    syscall.PROT_READ, syscall.MAP_SHARED)
+data, err := syscall.Mmap(int(f.Fd()), 0, int(fi.Size()), syscall.PROT_READ, syscall.MAP_SHARED)
+if err != nil {
+    return
+}
+defer syscall.Munmap(data)
 </code></pre>
 </div>
 
-<p><code>data</code> — это <code>[]byte</code>, напрямую указывающий на page cache. При чтении <code>data[i]</code> может произойти page fault, ядро загрузит страницу с диска. При записи (если MAP_SHARED) изменения синхронизируются с файлом. Но для сетевой передачи без копирования лучше использовать <code>sendfile</code>.</p>
+<p>Переменная <code>data</code> — это валидный слайс Go, базовый указатель которого ссылается непосредственно на адреса виртуальной памяти, связанные с Page Cache ядра. При первом чтении байта <code>data[i]</code> процессор генерирует аппаратное прерывание отсутствия страницы (Page Fault), и ядро прозрачно подгружает 4-килобайтную страницу с диска через DMA.</p>
+<p><code>mmap</code> полностью устраняет системный вызов <code>read</code> и промежуточный буфер. Однако при последующей отправке этого среза в сокет через <code>conn.Write(data)</code> ядру все равно придется выполнить копирование из памяти пользователя в буфер сокета. Поэтому для тривиальной передачи файлов по сети <code>sendfile</code> эффективнее, чем <code>mmap</code>.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><code>mmap</code> отображает файл в виртуальную память процесса. Если забыть <code>Munmap</code>, большие файлы могут занять адресное пространство (что не так страшно на 64-бит), но главное — процесс будет удерживать page cache страницы, не позволяя ядру эффективно управлять памятью.</p>
+    <p><strong>Сигнал <code>SIGBUS</code> при усечении файла в <code>mmap</code>.</strong> Если файл спроецирован через <code>syscall.Mmap</code>, а другой сторонний процесс внезапно усечет этот файл (truncate), попытка вашей Go-программы прочитать байты за пределами новой границы файла вызовет не ошибку Go, а аппаратный сигнал ядра <code>SIGBUS</code> (Bus Error)! Рантайм Go не сможет поймать его через <code>recover()</code>, и сервис аварийно завершится (crash). Кроме того, если вы забудете вызвать <code>syscall.Munmap(data)</code>, процесс будет удерживать страницы Page Cache в заблокированном состоянии.</p>
   </div>
 </div>
 
 <h2 id="zero-copy-v-go-standartnaya-biblioteka">Zero Copy в Go: стандартная библиотека</h2>
 
-<p>Стандартная библиотека Go автоматически использует zero-copy оптимизации в тех случаях, где это возможно и прозрачно для разработчика. Детали реализации платформозависимы и находятся в пакете <code>net</code>.</p>
+<p>Создатели языка Go спроектировали стандартную библиотеку так, чтобы zero-copy оптимизации применялись <strong>автоматически и прозрачно</strong> для разработчика везде, где это технически возможно.</p>
 <h3 id="sendfile-v-go">sendfile в Go</h3>
 
-<p>Если <code>io.Copy</code> копирует данные из <code>*os.File</code> в <code>*net.TCPConn</code>, Go вызывает внутреннюю функцию <code>sendFile</code> (файл <code>net/sendfile_linux.go</code>), которая в Linux делает системный вызов <code>sendfile</code>. Это происходит автоматически, без участия разработчика.</p>
-<p>То же касается <code>http.ServeFile</code>, <code>http.FileServer</code> и других файловых обработчиков: они используют <code>sendfile</code>, если ответ — это файл, а соединение — TCP.</p>
-<p>Исходный код (<code>net/splice_linux.go</code>):</p>
+<p>Когда вы вызываете стандартную функцию <code>io.Copy(dst, src)</code>, и операндами являются <code>dst = *net.TCPConn</code>, а <code>src = *os.File</code>, стандартная библиотека не крутит наивный цикл выделения временного буфера <code>make([]byte, 32*1024)</code>.</p>
+<p>Вместо этого срабатывает специализированный метод <code>(*TCPConn).ReadFrom(r io.Reader)</code>. Внутри него на платформе Linux вызывается функция <code>sendFile</code> из файла <code>src/net/sendfile_linux.go</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2356,9 +2400,11 @@ func sendFile(dst *TCPConn, src *os.File) (written int64, err error) {
 </code></pre>
 </div>
 
+<p>Благодаря этому функции <code>http.ServeFile</code> и стандартный файловый сервер <code>http.FileServer</code> при раздаче статических файлов в Linux работают с эффективностью Nginx, выполняя системный вызов <code>sendfile</code> напрямую на уровне ядра!</p>
 <h3 id="splice-v-go">splice в Go</h3>
 
-<p>Если оба конца <code>io.Copy</code> — это TCP-соединения (сокет в сокет, типичный случай для прокси), Go в Linux пробует использовать <code>splice</code>. Реализация в <code>net/splice_linux.go</code>:</p>
+<p>Если оба конца потока <code>io.Copy</code> являются сетевыми TCP-соединениями (<code>*net.TCPConn</code> → <code>*net.TCPConn</code>), Go в среде Linux пытается задействовать системный вызов <code>splice</code>.</p>
+<p>Реализация находится в файле <code>src/net/splice_linux.go</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2369,21 +2415,36 @@ func sendFile(dst *TCPConn, src *os.File) (written int64, err error) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func splice(dst *TCPConn, src *TCPConn) (int64, error) {
-    // создаётся pipe
+    // создаётся внутренний pipe ядра
     // splice src -&gt; pipe
     // splice pipe -&gt; dst
 }
 </code></pre>
 </div>
 
-<p>Однако <code>splice</code> менее стабилен и поддерживается не на всех ядрах. Go проверяет доступность на старте (<code>attemptSplice</code>), и в случае неудачи прозрачно откатывается к обычному <code>ReadFrom</code>/<code>WriteTo</code> с буфером.</p>
+<p>Рантайм Go автоматически проверяет доступность системного вызова на старте через функцию <code>attemptSplice</code>. Если ядро старое или сокет не поддерживает операцию, рантайм прозрачно деградирует до классического буферизированного копирования через интерфейсы <code>TCPConn.ReadFrom</code> / <code>WriteTo</code>.</p>
 <h3 id="kak-uznat-chto-zero-copy-srabotalo">Как узнать, что zero-copy сработало</h3>
 
-<p>Проще всего — запустить программу под <code>strace</code> и увидеть системные вызовы. Если копирование идёт через <code>sendfile</code> или <code>splice</code>, вы не увидите бесконечных <code>read</code> и <code>write</code>, а один вызов на большую порцию. Также можно поставить брейкпойнт в <code>runtime.sendfile</code> (через Delve).</p>
+<p>Убедиться в том, что ваше приложение задействует zero copy, проще всего с помощью системного трассировщика Linux:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">strace -f -e trace=sendfile,splice,read,write ./my_server
+</code></pre>
+</div>
+
+<p>Если zero copy работает успешно, в выводе трассировки вместо бесконечных парных вызовов <code>read(3, ...) = 32768</code> и <code>write(4, ...) = 32768</code> вы увидите компактные системные вызовы <code>sendfile(4, 3, ...)</code> или <code>splice(3, ..., 5, ...)</code>, передающие мегабайты данных за один системный вызов. Также можно воспользоваться отладчиком Delve, установив точку останова на внутреннюю функцию <code>runtime.sendfile</code>.</p>
 <h2 id="prakticheskiy-primer-proksi-i-staticheskiy-faylovyy-server">Практический пример: прокси и статический файловый сервер</h2>
 
-<h3 id="prosteyshiy-http-proksi-s-io-copy">Простейший HTTP-прокси с io.Copy</h3>
+<h3 id="prosteyshiy-http-proksi-s-io-copy">Простейший HTTP-прокси с `io.Copy`</h3>
 
+<p>Напишем фрагмент обратного HTTP-прокси:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2394,26 +2455,30 @@ func sendFile(dst *TCPConn, src *os.File) (written int64, err error) {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func proxyHandler(w http.ResponseWriter, r *http.Request) {
-    // предположим, у нас есть клиентское соединение
-    upstream, _ := net.Dial(&quot;tcp&quot;, &quot;backend:8080&quot;)
+    // Подключаемся к апстриму бэкенда
+    upstream, err := net.Dial(&quot;tcp&quot;, &quot;backend:8080&quot;)
+    if err != nil {
+        http.Error(w, &quot;Gateway Error&quot;, http.StatusBadGateway)
+        return
+    }
     defer upstream.Close()
 
-    // Проксируем запрос
+    // Передаем исходный запрос на бэкенд
     r.Write(upstream)
 
-    // Проксируем ответ — здесь io.Copy может использовать splice
+    // Читаем и проксируем ответ — здесь io.Copy прозрачно задействует splice!
     if response, err := http.ReadResponse(bufio.NewReader(upstream), r); err == nil {
         defer response.Body.Close()
         copyHeader(w.Header(), response.Header)
         w.WriteHeader(response.StatusCode)
-        io.Copy(w, response.Body) // w — это http.ResponseWriter, под капотом *net.TCPConn
-        // При splice: скопировано без userspace
+        io.Copy(w, response.Body) // w реализует http.ResponseWriter, под капотом *net.TCPConn
+        // Данные передаются ядром через splice без захода в userspace Go
     }
 }
 </code></pre>
 </div>
 
-<p><code>io.Copy</code> внутри вызывает <code>ReadFrom</code> у <code>TCPConn</code>, если источник поддерживает <code>WriteTo</code>. Это запускает <code>sendfile</code>/<code>splice</code>.</p>
+<p>В этом примере функция <code>io.Copy(w, response.Body)</code> автоматически определяет, что и источник, и приемник базируются на сетевых дескрипторах, и передает поток через системный вызов <code>splice</code>.</p>
 <h3 id="staticheskiy-faylovyy-server">Статический файловый сервер</h3>
 
 
@@ -2429,52 +2494,69 @@ func sendFile(dst *TCPConn, src *os.File) (written int64, err error) {
 </code></pre>
 </div>
 
-<p><code>FileServer</code> при запросе файла вызывает <code>serveFile</code>, которая на Linux использует <code>sendFile</code>. Проверить можно <code>strace -e sendfile</code> — будут видны вызовы <code>sendfile</code>.</p>
+<p>Стандартный <code>FileServer</code> вызывает функцию <code>serveFile</code>, которая на платформе Linux делегирует передачу функции <code>sendFile</code>. Проверка через <code>strace -e sendfile</code> покажет, что гигабайтные медиафайлы транслируются напрямую из дискового Page Cache в сетевой сокет, а процесс Go потребляет менее 1% процессорного времени.</p>
 <h2 id="kogda-zero-copy-ne-rabotaet-ogranicheniya-i-podvodnye-kamni">Когда zero copy не работает: ограничения и подводные камни</h2>
 
+<p>Каким бы привлекательным ни казался zero copy, существует жесткий спектр ситуаций, когда его применение архитектурно невозможно:</p>
 <h3 id="1-transformatsiya-dannykh">1. Трансформация данных</h3>
 
-<p>Если вам нужно изменить данные перед отправкой (добавить заголовок, сжать, зашифровать), zero copy невозможна. Вам придётся скопировать данные в userspace для обработки, заплатив CPU. Это особенно важно для HTTPS: шифрование TLS полностью разрушает zero copy, так как данные должны быть зашифрованы в userspace (если не используется kernel TLS — kTLS, который тоже ограничен).</p>
+<p>Если ваше приложение должно модифицировать передаваемый поток:<br />
+- На лету добавлять или изменять заголовки пакетов.<br />
+- Сжимать данные алгоритмами <code>gzip</code>, <code>snappy</code> или <code>zstd</code>.<br />
+- <strong>Шифровать данные по протоколу TLS (HTTPS).</strong></p>
+<p>В этих случаях данные обязаны быть доставлены в пространство пользователя (userspace) для выполнения криптографических вычислений в регистрах CPU. Шифрование TLS полностью разрушает классический <code>sendfile</code> (исключение составляет экспериментальный интерфейс ядра kTLS — Kernel TLS, но его поддержка в Go пока ограничена).</p>
 <h3 id="2-platformennaya-zavisimost">2. Платформенная зависимость</h3>
 
-<p>Zero copy в Go реализован только на Linux, в меньшей степени на macOS (sendfile с заголовками), и слабо на Windows. Код должен корректно деградировать до обычного <code>io.Copy</code>.</p>
+<p>Полноценная поддержка связки <code>sendfile</code> и <code>splice</code> реализована исключительно в ядре Linux. В macOS вызов <code>sendfile</code> имеет другие сигнатуры и семантику, а на платформе Windows аналоги требуют использования специфических Win32 API (<code>TransmitFile</code>). Код на Go обязан всегда предусматривать корректную деградацию до обычного <code>io.Copy</code>.</p>
 <h3 id="3-razmery-buferov-i-upravlenie-pamyatyu">3. Размеры буферов и управление памятью</h3>
 
-<p>При использовании <code>splice</code> данные временно живут в pipe. Размер pipe ограничен (по умолчанию 16 страниц, т.е. 64 КБ). Если передаваемый объём превышает этот размер, <code>splice</code> выполняется частями, что добавляет накладные расходы. <code>sendfile</code> также работает порциями до 2 ГБ.</p>
+<p>При использовании вызова <code>splice</code> страницы памяти временно размещаются в буфере системного канала (pipe). Размер pipe в Linux ограничен (по умолчанию 16 страниц, т.е. 64 КБ). Если объем передаваемых данных больше, операция <code>splice</code> выполняется последовательными порциями. Вызов <code>sendfile</code> также ограничен порциями до 2 ГБ за один вызов.</p>
 <h3 id="4-edge-triggered-povedenie">4. Edge-triggered поведение</h3>
 
-<p>При использовании <code>splice</code> с сокетами необходимо аккуратно обрабатывать <code>EAGAIN</code> и повторять вызовы, чтобы не потерять событие готовности. Рантайм Go делает это внутри.</p>
+<p>При работе с неблокирующими сокетами системный вызов <code>splice</code> может вернуть ошибку <code>EAGAIN</code>. Рантайм Go корректно перехватывает этот статус и интегрирует ожидание с netpoller, однако при самостоятельной реализации через низкоуровневые системные вызовы эту обработку необходимо реализовывать вручную.</p>
 <h3 id="5-kontrol-za-vremenem-zhizni-stranits">5. Контроль за временем жизни страниц</h3>
 
-<p>Если страница передана в сокет через <code>sendfile</code>, она удерживается до тех пор, пока TCP-стек не подтвердит отправку (ACK). Это может задерживать освобождение page cache памяти, что при большом трафике влияет на доступную память.</p>
+<p>Когда страница памяти передана в сокет через <code>sendfile</code>, она удерживается в оперативной памяти до тех пор, пока удаленный клиент не пришлет подтверждение TCP ACK. Если сеть медленная, а передаваемый файл огромен, ядро будет вынуждено держать заблокированными гигабайты страниц Page Cache, создавая искусственный дефицит памяти для других процессов.</p>
 <h2 id="mechanical-sympathy-kesh-dma-i-cpu">Mechanical Sympathy: кэш, DMA и CPU</h2>
 
-<p>На первый взгляд, zero copy полностью избавляет процессор от работы. Но есть нюансы:</p>
 <ul>
-<li><strong>Data Direct I/O (DDIO).</strong> В процессорах Intel начиная с Xeon E5 данные, передаваемые DMA, могут загружаться в L3-кэш процессора, минуя основную память. Это ускоряет последующую обработку, но также означает, что даже при zero copy данные «касаются» кэша, потенциально вымывая полезные данные приложения. Однако сам CPU не тратит такты на <code>memmove</code>.</li>
-<li><strong>TLB и метаданные.</strong> Ядро должно настраивать дескрипторы страниц, таблицы трансляции, обновлять счётчики. Это работа CPU, хоть и небольшая.</li>
-<li><strong>Стоимость syscall.</strong> <code>sendfile</code> и <code>splice</code> — это системные вызовы, каждый со своей ценой (<a href="1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>). Если нужно отправить много маленьких файлов, накладные расходы на syscall могут превысить выгоду от избегания копирования. Буферизация и агрегация всё ещё важны.</li>
+<li><strong>Data Direct I/O (Intel DDIO):</strong><br />
+  Начиная с микроархитектуры Intel Xeon E5, внедрена аппаратная технология DDIO. При передаче данных через DMA сетевой адаптер взаимодействует не с медленной DRAM, а напрямую с L3-кэшем процессора (Last Level Cache). Это радикально снижает задержку, однако означает, что даже при zero copy огромные сетевые потоки физически проходят через L3-кэш, потенциально вымывая оттуда горячие данные других потоков.</li>
+<li><strong>Таблицы страниц и TLB:</strong><br />
+  Несмотря на отсутствие копирования байтов, ядро процессора обязано манипулировать дескрипторами страниц и структурами <code>sk_buff</code>, выполняя легкую системную работу.</li>
+<li><strong>Стоимость системных вызовов:</strong><br />
+<code>sendfile</code> и <code>splice</code> — это полноценные системные вызовы (<a href="1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>). При передаче крошечных файлов (по 100 байт) накладные расходы на постоянный вход в Ring 0 могут нивелировать выигрыш от экономии на копировании. Буферизация и агрегация всё ещё важны.</li>
 </ul>
-<p>Для Senior-инженера ключевой навык — <strong>измерять</strong>. Профилировщик CPU (<code>runtime/pprof</code>) покажет, исчезли ли <code>memmove</code> и <code>read/write</code> из горячих точек. <code>perf stat</code> покажет снижение cache misses и увеличение throughput.</p>
+<p>Для Senior-инженера ключевой навык — <strong>измерять</strong>. Профилировщик CPU (<code>runtime/pprof</code>) покажет, исчезли ли <code>memmove</code> и <code>read/write</code> из горячих точек. Утилита <code>perf stat</code> покажет снижение cache misses и увеличение throughput.</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> В каких случаях функция <code>io.Copy</code> в Go выполняет операцию Zero Copy, а в каких нет?<br />
+<strong>Ответ:</strong> <code>io.Copy</code> использует Zero Copy только на поддерживаемых платформах (прежде всего Linux) и при определенных типах аргументов. Если передача идет из <code>*os.File</code> в <code>*net.TCPConn</code>, <code>io.Copy</code> под капотом вызывает метод <code>ReadFrom</code>, который делает системный вызов ядра <code>sendfile</code> (прямо из Page Cache в сетевой сокет). Если оба аргумента — <code>*net.TCPConn</code>, рантайм использует вызов <code>splice</code> через внутренний системный pipe. Если же хотя бы один из аргументов оборачивает буферизацию (например, <code>bufio.Reader</code>), шифрование (<code>tls.Conn</code>) или сжатие (<code>gzip.Reader</code>), данные неизбежно копируются в userspace через промежуточный буфер в куче.</p>
+  </div>
+</div>
+
 <h2 id="sravnenie-s-drugimi-yazykami">Сравнение с другими языками</h2>
 
 <ul>
-<li><strong>C/C++:</strong> Прямой доступ к <code>sendfile</code>/<code>splice</code>, но разработчик сам управляет буферами и асинхронностью.</li>
-<li><strong>Java:</strong> NIO предоставляет <code>FileChannel.transferTo/transferFrom</code>, которые под капотом вызывают <code>sendfile</code>/<code>splice</code>. Эффективность сравнима, но модель синхронизации сложнее (до Loom).</li>
-<li><strong>Rust (tokio, async-std):</strong> Аналогичные zero-copy примитивы. Благодаря контролю памяти аллокации минимальны.</li>
-<li><strong>Go:</strong> Zero copy встроен прозрачно, но не всегда очевиден. Разработчик получает его автоматически, но теряет тонкий контроль.</li>
+<li><strong>C/C++:</strong> Предоставляет прямой доступ к <code>sendfile</code>, <code>splice</code>, <code>vmsplice</code> и асинхронному <code>io_uring</code>. Разработчик имеет абсолютный контроль над буферами, но вынужден самостоятельно писать всю логику обработки ошибок и интеграции с <code>epoll</code>.</li>
+<li><strong>Java:</strong> Спецификация Java NIO предоставляет методы <code>FileChannel.transferTo/transferFrom</code> (<code>transferTo</code> и <code>transferFrom</code>), которые в Linux компилируются в системный вызов <code>sendfile</code>. Эффективность сопоставима с Go.</li>
+<li><strong>Rust (tokio, async-std):</strong> Предоставляет высокопроизводительные абстракции над zero-copy системными вызовами без сборщика мусора.</li>
+<li><strong>Язык Go:</strong> Максимально дружелюбен к инженеру: zero-copy механизмы активируются под капотом привычных интерфейсов <code>io.Reader</code> и <code>io.Writer</code> автоматически, обеспечивая производительность промышленного уровня без усложнения кодовой базы.</li>
 </ul>
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Zero copy</strong> — это семейство техник (<code>sendfile</code>, <code>splice</code>, <code>mmap</code>), позволяющих передавать данные между файлами и сокетами без промежуточного копирования через userspace.</li>
-<li>В Linux <code>sendfile</code> передаёт данные из файла в сокет через page cache и указатели; <code>splice</code> — универсальный двусторонний мост через pipe.</li>
-<li>Стандартная библиотека Go автоматически применяет zero copy в <code>io.Copy</code>, <code>http.ServeFile</code> и прокси через <code>TCPConn.ReadFrom</code>/<code>WriteTo</code>, если условия позволяют.</li>
-<li>Zero copy исключает CPU из уравнения, но не отменяет накладные расходы на системные вызовы, удержание страниц и влияние на кэш (DDIO).</li>
-<li>Трансформация данных (TLS, сжатие) разрушает zero copy; для HTTP/2 и gRPC данные всё равно копируются в userspace.</li>
-<li>Понимание zero copy и умение его включать/диагностировать (через <code>strace</code>, профили) — часть арсенала Senior-инженера, строящего высоконагруженные бэкенды.</li>
+<li><strong>Zero copy</strong> — концепция исключения промежуточного копирования данных через пользовательское пространство (User Space) с передачей страниц памяти напрямую между устройствами через аппаратный контроллер DMA.</li>
+<li>В операционной системе Linux базовыми механизмами являются системные вызовы <code>sendfile</code> (файл → сокет), <code>splice</code> (сокет ↔ сокет через системный pipe) и <code>mmap</code> (отображение файла в виртуальную память).</li>
+<li>Стандартная библиотека Go автоматически задействует <code>sendfile</code> и <code>splice</code> внутри стандартного метода <code>io.Copy</code> при передаче между файлами и TCP-сокетами.</li>
+<li>Модификация данных (шифрование TLS, сжатие, разбор заголовков) делает zero copy невозможным, принуждая процесс читать байты в память userspace.</li>
+<li>Диагностика работы zero copy в рантайме Go выполняется системным трассировщиком <code>strace</code> и профилировщиком CPU <code>runtime/pprof</code> (по отсутствию функций <code>memmove</code> и <code>copy_to_user</code>).</li>
 </ul>
-<p>Теперь, зная, как избежать лишних копирований, мы готовы рассмотреть следующий уровень — грамотное переиспользование буферов, чтобы даже при вынужденном копировании не порождать лавину аллокаций: <a href="6-buffer-reuse.html" class="wikilink">6. Buffer reuse</a>.</p>
+<p>Теперь, разобравшись, как полностью избежать лишних копирований, мы переходим к следующему фундаментальному уровню: как эффективно переиспользовать память, если копирование данных внутри приложения неизбежно: <a href="6-buffer-reuse.html" class="wikilink">6. Buffer reuse</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
