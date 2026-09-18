@@ -2169,57 +2169,160 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~42 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 4 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Inline и влияние на performance</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="pochemu-inlayning-eto-ne-prosto-vstroit-funktsiyu">Почему инлайнинг — это не просто «встроить функцию»</h2>
+            <h1>Inline и влияние на performance: цена вызова и анатомия оптимизаций</h1>
+<blockquote>
+<p><em>"A function call should be free in thought, but it is never free in silicon."</em><br />
+— Инженерный закон системного программирования  </p>
+<p><em>"Simplicity does not precede complexity, but follows it. Inlining is the compiler's way of turning our clean abstractions back into brutal linear machine code."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>В учебниках по программированию нас справедливо учат декомпозиции: разбивайте большие функции на маленькие, создавайте выразительные геттеры, изолируйте валидацию в лаконичные вспомогательные методы. Это делает архитектуру человечной, понятной и надежной.</p>
+<p>Но кремниевый кристалл процессора ничего не знает о чистоте архитектуры. Для конвейера CPU каждый вызов функции — это дорогостоящая церемония. Нужно подготовить аргументы в регистрах, выполнить инструкцию <code>CALL</code>, протолкнуть адрес возврата в аппаратный стек, выделить стековый кадр, выполнить две строчки сложения, восстановить регистры и выполнить инструкцию <code>RET</code>. Если полезная работа функции занимает ровно 1 такт процессора, а церемония ее вызова — 12 тактов, программа тратит более 90% энергии впустую!</p>
+<p>Чтобы разрешить этот вечный конфликт между чистотой архитектуры и безжалостной физикой процессора, компиляторы используют <strong>инлайнинг</strong> (inlining, или подстановку тела функции непосредственно в место вызова). Но влияние инлайнинга простирается неизмеримо дальше устранения накладных расходов <code>CALL</code>/<code>RET</code>: он кардинально меняет правила побега памяти в кучу (Escape Analysis), удаляет мертвые ветви кода и полностью перекраивает картину в CPU-профилях и Flamegraph.</p>
+<p>В этой лекции мы разберем, как инлайнинг работает на уровне машинного кода, как компилятор Go рассчитывает бюджет сложности функций, почему инлайнинг спасает от сборщика мусора и где проходит граница, за которой подстановка кода начинает разрушать кэш процессора.</p>
+<hr />
+<h2 id="pochemu-inlayning-eto-ne-prosto-vstroit-funktsiyu">Почему инлайнинг — это не просто «встроить функцию»</h2>
 
-<p>В <a href="4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a> мы научились классифицировать горячие функции и выявили, что множество мелких вызовов создают ощутимую нагрузку. В <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a> мы видели в <code>top</code> цепочки вызовов, где каждый переход отъедает такты. Теперь мы разберём механизм, который компилятор Go использует, чтобы убрать эти переходы — <strong>инлайнинг</strong> (inlining).</p>
-<p>Инлайнинг — это подстановка тела функции непосредственно в место вызова, исключающая накладные расходы на call/return, передачу аргументов и создание стекового кадра. Но его влияние гораздо глубже: он меняет то, как escape analysis распределяет память между кучей и стеком, открывает возможности для последующих оптимизаций и может кардинально изменить картину в CPU-профиле и flamegraph. Senior-инженер обязан понимать не только «что делает инлайнинг», но и «почему в одном месте он происходит, а в другом нет», и как этим управлять для достижения целевых метрик.</p>
+<p>В <a href="4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a> мы научились классифицировать горячие функции и заметили, что множество мелких вспомогательных вызовов создают ощутимую паразитную нагрузку. В <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a> мы видели в <code>top</code> длинные цепочки вызовов, где каждый шаг отнимает такты.</p>
+<p>Инлайнинг — главный катализатор оптимизирующего компилятора Go:<br />
+1. Он физически вырезает границу вызова функции.<br />
+2. Он объединяет изолированные пространства переменных вызывающей и вызываемой функций в единый контекст.<br />
+3. Он запускает цепную реакцию последующих оптимизаций в промежуточном представлении <strong>SSA (Static Single Assignment)</strong>: свертку констант, удаление мертвого кода и размещение объектов на стеке вместо кучи.</p>
+<p>Senior-инженер обязан не просто знать слово «инлайнинг», а понимать, почему в одной функции компилятор выполнил встраивание, а в соседней отказался, и как структурировать критический код, чтобы компилятор выжал из кремния максимум.</p>
+<hr />
 <h2 id="chto-takoe-inlayning-s-tochki-zreniya-protsessora">Что такое инлайнинг с точки зрения процессора</h2>
 
-<p>Каждый вызов функции в скомпилированном коде — это последовательность инструкций:</p>
+<p>Чтобы оценить колоссальную ценность инлайнинга, проследим полную аппаратную церемонию обычного вызова функции на архитектуре x86-64 / ARM64:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+sequenceDiagram
+autonumber
+participant Caller as Вызывающая функция (Caller)
+participant Regs as Регистры CPU (RAX, RDI, RSI, RSP)
+participant Stack as Оперативный стек (D-Cache / RAM)
+participant Callee as Вызываемая функция (Callee)
+
+Caller-&gt;&gt;Regs: 1. Загрузка аргументов в регистры ABIInternal
+Caller-&gt;&gt;Stack: 2. Инструкция CALL: сохранение RIP возврата на стек
+Note over Caller,Callee: Аппаратный переход: сброс конвейера, задержка декодера
+Callee-&gt;&gt;Stack: 3. Пролог: SUBQ $16, RSP (выделение кадра)
+Callee-&gt;&gt;Regs: 4. Тело функции (1 такт: ADDQ RDI, RAX)
+Callee-&gt;&gt;Stack: 5. Эпилог: ADDQ $16, RSP (освобождение кадра)
+Callee-&gt;&gt;Stack: 6. Инструкция RET: вычитка RIP с вершины стека
+Note over Callee,Caller: Прыжок назад: валидация через Return Stack Buffer (RSB)
+Caller-&gt;&gt;Caller: 7. Продолжение выполнения основного цикла
+  </pre>
+</div>
+
+
+<h3 id="nakladnye-raskhody-kazhdogo-shaga">Накладные расходы каждого шага:</h3>
 <ol>
-<li>Подготовка аргументов (помещение в регистры или на стек согласно ABI).</li>
-<li>Выполнение <code>CALL</code> — процессор кладёт адрес возврата на стек и переходит по адресу функции.</li>
-<li>Пролог функции: сохранение frame pointer, выделение места под локальные переменные.</li>
-<li>Тело функции.</li>
-<li>Эпилог: восстановление стека и <code>RET</code> — прыжок обратно по сохранённому адресу.</li>
+<li><strong>Инструкция <code>CALL</code> и <code>RET</code>:</strong> Запись и чтение адреса возврата на вершине стека (<code>RSP</code>). Хотя современный блок предсказания возвратов <strong>RSB (Return Stack Buffer)</strong> работает великолепно, инструкция <code>CALL</code> все равно тратит от 2 до 6 процессорных тактов.</li>
+<li><strong>Пролог и эпилог кадра:</strong> Манипуляции со стековым указателем <code>RSP</code> для резервирования места под локальные переменные.</li>
+<li><strong>Разрыв конвейера инструкций:</strong> Переход по удаленному адресу в памяти может вызвать промах мимо кэша инструкций <strong>L1I</strong> и потребовать ожидания декодера инструкций.</li>
+<li><strong>Вытеснение данных:</strong> Создание нового стекового кадра раздувает рабочий набор кэша данных <strong>L1D</strong>, повышая вероятность вытеснения полезных структур.</li>
 </ol>
-<p>Это стоит от нескольких тактов до десятка в зависимости от попадания в кэш инструкций и успешности предсказания перехода. Но главное — <code>CALL</code> разрывает конвейер процессора, потому что спекулятивное исполнение должно либо предсказать возврат, либо сбросить конвейер при промахе (хотя современные предсказатели возврата, типа Return Stack Buffer, очень точны). Кроме того, вызов формирует новый стековый кадр, который может вытеснить из L1-кэша данные вызывающей функции.</p>
-<p>Инлайнинг убирает всё это. Компилятор вставляет инструкции тела функции прямо в вызывающий код, как если бы вы написали их руками. Нет <code>CALL</code>, нет пролога/эпилога, аргументы могут оставаться в регистрах. Для крошечных функций (геттеры, проверки условий) это даёт ускорение в разы, а в CPU-профиле они перестают существовать как отдельные сущности — их время «растворяется» в родителе.</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                    До и после инлайнинга в ассемблере                   |
+|                                                                         |
+|  [Обычный вызов функции add(a, b)]       [Заинлайненный код]            |
+|    MOVQ   $10, AX                          ADDQ   $20, AX               |
+|    MOVQ   $20, BX                          (1 инструкция!               |
+|    CALL   main.add                          0 тактов на вызов,          |
+|    ...                                      чистая арифметика)          |
+|  main.add:                                                              |
+|    ADDQ   BX, AX                                                        |
+|    RET                                                                  |
++-------------------------------------------------------------------------+
+</code></pre>
+</div>
+
+<p>Инлайнинг физически устраняет этот ритуал. Компилятор подставляет машинные инструкции тела функции прямо в вызывающий код. Нет <code>CALL</code>, нет пролога, нет <code>RET</code>, аргументы вообще не покидают регистры ALU. Для простых операций (сложение, чтение поля структуры, проверка граничных условий) это дает <strong>ускорение в 3–5 раз</strong>!</p>
+<hr />
 <h2 id="kak-go-reshaet-chto-inlaynit">Как Go решает, что инлайнить</h2>
 
-<p>Решение об инлайнинге принимается на этапе SSA (Static Single Assignment) в компиляторе Go. Эвристики эволюционировали, но на момент Go 1.22+ основные критерии таковы:</p>
-<ul>
-<li><strong>Размер функции.</strong> До Go 1.12 инлайнились только функции без циклов, не порождающие замыканий и имеющие менее ~40 инструкций SSA. С введением <strong>mid-stack inlining</strong> (Go 1.12) планка повышена: можно инлайнить функции, которые сами вызывают другие, если они не превышают бюджет инструкций (примерно 80 узлов SSA). Конкретный бюджет настраивается флагом <code>-gcflags="-l=4"</code> (уровни линковки), но в продакшене это трогают редко.</li>
-<li><strong>Отсутствие сложных конструкций.</strong> Не инлайнятся функции с:</li>
-<li><code>defer</code> (хотя Go 1.18+ научился инлайнить простые defer в некоторых случаях),</li>
-<li><code>recover</code>,</li>
-<li><code>select</code>,</li>
-<li><code>go func()</code> (замыкания, запускаемые как горутины, кроме тривиальных),</li>
-<li><code>for</code> с неконстантными границами (раньше — любые циклы, сейчас иногда с простыми допускаются),</li>
-<li>поимённые результаты, если они сложно используются.</li>
-<li><strong>Замыкания.</strong> Анонимные функции обычно не инлайнятся, если они не вызываются сразу в той же области.</li>
-<li><strong>Интерфейсные вызовы.</strong> Динамический диспетчеринг исключает инлайнинг вызываемой конкретной реализации. Компилятор не знает, какой тип за интерфейсом, и не может подставить код.</li>
-</ul>
+<p>Решение о возможности встраивания принимается компилятором Go на этапе прохода <code>inline</code> и построения промежуточного графа <strong>SSA (Static Single Assignment)</strong>.</p>
+<p>Эвристики компилятора непрерывно развивались:<br />
+- <strong>Go до 1.12:</strong> Инлайнились только так называемые «листовые» функции (leaf functions) — функции, которые сами не вызывали никаких других функций, не содержали циклов и имели «стоимость» менее ~40 абстрактных операций.<br />
+- <strong>Go 1.12+ (Mid-Stack Inlining):</strong> Фундаментальный прорыв! Компилятор научился инлайнить функции, находящиеся в середине стека вызовов (то есть вызывающие другие подфункции), если их совокупная сложность не превышает бюджет.<br />
+- <strong>Go 1.22+ / 1.24+:</strong> Стандартный <strong>бюджет сложности функции составляет 80 узлов SSA</strong> (Nodes Budget). Каждая операция (сложение, чтение переменной, ветвление) имеет свою фиксированную «стоимость». Если сумма весов превышает 80, компилятор отказывает в инлайнинге.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Func[&quot;Функция-кандидат на инлайнинг&quot;] --&gt; Check1{&quot;Содержит запрещенные конструкции?&lt;br&gt;(defer, recover, select, go func)&quot;}
+Check1 -- &quot;Да&quot; --&gt; Reject[&quot;❌ Отказ в инлайнинге&quot;]
+Check1 -- &quot;Нет&quot; --&gt; Check2{&quot;Является ли вызовом интерфейса?&lt;br&gt;(Динамический диспетчеринг)&quot;}
+Check2 -- &quot;Да&quot; --&gt; Reject
+Check2 -- &quot;Нет&quot; --&gt; CalcBudget[&quot;Расчет веса AST/SSA узлов (Cost)&quot;]
+CalcBudget --&gt; Check3{&quot;Cost &lt;= 80 узлов бюджета?&quot;}
+Check3 -- &quot;Нет (Cost &gt; 80)&quot; --&gt; RejectTooComplex[&quot;❌ Отказ: function too complex&quot;]
+Check3 -- &quot;Да (Cost &lt;= 80)&quot; --&gt; InlineSuccess[&quot;✅ Успешный Mid-Stack Inlining!&quot;]
+  </pre>
+</div>
+
+
+<h3 id="konstruktsii-blokiruyushchie-inlayning">Конструкции, блокирующие инлайнинг:</h3>
+<ol>
+<li><strong><code>defer</code> и <code>recover</code>:</strong> Долгое время блокировали инлайнинг полностью. В современных версиях Go (1.22+) тривиальные <code>open-coded defers</code> могут инлайниться, но любая сложная логика отложенных вызовов гарантированно закрывает возможность подстановки.</li>
+<li><strong><code>select</code> и конкурентные примитивы:</strong> Любой канал в блоке <code>select</code> требует тяжелой координации рантайма и исключает инлайнинг.</li>
+<li><strong>Запуск горутин <code>go func()</code>:</strong> Создание отдельной горутины требует упаковки аргументов и вызова планировщика.</li>
+<li><strong>Сложные циклы <code>for</code> с неконстантными границами:</strong> Простые циклы с константным числом итераций иногда могут разворачиваться (Loop Unrolling), но динамические циклы резко завышают бюджет сложности функции.</li>
+<li><strong>Вызовы методов через интерфейсы:</strong> Если метод вызывается через интерфейс <code>MyInterface.Execute()</code>, компилятор не знает конкретного типа во время компиляции (динамический полиморфизм через <code>itable</code>). Инлайнинг невозможен, кроме редких случаев PGO или девиртуализации.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Настройка бюджета линковщика</span>
   </div>
   <div class="callout-body">
-    <p>Компилятор принимает решение об инлайнинге на этапе <code>inline</code> pass (до SSA, в AST). Затем SSA-оптимизатор может дополнительно инлайнить или отменять решения. Mid-stack inlining работает так: функция помечается как «inline-кандидат», и её тело, включая вызовы вложенных функций, встраивается. При этом создаётся «пред-инлайн» копия, а SSA-проход выполняет фактическое слияние. Если вложенная функция тоже маленькая и не содержит запретов, она тоже инлайнится — возникает «глубокий» инлайнинг.</p>
+    <p>Бюджет инлайнинга компилятора можно форсировать через передачу скрытого флага компилятора <code>-gcflags="-l=4"</code> (уровни агрессивности инлайнинга от 1 до 4). Однако в промышленной разработке трогать этот флаг категорически не рекомендуется: агрессивный инлайнинг приводит к гигантскому раздуванию размера бинарника (Code Bloat) и деградации L1I-кэша.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kak-uznat-chto-funktsiya-zainlaynena">Как узнать, что функция заинлайнена</h2>
 
-<p>Самый прямой способ — попросить компилятор показать решения:</p>
+<p>Никогда не гадайте — спросите компилятор напрямую.</p>
+<h3 id="1-flag-optimizatora-gcflags-m">1. Флаг оптимизатора `-gcflags="-m"`</h3>
+<p>Передайте компилятору флаг <code>-m</code> для включения диагностических логов оптимизаций:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2233,7 +2336,7 @@
 </code></pre>
 </div>
 
-<p>Вывод покажет строки вида:</p>
+<p>Вывод компилятора предельно информативен:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2245,10 +2348,17 @@
   </div>
   <pre class="language-text"><code class="language-text">./main.go:15:6: can inline add
 ./main.go:24:6: cannot inline heavyFunc: function too complex: cost 128 exceeds budget 80
+./main.go:42:13: inlining call to add
 </code></pre>
 </div>
 
-<p>Альтернативно, дизассемблировать:</p>
+<ul>
+<li><code>can inline add</code> — функция признана достаточно простой для встраивания.</li>
+<li><code>cannot inline heavyFunc: function too complex: cost 128 exceeds budget 80</code> — функция превысила лимит сложности на 48 единиц.</li>
+<li><code>inlining call to add</code> — конкретное место вызова, куда было подставлено тело функции.</li>
+</ul>
+<h3 id="2-analiz-assemblernogo-listinga">2. Анализ ассемблерного листинга</h3>
+<p>Чтобы лично убедиться в отсутствии инструкции <code>CALL</code>, дизассемблируйте код утилитой <code>go tool compile</code>:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2262,33 +2372,88 @@
 </code></pre>
 </div>
 
-<p>Если в ассемблерном листинге по месту вызова нет инструкции <code>CALL</code>, а есть просто арифметика — функция заинлайнена.</p>
-<p>В коде бенчмарков можно временно отключить инлайнинг флагом <code>-gcflags="-l"</code> (минус <code>l</code> с маленькой — отключает инлайнинг полностью) и сравнить производительность: если разница велика, инлайнинг важен.</p>
+<p>Если по месту вызова вместо инструкции <code>CALL</code> сгенерирована прямая инструкция <code>ADDQ</code> или <code>MOVQ</code> — функция полностью заинлайнена.</p>
+<h3 id="3-test-s-otklyucheniem-inlayninga">3. Тест с отключением инлайнинга</h3>
+<p>В бенчмарках можно временно принудительно отключить инлайнинг флагом <code>-gcflags="-l"</code> (строчная буква L от слова «disable inlining»):</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># Замер с инлайнингом
+go test -bench=BenchmarkMath
+
+# Замер с ПОЛНОСТЬЮ отключенным инлайнингом
+go test -gcflags=&quot;-l&quot; -bench=BenchmarkMath
+</code></pre>
+</div>
+
+<p>Сравнение покажет чистую стоимость накладных расходов на вызовы в вашем алгоритме.</p>
+<hr />
 <h2 id="vliyanie-na-proizvoditelnost-dvoystvennaya-priroda">Влияние на производительность: двойственная природа</h2>
 
-<h3 id="polozhitelnye-effekty">Положительные эффекты</h3>
+<p>Инлайнинг — обоюдоострый меч. Как и любая глубокая системная оптимизация, он несет как колоссальные выгоды, так и скрытые угрозы.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Inlining[&quot;Инлайнинг функций&quot;]
+
+Inlining --&gt; Pros[&quot;Положительные эффекты&quot;]
+Pros --&gt; P1[&quot;Устранение CALL / RET (~3-10 тактов)&quot;]
+Pros --&gt; P2[&quot;Свертка констант (Constant Folding)&quot;]
+Pros --&gt; P3[&quot;Удаление мертвого кода (DCE)&quot;]
+Pros --&gt; P4[&quot;Стековое размещение (Escape Analysis!)&quot;]
+Pros --&gt; P5[&quot;Bounds Check Elimination (BCE)&quot;]
+
+Inlining --&gt; Cons[&quot;Отрицательные эффекты&quot;]
+Cons --&gt; C1[&quot;Раздувание бинарного кода (Code Bloat)&quot;]
+Cons --&gt; C2[&quot;Вымывание кэша инструкций L1 I-cache&quot;]
+Cons --&gt; C3[&quot;Маскировка функций в CPU-профиле top&quot;]
+  </pre>
+</div>
+
+
+<h3 id="polozhitelnye-effekty">Положительные эффекты:</h3>
 
 <ol>
-<li><strong>Устранение overhead вызова.</strong> Самое очевидное — экономия тактов на <code>CALL</code>/<code>RET</code>, сохранение/восстановление регистров. Для функций из 1-2 инструкций это может дать ускорение в 2-4 раза.</li>
-<li><strong>Улучшенная локальность инструкций.</strong> Код остаётся в L1 Instruction Cache (I-cache), не прыгает в другие адреса. Меньше промахов I-cache.</li>
-<li><strong>Раскрытие возможностей для других оптимизаций.</strong> Когда компилятор видит тело функции в контексте вызывающего кода, он может:<br />
-   - <strong>Constant folding / propagation.</strong> Если аргумент — константа, инлайн-функция может быть вычислена на этапе компиляции.<br />
-   - <strong>Dead code elimination.</strong> После инлайнинга ветки, зависящие от констант, удаляются.<br />
-   - <strong>Escape analysis.</strong> Если инлайн-функция принимает указатель, компилятор видит, что он не утекает за пределы вызывающего кода, и может разместить объект на стеке, а не в куче (см. <a href="../04-memory-profiling/3-escape-analysis.html" class="wikilink">3. Escape analysis</a>). Это кардинально снижает нагрузку на GC.<br />
-   - <strong>Устранение проверки границ (bounds check elimination).</strong> При инлайнинге циклов со слайсами компилятор может понять, что индекс безопасен.</li>
+<li><strong>Экономия процессорных тактов:</strong> Устранение прологов, эпилогов и команд перехода.</li>
+<li><strong>Локальность потока инструкций:</strong> Процессор выполняет непрерывный линейный блок инструкций без прыжков по памяти.</li>
+<li><strong>Раскрытие каскадных оптимизаций компилятора:</strong><br />
+   - <strong>Constant folding / propagation:</strong> Если аргументом инлайн-функции является константа, компилятор производит все вычисления на этапе компиляции, подставляя готовое число.<br />
+   - <strong>Dead code elimination (DCE):</strong> Ветки <code>if</code>, зависящие от аргументов-констант, полностью вырезаются из машинного кода.<br />
+   - <strong>Bounds check elimination (BCE):</strong> Компилятор доказывает безопасность доступа к элементам слайса и выбрасывает скрытые проверки индексов <code>runtime.panicIndex</code>.<br />
+   - <strong>Победа над кучей (Escape analysis):</strong> Главнейший эффект! Компилятор видит жизненный цикл переменной внутри вызывающей функции и оставляет ее на стеке.</li>
 </ol>
-<p>Таким образом, инлайнинг не просто убирает call, он часто <strong>снижает количество аллокаций</strong> (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>) и открывает путь к деоптимизации менее эффективного кода.</p>
-<h3 id="otritsatelnye-effekty">Отрицательные эффекты</h3>
+<hr />
+<h3 id="otritsatelnye-effekty">Отрицательные эффекты:</h3>
 
 <ol>
-<li><strong>Раздувание кода (code bloat).</strong> Каждая инлайн-копия увеличивает размер исполняемого файла. В больших проектах это может превысить допустимый бюджет I-cache. Чрезмерный инлайнинг ведёт к тому, что горячий цикл больше не помещается в L1 I-cache, и производительность падает.</li>
-<li><strong>Усложнение отладки и профилирования.</strong> Заинлайненные функции не видны в стеке (они не формируют отдельный кадр). В CPU-профиле и flamegraph они не появляются, что мешает понять, сколько раз они исполняются. Вы видите только родителя, который стал «толще».</li>
-<li><strong>Потеря гибкости во время выполнения.</strong> Инлайн-версия не может быть заменена (патчингом, переопределением). Впрочем, для Go это нехарактерно.</li>
+<li><strong>Раздувание машинного кода (Code Bloat):</strong><br />
+   Если функция объемом в 50 байт вызывается в 1000 разных мест проекта, компилятор продублирует ее тело 1000 раз, добавив 50 КБ чистого машинного кода.</li>
+<li><strong>Катастрофа кэша инструкций (L1 I-cache Thrashing):</strong><br />
+   Объем кэша инструкций <strong>L1I</strong> в современных процессорах составляет всего <strong>32 КБ</strong> на ядро! Если раздутый горячий цикл перестает помещаться в 32 КБ, процессор начинает испытывать непрерывные промахи кэша инструкций (I-cache misses), и производительность программы резко падает.</li>
+<li><strong>Искажение и маскировка в профилях:</strong><br />
+   Заинлайненная функция физически перестает существовать в таблице символов как отдельный стек. В отчете <code>top</code> вы ее не увидите — ее время полностью растворится в вызывающей функции.</li>
 </ol>
-<p>Компилятор Go придерживается консервативного бюджета, чтобы балансировать ускорение и размер. Разработчик изредка может помочь компилятору, слегка изменив код.</p>
+<hr />
 <h2 id="inlayning-v-profilyakh-kak-uvidet-effekt">Инлайнинг в профилях: как увидеть эффект</h2>
 
-<p>Предположим, у нас есть код:</p>
+<p>Рассмотрим показательный код:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2298,19 +2463,24 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func add(a, b int) int { return a + b }
+  <pre class="language-go"><code class="language-go">package main
+
+func add(a, b int) int {
+    return a + b
+}
 
 func sumSlice(s []int) int {
     sum := 0
     for _, v := range s {
-        sum = add(sum, v) // будет инлайнено
+        sum = add(sum, v) // Идеальный кандидат на инлайнинг
     }
     return sum
 }
 </code></pre>
 </div>
 
-<p>В CPU-профиле, снятом с кода без инлайнинга (с флагом <code>-l</code>), мы увидим:</p>
+<h3 id="profil-bez-inlayninga-go-test-gcflags-l">Профиль без инлайнинга (`go test -gcflags="-l"`):</h3>
+
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2320,27 +2490,53 @@ func sumSlice(s []int) int {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text">flat  flat%   cum%
-0.30s 15.00% 0.30s 15.00%  main.add
-0.70s 35.00% 1.00s 50.00%  main.sumSlice
+  <pre class="language-text"><code class="language-text">(pprof) top
+Showing nodes accounting for 1.00s, 100% of 1.00s total
+      flat  flat%   sum%        cum   cum%
+     0.70s 70.00% 70.00%      0.70s 70.00%  main.add
+     0.30s 30.00% 100.0%      1.00s 100.0%  main.sumSlice
 </code></pre>
 </div>
 
-<p>С инлайнингом <code>main.add</code> исчезнет из профиля, а <code>main.sumSlice</code> займёт все 100% времени. Для разработчика это означает, что функция <code>add</code> не требует оптимизации — она бесплатна. Но если бы в <code>add</code> была дорогая логика, мы бы не узнали об этом без дизассемблера. Именно поэтому при анализе Flamegraph (<a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a>) стоит искать «раздутые» родительские функции и при необходимости проверять наличие инлайн-потомков через <code>go tool compile -S</code>.</p>
+<p>70% времени программа потратила на вызовы функции <code>main.add</code>!</p>
+<h3 id="profil-s-vklyuchennym-inlayningom-po-umolchaniyu">Профиль с включенным инлайнингом (по умолчанию):</h3>
+
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) top
+Showing nodes accounting for 0.25s, 100% of 0.25s total
+      flat  flat%   sum%        cum   cum%
+     0.25s 100.0% 100.0%      0.25s 100.0%  main.sumSlice
+</code></pre>
+</div>
+
+<p><strong>Результат:</strong><br />
+1. Функция <code>main.add</code> полностью <strong>исчезла из отчета <code>top</code></strong>!<br />
+2. Общее время выполнения сократилось <strong>с 1.00s до 0.25s (ускорение ровно в 4 раза!)</strong>.<br />
+3. В Flamegraph (<a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a>) пропали лишние этажи, стек стал плоским и монолитным.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ложная оптимизация невидимки</span>
   </div>
   <div class="callout-body">
-    <p>При анализе производительности нельзя полагаться только на <code>top</code>. Функция может быть невидима из-за инлайнинга, и вы можете оптимизировать родителя, не догадываясь, что проблема во встроенной логике. Используйте <code>-gcflags="-m"</code> и ассемблерный вывод, чтобы контролировать, что именно попало в замер.</p>
+    <p>Если в отчете <code>top</code> функция <code>sumSlice</code> занимает 100% CPU, неопытный разработчик бросится переписывать цикл. Однако в реальном сервисе внутри <code>sumSlice</code> могли быть заинлайнены десятки мелких методов. Если один из них был неоптимален, в профиле он невидим!<br />
+<strong>Правило:</strong> При исследовании раздутых функций всегда сверяйтесь с логом <code>go build -gcflags="-m"</code> и дизассемблером <code>go tool compile -S</code>, чтобы точно знать, какие методы растворились в теле функции.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="inlayning-i-escape-analysis-tandem-kotoryy-spasaet-ot-gc">Инлайнинг и escape analysis: тандем, который спасает от GC</h2>
 
-<p>Один из мощнейших косвенных эффектов инлайнинга — помощь в размещении переменных на стеке.</p>
-<p>Пример:</p>
+<p>Самый драматический эффект инлайнинга в Go — это не экономия наносекунд на инструкции <code>CALL</code>, а <strong>предотвращение аллокаций в куче</strong>!</p>
+<p>Разберем классический пример:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2350,59 +2546,142 @@ func sumSlice(s []int) int {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type Buffer struct{ data [64]byte }
+  <pre class="language-go"><code class="language-go">type Buffer struct {
+    data [64]byte
+}
 
-func newBuffer() *Buffer { return &amp;Buffer{} }
+// Конструктор, возвращающий указатель
+func newBuffer() *Buffer {
+    return &amp;Buffer{}
+}
 
 func process() {
     b := newBuffer()
-    // используем b
+    // Интенсивная работа с b...
+    _ = b
 }
 </code></pre>
 </div>
 
-<p>Без инлайнинга <code>newBuffer</code> — отдельная функция, возвращающая указатель. Компилятор видит, что указатель «уходит» из функции, и помечает, что <code>Buffer</code> сбегает в кучу. Escape analysis (<a href="../04-memory-profiling/3-escape-analysis.html" class="wikilink">3. Escape analysis</a>) фиксирует аллокацию. Если же <code>newBuffer</code> заинлайнена, возврат указателя происходит в контексте <code>process</code>, и компилятор видит, что указатель не покидает стек <code>process</code>, поэтому <code>Buffer</code> можно разместить на стеке. Число аллокаций падает, GC испытывает меньшую нагрузку.</p>
-<p>Отсюда практический совет: <strong>маленькие конструкторы и геттеры должны быть простыми</strong>, чтобы компилятор их инлайнил и не плодил кучу.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph WithoutInlining[&quot;1. Без инлайнинга (newBuffer изолирован)&quot;]
+W1[&quot;newBuffer создает &amp;Buffer{}&quot;]
+W2[&quot;Компилятор анализирует границы функции:&lt;br&gt;указатель покидает кадр newBuffer!&quot;]
+W3[&quot;Вердикт Escape Analysis:&lt;br&gt;escapes to heap!&quot;]
+W4[&quot;Результат: Аллокация в куче через runtime.newobject&lt;br&gt;Нагрузка на сборщик мусора GC&quot;]
+W1 --&gt; W2 --&gt; W3 --&gt; W4
+end
+
+subgraph WithInlining[&quot;2. С инлайнингом (Тело newBuffer встроено в process)&quot;]
+I1[&quot;Тело &amp;Buffer{} подставляется внутрь process&quot;]
+I2[&quot;Компилятор видит весь жизненный цикл b:&lt;br&gt;указатель никогда не покидает стек process!&quot;]
+I3[&quot;Вердикт Escape Analysis:&lt;br&gt;does not escape!&quot;]
+I4[&quot;Результат: Размещение строго на стеке (0 аллокаций!)&lt;br&gt;Абсолютно бесплатное освобождение при выходе&quot;]
+I1 --&gt; I2 --&gt; I3 --&gt; I4
+end
+  </pre>
+</div>
+
+
+<p>Без инлайнинга функция <code>newBuffer</code> компилируется как независимый блок. Компилятор видит, что локальная переменная возвращается по указателю наружу, и обязан отправить ее в кучу (<a href="../04-memory-profiling/3-escape-analysis.html" class="wikilink">3. Escape analysis</a>). Каждое создание буфера вызывает аллокатор <code>runtime.newobject</code> и нагружает GC.</p>
+<p>При инлайнинге граница функции стирается. Компилятор видит, что буфер создается и уничтожается строго внутри <code>process()</code>. Переменная <strong>остается на стеке</strong>.<br />
+Количество аллокаций падает со 100 000 до <strong>0</strong>!</p>
+<hr />
 <h2 id="prakticheskie-retsepty-i-antipatterny">Практические рецепты и антипаттерны</h2>
 
-<h3 id="1-razbivayte-bolshie-funktsii-na-neskolko-malenkikh-s-oglyadkoy">1. Разбивайте большие функции на несколько маленьких — с оглядкой</h3>
+<p>Senior-инженер пишет код так, чтобы компилятор охотно применял инлайнинг в критических путях:</p>
+<h3 id="1-pattern-bystryy-put-medlennyy-put-fast-path-slow-path">1. Паттерн «Быстрый путь / Медленный путь» (Fast Path / Slow Path)</h3>
+<p>Если функция в 99% случаев тривиальна, но содержит редкую сложную обработку ошибок, разделите ее на две:</p>
 
-<p>Дробление улучшает читаемость, но если дочерние функции не инлайнятся (из-за сложности), вы получите лишние call-ы. Проверяйте <code>-gcflags="-m"</code>: если критичная цепочка не инлайнится, либо упростите внутренние функции, либо объедините их вручную.</p>
-<h3 id="2-izbegayte-defer-v-goryachikh-malenkikh-funktsiyakh">2. Избегайте `defer` в горячих маленьких функциях</h3>
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">// ПЛОХО: Функция перегружена обработкой ошибок и не может быть заинлайнена (cost &gt; 80)
+func (c *Cache) Get(key string) ([]byte, error) {
+    c.mu.RLock()
+    val, ok := c.items[key]
+    c.mu.RUnlock()
+    if !ok {
+        // Тяжелое форматирование ошибки раздувает бюджет SSA
+        return nil, fmt.Errorf(&quot;item with key %s not found in cache&quot;, key)
+    }
+    return val, nil
+}
 
-<p><code>defer</code> долго не инлайнился, и до сих пор имеет ограничения. Если функция с <code>defer</code> не инлайнится, а она часто вызывается — это потеря производительности. Выносите <code>defer</code> выше или используйте manual cleanup.</p>
+// ОТЛИЧНО: Fast Path инлайнится, Slow Path вынесен в отдельную функцию!
+func (c *Cache) Get(key string) ([]byte, error) {
+    c.mu.RLock()
+    val, ok := c.items[key]
+    c.mu.RUnlock()
+    if !ok {
+        return c.slowNotFound(key) // Вызов редкой тяжелой функции
+    }
+    return val, nil // Быстрый путь встраивается в место вызова!
+}
+
+//go:noinline
+func (c *Cache) slowNotFound(key string) ([]byte, error) {
+    return nil, fmt.Errorf(&quot;item with key %s not found in cache&quot;, key)
+}
+</code></pre>
+</div>
+
+<h3 id="2-izbegayte-defer-v-malenkikh-goryachikh-funktsiyakh">2. Избегайте `defer` в маленьких горячих функциях</h3>
+<p>Инструкция <code>defer</code> в критическом цикле может легко лишить функцию права на инлайнинг. В высоконагруженных участках отдавайте предпочтение явному освобождению ресурсов.</p>
 <h3 id="3-ne-ispolzuyte-gonoinline-bez-veskoy-prichiny">3. Не используйте `go:noinline` без веской причины</h3>
-
-<p>Аннотация <code>//go:noinline</code> запрещает инлайнинг (часто для бенчмарков, чтобы избежать DCE). Если вы забыли её убрать в production — производительность упадёт.</p>
+<p>Аннотация <code>//go:noinline</code> принудительно запрещает оптимизатору встраивать функцию. Ее используют в бенчмарках для предотвращения удаления мертвого кода компилятором (DCE) или в тестах трассировки стека. Забытая директива <code>//go:noinline</code> в продакшене способна обрушить производительность сервиса в разы.</p>
 <h3 id="4-vnimatelno-proveryayte-interfeysnye-vyzovy">4. Внимательно проверяйте интерфейсные вызовы</h3>
-
-<p>Вызов метода через интерфейс никогда не инлайнится. Если это горячий путь, подумайте о замене интерфейса на конкретный тип или generic (с Go 1.18+ generics инлайнятся на уровне конкретного типа при мономорфизации). Но generics не панацея: инстанциация может создать свой набор функций, которые инлайнятся по обычным правилам.</p>
+<p>Вызов метода через интерфейс никогда не инлайнится компилятором. Если это горячий путь, подумайте о замене интерфейса на конкретный тип или generic (с Go 1.18+ generics инлайнятся на уровне конкретного типа при мономорфизации). Но generics не панацея: инстанциация создает свой код, подчиняющийся обычным правилам бюджета.</p>
 <h3 id="5-ne-gonites-za-inlayningom-v-ushcherb-yasnosti">5. Не гонитесь за инлайнингом в ущерб ясности</h3>
-
-<p>Микрооптимизации ради инлайнинга стоит применять только в доказанно горячих точках. Компилятор с каждым релизом умнеет, и то, что не инлайнилось вчера, может инлайниться завтра.</p>
+<p>Микрооптимизации ради инлайнинга стоит применять только в доказанно горячих точках. Читаемость и надежность кода всегда первичны. Компилятор с каждым релизом совершенствуется, и то, что не инлайнилось вчера, может автоматически заинлайниться завтра.</p>
+<hr />
 <h2 id="mechanical-sympathy-kak-inlayning-vzaimodeystvuet-s-protsessorom">Mechanical Sympathy: как инлайнинг взаимодействует с процессором</h2>
 
-<p>Инлайнинг не только убирает инструкции <code>CALL</code>. Он меняет шаблон доступа к памяти и поведение предсказателя переходов.</p>
-<ul>
-<li><strong>L1 I-cache:</strong> плотно упакованный инлайн-код лучше сидит в кэше инструкций. Но если инлайнинг раздувает код, может случиться вымывание: больше инструкций, чем I-cache, и начинаются промахи. Именно поэтому компилятор лимитирует бюджет.</li>
-<li><strong>Предсказание возврата (Return Stack Buffer).</strong> Каждый <code>CALL</code> добавляет запись в RSB, а <code>RET</code> — извлекает. При инлайнинге RSB не используется для этой функции, что уменьшает нагрузку на предсказатель, но это незаметно.</li>
-<li><strong>Спекулятивное исполнение:</strong> линейный код без переходов — идеал для конвейера. Инлайнинг «выпрямляет» исполнение, позволяя процессору загружать инструкции на много тактов вперёд.</li>
-<li><strong>Косвенно → кэш данных:</strong> уменьшение аллокаций (благодаря escape analysis) значит, что меньше мусора, меньше нагрузка на GC, и больше полезного времени CPU. Меньше давление на кэш данных, так как стековые объекты отлично локальны.</li>
-</ul>
+<p>Инлайнинг перестраивает физическое взаимодействие кода с кремнием:</p>
+<ol>
+<li><strong>L1I Instruction Cache:</strong><br />
+   Компактный инлайнинг удерживает горячий цикл в пределах 32 КБ кэша инструкций L1I. Однако чрезмерное раздувание кода приводит к эффекту <strong>I-cache Misses</strong>, когда процессор вынужден простаивать, подтягивая машинный код из L2/L3 кэшей.</li>
+<li><strong>Линеаризация конвейера (Pipelining):</strong><br />
+   Процессорный конвейер суперскалярного ядра любит прямые, непрерывные участки инструкций. Отсутствие переходов позволяет механизму Out-of-Order Execution (OoOE) и аппаратному префетчеру инструкций загружать конвейер на десятки тактов вперед без пауз.</li>
+<li><strong>Снижение нагрузки на Return Stack Buffer (RSB):</strong><br />
+   Аппаратный стек адресов возврата процессора имеет ограниченную глубину (обычно 16–32 записи). Инлайнинг устраняет вложенные вызовы, предотвращая переполнение RSB и устраняя штрафы за неверно предсказанные возвраты из функций.</li>
+</ol>
+<hr />
 <h2 id="inlayning-i-benchmarki">Инлайнинг и бенчмарки</h2>
 
-<p>При сравнении версий кода всегда проверяйте, не изменился ли инлайнинг. Внезапное ухудшение <code>ns/op</code> может быть вызвано тем, что невинное изменение структуры или добавление <code>if</code> выбило функцию из бюджета инлайнинга. Сравнивайте <code>-gcflags="-m"</code> вывод для обеих версий, и профили с отключённым инлайнингом, чтобы изолировать эффект.</p>
+<p>При анализе бенчмарков (<a href="../02-benchmarking/8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>) всегда проверяйте лог оптимизаций.</p>
+<p>Классическая драма: разработчик добавил в быструю функцию всего одну строчку логирования <code>log.Printf(...)</code> или проверку условия <code>if</code>. Скорость бенчмарка внезапно рухнула: показатель <code>ns/op</code> подскочил на 300%!<br />
+Разработчик в панике ищет ошибку в логировании, а реальная причина проста: эта строчка увеличила стоимость функции с 75 до 85 узлов, и <strong>компилятор молча отключил инлайнинг</strong>.</p>
+<p>Всегда сопоставляйте вывод <code>go build -gcflags="-m"</code> между двумя версиями кода, чтобы мгновенно обнаруживать потерю инлайнинга в критических функциях.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ul>
-<li><strong>Инлайнинг</strong> — ключевая оптимизация компилятора Go, устраняющая call/return и открывающая путь к escape analysis, constant propagation и удалению мёртвого кода.</li>
-<li>Критерии инлайнинга: размер и сложность функции (бюджет инструкций), отсутствие <code>defer</code>/<code>select</code>/<code>for</code> (в сложных случаях). Mid-stack inlining расширил возможности.</li>
-<li>В профилях инлайн-функции исчезают, поэтому важно проверять ассемблерный вывод, чтобы не пропустить «невидимые» горячие участки.</li>
-<li>Правильное использование инлайнинга (маленькие функции-конструкторы, избегание ненужных <code>defer</code>) снижает аллокации и нагрузку на GC.</li>
-<li>Избыточный инлайнинг ведёт к раздуванию кода и промахам I-cache; компилятор держит баланс, и ручная игра с бюджетами — на свой страх и риск.</li>
-<li>Понимание инлайнинга — часть инженерной культуры, разделяющей Senior, который видит не только код, но и то, во что его превращает компилятор.</li>
-</ul>
-<p>Теперь, когда мы знаем, как компилятор «склеивает» функции, перейдём к тому, как процессор предсказывает ветвления внутри них — и как это влияет на производительность. Следующая статья: <a href="6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>.</p>
+<ol>
+<li><strong>Инлайнинг — корона оптимизирующего компилятора:</strong> Он не просто экономит наносекунды на командах <code>CALL</code>/<code>RET</code>, а запускает каскад глубоких оптимизаций SSA (BCE, DCE, Constant Folding).</li>
+<li><strong>Бюджет сложности в Go (80 узлов):</strong> Компилятор Go консервативен: сложные функции с циклами, <code>defer</code> и тяжелыми ветвлениями не встраиваются.</li>
+<li><strong>Тандем с Escape Analysis:</strong> Инлайнинг позволяет компилятору удерживать создаваемые структуры на быстром стеке, предотвращая дорогостоящие аллокации в куче и разгружая Garbage Collector.</li>
+<li><strong>Невидимость в профилях:</strong> Заинлайненная функция растворяется в теле вызывающего родителя. Для ее обнаружения требуется дизассемблирование <code>go tool compile -S</code> и анализ логов <code>-gcflags="-m"</code>.</li>
+<li><strong>Опасность раздувания (Code Bloat):</strong> Чрезмерный инлайнинг вымывает кэш инструкций L1I (32 КБ). Баланс компилятора — надежная защита от переоптимизации.</li>
+</ol>
+<p>Теперь, когда мы понимаем, как компилятор выпрямляет код в единый поток инструкций, мы готовы заглянуть в то, как процессор справляется с развилками внутри этого кода: следующая лекция посвящена кремниевому предсказателю переходов — <a href="6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2430,7 +2709,7 @@ func process() {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pochemu-inlayning-eto-ne-prosto-vstroit-funktsiyu">Почему инлайнинг — это не просто «встроить функцию»</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-inlayning-s-tochki-zreniya-protsessora">Что такое инлайнинг с точки зрения процессора</a></li><li class="toc-item toc-h2"><a href="#kak-go-reshaet-chto-inlaynit">Как Go решает, что инлайнить</a></li><li class="toc-item toc-h2"><a href="#kak-uznat-chto-funktsiya-zainlaynena">Как узнать, что функция заинлайнена</a></li><li class="toc-item toc-h2"><a href="#vliyanie-na-proizvoditelnost-dvoystvennaya-priroda">Влияние на производительность: двойственная природа</a></li><li class="toc-item toc-h3"><a href="#polozhitelnye-effekty">Положительные эффекты</a></li><li class="toc-item toc-h3"><a href="#otritsatelnye-effekty">Отрицательные эффекты</a></li><li class="toc-item toc-h2"><a href="#inlayning-v-profilyakh-kak-uvidet-effekt">Инлайнинг в профилях: как увидеть эффект</a></li><li class="toc-item toc-h2"><a href="#inlayning-i-escape-analysis-tandem-kotoryy-spasaet-ot-gc">Инлайнинг и escape analysis: тандем, который спасает от GC</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-retsepty-i-antipatterny">Практические рецепты и антипаттерны</a></li><li class="toc-item toc-h3"><a href="#1-razbivayte-bolshie-funktsii-na-neskolko-malenkikh-s-oglyadkoy">1. Разбивайте большие функции на несколько маленьких — с оглядкой</a></li><li class="toc-item toc-h3"><a href="#2-izbegayte-defer-v-goryachikh-malenkikh-funktsiyakh">2. Избегайте defer в горячих маленьких функциях</a></li><li class="toc-item toc-h3"><a href="#3-ne-ispolzuyte-gonoinline-bez-veskoy-prichiny">3. Не используйте go:noinline без веской причины</a></li><li class="toc-item toc-h3"><a href="#4-vnimatelno-proveryayte-interfeysnye-vyzovy">4. Внимательно проверяйте интерфейсные вызовы</a></li><li class="toc-item toc-h3"><a href="#5-ne-gonites-za-inlayningom-v-ushcherb-yasnosti">5. Не гонитесь за инлайнингом в ущерб ясности</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-inlayning-vzaimodeystvuet-s-protsessorom">Mechanical Sympathy: как инлайнинг взаимодействует с процессором</a></li><li class="toc-item toc-h2"><a href="#inlayning-i-benchmarki">Инлайнинг и бенчмарки</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#pochemu-inlayning-eto-ne-prosto-vstroit-funktsiyu">Почему инлайнинг — это не просто «встроить функцию»</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-inlayning-s-tochki-zreniya-protsessora">Что такое инлайнинг с точки зрения процессора</a></li><li class="toc-item toc-h3"><a href="#nakladnye-raskhody-kazhdogo-shaga">Накладные расходы каждого шага:</a></li><li class="toc-item toc-h2"><a href="#kak-go-reshaet-chto-inlaynit">Как Go решает, что инлайнить</a></li><li class="toc-item toc-h3"><a href="#konstruktsii-blokiruyushchie-inlayning">Конструкции, блокирующие инлайнинг:</a></li><li class="toc-item toc-h2"><a href="#kak-uznat-chto-funktsiya-zainlaynena">Как узнать, что функция заинлайнена</a></li><li class="toc-item toc-h3"><a href="#1-flag-optimizatora-gcflags-m">1. Флаг оптимизатора -gcflags=&quot;-m&quot;</a></li><li class="toc-item toc-h3"><a href="#2-analiz-assemblernogo-listinga">2. Анализ ассемблерного листинга</a></li><li class="toc-item toc-h3"><a href="#3-test-s-otklyucheniem-inlayninga">3. Тест с отключением инлайнинга</a></li><li class="toc-item toc-h2"><a href="#vliyanie-na-proizvoditelnost-dvoystvennaya-priroda">Влияние на производительность: двойственная природа</a></li><li class="toc-item toc-h3"><a href="#polozhitelnye-effekty">Положительные эффекты:</a></li><li class="toc-item toc-h3"><a href="#otritsatelnye-effekty">Отрицательные эффекты:</a></li><li class="toc-item toc-h2"><a href="#inlayning-v-profilyakh-kak-uvidet-effekt">Инлайнинг в профилях: как увидеть эффект</a></li><li class="toc-item toc-h3"><a href="#profil-bez-inlayninga-go-test-gcflags-l">Профиль без инлайнинга (go test -gcflags=&quot;-l&quot;):</a></li><li class="toc-item toc-h3"><a href="#profil-s-vklyuchennym-inlayningom-po-umolchaniyu">Профиль с включенным инлайнингом (по умолчанию):</a></li><li class="toc-item toc-h2"><a href="#inlayning-i-escape-analysis-tandem-kotoryy-spasaet-ot-gc">Инлайнинг и escape analysis: тандем, который спасает от GC</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-retsepty-i-antipatterny">Практические рецепты и антипаттерны</a></li><li class="toc-item toc-h3"><a href="#1-pattern-bystryy-put-medlennyy-put-fast-path-slow-path">1. Паттерн «Быстрый путь / Медленный путь» (Fast Path / Slow Path)</a></li><li class="toc-item toc-h3"><a href="#2-izbegayte-defer-v-malenkikh-goryachikh-funktsiyakh">2. Избегайте defer в маленьких горячих функциях</a></li><li class="toc-item toc-h3"><a href="#3-ne-ispolzuyte-gonoinline-bez-veskoy-prichiny">3. Не используйте go:noinline без веской причины</a></li><li class="toc-item toc-h3"><a href="#4-vnimatelno-proveryayte-interfeysnye-vyzovy">4. Внимательно проверяйте интерфейсные вызовы</a></li><li class="toc-item toc-h3"><a href="#5-ne-gonites-za-inlayningom-v-ushcherb-yasnosti">5. Не гонитесь за инлайнингом в ущерб ясности</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-inlayning-vzaimodeystvuet-s-protsessorom">Mechanical Sympathy: как инлайнинг взаимодействует с процессором</a></li><li class="toc-item toc-h2"><a href="#inlayning-i-benchmarki">Инлайнинг и бенчмарки</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

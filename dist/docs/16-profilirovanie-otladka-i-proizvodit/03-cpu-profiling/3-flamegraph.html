@@ -2169,26 +2169,30 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~38 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 6 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Flamegraph</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="pochemu-plamya-luchshiy-drug-inzhenera">Почему пламя — лучший друг инженера</h2>
+            <h1>Flamegraph: визуализация процессорного времени и чтение пламени</h1>
+<blockquote>
+<p><em>"A picture is worth a thousand words. A flamegraph is worth a thousand stack traces."</em><br />
+— Брендан Грегг  </p>
+<p><em>"The art of profiling is not in collecting numbers, but in visualizing the flow of time."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>Представьте, что вам принесли распечатку телефонной книги объемом в пятьсот страниц, где каждая строчка — это стек вызовов: функции, пакеты, шестнадцатеричные адреса и счетчики тактов. Вам нужно за пять минут найти, почему процессор тратит 40% энергии впустую. Читать такую распечатку вручную — пытка. Даже консольная таблица <code>top</code> (<a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>) дает лишь плоский срез: она сообщает, что функция <code>runtime.mallocgc</code> заняла 30% времени, но наглухо скрывает, <em>кто именно</em> из сотен ваших обработчиков запросов спровоцировал этот лавинообразный шторм аллокаций.</p>
+<p>В 2011 году выдающийся системный инженер Брендан Грегг (Brendan Gregg), расследуя загадочное падение производительности базы данных в ядре Solaris, нарисовал первый в истории <strong>Flamegraph</strong> (пламенный график). Это изобретение навсегда перевернуло индустрию профилирования. Вместо блуждания по бесконечным текстовым простыням стеков инженер получил интуитивную цветовую карту процессорного времени.</p>
+<p>В Go технология Flamegraph интегрирована непосредственно в стандартный бинарник <code>go tool pprof</code>. В этой лекции мы разберем анатомию пламенных графиков, поймем, как рантайн сворачивает тысячи сэмплов в компактное дерево вызовов, научимся мгновенно вычислять виновников деградации по форме «башен» и «плато» и освоим искусство дифференциального визуального сравнения двух версий сервиса.</p>
+<hr />
+<h2 id="pochemu-plamya-luchshiy-drug-inzhenera">Почему пламя — лучший друг инженера</h2>
 
-<p>В <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a> мы научились получать CPU-профиль и читать таблицу <code>top</code> с <code>flat</code> и <code>cum</code>. Но таблица бессильна, когда нужно понять иерархию вызовов: «кто позвал эту тяжёлую функцию?», «какой путь съедает больше всего процессора?». Ответ даёт <strong>flamegraph</strong> — интерактивная визуализация, превращающая тысячи сэмплов стека в цветную карту времени.</p>
-<p>Flamegraph (граф-пламя) изобрёл Брендан Грегг для анализа производительности Linux, а затем инструмент был адаптирован для многих языков. В Go flamegraph встроен в <code>go tool pprof</code> и доступен через веб-интерфейс. Он заменяет гадание на таблицах пониманием: одним взглядом видно, какая функция «раздута» и через какую цепочку вызовов она исполняется.</p>
-<p>Эта статья — мост между сухими цифрами <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a> и глубинными причинами: инлайнингом (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>), предсказанием ветвлений (<a href="6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>), симметричным расположением в кэше (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>). Flamegraph даёт картину, а дальше мы раскладываем её на составляющие.</p>
-<h2 id="kak-ustroen-flamegraph">Как устроен flamegraph</h2>
-
-<p>Flamegraph — это горизонтальная столбчатая диаграмма, в которой:</p>
-<ul>
-<li><strong>Ось Y</strong> — глубина стека вызовов. Снизу вверх: от <code>main</code> или точки входа горутины до листовых функций.</li>
-<li><strong>Ось X</strong> — время, потраченное процессором. Ширина прямоугольника пропорциональна суммарному времени, проведённому в данной функции и её потомках (cumulative time).</li>
-<li><strong>Цвета</strong> — условно назначаются по пакетам, но могут отражать другие категории. В <code>pprof</code> по умолчанию цвета тёплые (красный/оранжевый) для кода пользователя, холодные (синий/зелёный) для рантайма, но это настраивается.</li>
-</ul>
+<p>В <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a> мы освоили консольный анализ через команды <code>top</code> и <code>list</code>. Они идеальны для точечной микрохирургии, когда имя больной функции уже известно. Но табличный вывод абсолютно бессилен перед вопросами системной топологии:<br />
+- <em>Через какую именно цепочку промежуточных мидлварей и хендлеров вызывается эта тяжелая сериализация?</em><br />
+- <em>Какую долю времени съедает роутер по сравнению с бизнес-логикой и обращением к БД?</em><br />
+- <em>Почему простая валидация входных данных раздулась в бесконечный стек вспомогательных абстракций?</em></p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2203,26 +2207,97 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-subgraph Flamegraph[&quot;Визуализация flamegraph&quot;]
-direction LR
-Main[&quot;main&quot;] --&gt; Process[&quot;ProcessRequest&quot;]
-Process --&gt; Parse[&quot;json.Unmarshal&quot;]
-Process --&gt; Validate[&quot;Validate&quot;]
-Parse --&gt; Malloc[&quot;runtime.mallocgc&quot;]
-Validate --&gt; Regexp[&quot;regexp.Find&quot;]
+subgraph RawData[&quot;Хаос сырых данных&quot;]
+Stacks[&quot;100 000 сэмплов SIGPROF&lt;br&gt;Сотни уникальных стеков глубиной до 60 кадров&quot;]
 end
-MainWidth[&quot;Ширина main = 100% времени&quot;]
-ParseWidth[&quot;Ширина Parse = 40%&quot;]
-MallocWidth[&quot;Ширина mallocgc = 25%&quot;]
+
+subgraph ClassicalTools[&quot;Классические инструменты&quot;]
+TopTab[&quot;Таблица top: плоский список без контекста&lt;br&gt;(Кто вызвал mallocgc? Неизвестно!)&quot;]
+Graphviz[&quot;Граф Graphviz: клубок из сотен стрелок&lt;br&gt;(Невозможно читать в реальном сервисе)&quot;]
+end
+
+subgraph FlamegraphSolution[&quot;Решение: Flamegraph (Брендан Грегг)&quot;]
+Flame[&quot;Интерактивная карта времени:&lt;br&gt;Ось X = 100% CPU, Ось Y = Глубина стека&lt;br&gt;Ширина блока = Реальная цена функции&quot;]
+end
+
+RawData --&gt; ClassicalTools
+RawData --&gt; FlamegraphSolution
   </pre>
 </div>
 
 
-<p>Каждый прямоугольник — это функция. Если навести курсор, всплывает подсказка: имя функции, пакет, абсолютное время (миллисекунды) и процент от общего. Прямоугольники, расположенные один над другим, образуют стек: функция снизу вызвала функцию сверху.</p>
-<p>Таким образом, flamegraph визуализирует иерархическое распределение <em>cumulative time</em>. Чтобы найти узкое место, мы ищем «широкие» полосы на верхних уровнях — это функции, которые сами исполняются долго и не передают управление дальше (flat time велик). Или широкие полосы в середине — диспетчеры, вызывающие дорогие операции.</p>
+<p>Flamegraph превращает абстрактные миллисекунды в геометрические пропорции. Одного взгляда на экран достаточно, чтобы локализовать узкое место: если вершина одной из башен срезана широким горизонтальным плато — перед вами главный виновник инцидента.</p>
+<p>Эта статья служит визуальным мостом между сухими цифрами профилировщика и низкоуровневыми оптимизациями компилятора: механикой инлайнинга (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>), предсказанием переходов процессора (<a href="6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>) и локальностью данных в кэше L1/L2/L3 (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<hr />
+<h2 id="kak-ustroen-flamegraph">Как устроен flamegraph</h2>
+
+<p>Flamegraph — это интерактивная двумерная диаграмма иерархии стеков вызовов:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                       Анатомия Flamegraph                               |
+|                                                                         |
+|  Листовой уровень:      [ runtime.mallocgc (25%) ]  [ regexp.Find (15%) ]|
+|                                     |                         |         |
+|  Промежуточный:         [  json.Unmarshal (35%)  ]  [ Validate (20%) ]  |
+|                                     \                         /         |
+|  Диспетчер:             [          ProcessRequest (70%)              ]  |
+|                                               |                         |
+|  Корень (Root):         [                 main (100%)                ]  |
+|                         +-----------------------------------------------+
+|                         | &lt;--------------- Ось X: Время ---------------&gt; |
++-------------------------------------------------------------------------+
+</code></pre>
+</div>
+
+<h3 id="glavnye-koordinaty-i-pravila-chteniya">Главные координаты и правила чтения:</h3>
+<ol>
+<li><strong>Ось Y (Глубина стека):</strong><br />
+   Отображает иерархию вызовов снизу вверх. В самом низу располагается корень исполнения (<code>main</code> или точка входа горутины <code>runtime.goexit.mcall</code>). Каждый следующий этаж — это дочерняя функция, вызванная функцией с нижнего этажа. Чем выше башня, тем глубже стек вызовов.</li>
+<li><strong>Ось X (Время / Доля CPU):</strong><br />
+   Ось X <strong>НЕ является временной шкалой слева направо!</strong> Время выполнения функций отсортировано не в хронологическом порядке, а <strong>алфавитно</strong> для объединения одинаковых путей.<br />
+<strong>Ширина каждого прямоугольника строго пропорциональна кумулятивному времени (<code>cum</code>)</strong>, проведенному в данной функции и всех ее потомках.<br />
+   Если функция <code>main</code> занимает 100% ширины основания, а функция <code>ProcessRequest</code> — 70%, значит, 70% всех процессорных тактов ушли в эту ветку.</li>
+<li><strong>Цветовая палитра:</strong><br />
+   По умолчанию в <code>pprof</code> цвета выбираются из теплой гаммы (желтый, оранжевый, красный) с псевдослучайным хэшированием по имени пакета. Это сделано намеренно, чтобы соседние блоки визуально контрастировали между собой. В некоторых темах холодные цвета (зеленый/синий) резервируются для системных пакетов рантайма Go.</li>
+</ol>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph FlamegraphRules[&quot;Ключевые законы чтения Flamegraph&quot;]
+R1[&quot;1. Горизонтальная ширина = Кумулятивное время (cum)&lt;br&gt;Широкий блок = Большой расход CPU&quot;]
+R2[&quot;2. Вертикальная высота = Глубина вызовов&lt;br&gt;Верхний блок вызван нижним блоком&quot;]
+R3[&quot;3. Плоская вершина (Плато) = Листовая функция с высоким flat&lt;br&gt;Главный кандидат на немедленную оптимизацию!&quot;]
+R4[&quot;4. Частокол из узких башен = Множественные мелкие вызовы&lt;br&gt;Потеря инлайнинга или чрезмерная абстракция&quot;]
+end
+  </pre>
+</div>
+
+
+<hr />
 <h2 id="sozdanie-flamegraph-v-go">Создание flamegraph в Go</h2>
 
-<p>Первый способ — встроенный в <code>go tool pprof</code> веб-интерфейс:</p>
+<h3 id="sposob-1-shtatnyy-veb-interfeys-go-tool-pprof-rekomenduemyy">Способ 1: Штатный веб-интерфейс `go tool pprof` (Рекомендуемый)</h3>
+
+<p>Начиная с Go 1.11+, визуализатор Flamegraph встроен непосредственно в инструментарий Go и не требует установки Perl, Node.js или Graphviz:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2232,12 +2307,20 @@ MallocWidth[&quot;Ширина mallocgc = 25%&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go tool pprof -http=:8080 cpu.prof
+  <pre class="language-bash"><code class="language-bash"># Запуск локального веб-сервера визуализации
+go tool pprof -http=:8080 cpu.prof
 </code></pre>
 </div>
 
-<p>В открывшемся браузере в верхнем меню выбрать <code>View</code> → <code>Flamegraph</code>. Страница отобразит интерактивный граф. Можно масштабировать, кликать на ячейки для фокусировки, искать по имени функции.</p>
-<p>Второй способ — генерация статического SVG (если нужен автономный файл для отчёта) с помощью утилиты <code>flamegraph.pl</code> Брендана Грегга и <code>go tool pprof -raw</code>:</p>
+<p>Браузер автоматически откроет дашборд. В верхнем навигационном меню выберите пункт:<br />
+<code>View</code> → <strong><code>Flame Graph</code></strong>.</p>
+<p><strong>Возможности интерактивного UI:</strong><br />
+- <strong>Zoom-in (Приближение):</strong> Кликните левой кнопкой мыши по любому прямоугольнику — график мгновенно перестроится, сделав выбранную функцию новым 100% основанием. Это позволяет исследовать даже крошечные ветки с долей 0.5%.<br />
+- <strong>Сброс масштаба:</strong> Кликните по корневой строке <code>Reset Zoom</code> в самом верху графа.<br />
+- <strong>Поиск (Search / Regex):</strong> Нажмите комбинацию <code>Ctrl+F</code> (или кликните по иконке поиска в углу) и введите регулярное выражение (например, <code>json|sql</code>). Все совпавшие прямоугольники подсветятся контрастным фиолетовым цветом, а в углу отобразится суммарная доля найденных функций во всем профиле.</p>
+<h3 id="sposob-2-generatsiya-avtonomnogo-svg-cherez-skripty-brendana-gregga">Способ 2: Генерация автономного SVG через скрипты Брендана Грегга</h3>
+
+<p>Если вам требуется сформировать легковесный векторный SVG-файл для вставки в технический отчет или документацию в Git, используется связка оригинальных утилит:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2247,12 +2330,15 @@ MallocWidth[&quot;Ширина mallocgc = 25%&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">go tool pprof -raw cpu.prof | stackcollapse-go.pl | flamegraph.pl &gt; flame.svg
+  <pre class="language-bash"><code class="language-bash"># 1. Сброс сырых данных профиля через флаг -raw
+go tool pprof -raw cpu.prof | stackcollapse-go.pl | flamegraph.pl &gt; flame.svg
 </code></pre>
 </div>
 
-<p>Но этот путь требует внешних скриптов и менее удобен; встроенный веб-интерфейс предпочтителен для интерактивного анализа.</p>
-<p>Третий способ — непосредственно в консоли <code>pprof</code> вызвать <code>web</code> (откроет граф вызовов, не flamegraph), или использовать <code>go tool pprof -flamegraph</code> для записи flamegraph-данных в файл (начиная с Go 1.17+):</p>
+<p>Полученный <code>flame.svg</code> открывается в любом браузере, сохраняя интерактивность (всплывающие подсказки и зум через встроенный JavaScript).</p>
+<h3 id="sposob-3-eksport-dannykh-flamegraph-v-fayl-i-komanda-web-go-1-17">Способ 3: Экспорт данных Flamegraph в файл и команда `web` (Go 1.17+)</h3>
+
+<p>Непосредственно в консоли <code>pprof</code> вызов команды <code>web</code> открывает традиционный граф вызовов Graphviz. А для экспорта данных Flamegraph в файл для передачи внешним сервисам мониторинга используется:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2266,48 +2352,11 @@ MallocWidth[&quot;Ширина mallocgc = 25%&quot;]
 </code></pre>
 </div>
 
-<p>Этот файл можно потом открыть через тот же веб-интерфейс.</p>
+<p>Файл <code>flame.out</code> содержит сериализованное дерево, готовое для рендеринга.</p>
+<hr />
 <h2 id="chtenie-flamegraph-ot-tsveta-k-probleme">Чтение flamegraph: от цвета к проблеме</h2>
 
-<h3 id="shag-1-nayti-shirokuyu-polosu-v-verkhney-chasti">Шаг 1: Найти широкую полосу в верхней части</h3>
-
-<p>Широкий прямоугольник на уровне листьев (над ним нет детей) означает функцию, которая сама выполняет много работы. Если это код вашего приложения — вероятно, в нём узкое место. Если это <code>runtime.mallocgc</code> — проблема в аллокациях, порождаемых где-то ниже по стеку. В отличие от таблицы <code>top</code>, здесь видно, кто именно вызвал <code>mallocgc</code>: можно проследить вниз и найти родительский вызов <code>json.Unmarshal</code> или <code>strings.Builder</code>.</p>
-<h3 id="shag-2-otsenit-stoimost-dispetcherov">Шаг 2: Оценить «стоимость» диспетчеров</h3>
-
-<p>Функция с умеренной собственной шириной, но с широкими «детьми» над ней, является диспетчером. Например, <code>ProcessRequest</code> может сама занимать 2% ширины, но над ней раздуты <code>json.Unmarshal</code> (30%) и <code>db.Query</code> (20%). Вывод: узкое место не в <code>ProcessRequest</code>, а в вызываемых сервисах. Оптимизировать нужно их.</p>
-<h3 id="shag-3-analizirovat-razmazannost-steka">Шаг 3: Анализировать «размазанность» стека</h3>
-
-<p>Много узких полосок, сливающихся в широкую башню — признак абстракций, которые по отдельности малы, но вместе создают накладные расходы. Например, глубоко вложенные мидлвари, декораторы, обёртки. Flamegraph это визуализирует как множество слоёв. Часто можно устранить несколько слоёв инлайнингом или упрощением.</p>
-<h3 id="shag-4-sravnit-dva-profilya">Шаг 4: Сравнить два профиля</h3>
-
-<p>С помощью <code>pprof -diff_base</code> (упоминалось в <a href="../02-benchmarking/8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>) можно открыть два профиля и во Flamegraph увидеть красные (прирост времени) и зелёные (снижение) полосы. Это мгновенно показывает, какая функция стала жрать процессор после рефакторинга.</p>
-<h2 id="pod-kapotom-kak-pprof-stroit-flamegraph">Под капотом: как pprof строит flamegraph</h2>
-
-<p>Внутренне flamegraph — это преобразование протобуф-профиля pprof в формат, понятный JavaScript-библиотеке. Профиль содержит записи:</p>
-
-<div class="code-block" data-lang="protobuf">
-  <div class="code-header">
-    <span class="code-lang-tag">PROTOBUF</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-protobuf"><code class="language-protobuf">message Profile {
-  repeated Sample sample = 1;
-  repeated Location location = 2;
-  repeated Function function = 3;
-  ...
-}
-
-message Sample {
-  repeated uint64 location_id = 1; // стек, снизу вверх
-  repeated int64 value = 2;        // количество сэмплов
-}
-</code></pre>
-</div>
-
-<p>При генерации flamegraph инструмент «сворачивает» одинаковые стеки, суммируя значения. Затем для каждого уникального стека строится путь от корня к листу. Ширина корневого узла (например, <code>main</code>) равна сумме всех сэмплов. Дочерние узлы получают ширину, пропорциональную сумме сэмплов, в которых они присутствуют.</p>
+<p>Умение читать Flamegraph — это навык визуального распознавания патологий в коде:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2322,76 +2371,235 @@ message Sample {
   </div>
   <pre class="mermaid">
 flowchart TD
-Samples[&quot;Тысячи сэмплов&lt;br&gt;со стеком&quot;] --&gt; Agg[&quot;Агрегация по уникальным стекам&quot;]
-Agg --&gt; Tree[&quot;Построение дерева вызовов&lt;br&gt;от корня к листьям&quot;]
-Tree --&gt; Width[&quot;Расчёт ширины:&lt;br&gt;сумма сэмплов для каждого узла&quot;]
-Width --&gt; Render[&quot;Рендеринг в SVG/Canvas&lt;br&gt;цвета по пакетам&quot;]
+Start[&quot;Анализ Flamegraph&quot;] --&gt; Step1[&quot;Шаг 1: Поиск широких горизонтальных плато на вершинах башен&quot;]
+Step1 --&gt; Step2[&quot;Шаг 2: Оценка ширины промежуточных диспетчеров&quot;]
+Step2 --&gt; Step3[&quot;Шаг 3: Анализ частокола узких башен (Размазанность стека)&quot;]
+Step3 --&gt; Step4[&quot;Шаг 4: Дифференциальное сравнение версий через -diff_base&quot;]
   </pre>
 </div>
 
 
-<p>Таким образом, flamegraph — это просто визуализация кумулятивного времени, но в отличие от плоского списка <code>top</code>, он сохраняет контекст вызова.</p>
+<h3 id="shag-1-nayti-shirokuyu-polosu-v-verkhney-chasti-plato">Шаг 1: Найти широкую полосу в верхней части (Плато)</h3>
+<p>Если на самом верхнем уровне башни (над блоком нет дочерних прямоугольников) лежит широкий плоский прямоугольник — это функция с <strong>колоссальным значением <code>flat</code></strong>. Она лично выполняет вычисления, сжигая кванты времени.<br />
+- Если это ваш код (например, <code>ComputeHash</code> или <code>FilterData</code>) — узкое место найдено, требуется алгоритмическая оптимизация.<br />
+- Если это системная функция <code>runtime.mallocgc</code> — процессор задыхается в аллокациях памяти. Проследите по стеку <strong>вниз от плато</strong>, чтобы найти, какой метод вашего сервиса инициирует выделение объектов (например, <code>json.Unmarshal</code> или <code>strings.Builder</code>).</p>
+<h3 id="shag-2-otsenit-stoimost-dispetcherov">Шаг 2: Оценить «стоимость» диспетчеров</h3>
+<p>Часто функция <code>ProcessOrder</code> сама по себе занимает лишь 2% времени, но под ней висит огромный блок шириной 60%. Внимательно изучите распределение дочерних блоков:<br />
+- Если 40% ширины уходит в <code>json.Unmarshal</code>, а 20% — в <code>db.Query</code>, оптимизировать внутренности <code>ProcessOrder</code> бессмысленно: нужно менять JSON-сериализатор или кэшировать запросы к БД.</p>
+<h3 id="shag-3-analizirovat-razmazannost-steka">Шаг 3: Анализировать «размазанность» стека</h3>
+<p>Если вместо выраженных башен вы видите «зубчатую стену» из сотен тонких иголочек одинаковой высоты — это признак <strong>чрезмерного распыления ресурсов</strong>:<br />
+- Бесконечные цепочки мидлварей, декораторов, валидаторов и интерцепторов, каждый из которых съедает по 0.5% CPU.<br />
+- Массовые интерфейсные вызовы, препятствующие инлайнингу компилятора.</p>
+<h3 id="shag-4-sravnit-dva-profilya-differential-flamegraph">Шаг 4: Сравнить два профиля (Differential Flamegraph)</h3>
+<p>С помощью утилиты <code>pprof -diff_base</code> (<a href="../02-benchmarking/8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>) можно вычесть эталонный базовый профиль из оптимизированного:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go tool pprof -http=:8080 -diff_base=cpu_base.prof cpu_optimized.prof
+</code></pre>
+</div>
+
+<p>Flamegraph окрасится в контрастные цвета:<br />
+- 🔴 <strong>Красные полосы:</strong> Функции, где время выполнения <strong>выросло</strong> (регрессия).<br />
+- 🟢 <strong>Зеленые полосы:</strong> Функции, где процессорные такты удалось <strong>сэкономить</strong> (успешная оптимизация).</p>
+<hr />
+<h2 id="pod-kapotom-kak-pprof-stroit-flamegraph">Под капотом: как pprof строит flamegraph</h2>
+
+<p>В основе бинарного формата <code>cpu.prof</code> лежит строгая схема Google Protocol Buffers (<code>profile.proto</code>):</p>
+
+<div class="code-block" data-lang="protobuf">
+  <div class="code-header">
+    <span class="code-lang-tag">PROTOBUF</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-protobuf"><code class="language-protobuf">message Profile {
+  repeated Sample sample = 1;
+  repeated Location location = 2;
+  repeated Function function = 3;
+  repeated string string_table = 4;
+  ...
+}
+
+message Sample {
+  repeated uint64 location_id = 1; // Стек вызовов от листа к корню
+  repeated int64 value = 2;        // Количество сэмплов / наносекунды
+}
+</code></pre>
+</div>
+
+<h3 id="algoritm-transformatsii-protobuf-v-plamya">Алгоритм трансформации protobuf в пламя:</h3>
+
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Samples[&quot;Сырые сэмплы Sample в protobuf&lt;br&gt;[loc1, loc2, loc3] = 4 сэмпла&lt;br&gt;[loc1, loc2, loc4] = 6 сэмплов&quot;] --&gt; Collapse[&quot;Сворачивание одинаковых стеков:&lt;br&gt;main;Handle;Parse = 4&lt;br&gt;main;Handle;Validate = 6&quot;]
+Collapse --&gt; Tree[&quot;Построение префиксного дерева (Trie):&lt;br&gt;Корень &#x27;main&#x27; (сумма = 10)&lt;br&gt;-&gt; Узел &#x27;Handle&#x27; (сумма = 10)&lt;br&gt;   |-&gt; &#x27;Parse&#x27; (4)&lt;br&gt;   +-&gt; &#x27;Validate&#x27; (6)&quot;]
+Tree --&gt; Layout[&quot;Геометрический расчет координат:&lt;br&gt;X = накопленный offset, Width = ratio * totalWidth&lt;br&gt;Y = глубина кадра (depth * rowHeight)&quot;]
+Layout --&gt; DOM[&quot;Отрисовка в браузере (HTML5 Canvas / SVG)&quot;]
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>Сворачивание стеков (Stack Collapse):</strong><br />
+   Инструмент перебирает тысячи записей <code>Sample</code>, разрешает идентификаторы <code>location_id</code> в человекочитаемые имена через таблицу строк и группирует одинаковые цепочки вызовов, суммируя счетчики сэмплов.</li>
+<li><strong>Построение дерева префиксов (Trie):</strong><br />
+   Из свернутых строк формируется ориентированное дерево от общего корня <code>main</code> к листьям.</li>
+<li><strong>Расчет геометрии:</strong><br />
+   Ширина корневого узла приравнивается к 100% ширины экрана. Ширина каждого дочернего прямоугольника вычисляется как отношение суммы сэмплов данного поддерева к сумме сэмплов корня.</li>
+</ol>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: Почему Flamegraph по умолчанию кумулятивен?</span>
   </div>
   <div class="callout-body">
-    <p>В pprof есть несколько алгоритмов фильтрации и свёртки (collapse). Flamegraph по умолчанию показывает «cumulative» слои. Если вы переключитесь в режим «flat», ширина будет отражать только собственное время функции, но тогда иерархия не будет вертикально согласованной. Поэтому flamegraph для CPU практически всегда смотрится в кумулятивном режиме.</p>
+    <p>В <code>pprof</code> предусмотрена возможность фильтрации и переключения представлений. Однако классический Flamegraph всегда отображает <strong>кумулятивное время (<code>cum</code>)</strong>. Если бы блоки рисовались только по значению собственного времени (<code>flat</code>), сумма ширин дочерних функций не сходилась бы с шириной родительского блока, и вертикальная визуальная согласованность дерева стеков была бы разрушена.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="lovushki-i-tipichnye-oshibki-pri-chtenii-flamegraph">Ловушки и типичные ошибки при чтении flamegraph</h2>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ширина — это время, а не число вызовов!</span>
   </div>
   <div class="callout-body">
-    <p><strong>Ширина = время, а не количество вызовов.</strong> Функция, вызванная миллион раз, но очень лёгкая, будет выглядеть тонкой полоской. Тяжёлая функция, вызванная единожды, займёт много места. Не путайте частоту с длительностью.</p>
+    <p>Самая частая ошибка начинающих: путать <strong>продолжительность</strong> с <strong>частотой вызовов</strong>.<br />
+Функция <code>fastMath()</code>, вызванная <strong>1 000 000 раз</strong>, но исполняющаяся за 2 наносекунды, на Flamegraph будет выглядеть незаметной волосяной полоской шириной в 0.1%.<br />
+Напротив, функция <code>slowEncryption()</code>, вызванная <strong>всего 1 раз</strong>, но выполнявшаяся 5 секунд, предстанет гигантским плато на 50% ширины экрана.<br />
+<strong>Ширина блока отражает совокупное процессорное время, а не счетчик вызовов.</strong></p>
   </div>
 </div>
 
-<ul>
-<li><strong>Неверное чтение глубины.</strong> Глубина стека не коррелирует с проблемой. Глубокие цепочки могут быть нормой (например, gRPC сериализация). Фокус на ширине, а не на высоте.</li>
-<li><strong>Игнорирование мелких фрагментов.</strong> Множество тонких полосок могут сливаться в значимую площадь, особенно если это системные вызовы или аллокации. Используйте поиск, чтобы найти все вхождения функции.</li>
-<li><strong>Эффект «раздутого» GC.</strong> Если вы видите широкие полосы <code>runtime.gcBgMarkWorker</code> или <code>runtime.mallocgc</code>, причина не в GC как таковом, а в коде, который генерирует мусор. Проследите вниз до инициатора аллокаций.</li>
-<li><strong>Слишком короткий профиль.</strong> Flamegraph из 5-секундного профиля будет отражать случайные флуктуации. Дайте профилировщику не менее 30 секунд под стабильной нагрузкой.</li>
-</ul>
+<p>Другие опасные заблуждения:<br />
+- <strong>Ошибочная погоня за высотой башен:</strong> Высокая узкая башня означает лишь глубокую иерархию вызовов (например, чистый луковичный слой Clean Architecture или gRPC pipeline). Если ее ширина всего 2% — оптимизировать ее бессмысленно. Ищите <strong>широкие</strong>, а не высокие блоки!<br />
+- <strong>Эффект «раздутого» GC:</strong> Обнаружив широкие полосы <code>runtime.gcBgMarkWorker</code> (фоновый сборщик мусора) или <code>runtime.mallocgc</code>, неопытный разработчик пытается тюнить параметры рантайма <code>GOGC</code> или <code>GOMEMLIMIT</code>. Но GC не возникает из ниоткуда: опуститесь взглядом ниже по стеку и найдите код приложения, непрерывно выделяющий временные объекты.<br />
+- <strong>Игнорирование мелких осколков:</strong> Сотни узких полосок одной и той же функции (например, разбросанные по разным хендлерам вызовы <code>regexp.Match</code>), взятые по отдельности, кажутся незначительными (по 1–2%). Используйте regex-поиск <code>Ctrl+F</code> — подсветка покажет, что суммарно они сжигают 25% CPU всего сервиса!</p>
+<hr />
 <h2 id="mechanical-sympathy-chto-flamegraph-rasskazyvaet-o-zheleze">Mechanical Sympathy: что flamegraph рассказывает о «железе»</h2>
 
-<p>Flamegraph не показывает кэш-промахи или ошибки предсказания ветвлений, но опытный инженер может их заподозрить по косвенным признакам.</p>
-<ul>
-<li><strong>Широкие полосы <code>runtime.memmove</code> / <code>runtime.duffcopy</code></strong> при копировании слайсов или строк — признак недружественной кэшу работы. Данные, перекладываемые большими кусками, могут не помещаться в L1/L2 и вызывать каскадные промахи. Подробнее в <a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>.</li>
-<li><strong>Широкие полосы <code>runtime.lock</code> / <code>runtime.unlock</code></strong> или <code>sync.Mutex.Lock</code> — contention. Если они выстроены в стеке над вашим кодом, пора смотреть <a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a> и <a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>.</li>
-<li><strong>Узкие, но многочисленные вызовы функций</strong> могут говорить об отсутствии инлайнинга (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>). Если flamegraph показывает частокол из коротких функций — проверьте, почему компилятор не встроил их.</li>
-<li><strong>Большое время в <code>runtime.cgocall</code></strong> — переходы в C-код, которые сбрасывают кэш процессора и стоят дорого.</li>
-</ul>
-<p>Таким образом, flamegraph используется как карта для дальнейшего расследования с помощью <code>perf stat</code> и других утилит из раздела <span class="wikilink-unresolved" title="Заметка в разработке">16. Профилирование, отладка и производительность</span>.</p>
+<p>Хотя Flamegraph оперирует программными именами функций, опытный инженер видит за ними аппаратные процессы:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph FlameSign[&quot;Симптомы на Flamegraph&quot;]
+F1[&quot;Широкие плато runtime.memmove и runtime.duffcopy&quot;]
+F2[&quot;Широкие плато runtime.lock / runtime.unlock&quot;]
+F3[&quot;Частокол узких ступеней мелких функций&quot;]
+F4[&quot;Массивные блоки runtime.cgocall&quot;]
+end
+
+subgraph HardwareReality[&quot;Кремниевая реальность микроархитектуры&quot;]
+H1[&quot;Перегрузка шины DRAM, промахи L1/L2 кэша&lt;br&gt;(Cache Stall cycles)&quot;]
+H2[&quot;Lock Contention, cache-line bouncing (MESI инвалидация)&quot;]
+H3[&quot;Неудавшийся инлайнинг компилятора,&lt;br&gt;накладные расходы прологов функций&quot;]
+H4[&quot;Сброс конвейера CPU, смена контекста регистров Cgo&quot;]
+end
+
+F1 --&gt; H1
+F2 --&gt; H2
+F3 --&gt; H3
+F4 --&gt; H4
+  </pre>
+</div>
+
+
+<ol>
+<li><strong><code>runtime.memmove</code> и <code>runtime.duffcopy</code> на вершине:</strong><br />
+   Сигнализируют о том, что процессор задыхается в промахах кэша (Cache Misses) при пересылке мегабайтов памяти. Данные вытесняются из L1/L2 кэша в медленную оперативную память (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
+<li><strong><code>runtime.lock</code> / <code>sync.Mutex.Lock</code>:</strong><br />
+   Указывают на разрушительный <strong>Lock Contention</strong> (<a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>). Несколько ядер процессора непрерывно инвалидируют общую кэш-линию через протокол когерентности MESI (<a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>).</li>
+<li><strong>Частокол неинлайненных функций:</strong><br />
+   Если в цепочке видна масса крошечных геттеров/сеттеров, компилятор Go не смог применить инлайнинг (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>), и процессор непрерывно тратит такты на сохранение регистров и инструкции <code>CALL</code>/<code>RET</code>.</li>
+<li><strong><code>runtime.cgocall</code>:</strong><br />
+   Свидетельствует о регулярных переходах через границу C-runtime, вызывающих сброс аппаратного конвейера и переключение стеков ОС.</li>
+</ol>
+<p>Таким образом, flamegraph используется как надежная навигационная карта для дальнейшего расследования с помощью системных счетчиков <code>perf stat</code> и других утилит из раздела <span class="wikilink-unresolved" title="Заметка в разработке">16. Профилирование, отладка и производительность</span>.</p>
+<hr />
 <h2 id="integratsiya-s-rabochim-protsessom">Интеграция с рабочим процессом</h2>
 
-<p>Рекомендуемый цикл для Senior:</p>
+<p>Канонический регламент Senior-инженера при оптимизации сервиса:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Step1[&quot;1. Снятие 30-секундного CPU-профиля под нагрузкой&quot;] --&gt; Step2[&quot;2. Запуск go tool pprof -http=:8080 cpu.prof&quot;]
+Step2 --&gt; Step3[&quot;3. Обзор Flamegraph: поиск самых широких плато на листьях&quot;]
+Step3 --&gt; Step4[&quot;4. Zoom-in на плато, проверка родительского стека вызовов&quot;]
+Step4 --&gt; Step5[&quot;5. Переключение в Top / list для построчной верификации кода&quot;]
+Step5 --&gt; Step6[&quot;6. Устранение проблемы в коде (Zero-alloc, кэш, алгоритм)&quot;]
+Step6 --&gt; Step7[&quot;7. Снятие нового профиля и валидация через -diff_base&quot;]
+Step7 --&gt; Step8[&quot;8. Количественное подтверждение выигрыша в benchstat&quot;]
+  </pre>
+</div>
+
+
 <ol>
-<li>Получить CPU-профиль нагруженного сервиса.</li>
-<li>Открыть flamegraph, найти самую широкую «горячую» цепочку.</li>
-<li>Кликнуть на неё для фокусировки и изучить список вызываемых функций.</li>
-<li>Переключиться на <code>Top</code> для точных процентов, затем <code>list</code> для построчного кода (как в <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>).</li>
-<li>Выдвинуть гипотезу (аллокации, лишние копирования, ожидания).</li>
-<li>Проверить гипотезу через другие профили (memory, block, mutex) или через <code>benchstat</code> после оптимизации.</li>
-<li>Повторить профилирование для подтверждения.</li>
+<li><strong>Макро-взгляд (Flamegraph):</strong> Открываем профиль в браузере, охватываем взглядом архитектурные пропорции, находим 1–2 самых широких плато.</li>
+<li><strong>Фокусировка (Zoom-in):</strong> Кликаем на подозрительный блок, изолируя его от остального шума.</li>
+<li><strong>Микро-хирургия (<code>top</code> и <code>list</code>):</strong> Переключаемся на вкладку <code>Top</code> и <code>Source</code> для построчного анализа затрат конкретных строк кода (как мы изучили в <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>).</li>
+<li><strong>Устранение причины:</strong> Переписываем алгоритм, выносим регулярные выражения в <code>init()</code>, предвыделяем срезы.</li>
+<li><strong>Дифференциальная верификация:</strong> Снимаем повторный профиль и открываем через <code>-diff_base</code>, чтобы убедиться, что проблемный узел позеленел и сжался, не вызвав побочных красных всплесков.</li>
+<li><strong>Математический арбитраж:</strong> Подтверждаем итоговое ускорение бенчмарком через <code>benchstat</code> (<a href="../02-benchmarking/8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>).</li>
 </ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ul>
-<li><strong>Flamegraph</strong> — визуализация кумулятивного времени, строящая мост между сырыми профилями и пониманием иерархии вызовов.</li>
-<li>Создаётся встроенным <code>go tool pprof -http</code> и не требует внешних инструментов.</li>
-<li>Читается по принципу: ширина — время, глубина — стек вызовов; широкие листья — прямые кандидаты на оптимизацию, широкие диспетчеры указывают, где искать дорогих потомков.</li>
-<li>Позволяет мгновенно увидеть вклад аллокаций (<code>mallocgc</code>), конкуренции (<code>Lock</code>), CGO (<code>cgocall</code>) и обнаружить избыточные слои абстракций.</li>
-<li>Не заменяет количественный анализ (<code>top</code>, <code>list</code>), а дополняет его визуальным контекстом.</li>
-<li>Служит отправной точкой для глубокого изучения причин: инлайнинг, кэш, ветвления, SIMD.</li>
-</ul>
-<p>Пламя осветило иерархию. Теперь мы спускаемся на уровень ниже — к систематическому анализу <code>top</code> функций и методу исключения, который описан в <a href="4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a>.</p>
+<ol>
+<li><strong>Flamegraph — высшая форма визуализации времени:</strong> Превращает хаос из десятков тысяч разрозненных сэмплов в интуитивную цветовую карту процессорных затрат.</li>
+<li><strong>Встроен в Go из коробки:</strong> Не требует сторонних зависимостей — запускается одной командой <code>go tool pprof -http=:8080 cpu.prof</code>.</li>
+<li><strong>Фундаментальные правила геометрии:</strong><br />
+   - Ширина прямоугольника = кумулятивное процессорное время (<code>cum</code>).<br />
+   - Высота = глубина стека вызовов.<br />
+   - Плоские широкие вершины («плато») = листовые узкие места с огромным собственным временем (<code>flat</code>).</li>
+<li><strong>Быстрое нахождение виновников:</strong> Позволяет моментально проследить путь от низкоуровневых операций рантайма (<code>mallocgc</code>, <code>memmove</code>, <code>lock</code>) вниз по стеку к конкретной строке вашего бизнес-кода.</li>
+<li><strong>Дифференциальный режим (<code>-diff_base</code>):</strong> Зеленые и красные полосы наглядно доказывают успех оптимизации в Pull Request.</li>
+</ol>
+<p>Освоив визуальное чтение пламенных графов, мы готовы перейти к систематическому разбору числовых показателей: в следующей лекции <a href="4-top-functions-analiz.html" class="wikilink">4. Top functions анализ</a> мы изучим методологию ранжирования функций в отчете <code>top</code> и освоим алгоритмы последовательного исключения ложных горячих точек.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2419,7 +2627,7 @@ Width --&gt; Render[&quot;Рендеринг в SVG/Canvas&lt;br&gt;цвета �
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pochemu-plamya-luchshiy-drug-inzhenera">Почему пламя — лучший друг инженера</a></li><li class="toc-item toc-h2"><a href="#kak-ustroen-flamegraph">Как устроен flamegraph</a></li><li class="toc-item toc-h2"><a href="#sozdanie-flamegraph-v-go">Создание flamegraph в Go</a></li><li class="toc-item toc-h2"><a href="#chtenie-flamegraph-ot-tsveta-k-probleme">Чтение flamegraph: от цвета к проблеме</a></li><li class="toc-item toc-h3"><a href="#shag-1-nayti-shirokuyu-polosu-v-verkhney-chasti">Шаг 1: Найти широкую полосу в верхней части</a></li><li class="toc-item toc-h3"><a href="#shag-2-otsenit-stoimost-dispetcherov">Шаг 2: Оценить «стоимость» диспетчеров</a></li><li class="toc-item toc-h3"><a href="#shag-3-analizirovat-razmazannost-steka">Шаг 3: Анализировать «размазанность» стека</a></li><li class="toc-item toc-h3"><a href="#shag-4-sravnit-dva-profilya">Шаг 4: Сравнить два профиля</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-kak-pprof-stroit-flamegraph">Под капотом: как pprof строит flamegraph</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-tipichnye-oshibki-pri-chtenii-flamegraph">Ловушки и типичные ошибки при чтении flamegraph</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-flamegraph-rasskazyvaet-o-zheleze">Mechanical Sympathy: что flamegraph рассказывает о «железе»</a></li><li class="toc-item toc-h2"><a href="#integratsiya-s-rabochim-protsessom">Интеграция с рабочим процессом</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#pochemu-plamya-luchshiy-drug-inzhenera">Почему пламя — лучший друг инженера</a></li><li class="toc-item toc-h2"><a href="#kak-ustroen-flamegraph">Как устроен flamegraph</a></li><li class="toc-item toc-h3"><a href="#glavnye-koordinaty-i-pravila-chteniya">Главные координаты и правила чтения:</a></li><li class="toc-item toc-h2"><a href="#sozdanie-flamegraph-v-go">Создание flamegraph в Go</a></li><li class="toc-item toc-h3"><a href="#sposob-1-shtatnyy-veb-interfeys-go-tool-pprof-rekomenduemyy">Способ 1: Штатный веб-интерфейс go tool pprof (Рекомендуемый)</a></li><li class="toc-item toc-h3"><a href="#sposob-2-generatsiya-avtonomnogo-svg-cherez-skripty-brendana-gregga">Способ 2: Генерация автономного SVG через скрипты Брендана Грегга</a></li><li class="toc-item toc-h3"><a href="#sposob-3-eksport-dannykh-flamegraph-v-fayl-i-komanda-web-go-1-17">Способ 3: Экспорт данных Flamegraph в файл и команда web (Go 1.17+)</a></li><li class="toc-item toc-h2"><a href="#chtenie-flamegraph-ot-tsveta-k-probleme">Чтение flamegraph: от цвета к проблеме</a></li><li class="toc-item toc-h3"><a href="#shag-1-nayti-shirokuyu-polosu-v-verkhney-chasti-plato">Шаг 1: Найти широкую полосу в верхней части (Плато)</a></li><li class="toc-item toc-h3"><a href="#shag-2-otsenit-stoimost-dispetcherov">Шаг 2: Оценить «стоимость» диспетчеров</a></li><li class="toc-item toc-h3"><a href="#shag-3-analizirovat-razmazannost-steka">Шаг 3: Анализировать «размазанность» стека</a></li><li class="toc-item toc-h3"><a href="#shag-4-sravnit-dva-profilya-differential-flamegraph">Шаг 4: Сравнить два профиля (Differential Flamegraph)</a></li><li class="toc-item toc-h2"><a href="#pod-kapotom-kak-pprof-stroit-flamegraph">Под капотом: как pprof строит flamegraph</a></li><li class="toc-item toc-h3"><a href="#algoritm-transformatsii-protobuf-v-plamya">Алгоритм трансформации protobuf в пламя:</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-tipichnye-oshibki-pri-chtenii-flamegraph">Ловушки и типичные ошибки при чтении flamegraph</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-flamegraph-rasskazyvaet-o-zheleze">Mechanical Sympathy: что flamegraph рассказывает о «железе»</a></li><li class="toc-item toc-h2"><a href="#integratsiya-s-rabochim-protsessom">Интеграция с рабочим процессом</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

@@ -2169,202 +2169,32 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~45 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">2. CPU profiling в Go</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie-ot-medlenno-k-konkretnoy-funktsii">Введение: от «медленно» к конкретной функции</h2>
+            <h1>CPU profiling в Go: анатомия горячих точек и анализ тактов</h1>
+<blockquote>
+<p><em>"Everyone knows that debugging is twice as hard as writing a program in the first place. So if you're as clever as you can be when you write it, how will you ever debug it?"</em><br />
+— Брайан Керниган  </p>
+<p><em>"A 100% CPU utilization is not an achievement; it is either brilliant math or an embarrassing spinlock."</em><br />
+— Инженерный фольклор</p>
+</blockquote>
+<p>Представьте приборную панель автомобиля: стрелка тахометра уперлась в красную зону на 7000 оборотах в минуту, рев мотора оглушает, бензин улетает ведрами, но машина еле ползет со скоростью 20 км/ч. Что происходит? Двигатель работает на пределе возможностей, но сцепление пробуксовывает: энергия сгорания топлива не доходит до колес, рассеиваясь в бесполезное трение и дым.</p>
+<p>В серверном бэкенде 100% утилизация CPU выглядит точно так же. Все ядра процессора раскалены до предела, кулеры серверной стойки воют на максимальных оборотах, а метрики задержки p99 улетают в космос. Загрузить процессор на 100% — дело нехитрое; задача Senior-инженера — понять, <strong>на что именно расходуются эти миллиарды тактов в секунду</strong>. Сжигаются ли они на реальную полезную бизнес-логику, либо тонут в бесконечных аллокациях памяти, вымывании кэшей L1/L2, пробуксовке атомарных спинлоков или слепом перекопировании слайсов?</p>
+<p>В <a href="1-pprof-vvedenie.html" class="wikilink">1. pprof. Введение</a> мы познакомились с фреймворком <code>pprof</code> и фундаментальной механикой сэмплирования по сигналам <code>SIGPROF</code>. В этой лекции мы с головой погружаемся в прикладной <strong>CPU profiling</strong>: научимся виртуозно владеть консольным анализатором <code>top</code> и построчным декомпилятором <code>list</code>, разберем фундаментальную разницу между собственным (<code>flat</code>) и кумулятивным (<code>cum</code>) временем, каталогизируем типичные процессорные ловушки Go-рантайма и научимся связывать стек вызовов с кремниевой микроархитектурой машины.</p>
+<hr />
+<h2 id="vvedenie-ot-medlenno-k-konkretnoy-funktsii">Введение: от «медленно» к конкретной функции</h2>
 
-<p>В <a href="1-pprof-vvedenie.html" class="wikilink">1. pprof. Введение</a> мы разобрали архитектуру pprof и виды профилей. Теперь мы погружаемся в самый частый сценарий: <strong>CPU profiling</strong>. Именно он отвечает на вопрос «почему процессор загружен на 100%, а запросы тормозят?» и прямо указывает на функции, которые сжигают такты.</p>
-<p>CPU-профиль — это не замер времени выполнения, а карта плотности процессорного времени. Он показывает, в каких функциях программа проводит время <em>пропорционально</em> их вкладу. Это делает его идеальным инструментом для диагностики CPU-bound задач (<a href="../01-fundament/3-cpu-bound-vs-io-bound-zadachi.html" class="wikilink">3. CPU bound vs IO bound задачи</a>) и для проверки гипотез после бенчмарков (<a href="../02-benchmarking/2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>, <a href="../02-benchmarking/7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>).</p>
-<p>В этой статье мы научимся получать CPU-профиль из любого Go-приложения, интерпретировать отчёт <code>top</code>, различать <code>flat</code> и <code>cum</code>, выявлять типичные паттерны перерасхода CPU и связывать их с фундаментальными причинами — от лишних аллокаций до промахов кэша.</p>
-<h2 id="poluchenie-cpu-profilya">Получение CPU-профиля</h2>
-
-<h3 id="1-cherez-http-endpoint-nethttppprof">1. Через HTTP-эндпоинт `net/http/pprof`</h3>
-
-<p>Универсальный метод для долгоживущих серверов. Подключаем пакет и запускаем HTTP-сервер на отладочном порту:</p>
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">import (
-    &quot;net/http&quot;
-    _ &quot;net/http/pprof&quot;
-)
-
-func main() {
-    go func() {
-        log.Println(http.ListenAndServe(&quot;localhost:6060&quot;, nil))
-    }()
-    // основной код приложения
-}
-</code></pre>
-</div>
-
-<p>Профиль CPU снимается GET-запросом с указанием длительности в секундах:</p>
-
-<div class="code-block" data-lang="bash">
-  <div class="code-header">
-    <span class="code-lang-tag">Bash</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-bash"><code class="language-bash">curl -o cpu.prof &quot;http://localhost:6060/debug/pprof/profile?seconds=30&quot;
-</code></pre>
-</div>
-
-<p>Сервер заблокирует ответ на 30 секунд, собирая сэмплы, затем вернёт бинарный pprof-файл. Важно, чтобы в это время приложение находилось под нагрузкой — иначе профиль покажет только idle.</p>
-<h3 id="2-pryamoy-vyzov-runtimepprof">2. Прямой вызов `runtime/pprof`</h3>
-
-<p>Для CLI-утилит, скриптов или специфичных участков кода:</p>
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">f, _ := os.Create(&quot;cpu.prof&quot;)
-pprof.StartCPUProfile(f)
-defer pprof.StopCPUProfile()
-
-// целевая работа
-expensiveComputation()
-</code></pre>
-</div>
-
-<p>Этот способ даёт полный контроль над моментом старта и остановки. Минус — нельзя интерактивно менять длительность, и нужно встраивать вызовы в код.</p>
-<h3 id="3-cherez-go-test">3. Через `go test`</h3>
-
-<p>При запуске бенчмарков или тестов, которые выполняют тяжёлую работу:</p>
-
-<div class="code-block" data-lang="bash">
-  <div class="code-header">
-    <span class="code-lang-tag">Bash</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkFoo -cpuprofile=cpu.prof
-</code></pre>
-</div>
-
-<p>Профиль запишется только для финального стабильного прогона бенчмарка (как описано в <a href="../02-benchmarking/3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a> и <a href="../02-benchmarking/7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>). Это удобно для изолированных измерений.</p>
-<h2 id="nastroyka-chastoty-semplirovaniya">Настройка частоты сэмплирования</h2>
-
-<p>По умолчанию CPU-профилировщик работает на частоте 100 Гц (100 прерываний в секунду). Этого достаточно для большинства сценариев. Увеличить частоту можно через <code>runtime.SetCPUProfileRate(hz)</code>, вызванную до <code>StartCPUProfile</code>. Но:</p>
-<ul>
-<li>Частота выше 1000 Гц резко увеличивает overhead (вплоть до 10-15% CPU).</li>
-<li>Слишком высокая частота может исказить профиль, «сдвинув» его в сторону кода самого профилировщика.</li>
-<li>Низкая частота (&lt; 50 Гц) пропускает короткоживущие функции.</li>
-</ul>
-<p>Рекомендация: на продакшене использовать 100 Гц, для локальной отладки можно поднять до 500 Гц, если ищете микроскопические задержки.</p>
-<div class="callout callout-info">
-  <div class="callout-header">
-    <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
-  </div>
-  <div class="callout-body">
-    <p>Сигнал <code>SIGPROF</code> в Linux генерируется не аппаратным таймером, а через <code>setitimer(ITIMER_PROF)</code>, который считает время только когда процесс исполняется в пользовательском или системном режиме. Это означает, что если процесс заблокирован в <code>epoll_wait</code> или <code>futex</code>, таймер не тикает, и сэмплы не берутся. Поэтому CPU-профиль «чист»: в нём нет времени ожидания ввода-вывода.</p>
-  </div>
-</div>
-
-<h2 id="interpretatsiya-otchyota-flat-cum-top">Интерпретация отчёта: flat, cum, top</h2>
-
-<p>После сбора профиля запускаем интерактивный анализ:</p>
-
-<div class="code-block" data-lang="bash">
-  <div class="code-header">
-    <span class="code-lang-tag">Bash</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-bash"><code class="language-bash">go tool pprof cpu.prof
-</code></pre>
-</div>
-
-<p>В консоли <code>(pprof)</code> доступны команды. Основная — <code>top</code>:</p>
-
-<div class="code-block" data-lang="text">
-  <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-text"><code class="language-text">(pprof) top
-Showing nodes accounting for 4.50s, 90% of 5.00s total
-      flat  flat%   sum%        cum   cum%
-     1.20s 24.00% 24.00%      1.20s 24.00%  runtime.mallocgc
-     0.90s 18.00% 42.00%      0.90s 18.00%  encoding/json.Unmarshal
-     0.50s 10.00% 52.00%      1.70s 34.00%  mypkg.ProcessRecord
-</code></pre>
-</div>
-
-<ul>
-<li><strong>flat</strong> — время, проведённое непосредственно в теле функции (исключая вызванные из неё). Если функция вызывает другие, это время в flat не включается.</li>
-<li><strong>cum</strong> (cumulative) — полное время от входа в функцию до выхода из неё, включая всех потомков. Показывает «стоимость» функции вместе с её зависимостями.</li>
-<li><strong>sum%</strong> — накопительный процент flat.</li>
-</ul>
-<p>Типичная аналитическая логика:</p>
-<ol>
-<li>Смотрим на функции с большим <code>cum</code> — они «диспетчеры», в которых скрыто реальное узкое место.</li>
-<li>Смотрим на функции с большим <code>flat</code> — они сами выполняют тяжёлую работу (например, копирование памяти, вычисления хешей).</li>
-<li>Выбираем интересующую функцию и уточняем <code>list FuncName</code> — получаем аннотированный исходный код с процентом времени на каждой строке.</li>
-</ol>
-<p>Пример <code>list ProcessRecord</code>:</p>
-
-<div class="code-block" data-lang="go">
-  <div class="code-header">
-    <span class="code-lang-tag">Go</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-go"><code class="language-go">(pprof) list ProcessRecord
-ROUTINE ======================== mypkg.ProcessRecord
-     0.50s      1.70s (flat, cum) 34.00% of Total
-         .          .    100:func ProcessRecord(r *Record) error {
-         .      0.10s    101:    data, err := json.Marshal(r)
-         .      0.80s    102:    if err != nil {
-         .          .    103:        return err
-         .          .    104:    }
-     0.50s      0.50s    105:    return store.Save(data)
-</code></pre>
-</div>
-
-<p>Видно, что 0.10s ушло на <code>Marshal</code>, 0.80s — на <code>Save</code> (кумулятивно), а 0.50s — непосредственно внутри <code>ProcessRecord</code> (вероятно, подготовка данных после маршалинга). Это позволяет сказать: «80% времени ProcessRecord занимает запись в хранилище, 10% — сериализация, 50% — некоторая постобработка».</p>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Что означает, если у функции большой <code>flat</code>, а <code>cum</code> почти равен <code>flat</code>?<br />
-<strong>Ответ:</strong> Это «листовая» функция, которая сама выполняет тяжёлую работу, не вызывая другие дорогие функции. Оптимизировать нужно именно её тело. Если же <code>flat</code> маленький, а <code>cum</code> большой — функция выступает координатором, и узкое место внутри вызываемых ею методов.</p>
-  </div>
-</div>
-
-<h2 id="vizualizatsiya-flamegraph-i-graf-vyzovov">Визуализация: flamegraph и граф вызовов</h2>
-
-<p>Хотя детально flamegraph разбирается в <a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a>, здесь важно понимание интерфейса. Команда <code>go tool pprof -http=:8080 cpu.prof</code> открывает веб-дашборд, где можно переключиться на Flamegraph и увидеть иерархию вызовов, где ширина полосы пропорциональна времени. Это более наглядно для обнаружения «раздутых» путей.</p>
+<p>В отличие от бенчмарков (<a href="../02-benchmarking/2-benchmarking-v-go.html" class="wikilink">2. Benchmarking в Go</a>, <a href="../02-benchmarking/7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>), которые замеряют абсолютное время выполнения изолированного цикла в наносекундах, CPU-профиль — это <strong>карта плотности процессорного времени</strong>. Он отображает относительное статистическое распределение тактов по иерархии вызовов программы.</p>
+<p>CPU-профиль — инструмент первой линии при диагностике строго <strong>CPU-bound задач</strong> (<a href="../01-fundament/3-cpu-bound-vs-io-bound-zadachi.html" class="wikilink">3. CPU bound vs IO bound задачи</a>):<br />
+- Тяжелые криптографические вычисления и хэширование.<br />
+- Парсинг, валидация и сериализация протоколов (JSON, Protobuf, XML).<br />
+- Сжатие данных (Gzip, ZSTD, Snappy).<br />
+- Алгоритмы фильтрации, сортировки и поиска в оперативной памяти.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2379,21 +2209,146 @@ ROUTINE ======================== mypkg.ProcessRecord
   </div>
   <pre class="mermaid">
 flowchart TD
-Start[&quot;Старт анализа CPU профиля&quot;] --&gt; Top[&quot;top: поиск функций с max cum&quot;]
-Top --&gt; Choose[&quot;list FuncName: построчный разбор&quot;]
-Choose --&gt; Flame[&quot;Flamegraph: визуальная иерархия&quot;]
-Flame --&gt; Hypothesis[&quot;Формулировка гипотезы об узком месте&quot;]
-Hypothesis --&gt; Fix[&quot;Оптимизация кода&quot;]
-Fix --&gt; Verify[&quot;Повторный профиль: проверка эффекта&quot;]
+Incident[&quot;Инцидент: CPU 100%, p99 &gt; 2s&quot;] --&gt; Capture[&quot;Снятие 30-секундного CPU-профиля&lt;br&gt;curl /debug/pprof/profile?seconds=30&quot;]
+Capture --&gt; Analysis[&quot;Анализ в go tool pprof&lt;br&gt;(Команды top, list, flamegraph)&quot;]
+Analysis --&gt; Classification{&quot;Характер узкого места?&quot;}
+Classification -- &quot;Высокий flat в бизнес-коде&quot; --&gt; AlgFix[&quot;Алгоритмическая оптимизация&lt;br&gt;(Замена O(N) на O(1), SIMD)&quot;]
+Classification -- &quot;Высокий flat в runtime.mallocgc&quot; --&gt; AllocFix[&quot;Оптимизация памяти (Zero-alloc, sync.Pool)&quot;]
+Classification -- &quot;Высокий flat в runtime.memmove&quot; --&gt; CopyFix[&quot;Предвыделение емкости слайсов (make cap)&quot;]
+Classification -- &quot;Высокий flat в runtime.cgocall&quot; --&gt; CgoFix[&quot;Ревизия Cgo границ и FFI вызовов&quot;]
   </pre>
 </div>
 
 
-<h2 id="prakticheskie-primery-diagnostiki">Практические примеры диагностики</h2>
+<hr />
+<h2 id="poluchenie-cpu-profilya">Получение CPU-профиля</h2>
 
-<h3 id="primer-1-json-serializatsiya-sedaet-60-cpu">Пример 1: JSON-сериализация съедает 60% CPU</h3>
+<p>В зависимости от среды исполнения Go предоставляет три надежных способа снятия процессорного профиля:</p>
+<h3 id="1-cherez-http-endpoint-nethttppprof">1. Через HTTP-эндпоинт `net/http/pprof`</h3>
 
-<p>Профиль показывает:</p>
+<p>Канонический подход для микросервисов, gRPC-бэкендов и долгоживущих демонов в Kubernetes. Достаточно подключить анонимный импорт и поднять диагностический слушатель:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;log&quot;
+    &quot;net/http&quot;
+    _ &quot;net/http/pprof&quot; // Регистрирует /debug/pprof/ на DefaultServeMux
+)
+
+func main() {
+    // ВНИМАНИЕ: Запускаем pprof на внутреннем loopback интерфейсе!
+    go func() {
+        log.Println(http.ListenAndServe(&quot;localhost:6060&quot;, nil))
+    }()
+
+    // Запуск боевого сервера...
+}
+</code></pre>
+</div>
+
+<p>Снятие 30-секундного снимка боевой нагрузки из консоли администратора:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">curl -o cpu.prof &quot;http://localhost:6060/debug/pprof/profile?seconds=30&quot;
+</code></pre>
+</div>
+
+<p>HTTP-сервер Go приостановит ответ на 30 секунд, в течение которых фоновый таймер ядра будет с частотой 100 Гц фиксировать стеки исполняемых горутин, после чего отдаст бинарный поток protobuf.<br />
+<em>Критическое требование:</em> Во время сбора профиля сервис обязан находиться под реальной боевой или синтетической нагрузкой. Снятие профиля с простаивающего сервера покажет только ожидание сетевого поллера.</p>
+<h3 id="2-pryamoy-vyzov-runtimepprof">2. Прямой вызов `runtime/pprof`</h3>
+
+<p>Оптимально для пакетных скриптов, консольных CLI-утилит или юнит-тестов:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;os&quot;
+    &quot;runtime/pprof&quot;
+)
+
+func main() {
+    f, err := os.Create(&quot;cpu.prof&quot;)
+    if err != nil {
+        panic(err)
+    }
+    defer f.Close()
+
+    // Активируем интервальный таймер POSIX
+    if err := pprof.StartCPUProfile(f); err != nil {
+        panic(err)
+    }
+    defer pprof.StopCPUProfile() // Сбрасывает хэш-таблицы на диск
+
+    // Выполнение тяжелой вычислительной работы
+    expensiveComputation()
+}
+</code></pre>
+</div>
+
+<h3 id="3-cherez-testovyy-ranner-go-test">3. Через тестовый раннер `go test`</h3>
+
+<p>Для изолированных функций в рамках бенчмаркинга (<a href="../02-benchmarking/3-go-test-bench-pod-kapotom.html" class="wikilink">3. go test -bench под капотом</a>, <a href="../02-benchmarking/7-profilirovanie-vnutri-benchmark.html" class="wikilink">7. Профилирование внутри benchmark</a>):</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -bench=BenchmarkFoo -cpuprofile=cpu.prof
+</code></pre>
+</div>
+
+<p>Фреймворк <code>testing</code> автоматически активирует сбор профиля строго на финальном стабильном прогоне <code>b.N</code>.</p>
+<hr />
+<h2 id="nastroyka-chastoty-semplirovaniya">Настройка частоты сэмплирования</h2>
+
+<p>По умолчанию процессорный профилировщик Go прерывает выполнение потоков с частотой <strong>100 Гц</strong> (100 сэмплов в секунду на каждое активное ядро, интервал 10 мс).</p>
+<p>Частоту сэмплирования можно программно изменить через <code>runtime.SetCPUProfileRate(hz)</code> до первого вызова профилировщика:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">import &quot;runtime&quot;
+
+func init() {
+    // Изменение частоты до 500 Гц (500 сэмплов в секунду)
+    runtime.SetCPUProfileRate(500)
+}
+</code></pre>
+</div>
+
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2403,21 +2358,230 @@ Fix --&gt; Verify[&quot;Повторный профиль: проверка эф
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text">flat  flat%   cum%
-0.80s 16.00% 1.60s 32.00%  encoding/json.Marshal
-0.30s  6.00% 0.90s 18.00%  runtime.mallocgc
-0.20s  4.00% 0.20s  4.00%  runtime.memmove
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                  Спектр частоты сэмплирования pprof                     |
+|                                                                         |
+|  [&lt; 50 Гц]              [100 Гц - Стандарт]             [&gt; 1000 Гц]     |
+|   Слишком грубо:         Золотая середина:               Опасно:        |
+|   пропуск функций        погрешность &lt; 2%,               overhead &gt; 10% |
+|   короче 20 мс           накладные расходы ~1%           искажение кэша |
++-------------------------------------------------------------------------+
 </code></pre>
 </div>
 
-<p>Интерпретация: <code>Marshal</code> вызывает массу аллокаций (<code>mallocgc</code>) и копирований (<code>memmove</code>). Это не проблема процессора как такового, а проблема аллокаций, которые заставляют процессор тратить время на управление памятью. Решение:</p>
-<ul>
-<li>Использовать <code>easyjson</code> или <code>sonic</code>, генерирующие меньше аллокаций.</li>
-<li>Или переиспользовать буферы через <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</li>
-</ul>
-<h3 id="primer-2-pustoy-tsikl-nagruzhaet-cpu">Пример 2: «Пустой» цикл нагружает CPU</h3>
+<p>Инженерные рекомендации по выбору частоты:<br />
+- <strong>Production (100 Гц):</strong> Стандартное значение. Обеспечивает ничтожный оверхед (0.5–1.5% CPU), абсолютно безопасно для непрерывного профилирования боевых кластеров.<br />
+- <strong>Локальная отладка (500–1000 Гц):</strong> Применяется при поиске микроскопических задержек в быстрых функциях.<br />
+- <strong>Предостережение (&gt; 1000 Гц):</strong> Прерывания чаще 1 раза в миллисекунду создают ощутимый оверхед на сброс конвейера CPU, а сам код обработчика <code>sigprof</code> начинает вытеснять данные из кэшей L1D/L1I, искажая результаты замера.</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом: Почему CPU-профиль не содержит времени ожидания?</span>
+  </div>
+  <div class="callout-body">
+    <p>Системный сигнал <code>SIGPROF</code> генерируется ядром Linux на основе интервального таймера <code>setitimer(ITIMER_PROF)</code>. В отличие от таймера реального времени <code>ITIMER_REAL</code>, таймер <code>ITIMER_PROF</code> декрементируется <strong>только тогда, когда процесс реально исполняет инструкции на ядре CPU</strong> (в User space или в System call).<br />
+Если горутина заблокирована в системном вызове ожидания сети (<code>epoll_wait</code>) или спит на примитиве синхронизации ядра (<code>futex</code>), процессор не выделяет ей кванты времени. Таймер <code>ITIMER_PROF</code> замирает, сигнал не посылается, и сэмпл не берется. Поэтому CPU-профиль Go кристально чист: в нем отсутствует шум от простаивающих потоков.</p>
+  </div>
+</div>
 
-<p>top показывает:</p>
+<hr />
+<h2 id="interpretatsiya-otchyota-flat-cum-top">Интерпретация отчёта: flat, cum, top</h2>
+
+<p>Запускаем интерактивный анализ полученного профиля:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go tool pprof cpu.prof
+</code></pre>
+</div>
+
+<p>Команда <code>top</code> — главная отправная точка расследования:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) top 10
+Showing nodes accounting for 4.50s, 90.00% of 5.00s total
+Dropped 45 nodes (cum &lt;= 0.02s)
+      flat  flat%   sum%        cum   cum%
+     1.20s 24.00% 24.00%      1.20s 24.00%  runtime.mallocgc
+     0.90s 18.00% 42.00%      0.90s 18.00%  encoding/json.Unmarshal
+     0.50s 10.00% 52.00%      1.70s 34.00%  mypkg.ProcessRecord
+     0.40s  8.00% 60.00%      0.40s  8.00%  runtime.memmove
+     ...
+</code></pre>
+</div>
+
+<p>Разберем каждую колонку:<br />
+- <strong><code>flat</code> (Собственное время):</strong> Время, проведенное процессором непосредственно в теле данной функции (за вычетом времени вызова любых дочерних функций).<br />
+- <strong><code>flat%</code>:</strong> Доля собственного времени функции относительно общей длительности профиля.<br />
+- <strong><code>sum%</code>:</strong> Накопительная сумма процентов <code>flat%</code> от первой строки до текущей.<br />
+- <strong><code>cum</code> (Кумулятивное время):</strong> Совокупное время, проведенное в данной функции со всеми ее потомками вниз по дереву стека вызовов.<br />
+- <strong><code>cum%</code>:</strong> Доля кумулятивного времени от общего времени профиля.</p>
+<h3 id="anatomicheskaya-model-general-i-soldat">Анатомическая модель: Генерал и Солдат</h3>
+
+<p>Чтобы мгновенно считывать отчет <code>top</code>, используйте простую физическую аналогию:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                  Модель вызовов: Диспетчер vs Исполнитель               |
+|                                                                         |
+|  [Генерал: ProcessRecord]        flat = 0.05s (низкий)                  |
+|          |                       cum  = 4.50s (высокий: 90% трафика)    |
+|          +---&gt; Координирует армию, сам в окопе не копает                |
+|          |                                                              |
+|  [Солдат: runtime.memmove]       flat = 3.80s (высокий: 76% тактов)     |
+|                                  cum  = 3.80s (равен flat)              |
+|                                  Листовая функция: копает траншею       |
++-------------------------------------------------------------------------+
+</code></pre>
+</div>
+
+<ol>
+<li><strong>Высокий <code>cum</code>, низкий <code>flat</code> (Диспетчер):</strong><br />
+   Функция координирует бизнес-логику (<code>mypkg.ProcessRecord</code>). Сама по себе она почти не делает вычислений, но запускает тяжелые подсистемы. Оптимизировать нужно не ее тело, а дерево ее потомков.</li>
+<li><strong>Высокий <code>flat</code>, <code>cum</code> равен <code>flat</code> (Листовой исполнитель):</strong><br />
+   Функция-терминатор (<code>runtime.mallocgc</code>, <code>runtime.memmove</code>, алгоритм хэширования). В ней сгорают реальные такты ALU. Оптимизировать нужно непосредственно ее алгоритм или устранять причины ее вызова сверху.</li>
+</ol>
+<hr />
+<h3 id="postrochnaya-khirurgiya-s-pomoshchyu-komandy-list">Построчная хирургия с помощью команды `list`</h3>
+
+<p>Обнаружив подозрительную функцию в отчете <code>top</code>, вызовите команду <code>list FuncName</code> (например, <code>list ProcessRecord</code>):</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) list ProcessRecord
+ROUTINE ======================== mypkg.ProcessRecord in /app/record.go
+     0.50s      1.70s (flat, cum) 34.00% of Total
+         .          .    100:func ProcessRecord(r *Record) error {
+         .      0.10s    101:    data, err := json.Marshal(r)
+         .      0.80s    102:    if err != nil {
+         .          .    103:        return err
+         .          .    104:    }
+     0.50s      0.50s    105:    return store.Save(data)
+         .          .    106:}
+</code></pre>
+</div>
+
+<p>Утилита <code>pprof</code> извлекает исходный код файла и сопоставляет каждую строку со счетчиками сэмплов <code>SIGPROF</code>!<br />
+В приведенном листинге Senior-инженер сразу видит:<br />
+- Строка 101 (<code>json.Marshal</code>) потребовала 0.10s.<br />
+- Строка 102 проверки ошибок неожиданно потребовала 0.80s кумулятивного времени (скорее всего, внутри происходит дорогое форматирование трейса через <code>fmt.Errorf</code>).<br />
+- Строка 105 (<code>store.Save</code>) съела 0.50s процессора.</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Что означает, если у функции показатель <code>flat</code> практически равен показателю <code>cum</code>, и оба они составляют 35% от всего профиля CPU?</p>
+<p><strong>Ответ кандидата уровня Senior:</strong><br />
+Это однозначный признак <strong>«листовой» (leaf) функции</strong>, выполняющей тяжелую низкоуровневую работу собственными машинными инструкциями, без делегирования в дочерние методы.<br />
+Типичные примеры в Go: алгоритмы сжатия, криптографические раунды AES, поиск по срезу байт или функции рантайма (<code>runtime.memmove</code>, <code>runtime.memclr</code>, <code>runtime.aeshashbody</code>). Оптимизировать такую точку нужно алгоритмически: сокращать число итераций, использовать векторизацию SIMD, либо избегать ее вызова на более высоких уровнях архитектуры.</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="vizualizatsiya-flamegraph-i-graf-vyzovov">Визуализация: flamegraph и граф вызовов</h2>
+
+<p>Консольный отчет <code>top</code> плоский — он скрывает глубину и ветвление дерева стеков. Чтобы увидеть систему целиком, запускают веб-интерфейс:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go tool pprof -http=:8080 cpu.prof
+</code></pre>
+</div>
+
+<p>В меню <code>View</code> доступны два главных режима визуализации:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+PProfWeb[&quot;go tool pprof -http=:8080&quot;] --&gt; ViewGraph[&quot;1. Call Graph (Граф вызовов)&lt;br&gt;Толщина стрелок = объем CPU&lt;br&gt;Красные узлы = горячие точки&quot;]
+PProfWeb --&gt; ViewFlame[&quot;2. Flamegraph (Огненный график)&lt;br&gt;Ширина блока = доля времени&lt;br&gt;Высота = глубина стека&quot;]
+  </pre>
+</div>
+
+
+<ol>
+<li><strong>Call Graph (Граф вызовов):</strong> Показывает топологию зависимостей. Узлы окрашиваются цветами от серого (холодный) к ярко-красному (критически горячий).</li>
+<li><strong>Flamegraph (<a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a>):</strong> Самый удобный инструмент современной инженерии:<br />
+   - Ось X — 100% времени профиля.<br />
+   - Ось Y — глубина стека вызовов (снизу вверх: от функции <code>main</code> к глубоким вспомогательным методам).<br />
+   - Широкие «плато» на вершине огненных башен — это ваши главные враги: листовые функции, сжигающие CPU.</li>
+</ol>
+<hr />
+<h2 id="prakticheskie-primery-diagnostiki">Практические примеры диагностики</h2>
+
+<h3 id="primer-1-json-serializatsiya-sedaet-60-cpu">Пример 1: JSON-сериализация съедает 60% CPU</h3>
+
+<p>Симптомы: бэкенд захлебывается при 5 000 RPS.</p>
+<p>Отчет <code>top</code>:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">flat  flat%   cum%        cum   cum%
+0.80s 16.00% 16.00%      1.60s 32.00%  encoding/json.Marshal
+0.30s  6.00% 22.00%      0.90s 18.00%  runtime.mallocgc
+0.20s  4.00% 26.00%      0.20s  4.00%  runtime.memmove
+</code></pre>
+</div>
+
+<p><strong>Инженерный диагноз:</strong><br />
+Стандартный пакет <code>encoding/json</code> интенсивно использует рефлексию <code>reflect</code>, боксинг интерфейсов и непрерывно выделяет промежуточные буферы в куче (<code>runtime.mallocgc</code>) с последующим перекопированием байт (<code>runtime.memmove</code>). Проблема не в скорости CPU, а в неэффективном управлении памятью.</p>
+<p><strong>Рецепт лечения:</strong><br />
+- Переход на кодогенерацию без рефлексии: <code>easyjson</code> или современные сверхбыстрые парсеры с поддержкой SIMD (например, <code>sonic</code> от ByteDance).<br />
+- Переиспользование структур и буферов через <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</p>
+<hr />
+<h3 id="primer-2-pustoy-tsikl-lineynogo-poiska">Пример 2: «Пустой» цикл линейного поиска</h3>
+
+<p>В отчете <code>top</code> функция <code>mypkg.contains</code> держит 30% всего CPU сервера:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2432,7 +2596,7 @@ Fix --&gt; Verify[&quot;Повторный профиль: проверка эф
 </code></pre>
 </div>
 
-<p><code>list contains</code>:</p>
+<p>Листинг <code>list contains</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2453,79 +2617,164 @@ Fix --&gt; Verify[&quot;Повторный профиль: проверка эф
 </code></pre>
 </div>
 
-<p>Это линейный поиск по большому слайсу. Решение — заменить на <code>map[string]struct{}</code> для O(1) или использовать сортировку + бинарный поиск. Механическая эмпатия: даже замена слайса на map не гарантирует ускорения, если не учесть cache friendliness (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<p><strong>Инженерный диагноз:</strong><br />
+Линейный поиск со сложностью $O(N)$ по срезу из 10 000 элементов в горячем цикле обработки запроса. На каждой итерации процессор производит посимвольное сравнение строк.</p>
+<p><strong>Рецепт лечения:</strong><br />
+1. Если коллекция статична — предварительно индексировать срез в хэш-таблицу <code>map[string]struct{}</code> для получения поиска за $O(1)$.<br />
+2. Если коллекция упорядочена — применить бинарный поиск <code>sort.SearchStrings</code> за $O(\log N)$.<br />
+3. <em>Mechanical sympathy:</em> Помните, что для сверхмалых срезов ($N \le 8$) линейный скан по срезу в памяти часто работает быстрее <code>map</code> за счет локальности кэша процессора L1D (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<hr />
 <h3 id="primer-3-vysokoe-vremya-v-runtime-cgocall">Пример 3: Высокое время в `runtime.cgocall`</h3>
 
-<p>Если в топе <code>runtime.cgocall</code> и <code>runtime.asmcgocall</code>, значит много времени уходит в вызовы C-кода (например, драйвер БД или специфичные библиотеки). Такой профиль — сигнал к ревизии использования CGO. Подробнее о системных вызовах: <a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>.</p>
+<p>В отчете <code>top</code> доминируют функции рантайма <code>runtime.cgocall</code> и <code>runtime.asmcgocall</code>:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">flat  flat%   cum%
+1.10s 22.00% 1.10s 22.00%  runtime.cgocall
+0.45s  9.00% 0.45s  9.00%  runtime.asmcgocall
+</code></pre>
+</div>
+
+<p><strong>Инженерный диагноз:</strong><br />
+Приложение слишком часто пересекает границу Cgo (FFI вызовы к C-библиотеке, драйверу СУБД или криптографии).<br />
+Каждый вызов Cgo стоит от 40 до 100 наносекунд: он требует вызова <code>runtime.entersyscall</code>, смены стека Go на стек операционной системы <code>pthread</code>, сохранения регистров и блокировки потока <code>M</code> (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>).</p>
+<p><strong>Рецепт лечения:</strong><br />
+- Батчинг: передавать в C массив из 10 000 элементов за один FFI-вызов вместо 10 000 отдельных вызовов по одному элементу.<br />
+- Переписывание критической логики на чистый Go с ассемблерными вставками.</p>
+<hr />
 <h2 id="tipichnye-cpu-bound-patterny-v-go">Типичные CPU-bound паттерны в Go</h2>
 
-<p>Зная типовые «горячие» паттерны, можно быстрее ставить диагноз.</p>
-<h3 id="1-serializatsiya-deserializatsiya">1. Сериализация / десериализация</h3>
+<p>Каталог типичных узких мест, с которыми сталкивается бэкенд-разработчик:</p>
 
-<p><code>json.Marshal/Unmarshal</code>, <code>xml.Decode</code>, <code>protobuf.Marshal</code>. Кроме прямого времени, генерируют много аллокаций, что видно по соседству <code>runtime.mallocgc</code> в top.</p>
-<h3 id="2-regulyarnye-vyrazheniya">2. Регулярные выражения</h3>
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                    Каталог CPU-паттернов в Go                           |
++------------------------------------+------------------------------------+
+| Симптом в профиле                  | Первопричина и решение             |
++------------------------------------+------------------------------------+
+| runtime.mallocgc &gt; 20%             | Скрытые аллокации (интерфейсы,     |
+|                                    | замыкания). Нужен Escape Analysis. |
+|                                    |                                    |
+| runtime.memmove / growslice        | Непредвыделенные слайсы.           |
+|                                    | Использовать make([]T, 0, cap).    |
+|                                    |                                    |
+| regexp.(*Regexp).doExecute         | Регулярки в цикле. Заменить на     |
+|                                    | strings.Index / strings.Contains.  |
+|                                    |                                    |
+| runtime.mapaccess / mapassign      | Избыточные операции с map.         |
+|                                    | Предвыделять размер make(map, N).  |
+|                                    |                                    |
+| runtime.procyield / osyield        | Busy-wait спинлоки, lock contention|
+|                                    | Разрежать локи, шардировать кэш.   |
+|                                    |                                    |
+| strings.Builder / конкатенация     | Склейка через '+'.                 |
+|                                    | Использовать strings.Builder.Grow. |
++------------------------------------+------------------------------------+
+</code></pre>
+</div>
 
-<p><code>regexp.MustCompile</code> + <code>FindAll</code>. Компиляция и выполнение regexp — CPU-ёмкие. Если выражение статично, компилировать один раз глобально.</p>
-<h3 id="3-strokovye-operatsii-v-tsiklakh">3. Строковые операции в циклах</h3>
-
-<p>Конкатенация через <code>+</code> в цикле порождает множество аллокаций и копирований. Профиль может показать <code>runtime.memmove</code> и <code>runtime.growslice</code>. Использовать <code>strings.Builder</code>.</p>
-<h3 id="4-khesh-tablitsy-s-plokhoy-khesh-funktsiey">4. Хеш-таблицы с плохой хеш-функцией</h3>
-
-<p><code>runtime.mapaccess</code> с большим процентом может указывать на избыточные эвакуации бакетов (рост мапы) или коллизии. Решение — предвыделение размера (<code>make(map[K]V, size)</code>).</p>
-<h3 id="5-sinkhronizatsiya-realizovannaya-cherez-busy-wait">5. Синхронизация, реализованная через busy-wait</h3>
-
-<p>Например, попытки атомарного CAS в цикле без отката. Профиль покажет <code>runtime.procyield</code> или <code>runtime.osyield</code>.</p>
-<h3 id="6-chastye-sistemnye-vyzovy">6. Частые системные вызовы</h3>
-
-<p>В CPU-профиль они не попадают напрямую (так как ядерное время не сэмплируется), но могут проявляться через <code>runtime.syscall</code> или пакеты-обёртки. Если есть подозрение на IO, нужно смотреть блокировочный профиль (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>).</p>
+<ol>
+<li><strong>Сериализация / десериализация:</strong><br />
+<code>json.Marshal/Unmarshal</code>, <code>xml.Decode</code>, <code>protobuf.Marshal</code>. Помимо времени парсинга, они нагружают память, что диагностируется по соседству с <code>runtime.mallocgc</code>.</li>
+<li><strong>Регулярные выражения:</strong><br />
+   Вызовы <code>regexp.MustCompile</code> внутри функций или частые <code>FindAll</code>. Движок регулярных выражений Go реализует недетерминированный конечный автомат (NFA) без обратного отката, что гарантирует защиту от ReDoS, но требует огромного числа процессорных инструкций. Для простых паттернов всегда предпочитайте функции пакета <code>strings</code> или <code>bytes</code>.</li>
+<li><strong>Строковые операции в циклах:</strong><br />
+   Конкатенация строк оператором <code>+</code> в цикле порождает квадратичное копирование памяти. В топе мгновенно возникают <code>runtime.memmove</code> и <code>runtime.growslice</code>. Решение — предвыделенный <code>strings.Builder</code> с вызовом <code>sb.Grow(size)</code>.</li>
+<li><strong>Хеш-таблицы с плохой хеш-функцией:</strong><br />
+   Доминирование <code>runtime.mapaccess</code> и <code>runtime.mapassign</code> часто указывает на постоянные коллизии бакетов либо ступенчатый рост мапы с эвакуацией элементов. Предвыделяйте размер мапы: <code>make(map[K]V, size)</code>.</li>
+<li><strong>Синхронизация через Busy-Wait (Спинлоки):</strong><br />
+   Попытки реализовать спинлок через атомарный <code>atomic.CompareAndSwap</code> (CAS) в плотном цикле <code>for !cas(...) {}</code>. Процессор сжигает 100% мощности активного ядра. В профиле это проявляется функциями <code>runtime.procyield</code> (инструкция <code>PAUSE</code> на x86) или <code>runtime.osyield</code>.</li>
+<li><strong>Частые системные вызовы:</strong><br />
+   Хотя само время ядра не входит в профиль, накладные расходы на переход <code>user -&gt; kernel -&gt; user</code> проявляются через <code>runtime.syscall</code> или сопутствующие вспомогательные функции рантайма. При подозрениях на ввод-вывод исследуйте блокировочный профиль (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>).</li>
+</ol>
+<hr />
 <h2 id="mechanical-sympathy-cpu-profil-i-mikroarkhitektura">Mechanical Sympathy: CPU-профиль и микроархитектура</h2>
 
-<p>Профиль процессора отражает не только код, но и взаимодействие с «железом»:</p>
-<ul>
-<li><strong>Кэш-промахи:</strong> большое время в <code>runtime.memmove</code> или <code>runtime.duffcopy</code> при копировании слайсов намекает на неэффективную работу с памятью. Оптимизация: структуры, дружественные кэшу (<a href="../09-prakticheskie-optimizatsii/6-cache-friendly-struktury.html" class="wikilink">6. Cache friendly структуры</a>).</li>
-<li><strong>Ветвления:</strong> если функция с множеством <code>if</code> занимает неожиданно много времени, но <code>list</code> не показывает отдельных дорогих строк, проблема может быть в ошибках предсказания ветвлений (<a href="6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>). Косвенно это можно выявить через <code>perf stat -e branch-misses</code>.</li>
-<li><strong>Инлайнинг:</strong> маленькие функции, которые не инлайнятся, добавляют накладные расходы на вызов. Профиль покажет их в топе, хотя тело простое. Корректируется перестройкой кода для удовлетворения эвристик инлайнинга компилятора (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>).</li>
-</ul>
-<p>Инструментарий профилирования не всегда детализирует такие эффекты, но опытный инженер, зная внутренности рантайма и процессора, может строить гипотезы и проверять их через дополнительные утилиты (<code>perf</code>, <code>objdump</code>).</p>
+<p>CPU-профиль отображает верхушку айсберга. Настоящее понимание происходящего требует механического сочувствия к кремнию:</p>
+<ol>
+<li><strong>Кэш-промахи и задержки шины памяти:</strong><br />
+   Если функция тратит массу времени на тривиальное сложение элементов в цикле, либо в топе висят <code>runtime.memmove</code> и <code>runtime.duffcopy</code> при пересылке структур — процессор находится в состоянии <strong>CPU Stall</strong>. Он простаивает сотни тактов в ожидании доставки кэш-линии из DRAM. Оптимизируйте раскладку памяти: переходите от структур указателей к плоским массивам (Cache-friendly структуры, <a href="../09-prakticheskie-optimizatsii/6-cache-friendly-struktury.html" class="wikilink">6. Cache friendly структуры</a>).</li>
+<li><strong>Ошибки предсказателя ветвлений (Branch Mispredictions):</strong><br />
+   Если код насыщен сложными каскадами <code>if/else</code>, конвейер процессора регулярно сбрасывается из-за неверного спекулятивного исполнения (<a href="6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>). Косвенно такие проблемы диагностируются через утилиту Linux <code>perf stat -e branch-misses ./binary</code>.</li>
+<li><strong>Накладные расходы вызовов и инлайнинг:</strong><br />
+   Если мелкая функция вызывается миллиард раз, накладные расходы на пролог и эпилог стека могут превышать время полезной работы. Изучите отчет компилятора <code>go build -gcflags="-m"</code> и убедитесь, что компилятор выполнил инлайнинг (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>).</li>
+</ol>
+<p>Инструментарий профилирования не всегда детализирует такие низкоуровневые эффекты, но опытный инженер, зная механику рантайма и процессора, строит гипотезы и проверяет их через ассемблерные листинги и утилиты (<code>perf</code>, <code>objdump</code>).</p>
+<hr />
 <h2 id="oshibki-i-lovushki-pri-rabote-s-cpu-profilem">Ошибки и ловушки при работе с CPU-профилем</h2>
 
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Слепота к Off-CPU задержкам</span>
   </div>
   <div class="callout-body">
-    <p><strong>Игнорирование времени ожидания.</strong> Разработчик видит, что CPU загружен на 100% и пытается оптимизировать вычисления. Но профиль CPU не показывает ожидания (блокировки, сетевые задержки). Если приложение тормозит, но CPU-профиль почти пуст — проблема в IO или синхронизации. Нужен блокировочный профиль или трассировка.</p>
+    <p><strong>Главная ментальная ловушка инженера:</strong> Сервис отвечает с задержкой 5 секунд, разработчик снимает CPU-профиль и обнаруживает, что суммарное время всех функций за 30 секунд составило... всего 0.4 секунды!<br />
+Начинается паника: «Профайлер сломался! Он ничего не показывает!».<br />
+<strong>Объяснение:</strong> Сервис не загружает CPU — он <strong>спит</strong>! Горутины заблокированы в ожидании ответа базы данных, захвата мьютекса или чтения из сетевого сокета. Сэмплирующий CPU-профиль фиксирует только активные такты процессора. При задержках на спящих горутинах немедленно снимайте <strong>Block Profile</strong> или используйте <strong>Execution Tracer</strong>!</p>
   </div>
 </div>
 
-<ul>
-<li><strong>Слишком короткий профиль.</strong> 5 секунд может попасть на пик аллокаций и показать искажённую картину. Минимум 30 секунд под стабильной нагрузкой.</li>
-<li><strong>Неучтённый overhead профилировщика.</strong> При очень высокой частоте или на микро-бенчмарках профилировщик может «накрутить» десятки процентов. Проверяйте: временно отключите профилировщик и сравните пропускную способность.</li>
-<li><strong>Профилирование без нагрузки.</strong> Снятый на idle-сервере профиль покажет <code>runtime.gopark</code>, <code>netpoll</code>, <code>findrunnable</code>. Это бесполезно. Нужна нагрузка, репрезентативная для production.</li>
-<li><strong>Неправильная интерпретация flat/cum.</strong> Новичок может смотреть только на flat и упустить, что 90% времени скрыто в <code>cum</code> родительской функции. Всегда анализируйте иерархию.</li>
-</ul>
+<p>Другие частые ошибки:<br />
+- <strong>Слишком короткий замер:</strong> Профиль длительностью 3–5 секунд искажен случайными микрособытиями рантайма. Минимальный порог — <strong>30 секунд</strong>.<br />
+- <strong>Профилирование без рабочей нагрузки:</strong> Снятие профиля на тестовом стенде без входящих запросов покажет только фоновые функции рантайма: <code>runtime.gopark</code>, <code>netpoll</code>, <code>findrunnable</code>.<br />
+- <strong>Игнорирование иерархии <code>flat</code> vs <code>cum</code>:</strong> Попытка оптимизировать диспетчера с большим <code>cum</code>, не заглядывая в его листовые зависимости.</p>
+<hr />
 <h2 id="svyaz-s-ostalnymi-instrumentami">Связь с остальными инструментами</h2>
 
-<p>CPU-профиль — часть пазла. Когда он показывает аномалию, мы идём глубже:</p>
-<ul>
-<li>Если много аллокаций (mallocgc) → memory profile (<a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>), чтобы найти источники.</li>
-<li>Если видны блокировки (select, chan) → block profile (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>).</li>
-<li>Если подозреваем contention → mutex profile (<a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>).</li>
-<li>Если нужна динамика во времени → execution tracer (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>).</li>
-</ul>
-<p>И обязательно подкрепляем профили бенчмарками для количественной оценки оптимизаций (<a href="../02-benchmarking/8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>).</p>
+<p>CPU-профиль — отправная точка комплексной диагностики:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+CPUProf[&quot;CPU Profile (go tool pprof)&quot;]
+
+CPUProf --&gt;|Много mallocgc / memmove| MemProf[&quot;[[5. pprof memory profile]]&lt;br&gt;Анализ аллокаций и кучи&quot;]
+CPUProf --&gt;|Много select / chansend| BlockProf[&quot;[[5. block profile]]&lt;br&gt;Анализ времени блокировок&quot;]
+CPUProf --&gt;|Много runtime.lock / procyield| MutexProf[&quot;[[6. mutex profile]]&lt;br&gt;Анализ contention за мьютексы&quot;]
+CPUProf --&gt;|Непонятная динамика во времени| Tracer[&quot;[[3. execution tracer]]&lt;br&gt;Покадровая трассировка рантайма&quot;]
+CPUProf --&gt;|Проверка гипотез оптимизации| Benchmarks[&quot;[[8. Сравнение версий кода]]&lt;br&gt;Математическая верификация benchstat&quot;]
+  </pre>
+</div>
+
+
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ul>
-<li>CPU-профиль в Go, получаемый через <code>net/http/pprof</code> или <code>runtime/pprof</code>, показывает распределение процессорного времени с точностью до функции и строки кода.</li>
-<li>Основные метрики: <code>flat</code> (время внутри функции) и <code>cum</code> (время с учётом потомков). Их анализ через <code>top</code>, <code>list</code> и <code>flamegraph</code> позволяет точно локализовать узкое место.</li>
-<li>Типичные CPU-bound паттерны — сериализация, строковые операции, избыточные вычисления, плохие структуры данных.</li>
-<li>Профиль CPU не показывает ожидания и системные вызовы; для полной картины нужно комплексировать с другими профилями.</li>
-<li>При интерпретации важно учитывать микроархитектурные эффекты (кэш, ветвления, инлайнинг) — механическая эмпатия превращает подозрения в обоснованные гипотезы.</li>
-<li>Полученный навык читать CPU-профиль — фундамент, без которого невозможен переход к более сложным темам: flamegraph, оптимизации inline, анализ branch prediction и cache friendliness.</li>
-</ul>
-<p>Теперь, освоив плоскую таблицу <code>top</code>, мы переходим к визуальному методу, который делает очевидной иерархию вызовов: <a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a>.</p>
+<ol>
+<li><strong>CPU-профиль — карта плотности процессорного времени:</strong> Он показывает относительное распределение тактов процессора по функциям и строкам кода.</li>
+<li><strong>Аналитический дуэт <code>flat</code> и <code>cum</code>:</strong><br />
+   - <code>flat</code> — собственное время функции (листовой исполнитель).<br />
+   - <code>cum</code> — кумулятивное время с потомками (архитектурный диспетчер).</li>
+<li><strong>Хирургическая точность <code>list</code>:</strong> Позволяет сопоставить строки исходного кода с процентом сгоревших процессорных тактов.</li>
+<li><strong>Типовые виновники:</strong> Сериализация без кодогенерации, непредвыделенные слайсы и мапы, Cgo переходы и псевдослучайные линейные сканы.</li>
+<li><strong>Помните об ограничениях:</strong> CPU-профиль слеп к задержкам ожидания ввода-вывода (Off-CPU) — при низком потреблении процессора исследуйте блокировки через <code>block profile</code> и <code>trace</code>.</li>
+</ol>
+<p>В следующей лекции <a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a> мы разберем главный визуальный инструмент высоконагруженной инженерии — пламенные графики Брендана Грегга, научимся одним взглядом находить узкие места в глубине 50-уровневых стеков вызовов и мгновенно локализовать архитектурные аномалии.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2553,7 +2802,7 @@ Fix --&gt; Verify[&quot;Повторный профиль: проверка эф
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vvedenie-ot-medlenno-k-konkretnoy-funktsii">Введение: от «медленно» к конкретной функции</a></li><li class="toc-item toc-h2"><a href="#poluchenie-cpu-profilya">Получение CPU-профиля</a></li><li class="toc-item toc-h3"><a href="#1-cherez-http-endpoint-nethttppprof">1. Через HTTP-эндпоинт net/http/pprof</a></li><li class="toc-item toc-h3"><a href="#2-pryamoy-vyzov-runtimepprof">2. Прямой вызов runtime/pprof</a></li><li class="toc-item toc-h3"><a href="#3-cherez-go-test">3. Через go test</a></li><li class="toc-item toc-h2"><a href="#nastroyka-chastoty-semplirovaniya">Настройка частоты сэмплирования</a></li><li class="toc-item toc-h2"><a href="#interpretatsiya-otchyota-flat-cum-top">Интерпретация отчёта: flat, cum, top</a></li><li class="toc-item toc-h2"><a href="#vizualizatsiya-flamegraph-i-graf-vyzovov">Визуализация: flamegraph и граф вызовов</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-primery-diagnostiki">Практические примеры диагностики</a></li><li class="toc-item toc-h3"><a href="#primer-1-json-serializatsiya-sedaet-60-cpu">Пример 1: JSON-сериализация съедает 60% CPU</a></li><li class="toc-item toc-h3"><a href="#primer-2-pustoy-tsikl-nagruzhaet-cpu">Пример 2: «Пустой» цикл нагружает CPU</a></li><li class="toc-item toc-h3"><a href="#primer-3-vysokoe-vremya-v-runtime-cgocall">Пример 3: Высокое время в runtime.cgocall</a></li><li class="toc-item toc-h2"><a href="#tipichnye-cpu-bound-patterny-v-go">Типичные CPU-bound паттерны в Go</a></li><li class="toc-item toc-h3"><a href="#1-serializatsiya-deserializatsiya">1. Сериализация / десериализация</a></li><li class="toc-item toc-h3"><a href="#2-regulyarnye-vyrazheniya">2. Регулярные выражения</a></li><li class="toc-item toc-h3"><a href="#3-strokovye-operatsii-v-tsiklakh">3. Строковые операции в циклах</a></li><li class="toc-item toc-h3"><a href="#4-khesh-tablitsy-s-plokhoy-khesh-funktsiey">4. Хеш-таблицы с плохой хеш-функцией</a></li><li class="toc-item toc-h3"><a href="#5-sinkhronizatsiya-realizovannaya-cherez-busy-wait">5. Синхронизация, реализованная через busy-wait</a></li><li class="toc-item toc-h3"><a href="#6-chastye-sistemnye-vyzovy">6. Частые системные вызовы</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-cpu-profil-i-mikroarkhitektura">Mechanical Sympathy: CPU-профиль и микроархитектура</a></li><li class="toc-item toc-h2"><a href="#oshibki-i-lovushki-pri-rabote-s-cpu-profilem">Ошибки и ловушки при работе с CPU-профилем</a></li><li class="toc-item toc-h2"><a href="#svyaz-s-ostalnymi-instrumentami">Связь с остальными инструментами</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#vvedenie-ot-medlenno-k-konkretnoy-funktsii">Введение: от «медленно» к конкретной функции</a></li><li class="toc-item toc-h2"><a href="#poluchenie-cpu-profilya">Получение CPU-профиля</a></li><li class="toc-item toc-h3"><a href="#1-cherez-http-endpoint-nethttppprof">1. Через HTTP-эндпоинт net/http/pprof</a></li><li class="toc-item toc-h3"><a href="#2-pryamoy-vyzov-runtimepprof">2. Прямой вызов runtime/pprof</a></li><li class="toc-item toc-h3"><a href="#3-cherez-testovyy-ranner-go-test">3. Через тестовый раннер go test</a></li><li class="toc-item toc-h2"><a href="#nastroyka-chastoty-semplirovaniya">Настройка частоты сэмплирования</a></li><li class="toc-item toc-h2"><a href="#interpretatsiya-otchyota-flat-cum-top">Интерпретация отчёта: flat, cum, top</a></li><li class="toc-item toc-h3"><a href="#anatomicheskaya-model-general-i-soldat">Анатомическая модель: Генерал и Солдат</a></li><li class="toc-item toc-h3"><a href="#postrochnaya-khirurgiya-s-pomoshchyu-komandy-list">Построчная хирургия с помощью команды list</a></li><li class="toc-item toc-h2"><a href="#vizualizatsiya-flamegraph-i-graf-vyzovov">Визуализация: flamegraph и граф вызовов</a></li><li class="toc-item toc-h2"><a href="#prakticheskie-primery-diagnostiki">Практические примеры диагностики</a></li><li class="toc-item toc-h3"><a href="#primer-1-json-serializatsiya-sedaet-60-cpu">Пример 1: JSON-сериализация съедает 60% CPU</a></li><li class="toc-item toc-h3"><a href="#primer-2-pustoy-tsikl-lineynogo-poiska">Пример 2: «Пустой» цикл линейного поиска</a></li><li class="toc-item toc-h3"><a href="#primer-3-vysokoe-vremya-v-runtime-cgocall">Пример 3: Высокое время в runtime.cgocall</a></li><li class="toc-item toc-h2"><a href="#tipichnye-cpu-bound-patterny-v-go">Типичные CPU-bound паттерны в Go</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-cpu-profil-i-mikroarkhitektura">Mechanical Sympathy: CPU-профиль и микроархитектура</a></li><li class="toc-item toc-h2"><a href="#oshibki-i-lovushki-pri-rabote-s-cpu-profilem">Ошибки и ловушки при работе с CPU-профилем</a></li><li class="toc-item toc-h2"><a href="#svyaz-s-ostalnymi-instrumentami">Связь с остальными инструментами</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

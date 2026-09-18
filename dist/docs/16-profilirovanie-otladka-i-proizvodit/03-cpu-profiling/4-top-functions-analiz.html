@@ -2169,211 +2169,104 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~36 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Top functions анализ</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="zachem-sistemno-analizirovat-top-funktsii">Зачем системно анализировать top-функции</h2>
+            <h1>Top functions анализ: системный детектив узких мест</h1>
+<blockquote>
+<p><em>"Premature optimization is the root of all evil. But blind optimization without taxonomy is pure madness."</em><br />
+— Перефразируя Дональда Кнута  </p>
+<p><em>"A good doctor doesn't treat the fever; he treats the infection. A good engineer doesn't optimize the top function; he understands why it is at the top."</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<p>Представьте опытного врача-клинициста, которому принесли развернутый биохимический анализ крови пациента на сорока листах. Неопытный интерн растеряется от обилия незнакомых показателей или начнет сбивать легкую температуру жаропонижающим. Мудрый диагност не смотрит на случайные единичные отклонения: он группирует маркеры в клинические синдромы. Повышенные ферменты АЛТ и АСТ указывают на печень, креатинин — на почки, а лейкоцитоз — на воспалительный процесс. Он лечит не симптом, а первопричину.</p>
+<p>Консольный отчет <code>top</code> в <code>go tool pprof</code> — это точно такой же биохимический анализ работающего Go-сервиса. Неопытный разработчик бросается оптимизировать самую первую функцию в списке. Увидев на вершине <code>runtime.mallocgc</code>, он пытается переписать сборщик мусора Go. Увидев <code>runtime.memmove</code>, он пытается переизобрести ассемблерные инструкции копирования памяти.</p>
+<p>Senior-инженер мыслит иначе. Для него отчет <code>top</code> — это улика в системном расследовании. Он задает проверочные вопросы: <em>«Это листовой исполнитель (<code>flat</code>) или архитектурный диспетчер (<code>cum</code>)? Это код нашего приложения или внутренности рантайма? Это вычисления, аллокации или скрытая конкуренция за блокировки?»</em>.</p>
+<p>В <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a> мы освоили основы чтения показателей <code>flat</code> и <code>cum</code>, а во <a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a> научились визуализировать стек вызовов. В этой лекции мы превратим разрозненные наблюдения в строгую, повторяемую методологию — <strong>Top Functions Analysis</strong>. Мы построим полную классификацию типовых симптомов рантайма Go, разберем пошаговый алгоритм расследования и научимся находить корень проблемы за считанные минуты.</p>
+<hr />
+<h2 id="zachem-sistemno-analizirovat-top-funktsii">Зачем системно анализировать top-функции</h2>
 
-<p>В <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a> мы научились читать таблицу <code>top</code>: что означают <code>flat</code>, <code>cum</code> и как получить построчный <code>list</code>. Во <a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a> мы добавили визуальную иерархию. Теперь пришло время превратить эти навыки в строгую, повторяемую методологию — <strong>Top Functions Analysis</strong>.</p>
-<p>Суть метода: не просто увидеть «горячие» функции, а классифицировать их, понять причину дороговизны, связать с конкретным профилем (память, блокировки, contention) и выйти на целенаправленную оптимизацию. Senior-инженер не бросается на первую строку в <code>top</code> — он задаёт вопросы: «это flat или cum?», «это мой код или рантайм?», «это аллокация, копирование или ожидание?», «как это связано с кэшем и ветвлениями?».</p>
-<p>Эта статья выстраивает полный аналитический фреймворк, который станет для вас алгоритмом на все случаи CPU-профилирования.</p>
+<p>Системный анализ верхних строк отчета профилировщика предотвращает хаотичные и бесполезные попытки оптимизировать код вслепую. Мы не бросаемся на первую попавшуюся строку, а методично отделяем симптомы от первопричины.</p>
+<hr />
 <h2 id="dva-vzglyada-flat-protiv-cum">Два взгляда: flat против cum</h2>
 
-<p>Напомним ключевые определения из <a href="2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>:</p>
-<ul>
-<li><strong>flat</strong> — время, проведённое непосредственно в теле функции, исключая вызванные ею.</li>
-<li><strong>cum</strong> (cumulative) — полное время от входа до выхода, включая все дочерние вызовы.</li>
-</ul>
-<p>Оба взгляда важны, но отвечают на разные вопросы:</p>
+<p>Фундамент любого числового анализа профилей — четкое разделение ответственности между собственным и кумулятивным временем:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                  Дихотомия метрик: flat vs cum                          |
+|                                                                         |
+|  [main.handleRequest]     flat = 0.05s (1%)   cum = 4.20s (84%)         |
+|         |                 -&gt; Диспетчер: входная точка для оптимизации   |
+|         v                                                               |
+|  [myapp.ProcessOrder]     flat = 0.20s (4%)   cum = 3.80s (76%)         |
+|         |                 -&gt; Координатор: делегирует работу потомкам    |
+|         v                                                               |
+|  [runtime.mallocgc]       flat = 2.10s (42%)  cum = 2.10s (42%)         |
+|                           -&gt; Листовой исполнитель: здесь горят такты    |
++-------------------------------------------------------------------------+
+</code></pre>
+</div>
+
 <div class="table-container"><table>
 <thead>
 <tr>
-<th>Вопрос</th>
-<th>Какой взгляд</th>
+<th>Диагностический вопрос</th>
+<th style="text-align: center;">Метрика анализа</th>
+<th>Команда в pprof</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Какая функция сама выполняет тяжёлую работу?</td>
-<td>flat</td>
+<td><strong>Какой сквозной путь выполнения съедает больше всего CPU?</strong></td>
+<td style="text-align: center;"><code>cum</code> (Cumulative)</td>
+<td><code>top -cum</code></td>
 </tr>
 <tr>
-<td>Какой путь стоит оптимизировать целиком?</td>
-<td>cum</td>
+<td><strong>В какую подсистему выгоднее всего инвестировать время рефакторинга?</strong></td>
+<td style="text-align: center;"><code>cum</code> (Родитель)</td>
+<td><code>top -cum -focus=MyPackage</code></td>
 </tr>
 <tr>
-<td>Где узкое место скрыто за вызовами?</td>
-<td>cum (родитель) + flat (потомки)</td>
+<td><strong>Какая конкретная функция лично сжигает процессорные такты в своих инструкциях?</strong></td>
+<td style="text-align: center;"><code>flat</code> (Flat time)</td>
+<td><code>top -flat</code> (или просто <code>top</code>)</td>
 </tr>
 <tr>
-<td>Какая листовая функция — конечный потребитель тактов?</td>
-<td>flat</td>
+<td><strong>Является ли функция терминальным исполнителем («листом»)?</strong></td>
+<td style="text-align: center;"><code>flat ≈ cum</code></td>
+<td>Сопоставление колонок</td>
 </tr>
 </tbody>
 </table></div>
-<p>Алгоритм анализа:<br />
-1. Сортируем по <code>cum</code> (<code>top -cum</code>), находим «диспетчеров» с большим кумулятивным временем. Это входные точки для оптимизации.<br />
-2. Для каждого диспетчера смотрим его <code>flat</code>. Если <code>flat</code> мал — проблема в потомках. Используем <code>list</code> или <code>web</code> для детализации.<br />
-3. Сортируем по <code>flat</code> (<code>top -flat</code>), находим «листья», которые сами жрут такты.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В top-списке функция имеет <code>flat=1.5s</code>, <code>cum=1.5s</code>. О чём это говорит?<br />
-<strong>Ответ:</strong> Это листовая функция, которая не вызывает других дорогих операций. Всё время проводится в её теле. Оптимизировать нужно именно её код.</p>
+    <p><strong>Вопрос:</strong> В top-списке функция имеет <code>flat=1.5s</code>, <code>cum=1.5s</code>. О чем это свидетельствует и какова стратегия ее оптимизации?</p>
+<p><strong>Ответ кандидата уровня Senior:</strong><br />
+Равенство <code>flat</code> и <code>cum</code> — безусловный признак <strong>листовой (leaf) функции</strong>. Это означает, что внутри нее нет вызовов других тяжелых функций; все 1.5 секунды процессор провел непосредственно в ее собственном машинном теле.<br />
+Стратегия: необходимо открыть ее исходный код через <code>list FuncName</code> (или визуальный граф <code>web</code>) и оптимизировать внутренний алгоритм (устранение лишних итераций, использование SIMD-инструкций, предвычисление таблиц) либо устранить причину ее частого вызова на уровне вызывающих родительских функций.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="metodologiya-analiza-top-funktsiy">Методология анализа top-функций</h2>
 
-<h3 id="shag-1-sbor-kachestvennogo-profilya">Шаг 1. Сбор качественного профиля</h3>
-
-<p>Условия для достоверного профиля:<br />
-- Приложение под реалистичной нагрузкой (иначе увидим <code>runtime.gopark</code>, <code>netpoll</code>).<br />
-- Длительность не менее 30 секунд (меньше — риск смещения).<br />
-- Частота 100 Гц (по умолчанию), если не ищем наносекундные эффекты.<br />
-- Профиль снят на том же железе, где наблюдалась проблема.</p>
-<h3 id="shag-2-pervichnyy-osmotr-top-cum">Шаг 2. Первичный осмотр: `top -cum`</h3>
-
-
-<div class="code-block" data-lang="bash">
-  <div class="code-header">
-    <span class="code-lang-tag">Bash</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-bash"><code class="language-bash">go tool pprof cpu.prof
-(pprof) top -cum
-</code></pre>
-</div>
-
-<p>Вывод показывает функции, на которые приходится максимум <em>общего</em> времени. Вверху — корневые диспетчеры. Игнорируем <code>runtime.main</code>, <code>runtime.goexit</code> (это каркас). Ищем функции нашего кода с наибольшим <code>cum</code>.</p>
-<p>Пример:</p>
-
-<div class="code-block" data-lang="text">
-  <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-text"><code class="language-text">      flat  flat%   sum%        cum   cum%
-     0.10s  2.00%  2.00%      3.50s 70.00%  myapp.ProcessRequest
-     0.50s 10.00% 12.00%      2.00s 40.00%  encoding/json.Unmarshal
-     0.80s 16.00% 28.00%      1.20s 24.00%  myapp.ValidateRecord
-     0.20s  4.00% 32.00%      0.80s 16.00%  runtime.mallocgc
-</code></pre>
-</div>
-
-<p>Вывод: <code>ProcessRequest</code> «стоит» 70% всего CPU. Но её собственный <code>flat</code> всего 0.10s — смотрим потомков. <code>json.Unmarshal</code> — 40% cum; <code>ValidateRecord</code> — 24% cum. Идём в них.</p>
-<h3 id="shag-3-vydelenie-potomkov-liderov">Шаг 3. Выделение «потомков-лидеров»</h3>
-
-<p>Для каждой подозрительной функции смотрим:</p>
-
-<div class="code-block" data-lang="text">
-  <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
-    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-      <span>Копировать</span>
-    </button>
-  </div>
-  <pre class="language-text"><code class="language-text">(pprof) list ProcessRequest
-(pprof) top -cum -focus=ProcessRequest
-</code></pre>
-</div>
-
-<p>Или через веб-интерфейс (<code>-http</code>) — flamegraph, сфокусированный на <code>ProcessRequest</code>. Определяем, какие дочерние вызовы отъедают время.</p>
-<h3 id="shag-4-klassifikatsiya-goryachego-koda">Шаг 4. Классификация «горячего» кода</h3>
-
-<p>Это центральный этап, где механическая эмпатия превращает цифры в диагноз. Ниже — классификация типичных «жителей» top-списка.</p>
-<h2 id="klassifikatsiya-goryachikh-funktsiy-i-strategiya-deystviy">Классификация «горячих» функций и стратегия действий</h2>
-
-<h3 id="klass-1-funktsii-rantayma-allokatsii-mallocgc-newobject">Класс 1: Функции рантайма — аллокации (`mallocgc`, `newobject`)</h3>
-
-<p><strong>Симптом:</strong> в top значительный <code>flat</code> у <code>runtime.mallocgc</code> или <code>runtime.newobject</code>.</p>
-<p><strong>Причина:</strong> код аллоцирует память в куче с высокой частотой. Это тянет за собой не только CPU на выделение, но и нагрузку на GC (<a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>).</p>
-<p><strong>Стратегия:</strong><br />
-- Перейти к memory profile (<code>-alloc_space</code>), найти источники аллокаций (<a href="../04-memory-profiling/4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>).<br />
-- Уменьшить аллокации: предвыделение, <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>), возврат по значению вместо указателя, смена структуры (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>).</p>
-<h3 id="klass-2-kopirovanie-pamyati-memmove-duffcopy-memclrnoheappointers">Класс 2: Копирование памяти (`memmove`, `duffcopy`, `memclrNoHeapPointers`)</h3>
-
-<p><strong>Симптом:</strong> <code>runtime.memmove</code> или <code>runtime.duffcopy</code> в top.</p>
-<p><strong>Причина:</strong> большие копирования (слайсы, строки, структуры). Часто это передача по значению, динамический рост слайса (<code>growslice</code>), или сериализация.</p>
-<p><strong>Стратегия:</strong><br />
-- Проверить на <code>list</code>, откуда вызывается копирование.<br />
-- Перейти на передачу по указателю или <code>copy</code> в предварительно выделенный буфер.<br />
-- Использовать <code>strings.Builder</code> с предварительным <code>Grow</code>.<br />
-- Рассмотреть zero-copy подходы (<a href="../07-io-i-sistemnyy-uroven/5-zero-copy-podkhody.html" class="wikilink">5. Zero copy подходы</a>).</p>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p><code>runtime.memmove</code> сам по себе очень быстр (SIMD-оптимизирован), но его наличие означает, что данные перекладываются. Если копирование повторяется многократно (например, при росте слайса), это создаёт каскадные накладные расходы и вымывает кэш (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
-  </div>
-</div>
-
-<h3 id="klass-3-blokirovki-i-ozhidaniya-lock-unlock-semacquire">Класс 3: Блокировки и ожидания (`lock`, `unlock`, `semacquire`)</h3>
-
-<p><strong>Симптом:</strong> <code>runtime.lock</code>, <code>runtime.unlock</code>, <code>runtime.semacquire</code> в топе, обычно с большим <code>flat</code> или заметным <code>cum</code>.</p>
-<p><strong>Причина:</strong> contention на мьютексах или ожидание на каналах (но ожидание на каналах чаще видно в block profile). CPU-профиль показывает только время <em>захвата</em> блокировки, а не время ожидания (оно вне CPU). Но если захват дорогой, значит ядро упирается в атомарные операции или futex.</p>
-<p><strong>Стратегия:</strong><br />
-- Перейти к <a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a> и <a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a> для точной картины contention.<br />
-- Уменьшить критическую секцию, шардировать мьютексы, использовать lock-free структуры (atomic).<br />
-- Проверить false sharing (<a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>), если contention необъясним.</p>
-<h3 id="klass-4-cgo-cgocall-asmcgocall">Класс 4: CGO (`cgocall`, `asmcgocall`)</h3>
-
-<p><strong>Симптом:</strong> <code>runtime.cgocall</code> в топе.</p>
-<p><strong>Причина:</strong> частые переходы в C-код (например, драйвер БД, библиотеки). CGO-вызов — это смена стека, сброс кэша TLB, иногда syscall.</p>
-<p><strong>Стратегия:</strong><br />
-- Минимизировать количество CGO-вызовов, агрегировать операции в батчи.<br />
-- Если возможно, заменить C-библиотеку на Go-аналог.<br />
-- См. <a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a> для понимания накладных расходов.</p>
-<h3 id="klass-5-operatsii-s-mapami-mapaccess-mapassign">Класс 5: Операции с мапами (`mapaccess`, `mapassign`)</h3>
-
-<p><strong>Симптом:</strong> <code>runtime.mapaccess1_fast64</code> (или подобные), <code>runtime.mapassign</code>, <code>runtime.growWork</code> в топе.</p>
-<p><strong>Причина:</strong> хеш-таблица активно используется, возможно, с неоптимальным размером, что вызывает рост и эвакуацию бакетов.</p>
-<p><strong>Стратегия:</strong><br />
-- Предвыделять размер: <code>make(map[K]V, expectedSize)</code>.<br />
-- Использовать <code>struct{}</code> для значений-флагов.<br />
-- Проверить хеш-функцию, не вызывает ли тип коллизий.<br />
-- При сверхбольших объёмах — специализированные структуры (<span class="wikilink-unresolved" title="Заметка в разработке">20. Алгоритмы и структуры данных (DSA) на Go</span>).</p>
-<h3 id="klass-6-rost-slaysov-growslice">Класс 6: Рост слайсов (`growslice`)</h3>
-
-<p><strong>Симптом:</strong> <code>runtime.growslice</code> в топе.</p>
-<p><strong>Причина:</strong> слайс растёт динамически, вызывая аллокации и копирование.</p>
-<p><strong>Стратегия:</strong><br />
-- Предвыделять <code>make([]T, 0, capacity)</code>.<br />
-- Использовать <code>sync.Pool</code> для переиспользования.<br />
-- См. <a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>.</p>
-<h3 id="klass-7-serializatsiya-deserializatsiya">Класс 7: Сериализация / десериализация</h3>
-
-<p><strong>Симптом:</strong> <code>encoding/json.Unmarshal</code>, <code>xml.Decode</code>, <code>protobuf.Marshal</code> с высоким <code>flat</code> или <code>cum</code>.</p>
-<p><strong>Причина:</strong> формат неоптимален, много рефлексии (в случае JSON), много аллокаций.</p>
-<p><strong>Стратегия:</strong><br />
-- Перейти на более быстрые библиотеки (sonic, easyjson).<br />
-- Использовать Protobuf/gRPC для внутренних сервисов.<br />
-- Для JSON — <code>json.Decoder</code> с переиспользованием буферов.</p>
-<h3 id="klass-8-regulyarnye-vyrazheniya">Класс 8: Регулярные выражения</h3>
-
-<p><strong>Симптом:</strong> <code>regexp.(*Regexp).FindAllString</code>, <code>regexp.(*Regexp).Find</code>.</p>
-<p><strong>Причина:</strong> компиляция regexp на лету или сложное выражение.</p>
-<p><strong>Стратегия:</strong><br />
-- Вынести <code>regexp.MustCompile</code> в глобальные переменные.<br />
-- Заменить на более простые строковые операции, если возможно.</p>
-<h2 id="protsess-analiza-algoritmicheskiy-podkhod">Процесс анализа: алгоритмический подход</h2>
-
+<p>Системный анализ отчета <code>top</code> выполняется по строгому четырехшаговому алгоритму:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2388,68 +2281,36 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Снять CPU-профиль под нагрузкой&quot;] --&gt; B[&quot;top -cum: найти диспетчеров&quot;]
-B --&gt; C[&quot;Для лидера по cum: посмотреть flat&quot;]
-C --&gt; D{&quot;flat велик?&quot;}
-D -- &quot;Да&quot; --&gt; E[&quot;Анализировать тело функции&lt;br&gt;list FuncName&quot;]
-D -- &quot;Нет&quot; --&gt; F[&quot;Спуститься к потомкам:&lt;br&gt;top -cum -focus=Parent&quot;]
-F --&gt; C
-E --&gt; G[&quot;Классифицировать горячие функции&lt;br&gt;по категориям&quot;]
-G --&gt; H[&quot;Выбрать соответствующий профиль&lt;br&gt;или инструмент&quot;]
-H --&gt; I[&quot;Оптимизировать, проверить гипотезу&quot;]
-I --&gt; J[&quot;Повторить профилирование&quot;]
-J --&gt; B
-G --&gt; H
+Step1[&quot;Шаг 1. Сбор качественного профиля&lt;br&gt;(Под нагрузкой, &gt;= 30 сек, 100 Гц)&quot;] --&gt; Step2[&quot;Шаг 2. Осмотр диспетчеров: top -cum&lt;br&gt;(Поиск верхнеуровневых бизнес-путей)&quot;]
+Step2 --&gt; Step3[&quot;Шаг 3. Изоляция ветви: top -cum -focus=Handler&lt;br&gt;(Поиск потомков-лидеров)&quot;]
+Step3 --&gt; Step4[&quot;Шаг 4. Анализ листьев: top -flat и list&lt;br&gt;(Классификация симптомов рантайма)&quot;]
+Step4 --&gt; Action[&quot;Выбор специализированного инструмента&lt;br&gt;(Memory, Block, Mutex профили или рефакторинг)&quot;]
   </pre>
 </div>
 
 
-<p>Классификация и выбор следующего шага:</p>
-<div class="table-container"><table>
-<thead>
-<tr>
-<th>Категория в top</th>
-<th>Следующий шаг</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>runtime.mallocgc</code> / <code>newobject</code></td>
-<td>Memory profile, <a href="../04-memory-profiling/4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a></td>
-</tr>
-<tr>
-<td><code>runtime.memmove</code> / <code>duffcopy</code> / <code>growslice</code></td>
-<td>Исследовать копирования, <a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a></td>
-</tr>
-<tr>
-<td><code>runtime.lock</code> / <code>semacquire</code> / <code>sync.Mutex</code></td>
-<td><a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>, <a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a></td>
-</tr>
-<tr>
-<td><code>runtime.cgocall</code></td>
-<td>Ревизия CGO-вызовов</td>
-</tr>
-<tr>
-<td><code>mapaccess</code> / <code>mapassign</code></td>
-<td>Оптимизация мап</td>
-</tr>
-<tr>
-<td><code>json.Unmarshal</code> / <code>Marshal</code></td>
-<td>Пул буферов, альтернативные библиотеки</td>
-</tr>
-<tr>
-<td><code>regexp.Find</code></td>
-<td>Предкомпиляция</td>
-</tr>
-<tr>
-<td>Пользовательские функции с большим <code>flat</code></td>
-<td>Построчный <code>list</code>, оценка алгоритма, инлайнинг</td>
-</tr>
-</tbody>
-</table></div>
-<h2 id="primer-sistemnogo-analiza">Пример системного анализа</h2>
+<h3 id="shag-1-sbor-kachestvennogo-profilya">Шаг 1. Сбор качественного профиля</h3>
+<p>Профиль достоверен только при соблюдении метрологических стандартов:<br />
+- Сервис находится под стабильной боевой или синтетической нагрузкой (на холостом ходу в <code>top</code> будут видны только системные функции ожидания: <code>runtime.gopark</code>, <code>netpoll</code>, <code>findrunnable</code>).<br />
+- Длительность записи составляет <strong>не менее 30 секунд</strong> (защита от случайных микровыбросов).<br />
+- Частота сэмплирования зафиксирована на стандартных <strong>100 Гц</strong>.</p>
+<h3 id="shag-2-pervichnyy-osmotr-top-cum">Шаг 2. Первичный осмотр: `top -cum`</h3>
+<p>Запускаем <code>go tool pprof</code> и сортируем список по убыванию кумулятивного времени:</p>
 
-<p>Возьмём реальный профиль микросервиса:</p>
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go tool pprof cpu.prof
+(pprof) top -cum 10
+</code></pre>
+</div>
+
+<p>Пример вывода:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2459,7 +2320,213 @@ G --&gt; H
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text">(pprof) top -cum
+  <pre class="language-text"><code class="language-text">Showing nodes accounting for 4.20s, 84.00% of 5.00s total
+Dropped 40 nodes (cum &lt;= 0.02s)
+      flat  flat%   sum%        cum   cum%
+     0.05s  1.00%  1.00%      4.20s 84.00%  main.handleRequest
+     0.10s  2.00%  3.00%      3.50s 70.00%  myapp.ProcessRequest
+     0.50s 10.00% 13.00%      2.00s 40.00%  encoding/json.Unmarshal
+     0.80s 16.00% 29.00%      1.20s 24.00%  myapp.ValidateRecord
+     0.20s  4.00% 33.00%      0.80s 16.00%  runtime.mallocgc
+</code></pre>
+</div>
+
+<p><strong>Инженерный фильтр:</strong><br />
+Игнорируем инфраструктурный каркас рантайма (<code>runtime.main</code>, <code>runtime.goexit</code>, <code>net/http.(*conn).serve</code>). Находим функцию нашего прикладного кода с наибольшим значением <code>cum</code> — это главный диспетчер <code>myapp.ProcessRequest</code> (70% всего CPU!). Поскольку собственный <code>flat</code> у нее ничтожен (0.10s), узкое место спрятано внутри ее дочерних вызовов.</p>
+<h3 id="shag-3-vydelenie-potomkov-liderov">Шаг 3. Выделение «потомков-лидеров»</h3>
+<p>Фокусируемся на подозрительной ветке с помощью фильтра <code>-focus</code>:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">(pprof) top -cum -focus=ProcessRequest
+(pprof) list ProcessRequest
+</code></pre>
+</div>
+
+<p>Или открываем веб-интерфейс (<code>-http</code>) с интерактивным графом или flamegraph (<a href="3-flamegraph.html" class="wikilink">3. Flamegraph</a>). Мы видим, что из 70% времени <code>ProcessRequest</code>:<br />
+- 40% уходит в <code>encoding/json.Unmarshal</code>.<br />
+- 24% уходит в <code>myapp.ValidateRecord</code>.</p>
+<h3 id="shag-4-klassifikatsiya-goryachego-koda">Шаг 4. Классификация «горячего» кода</h3>
+<p>Теперь мы исследуем листовые функции с максимальным значением <code>flat</code>. Большинство из них принадлежит рантайму Go. Опытный инженер классифицирует их по типам затрат и применяет соответствующий протокол лечения.</p>
+<hr />
+<h2 id="klassifikatsiya-goryachikh-funktsiy-i-strategiya-deystviy">Классификация «горячих» функций и стратегия действий</h2>
+
+<p>Все типовые обитатели вершины отчета <code>top</code> делятся на <strong>8 фундаментальных классов</strong>:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+TopReport[&quot;Символы в top -flat&quot;] --&gt; C1[&quot;1. Аллокации: mallocgc, newobject&quot;]
+TopReport --&gt; C2[&quot;2. Копирование: memmove, duffcopy&quot;]
+TopReport --&gt; C3[&quot;3. Синхронизация: lock, semacquire&quot;]
+TopReport --&gt; C4[&quot;4. CGO FFI: cgocall, asmcgocall&quot;]
+TopReport --&gt; C5[&quot;5. Хэш-таблицы: mapaccess, mapassign&quot;]
+TopReport --&gt; C6[&quot;6. Слайсы: growslice&quot;]
+TopReport --&gt; C7[&quot;7. Парсинг: json.Unmarshal, xml.Decode&quot;]
+TopReport --&gt; C8[&quot;8. Регулярки: regexp.Find, doExecute&quot;]
+  </pre>
+</div>
+
+
+<hr />
+<h3 id="klass-1-funktsii-rantayma-allokatsii-mallocgc-newobject">Класс 1: Функции рантайма — аллокации (`mallocgc`, `newobject`)</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> Высокий <code>flat</code> у <code>runtime.mallocgc</code>, <code>runtime.newobject</code>.</li>
+<li><strong>Физическая первопричина:</strong> Программа непрерывно создает короткоживущие объекты в динамической куче (Heap), перегружая потоковые кэши <code>mcache</code> и заставляя рантайм тратить такты на поиск свободных span-блоков и фоновую маркировку GC (<a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>).</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Немедленно снять профиль памяти с флагом <code>-alloc_space</code> (<a href="../04-memory-profiling/4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>).<br />
+  2. Провести ревизию побега переменных через <code>go build -gcflags="-m"</code>: устранить неявный боксинг в интерфейсы <code>any</code>, замыкания и возврат структур по указателю.<br />
+  3. Внедрить пул буферов <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) или перейти на структуры с фиксированным размером (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>).</li>
+</ul>
+<hr />
+<h3 id="klass-2-kopirovanie-pamyati-memmove-duffcopy-memclrnoheappointers">Класс 2: Копирование памяти (`memmove`, `duffcopy`, `memclrNoHeapPointers`)</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> Доминирование <code>runtime.memmove</code>, <code>runtime.duffcopy</code>, <code>runtime.memclrNoHeapPointers</code>.</li>
+<li><strong>Физическая первопричина:</strong> Процессор тратит колоссальное количество тактов на тупое перекладывание байт из одной области памяти в другую. Это происходит при передаче тяжелых структур по значению, конкатенации строк, динамическом расширении срезов или заполнении структур нулями.</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Найти вызывающую строку через команду <code>list</code>.<br />
+  2. Передавать структуры размером более 64 байт по указателю <code>*MyStruct</code>.<br />
+  3. Для строк использовать <code>strings.Builder</code> с обязательным предварительным вызовом <code>Grow(size)</code>.<br />
+  4. Применять Zero-Copy подходы (<a href="../07-io-i-sistemnyy-uroven/5-zero-copy-podkhody.html" class="wikilink">5. Zero copy подходы</a>).</li>
+</ul>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha: Иллюзия скорости `runtime.memmove`</span>
+  </div>
+  <div class="callout-body">
+    <p>Ассемблерная функция <code>runtime.memmove</code> написана на пределе возможностей архитектуры — она использует векторные инструкции AVX2 / AVX-512 для копирования по 32–64 байта за такт.<br />
+Однако ее наличие на вершине <code>top</code> означает системную катастрофу: <strong>шина памяти перегружена, а кэши процессора L1D и L2 вымываются гигабайтами пересылаемых данных</strong>. Не пытайтесь ускорить <code>memmove</code> — устраните саму необходимость копирования данных (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+  </div>
+</div>
+
+<hr />
+<h3 id="klass-3-blokirovki-i-ozhidaniya-lock-unlock-semacquire">Класс 3: Блокировки и ожидания (`lock`, `unlock`, `semacquire`)</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> Появление <code>runtime.lock</code>, <code>runtime.unlock</code>, <code>runtime.semacquire</code>, операций <code>sync.Mutex</code> (<code>sync.(*Mutex).Lock</code>).</li>
+<li><strong>Физическая первопричина:</strong> Жесткий <strong>Lock Contention</strong>. Ядра процессора конкурируют за общие мьютексы рантайма (аллокатор, планировщик) или пользовательские примитивы синхронизации. Процессор тратит такты на атомарные инструкции <code>CMPXCHG</code>, спинлоки рантайма и системные вызовы ядра <code>futex</code>.</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Снять профиль мьютексов <code>go test -mutexprofile=mutex.prof</code> (<a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>) и профиль блокировок (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>).<br />
+  2. Сократить критические секции: вынести из-под лока сетевые вызовы и аллокации.<br />
+  3. Шардировать разделяемые кэши на независимые корзины (Striped Mutex).<br />
+  4. Проверить код на False Sharing (<a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>), разнеся счетчики по разным 64-байтным кэш-линиям.</li>
+</ul>
+<hr />
+<h3 id="klass-4-cgo-cgocall-asmcgocall">Класс 4: CGO (`cgocall`, `asmcgocall`)</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> Заметное присутствие <code>runtime.cgocall</code>, <code>runtime.asmcgocall</code>.</li>
+<li><strong>Физическая первопричина:</strong> Слишком гранулярные FFI-вызовы в код на C/C++. Каждый переход требует смены стека, переключения ABI, сохранения регистров и вызова <code>entersyscall</code> (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>).</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Батчинг: передавать пачки данных (например, массив из 5 000 элементов) за один вызов в C вместо 5 000 индивидуальных обращений.<br />
+  2. Переписать узкий участок на чистый Go.</li>
+</ul>
+<hr />
+<h3 id="klass-5-operatsii-s-mapami-mapaccess-mapassign-growwork">Класс 5: Операции с мапами (`mapaccess`, `mapassign`, `growWork`)</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> Функции <code>runtime.mapaccess1_fast64</code> (или аналоги), <code>runtime.mapassign</code>, <code>runtime.growWork</code>.</li>
+<li><strong>Физическая первопричина:</strong> Массовые обращения к хэш-таблицам. Если в топе виден <code>runtime.growWork</code> — мапа динамически растет под нагрузкой, непрерывно аллоцируя новые бакеты и эвакуируя старые элементы.</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Всегда предвыделять размер хэш-таблицы: <code>make(map[K]V, expectedSize)</code>.<br />
+  2. Для множеств-флагов использовать пустое значение <code>struct{}</code> (размером 0 байт).<br />
+  3. При критических нагрузках применять плоские структуры данных или специализированные алгоритмы (<span class="wikilink-unresolved" title="Заметка в разработке">20. Алгоритмы и структуры данных (DSA) на Go</span>).</li>
+</ul>
+<hr />
+<h3 id="klass-6-rost-slaysov-growslice">Класс 6: Рост слайсов (`growslice`)</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> <code>runtime.growslice</code>.</li>
+<li><strong>Физическая первопричина:</strong> Вызовы <code>append()</code> к срезам с нулевой начальной емкостью. При каждом переполнении емкость удваивается, вызывая вызов аллокатора и <code>runtime.memmove</code>.</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Предвыделять емкость слайса при создании: <code>make([]T, 0, capacity)</code> (<a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>).<br />
+  2. Переиспользовать срезы через <code>slice = slice[:0]</code>.</li>
+</ul>
+<hr />
+<h3 id="klass-7-serializatsiya-deserializatsiya">Класс 7: Сериализация / десериализация</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> <code>encoding/json.Unmarshal</code>, <code>encoding/json.Marshal</code>, <code>xml.Decode</code>, <code>protobuf.Marshal</code>.</li>
+<li><strong>Физическая первопричина:</strong> Рефлексия <code>reflect</code>, парсинг текстовых представлений, боксинг интерфейсов.</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Использовать сверхбыстрые парсеры с кодогенерацией (<code>easyjson</code>) или SIMD-ускорением (<code>sonic</code>).<br />
+  2. Использовать стриминговый <code>json.Decoder</code> с переиспользованием внутренних буферов.<br />
+  3. Для межсервисного общения перейти на бинарный протокол Protobuf/gRPC.</li>
+</ul>
+<hr />
+<h3 id="klass-8-regulyarnye-vyrazheniya">Класс 8: Регулярные выражения</h3>
+
+<ul>
+<li><strong>Симптомы в <code>top</code>:</strong> <code>regexp.(*Regexp).FindAllString</code>, <code>regexp.(*Regexp).Find</code>, <code>regexp.(*Regexp).doExecute</code>.</li>
+<li><strong>Физическая первопричина:</strong> Компиляция регулярного выражения на лету внутри цикла или тяжелый обход автомата NFA.</li>
+<li><strong>Протокол действий:</strong><br />
+  1. Вынести компиляцию в глобальную переменную через <code>regexp.MustCompile</code> один раз при старте сервиса.<br />
+  2. Для тривиальных проверок (поиск подстроки, префикса, суффикса) заменить регулярку на высокооптимизированные функции стандартного пакета <code>strings</code> (<code>strings.Contains</code>, <code>strings.HasPrefix</code>).</li>
+</ul>
+<hr />
+<h2 id="protsess-analiza-algoritmicheskiy-podkhod">Процесс анализа: алгоритмический подход</h2>
+
+<p>Сводная матрица принятия решений Senior-инженера:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">+-------------------------------------------------------------------------+
+|                Матрица действий по результатам top                      |
++------------------------------------+------------------------------------+
+| Симптом в отчете top               | Следующий диагностический шаг      |
++------------------------------------+------------------------------------+
+| runtime.mallocgc / newobject       | Снять memory profile (-alloc_space)|
+| runtime.memmove / duffcopy         | Проверить make cap, strings.Builder|
+| runtime.lock / semacquire          | Снять mutex / block profile        |
+| runtime.cgocall / asmcgocall       | Батчинг FFI вызовов Cgo            |
+| mapaccess / mapassign / growWork   | make(map, size), Swiss Tables      |
+| runtime.growslice                  | make([]T, 0, capacity)             |
+| encoding/json.Unmarshal            | Перейти на sonic / easyjson        |
+| regexp.(*Regexp).doExecute         | Заменить на пакет strings          |
+| Высокий flat в коде приложения     | list FuncName, оценка алгоритма    |
++------------------------------------+------------------------------------+
+</code></pre>
+</div>
+
+<hr />
+<h2 id="primer-sistemnogo-analiza">Пример системного анализа</h2>
+
+<p>Разберем завершенный клинический пример расследования реального микросервиса:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(pprof) top -cum 8
       flat  flat%   sum%        cum   cum%
      0.05s  1.00%  1.00%      4.20s 84.00%  main.handleRequest
      0.30s  6.00%  7.00%      3.80s 76.00%  myapp.BusinessLogic
@@ -2470,32 +2537,76 @@ G --&gt; H
 </code></pre>
 </div>
 
-<p>Анализ:<br />
-- <code>handleRequest</code> — точка входа, cum=84%, но собственного времени почти нет.<br />
-- Спускаемся в <code>BusinessLogic</code> (cum=76%), flat=0.30s — диспетчер.<br />
-- В <code>BusinessLogic</code> потомки: <code>json.Unmarshal</code> (50%), <code>Validate</code> (18%), <code>mallocgc</code> (36%).<br />
-- <code>json.Unmarshal</code> вызывает <code>mallocgc</code> и <code>memmove</code> — это основной источник затрат.<br />
-- <code>memmove</code> с flat=0.70s — листовая, копирует данные при анмаршалинге.</p>
-<p>Решение: заменить <code>encoding/json</code> на <code>sonic</code> (снижает аллокации). После замены повторный профиль должен показать снижение <code>mallocgc</code> и <code>memmove</code>.</p>
+<h3 id="razbor-poletov-po-shagam">Разбор полетов по шагам:</h3>
+<ol>
+<li><code>main.handleRequest</code> держит 84% кумулятивного времени (<code>cum</code>), но ее собственный <code>flat</code> всего 0.05s — это транспортная точка входа.</li>
+<li>Спускаемся в <code>myapp.BusinessLogic</code> (<code>cum = 3.80s</code>, 76%). Ее собственные вычисления малы (0.30s). Смотрим дочерние ветви.</li>
+<li>Дочерние вызовы:<br />
+   - <code>encoding/json.Unmarshal</code> — 50% CPU!<br />
+   - <code>myapp.Validate</code> — 18% CPU.</li>
+<li>Смотрим листовые функции:<br />
+   - <code>runtime.mallocgc</code> (36% cum, 8% flat).<br />
+   - <code>runtime.memmove</code> (14% flat, 14% cum — чистый лист!).</li>
+<li><strong>Синтез картины:</strong><br />
+   Половина всей мощности CPU сервера сгорает в стандартном JSON-парсере, который на каждой структуре заставляет аллокатор выделять память (<code>mallocgc</code>), а процессор — побайтово перекопировать ее (<code>memmove</code>).</li>
+<li><strong>Решение:</strong><br />
+   Замена <code>encoding/json</code> на библиотеку <code>sonic</code> сокращает аллокации в 4 раза. Повторный профиль демонстрирует падение <code>mallocgc</code> и <code>memmove</code> до фоновых 2%, а общая пропускная способность сервиса возрастает на <strong>65%</strong>.</li>
+</ol>
+<hr />
 <h2 id="mechanical-sympathy-chitaem-mezhdu-strok">Mechanical Sympathy: читаем между строк</h2>
 
-<p>Опытный инженер видит в top-функциях не просто названия, а физические процессы:</p>
-<ul>
-<li><strong><code>runtime.memmove</code></strong> = данные физически перемещаются между ячейками памяти. При большом объёме это означает вымывание L1/L2 кэша. Даже если это «всего лишь» копия, она может разрушить cache friendliness (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
-<li><strong><code>runtime.lock</code> / <code>runtime.unlock</code></strong> с большим flat может указывать не только на contention, но и на частое переключение контекста, которое сбрасывает TLB и BTB (branch target buffer). Эти накладные расходы не фиксируются профилем, но ощущаются в throughput.</li>
-<li><strong>Вызовы функций из <code>top -cum</code> с малой шириной в flamegraph, но большим cum</strong>, говорят о глубокой иерархии. Вложенные вызовы могут мешать инлайнингу (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>) и увеличивать давление на стек.</li>
-</ul>
-<p>Понимание этих связей превращает догадку в уверенный диагноз.</p>
+<p>Опытный инженер читает названия системных функций как индикаторы кремниевой микроархитектуры:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph TopSymbols[&quot;Символы в отчете top&quot;]
+T1[&quot;runtime.memmove / duffcopy&quot;]
+T2[&quot;runtime.lock / runtime.unlock&quot;]
+T3[&quot;Множество мелких функций с равным cum&quot;]
+end
+
+subgraph HardwareStall[&quot;Аппаратный отклик кремния&quot;]
+H1[&quot;Cache Pollution: вымывание кэшей L1/L2 в DRAM,&lt;br&gt;конвейер процессора простаивает на шине памяти&quot;]
+H2[&quot;MESI Invalidation: шторм когерентности кэшей,&lt;br&gt;инвалидация 64-байтных строк, сброс BTB и TLB&quot;]
+H3[&quot;Failed Inlining: накладные расходы прологов функций,&lt;br&gt;сохранение регистров, сброс предсказателя ветвлений&quot;]
+end
+
+T1 --&gt; H1
+T2 --&gt; H2
+T3 --&gt; H3
+  </pre>
+</div>
+
+
+<ol>
+<li><strong><code>runtime.memmove</code> и промахи кэша:</strong><br />
+   Массивное перемещение памяти физически стирает горячие данные прикладного кода из быстрейших кэшей L1D (задержка ~1 нс) и L2 (~3 нс), принуждая следующие инструкции замирать на сотни тактов в ожидании шины DRAM (<a href="8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
+<li><strong><code>runtime.lock</code> и сброс TLB/BTB:</strong><br />
+   Частая борьба за мьютексы вызывает сброс аппаратного буфера предсказателя переходов <strong>BTB</strong> (Branch Target Buffer) и буфера трансляции адресов <strong>TLB</strong> при переключении контекста планировщиком. Процессор теряет накопленную статистику спекулятивного исполнения.</li>
+<li><strong>Глубокие цепочки и провал инлайнинга:</strong><br />
+   Если в <code>top -cum</code> виден частокол мелких вспомогательных функций, компилятор Go не смог применить оптимизацию <strong>Inline Expansion</strong> (<a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>), и процессор вынужден непрерывно тратить драгоценные инструкции на организацию кадров стека (<code>PUSH</code>/<code>POP</code>).</li>
+</ol>
+<hr />
 <h2 id="itog">Итог</h2>
 
-<ul>
-<li><strong>Top functions анализ</strong> — системный метод, идущий от <code>cum</code>-лидеров к <code>flat</code>-листьям, с обязательной классификацией функций по типу затрат.</li>
-<li><code>flat</code> показывает, где именно тратятся такты; <code>cum</code> — кто за это отвечает. Игнорировать <code>cum</code> — потерять контекст.</li>
-<li>Каждый класс «горячих» функций (аллокация, копирование, блокировки, CGO, мапы, сериализация) имеет стандартный протокол дальнейшего исследования через memory, block, mutex профили или алгоритмический анализ.</li>
-<li>Механическая эмпатия позволяет интерпретировать названия функций рантайма как индикаторы кэш-промахов, contention или проблем инлайнинга.</li>
-<li>Системный подход предотвращает бессистемную оптимизацию и гарантирует, что каждое действие обосновано цифрами.</li>
-</ul>
-<p>Теперь, вооружившись умением находить конкретные «горячие» функции, мы переходим к тому, как решения компилятора — инлайнинг — кардинально влияют на то, какие функции вообще попадают в этот top. Следующая статья: <a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>.</p>
+<ol>
+<li><strong>Top functions анализ — это доказательная медицина:</strong> Мы не угадываем узкие места, а последовательно декомпозируем затраты времени от диспетчеров (<code>top -cum</code>) к исполнителям (<code>top -flat</code>).</li>
+<li><strong><code>flat</code> против <code>cum</code>:</strong> <code>cum</code> определяет стратегическое направление оптимизации, а <code>flat</code> указывает точный адрес сгорания процессорных тактов.</li>
+<li><strong>8 классов патологий рантайма:</strong> Каждая функция Go-рантайма (<code>mallocgc</code>, <code>memmove</code>, <code>lock</code>, <code>growslice</code>, <code>mapaccess</code>, <code>cgocall</code>) имеет однозначную физическую причину и стандартный протокол устранения.</li>
+<li><strong>Связь с другими профилями:</strong> Обнаружив симптомы в CPU-профиле, инженер углубляет расследование специализированными инструментами: Memory Profile (<code>-alloc_space</code>), Block Profile и Mutex Profile.</li>
+</ol>
+<p>Теперь, когда мы научились находить и классифицировать горячие функции, возникает фундаментальный вопрос: <em>почему некоторые функции вообще появляются в отчете <code>top</code>, а другие бесследно исчезают из стека?</em> Ответ кроется в работе оптимизатора компилятора — механизме инлайнинга. Следующая лекция: <a href="5-inline-i-vliyanie-na-performance.html" class="wikilink">5. Inline и влияние на performance</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2523,7 +2634,7 @@ G --&gt; H
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#zachem-sistemno-analizirovat-top-funktsii">Зачем системно анализировать top-функции</a></li><li class="toc-item toc-h2"><a href="#dva-vzglyada-flat-protiv-cum">Два взгляда: flat против cum</a></li><li class="toc-item toc-h2"><a href="#metodologiya-analiza-top-funktsiy">Методология анализа top-функций</a></li><li class="toc-item toc-h3"><a href="#shag-1-sbor-kachestvennogo-profilya">Шаг 1. Сбор качественного профиля</a></li><li class="toc-item toc-h3"><a href="#shag-2-pervichnyy-osmotr-top-cum">Шаг 2. Первичный осмотр: top -cum</a></li><li class="toc-item toc-h3"><a href="#shag-3-vydelenie-potomkov-liderov">Шаг 3. Выделение «потомков-лидеров»</a></li><li class="toc-item toc-h3"><a href="#shag-4-klassifikatsiya-goryachego-koda">Шаг 4. Классификация «горячего» кода</a></li><li class="toc-item toc-h2"><a href="#klassifikatsiya-goryachikh-funktsiy-i-strategiya-deystviy">Классификация «горячих» функций и стратегия действий</a></li><li class="toc-item toc-h3"><a href="#klass-1-funktsii-rantayma-allokatsii-mallocgc-newobject">Класс 1: Функции рантайма — аллокации (mallocgc, newobject)</a></li><li class="toc-item toc-h3"><a href="#klass-2-kopirovanie-pamyati-memmove-duffcopy-memclrnoheappointers">Класс 2: Копирование памяти (memmove, duffcopy, memclrNoHeapPointers)</a></li><li class="toc-item toc-h3"><a href="#klass-3-blokirovki-i-ozhidaniya-lock-unlock-semacquire">Класс 3: Блокировки и ожидания (lock, unlock, semacquire)</a></li><li class="toc-item toc-h3"><a href="#klass-4-cgo-cgocall-asmcgocall">Класс 4: CGO (cgocall, asmcgocall)</a></li><li class="toc-item toc-h3"><a href="#klass-5-operatsii-s-mapami-mapaccess-mapassign">Класс 5: Операции с мапами (mapaccess, mapassign)</a></li><li class="toc-item toc-h3"><a href="#klass-6-rost-slaysov-growslice">Класс 6: Рост слайсов (growslice)</a></li><li class="toc-item toc-h3"><a href="#klass-7-serializatsiya-deserializatsiya">Класс 7: Сериализация / десериализация</a></li><li class="toc-item toc-h3"><a href="#klass-8-regulyarnye-vyrazheniya">Класс 8: Регулярные выражения</a></li><li class="toc-item toc-h2"><a href="#protsess-analiza-algoritmicheskiy-podkhod">Процесс анализа: алгоритмический подход</a></li><li class="toc-item toc-h2"><a href="#primer-sistemnogo-analiza">Пример системного анализа</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chitaem-mezhdu-strok">Mechanical Sympathy: читаем между строк</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#zachem-sistemno-analizirovat-top-funktsii">Зачем системно анализировать top-функции</a></li><li class="toc-item toc-h2"><a href="#dva-vzglyada-flat-protiv-cum">Два взгляда: flat против cum</a></li><li class="toc-item toc-h2"><a href="#metodologiya-analiza-top-funktsiy">Методология анализа top-функций</a></li><li class="toc-item toc-h3"><a href="#shag-1-sbor-kachestvennogo-profilya">Шаг 1. Сбор качественного профиля</a></li><li class="toc-item toc-h3"><a href="#shag-2-pervichnyy-osmotr-top-cum">Шаг 2. Первичный осмотр: top -cum</a></li><li class="toc-item toc-h3"><a href="#shag-3-vydelenie-potomkov-liderov">Шаг 3. Выделение «потомков-лидеров»</a></li><li class="toc-item toc-h3"><a href="#shag-4-klassifikatsiya-goryachego-koda">Шаг 4. Классификация «горячего» кода</a></li><li class="toc-item toc-h2"><a href="#klassifikatsiya-goryachikh-funktsiy-i-strategiya-deystviy">Классификация «горячих» функций и стратегия действий</a></li><li class="toc-item toc-h3"><a href="#klass-1-funktsii-rantayma-allokatsii-mallocgc-newobject">Класс 1: Функции рантайма — аллокации (mallocgc, newobject)</a></li><li class="toc-item toc-h3"><a href="#klass-2-kopirovanie-pamyati-memmove-duffcopy-memclrnoheappointers">Класс 2: Копирование памяти (memmove, duffcopy, memclrNoHeapPointers)</a></li><li class="toc-item toc-h3"><a href="#klass-3-blokirovki-i-ozhidaniya-lock-unlock-semacquire">Класс 3: Блокировки и ожидания (lock, unlock, semacquire)</a></li><li class="toc-item toc-h3"><a href="#klass-4-cgo-cgocall-asmcgocall">Класс 4: CGO (cgocall, asmcgocall)</a></li><li class="toc-item toc-h3"><a href="#klass-5-operatsii-s-mapami-mapaccess-mapassign-growwork">Класс 5: Операции с мапами (mapaccess, mapassign, growWork)</a></li><li class="toc-item toc-h3"><a href="#klass-6-rost-slaysov-growslice">Класс 6: Рост слайсов (growslice)</a></li><li class="toc-item toc-h3"><a href="#klass-7-serializatsiya-deserializatsiya">Класс 7: Сериализация / десериализация</a></li><li class="toc-item toc-h3"><a href="#klass-8-regulyarnye-vyrazheniya">Класс 8: Регулярные выражения</a></li><li class="toc-item toc-h2"><a href="#protsess-analiza-algoritmicheskiy-podkhod">Процесс анализа: алгоритмический подход</a></li><li class="toc-item toc-h2"><a href="#primer-sistemnogo-analiza">Пример системного анализа</a></li><li class="toc-item toc-h3"><a href="#razbor-poletov-po-shagam">Разбор полетов по шагам:</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chitaem-mezhdu-strok">Mechanical Sympathy: читаем между строк</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
