@@ -2169,38 +2169,46 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Performance regression detection</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="4-canary-releases.html" class="wikilink">4. Canary releases</a> мы разобрали, как безопасно выкатывать изменения на "живой" трафик. Канарейка спасает нас от катастрофы в Production. Но если релиз дошел до стадии канарейки, а затем был откачен из-за просадки производительности — время разработчиков, QA и CI-пайплайна уже потрачено впустую.</p>
-<p>Истинная инженерия уровня Senior/Lead требует проактивности. Производительность не падает внезапно. В больших проектах действует правило <strong>"Смерти от тысячи порезов" (Death by a thousand cuts)</strong>: один коммит добавил лишний <code>fmt.Sprintf</code> (аллокация), другой добавил интерфейс (убил <a href="../09-prakticheskie-optimizatsii/8-inline-optimizatsii.html" class="wikilink">8. Inline оптимизации</a>), третий переставил поля в структуре (увеличил паддинг). Ни один из этих коммитов по отдельности не уронит канарейку, но за полгода <code>p99 latency</code> вырастет вдвое.</p>
-<p>Чтобы этого избежать, нам нужна <strong>Continuous Performance Regression Detection (Непрерывное обнаружение деградации производительности)</strong> — система, которая будет автоматически "бить по рукам" на этапе Pull Request-а, если код стал медленнее.</p>
-<h2 id="1-problema-dispersii-i-utilita-benchstat">1. Проблема дисперсии и утилита benchstat</h2>
+            <p>В предыдущей статье <a href="4-canary-releases.html" class="wikilink">4. Canary releases</a> мы разобрали, как безопасно выкатывать свежий бинарный файл на боевой трафик. Канареечный деплой спасает продакшен от масштабной катастрофы. Но давайте взглянем правде в глаза: если код дошел до канарейки и был экстренно откатан из-за просадки производительности, это все равно поражение. Время разработчиков, QA-инженеров и вычислительные ресурсы CI-пайплайна уже сожжены впустую.</p>
+<p>Инженерный подход зрелой команды требует проактивности: деградацию необходимо душить еще на этапе pull request (PR).</p>
+<p>Производительность систем редко рушится в одночасье. В зрелых проектах с сотнями инженеров правит коварный закон: <strong>«Смерть от тысячи порезов» (Death by a thousand cuts)</strong>:<br />
+- Один инженер добавил безобидный с виду <code>fmt.Sprintf("%d", id)</code> в горячий цикл — возникла скрытая аллокация в куче.<br />
+- Другой передал структуру по интерфейсу, из-за чего компилятор Go отключил спасительные <a href="../09-prakticheskie-optimizatsii/8-inline-optimizatsii.html" class="wikilink">8. Inline оптимизации</a> и отправил указатель на кучу через Escape Analysis.<br />
+- Третий добавил в структуру поле <code>bool</code> перед <code>int64</code>, увеличив паддинг (Padding) и раздув размер объекта на 8 байт, из-за чего кэш-линии процессора L1d стали вмещать меньше записей.</p>
+<p>Ни один из этих коммитов по отдельности не уронит канарейку и не вызовет тревогу в SRE-дашбордах. Но за полгода суммарная задержка <code>p99 latency</code> вырастает вдвое, а счета за облачные сервера увеличиваются на миллионы.</p>
+<p>Чтобы предотвратить эту ползучую эрозию, необходима система <strong>Continuous Performance Regression Detection (Непрерывное обнаружение деградации производительности)</strong> — автоматический сторожевой пес в CI/CD, блокирующий мерж pull request'а, если код стал медленнее или прожорливее.</p>
+<hr />
+<h2 id="1-problema-dispersii-i-statisticheskiy-arbitr-benchstat">1. Проблема дисперсии и статистический арбитр `benchstat`</h2>
 
-<p>Когда разработчики впервые пытаются автоматизировать бенчмарки в CI (Continuous Integration), они пишут простой Bash-скрипт, который запускает <code>go test -bench .</code>, парсит наносекунды и сравнивает числа из <code>main</code> ветки с текущим PR.</p>
-<p>Это <strong>не работает</strong>. Если вы запустите бенчмарк дважды подряд на одном и том же коде, результаты будут отличаться на 2-10%. Операционная система может решить запустить фоновый процесс, процессор может изменить тактовую частоту из-за нагрева — возникнет <em>шум</em>. Если ваш скрипт будет падать при любом отклонении на 3%, разработчики возненавидят ваш CI за ложноположительные срабатывания (Flaky tests).</p>
-<p><strong>Решение: Статистический подход.</strong></p>
-<p>В экосистеме Go для этого существует официальная утилита <code>benchstat</code> (<code>golang.org/x/perf/cmd/benchstat</code>).</p>
-<p>Bash</p>
+<p>Первая наивная попытка автоматизировать бенчмарки в CI обычно выглядит так: инженер пишет Bash-скрипт, запускающий <code>go test -bench .</code>, вырезает число наносекунд с помощью <code>awk</code> и сравнивает его с числом из ветки <code>main</code>.</p>
+<p>Этот подход <strong>обречен на провал</strong>.</p>
+<p>Если вы запустите один и тот же тест дважды подряд на одной и той же машине, результаты будут естественным образом "гулять" на 2–10%. Планировщик Linux выделил квант времени демону <code>systemd</code>, соседнее ядро нагрелось и сбросило частоту, сработал кэш диска — все это создает <strong>стохастический шум</strong>. Если пайплайн будет падать при случайном колебании на 3%, разработчики быстро отключат проверку из-за постоянных ложноположительных срабатываний (Flaky tests).</p>
+<h3 id="reshenie-matematicheskaya-statistika-i-benchstat">Решение: Математическая статистика и `benchstat`</h3>
 
-<div class="code-block" data-lang="text">
+<p>В официальном инструментарии Go есть эталонный инструмент для решения этой проблемы — утилита <code>benchstat</code> (<code>golang.org/x/perf/cmd/benchstat</code>).</p>
+<p>Ее принцип базируется на выборке: бенчмарк запускается не один раз, а сериями (как минимум <code>count=10</code>):</p>
+
+<div class="code-block" data-lang="bash">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Bash</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text"># 1. Checkout в основную ветку (baseline)
+  <pre class="language-bash"><code class="language-bash"># 1. Переключаемся на базовую ветку (baseline)
 git checkout main
 # ОБЯЗАТЕЛЬНО запускаем бенчмарки несколько раз (count=10) для сбора статистики
 go test -run=^$ -bench=. -count=10 &gt; old.txt
 
-# 2. Checkout в ветку с фичей
+# 2. Переключаемся на ветку с оптимизацией / фичей
 git checkout feature-branch
 go test -run=^$ -bench=. -count=10 &gt; new.txt
 
@@ -2215,23 +2223,46 @@ benchstat old.txt new.txt
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p><code>benchstat</code> не просто вычисляет среднее арифметическое. Он использует непараметрический статистический критерий <strong>U-критерий Манна — Уитни (Mann-Whitney U test)</strong>.</p>
-<p>Алгоритм берет два массива результатов (по 10 запусков) и математически доказывает: является ли разница между ними случайным шумом дисперсии ОС, или новые значения действительно сместились на графике.</p>
-<p>Если <code>benchstat</code> показывает <code>delta +15%</code> и <code>p-value &lt; 0.05</code> — это математически доказанная регрессия, которую нельзя списывать на "сервер лаганул".</p>
+    <p><code>benchstat</code> принципиально не использует наивное среднее арифметическое (Mean), так как редкий выброс (например, прерывание ОС) искажает среднее до неузнаваемости.</p>
+<p>Под капотом утилита применяет непараметрический статистический критерий — <strong>U-критерий Манна — Уитни (Mann-Whitney U test)</strong>. Алгоритм ранжирует все 20 замеров (10 старых и 10 новых) и математически вычисляет вероятность того, что оба набора взяты из одного и того же распределения.</p>
+<p>Если <code>benchstat</code> рапортует <code>delta +15%</code> при <code>p-value &lt; 0.05</code> — это строгое математическое доказательство того, что код замедлился. Списать это на «сервер лаганул» разработчик уже не сможет: вероятность случайного совпадения составляет менее 5%.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="2-mechanical-sympathy-apparatnye-lovushki-cicd">2. Mechanical Sympathy: Аппаратные ловушки CI/CD</h2>
 
-<p>Самая большая архитектурная проблема CI/CD пайплайнов (GitHub Actions, GitLab CI) — это использование эфемерных виртуальных машин. Виртуалки в облаке страдают от проблемы <strong>"Шумных соседей" (Noisy Neighbors)</strong>. Ваш бенчмарк может делить физическое ядро (vCPU) с контейнером, который майнит биткоины, что приведет к катастрофической разнице в CPU Cache Misses.</p>
-<p>Для надежной ловли регрессий вам потребуется <strong>выделенный Bare-Metal сервер (Железо)</strong>, настроенный специфическим образом:</p>
+<p>Самая опасная иллюзия при построении regression testing — запуск бенчмарков на стандартных виртуальных машинах в облаке (GitHub-hosted Runners, GitLab Shared Runners).</p>
+<p>Облачные виртуалки страдают от феномена <strong>«Шумных соседей» (Noisy Neighbors)</strong>. Ваш виртуальный процессор (vCPU) в любой момент может быть вытеснен гипервизором, если на соседней ВМ другой клиент запустил компиляцию ядра или майнинг криптовалюты. В такой обстановке кэши L1/L2/L3 непрерывно сдуваются чужими процессами, а замеры <code>ns/op</code> превращаются в генератор случайных чисел.</p>
+<p>Для прецизионного замера времени процессора требуется <strong>выделенный Bare-Metal сервер (Железо)</strong> с физически изолированной конфигурацией:</p>
+
+<div class="code-block" data-lang="ascii">
+  <div class="code-header">
+    <span class="code-lang-tag">DIAGRAM</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-ascii"><code class="language-ascii">Изоляция кремния под бенчмаркинг:
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. CPU Frequency Lock: Отключение Intel Turbo Boost / AMD Precision    │
+│    -&gt; Фиксация частоты (scaling governor = performance)               │
+├────────────────────────────────────────────────────────────────────────┤
+│ 2. CPU Isolation (isolcpus=2,3): Ядра 2 и 3 изолированы от ядра Linux  │
+│    -&gt; Ядро ОС не посылает прерывания и фоновые треды на эти ядра       │
+├────────────────────────────────────────────────────────────────────────┤
+│ 3. Disable ASLR (randomize_va_space=0): Детерминизм страниц памяти     │
+│    -&gt; Исключает случайные промахи мимо L1i/L1d кэш-линий              │
+└────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+</div>
+
 <ol>
-<li><strong>Отключение Turbo Boost:</strong> Процессор не должен разгоняться. Если <code>main</code> ветка тестировалась при частоте 3.0 ГГц, а на <code>feature</code> ветке CPU "разогрелся" до 4.5 ГГц (Turbo Boost), вы получите ложноположительное улучшение производительности. Частота (CPU Scaling Governor) должна быть зафиксирована на <code>performance</code> или жесткой частоте.</li>
-<li><strong>Изоляция ядер (CPU Isolation):</strong> Используйте параметры ядра Linux <code>isolcpus</code>, чтобы ОС не планировала свои прерывания на тех ядрах, где бегут бенчмарки.</li>
-<li><strong>Отключение ASLR:</strong> Рандомизация адресного пространства ОС (ASLR) может приводить к тому, что в разных запусках бинарник ложится в память по-разному, по-разному попадая в кэш-линии (см. подробнее в <a href="../02-benchmarking/6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>).</li>
+<li><strong>Отключение Turbo Boost:</strong> Динамический разгон частоты процессора недопустим. Если ветка <code>main</code> тестировалась на холодной системе при частоте 3.0 ГГц, а ветка <code>feature</code> запустилась, когда процессор разогрелся и сбросил частоту (или наоборот, включил Turbo Boost до 4.5 ГГц), вы получите фантастическую погрешность до 50%. Тактовая частота процессора должна быть жестко зафиксирована через CPU Scaling Governor в режиме <code>performance</code>.</li>
+<li><strong>Изоляция ядер (CPU Isolation):</strong> Параметр ядра Linux <code>isolcpus=2,3</code> запрещает планировщику CFS запускать на выделенных ядрах любые системные процессы и прерывания устройств. Бенчмарки Go привязываются к изолированным ядрам через утилиту <code>taskset -c 2,3</code>.</li>
+<li><strong>Отключение ASLR:</strong> Рандомизация адресного пространства (Address Space Layout Randomization) меняет базовые адреса структур при каждом запуске. Это приводит к тому, что структуры ложатся в кэш-линии процессора с разным смещением, меняя процент Cache Misses (подробнее см. в <a href="../02-benchmarking/6-stabilizatsiya-rezultatov.html" class="wikilink">6. Стабилизация результатов</a>). Для CI-бенчмарков ASLR отключают: <code>echo 0 &gt; /proc/sys/kernel/randomize_va_space</code>.</li>
 </ol>
-<p>Фрагмент кода</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2246,36 +2277,45 @@ benchstat old.txt new.txt
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Pull Request&quot;] --&gt; B[&quot;Сборка бинарников&quot;]
-B --&gt; C{&quot;Где запускать?&quot;}
-C -- &quot;Обычные Unit-тесты&quot; --&gt; D[&quot;Shared CI Runner&lt;br&gt;Docker/VM&quot;]
-C -- &quot;go test -bench&quot; --&gt; E[&quot;Выделенный Bare-Metal&lt;br&gt;CPU Frequency Locked&quot;]
-E --&gt; F[&quot;Генерация old.txt и new.txt&quot;]
-F --&gt; G[&quot;benchstat&quot;]
-G --&gt; H{&quot;Деградация &gt; 5%?&quot;}
-H -- &quot;Да&quot; --&gt; I[&quot;Блокировка мержа -Крестик-&quot;]
-H -- &quot;Нет&quot; --&gt; J[&quot;Разрешение мержа -Галочка-&quot;]
+PR[&quot;Pull Request разработчика&quot;] --&gt; Build[&quot;Сборка бинарников main и feature&quot;]
+Build --&gt; Route{&quot;Тип тестов?&quot;}
+
+Route -- &quot;Unit-тесты и линтеры&quot; --&gt; SharedRunner[&quot;Shared CI Runner&lt;br&gt;(Docker / VM)&quot;]
+Route -- &quot;go test -bench&quot; --&gt; MetalRunner[&quot;Выделенный Bare-Metal Runner&lt;br&gt;(CPU Frequency Locked, isolcpus)&quot;]
+
+MetalRunner --&gt; Bench[&quot;Генерация old.txt и new.txt&lt;br&gt;(count=10)&quot;]
+Bench --&gt; Stat[&quot;Анализ через benchstat&quot;]
+Stat --&gt; Verdict{&quot;Деградация &gt; 5%&lt;br&gt;при p &lt; 0.05?&quot;}
+
+Verdict -- &quot;Да&quot; --&gt; Fail[&quot;Блокировка мержа ❌&lt;br&gt;(Комментарий в PR со статистикой)&quot;]
+Verdict -- &quot;Нет&quot; --&gt; Pass[&quot;Разрешение мержа ✅&quot;]
+
+style Fail fill:#2a1b1b,stroke:#f43f5e,stroke-width:2px
+style Pass fill:#132d29,stroke:#10b981,stroke-width:2px
+style MetalRunner fill:#161e31,stroke:#3b82f6,stroke-width:2px
   </pre>
 </div>
 
 
 <hr />
-<h2 id="3-otslezhivanie-allokatsiy-nulevaya-terpimost">3. Отслеживание аллокаций: Нулевая терпимость</h2>
+<h2 id="3-otslezhivanie-allokatsiy-nulevaya-terpimost-k-musoru">3. Отслеживание аллокаций: Нулевая терпимость к мусору</h2>
 
-<p>Даже если у вас нет идеального "железа" для замеров наносекунд, вы обязаны отслеживать <strong>метрики аллокаций памяти</strong>.</p>
-<p>В отличие от времени процессора, количество аллокаций детерминировано. Одна и та же функция с одними и теми же входными данными всегда выделит одинаковое количество байт и объектов (вспомните концепции из <a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>).</p>
+<p>Что делать, если у вашей компании нет бюджета на отдельный выделенный Bare-Metal сервер для бенчмарков, а GitHub Actions крутятся на виртуальных машинах общего пула?</p>
+<p>Выход есть, и он фундаментален: <strong>отслеживать детерминированные метрики памяти</strong>.</p>
+<p>В отличие от процессорного времени (<code>ns/op</code>), которое колеблется от температуры воздуха в серверной, <strong>количество аллокаций памяти и объем выделенных байт абсолютно детерминированы</strong>. Одна и та же детерминированная функция с одинаковыми входными аргументами всегда выделит ровно то же количество байт в куче (вспомните фундаментальные основы из <a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> В нашем CI <code>benchstat</code> постоянно показывает "шум" по времени выполнения (CPU time), но нам критически важно не пропускать код, который мусорит в память. Как настроить CI?</p>
-<p><strong>Ответ:</strong> Запускать тесты с флагом <code>-benchmem</code> и написать парсер (или использовать <code>benchstat</code>), который будет игнорировать изменения в <code>ns/op</code> (наносекунды), но строго фейлить пайплайн, если <code>B/op</code> (байты) или <code>allocs/op</code> (количество аллокаций) увеличились хотя бы на 1. Аллокации не зависят от нагрузки на CI-сервер.</p>
+    <p><strong>Вопрос:</strong> В нашем CI виртуальные машины сильно загружены фоновыми задачами, и <code>benchstat</code> постоянно показывает статистический шум по процессорному времени (<code>ns/op</code>). Нам критически важно защитить сервис от скрытых аллокаций памяти в горячем пути (Hot Path). Как организовать проверку?</p>
+<p><strong>Ответ:</strong> Запускать бенчмарки с флагом <code>-benchmem</code> и настроить проверку так, чтобы полностью игнорировать изменения времени <code>ns/op</code>, но ввести <strong>правило нулевой терпимости (Zero Tolerance)</strong> к росту аллокаций памяти: фейлить пайплайн, если количество аллокаций <code>allocs/op</code> или объем памяти <code>B/op</code> увеличились хотя бы на 1 единицу. </p>
+<p>Выделение памяти в Go детерминировано и не зависит от загрузки физического сервера. Рост <code>allocs/op</code> — это прямое доказательство утечки объекта в кучу через Escape Analysis.</p>
   </div>
 </div>
 
-<p>Типичный скрипт для CI, который ловит утечки абстракций в Hot Path:</p>
+<p>Вот классический CI-скрипт, отлавливающий деградации аллокаций в горячем пути:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2285,12 +2325,17 @@ H -- &quot;Нет&quot; --&gt; J[&quot;Разрешение мержа -Гало
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash"># Получаем разницу
+  <pre class="language-bash"><code class="language-bash"># Запускаем бенчмарки с профилированием памяти
+go test -run=^$ -bench=BenchmarkHotPath -benchmem -count=5 &gt; new.txt
+git checkout main
+go test -run=^$ -bench=BenchmarkHotPath -benchmem -count=5 &gt; old.txt
+
+# Получаем статистическую разницу
 benchstat old.txt new.txt &gt; diff.txt
 
-# Если в колонке 'allocs/op' есть знак '+' (увеличение аллокаций)
+# Если в колонке 'allocs/op' появился знак '+' (увеличение аллокаций)
 if grep -q &quot;allocs/op&quot; diff.txt | grep -q &quot;+&quot;; then
-    echo &quot;ERROR: Обнаружена деградация аллокаций памяти!&quot;
+    echo &quot;ERROR: Обнаружена деградация аллокаций памяти в Hot Path!&quot;
     cat diff.txt
     exit 1
 fi
@@ -2300,33 +2345,36 @@ fi
 <hr />
 <h2 id="4-makro-regressii-nepreryvnoe-nagruzochnoe-testirovanie">4. Макро-регрессии: Непрерывное Нагрузочное Тестирование</h2>
 
-<p>Бенчмарки (микро-уровень) проверяют отдельные функции. Но они не поймают регрессию, связанную с Lock Contention. Например, разработчик случайно добавил глобальный <code>sync.Mutex</code> в популярный middleware. Юнит-бенчмарк этого хендлера может пройти быстро, так как он запускается в один поток. А вот под нагрузкой приложение "встанет в пробку".</p>
-<p>Чтобы ловить макро-регрессии:</p>
+<p>Микро-бенчмарки (<code>go test -bench</code>) великолепны для изолированных функций. Но у них есть фатальная слепая зона: <strong>они не ловят проблемы конкуренции за ресурсы (Lock Contention)</strong>.</p>
+<p>Представьте: разработчик добавил глобальный <code>sync.Mutex</code> в популярный middleware авторизации. Одиночный юнит-бенчмарк этого хендлера выполнится за 20 наносекунд, ведь он запущен в один поток. Но когда в продакшене сойдутся 10 000 горутин, ядра процессора встанут в ступор из-за каскада кэш-инвалидаций протокола MESI и ожидания мьютекса.</p>
+<p>Для защиты от системных деградаций в CI/CD внедряется непрерывное макро-тестирование:</p>
 <ol>
-<li>В пайплайн перед мержем в <code>main</code> добавляется шаг деплоя в изолированный Staging (похожий на прод).</li>
-<li>Инструмент вроде <code>vegeta</code> или <code>k6</code> запускает 5-минутный тест с профилем открытой нагрузки (например, 5000 RPS).</li>
-<li>Парсятся результаты: если <code>p99 latency</code> превысила базовую линию (Baseline) прошлых сборок более чем на 10%, релиз блокируется.</li>
+<li><strong>Ephemeral Staging Environment:</strong> Перед мержем критических релизов сервис автоматически деплоится в изолированный контур, архитектурно идентичный проду.</li>
+<li><strong>Синтетический генератор нагрузки:</strong> Утилита нагрузки вроде <code>vegeta</code> или <code>k6</code> запускает 5-минутный тест с профилем открытой нагрузки (Open-loop Model, например, постоянные 5000 RPS).</li>
+<li><strong>Анализ задержек по SLA:</strong> Собираются агрегированные метрики задержки. Если <code>p99 latency</code> превышает установленный порог базовой линии более чем на 10%, пайплайн падает.</li>
 </ol>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Ошибка скользящей базовой линии (Moving Baseline)</span>
   </div>
   <div class="callout-body">
-    <p>Ошибка "хрупких тестов": не сравнивайте <code>p99</code> нового коммита с <code>p99</code> <strong>предыдущего</strong> коммита. Если каждый коммит будет ухудшать скорость на 1%, скрипт этого не заметит (разница слишком мала), но за 100 коммитов скорость упадет в 2 раза!</p>
-<p>Всегда сравнивайте результаты с фиксированной <strong>Базовой линией (Baseline)</strong> — результатами мажорного релиза (например, v1.0.0), либо с жестко зашитым SLA (например, "p99 &lt; 50ms").</p>
+    <p>Никогда не сравнивайте <code>p99 latency</code> нового коммита с <code>p99</code> <strong>непосредственно предыдущего</strong> коммита!</p>
+<p>Если каждый pull request будет замедлять систему всего на 0.5–1%, скрипт верификации никогда не сработает: разница утонет в допустимой погрешности. Однако спустя 100 таких «незаметных» коммитов задержка сервиса вырастет в два раза.</p>
+<p>Всегда сравнивайте результаты с фиксированной <strong>Базовой линией (Baseline)</strong> — результатами последнего стабильного мажорного релиза (например, тега <code>v1.0.0</code>), либо с жестко зашитым SLA спецификации (например, строгое требование <code>p99 &lt; 50ms</code> при 5000 RPS).</p>
   </div>
 </div>
 
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="rezyume">Резюме</h2>
 
 <ol>
-<li>Используйте <strong><code>benchstat</code></strong> и U-критерий для доказательства деградации, не полагайтесь на сырые наносекунды из одного прогона.</li>
-<li>Изолируйте аппаратную среду для CI-бенчмарков: отключайте частотный скейлинг процессора и "шумных соседей".</li>
-<li><strong>Allocs/op</strong> — ваша самая надежная метрика в CI, так как она полностью детерминирована и не зависит от загрузки процессора.</li>
-<li>Дополняйте микро-бенчмарки в CI автоматическими макро-тестами на изоляции (Staging) с проверкой <code>p99</code> по жесткому Baseline-у.</li>
+<li><strong><code>benchstat</code> обязателен:</strong> Забудьте про сравнение одиночных чисел в Bash. Используйте многократные запуски (<code>count=10</code>) и статистический U-критерий Манна — Уитни для доказательства регрессий.</li>
+<li><strong>Изолируйте аппаратную среду:</strong> На облачных виртуальных машинах процессорное время подвержено стохастическому шуму из-за Noisy Neighbors. Для замера наносекунд используйте Bare-Metal сервера с фиксированной частотой процессора и отключенным Turbo Boost.</li>
+<li><strong><code>Allocs/op</code> — безупречный индикатор:</strong> Если у вас нет выделенного оборудования, отслеживайте метрики <code>allocs/op</code> и <code>B/op</code>. Они на 100% детерминированы и мгновенно вскрывают непреднамеренные побеги переменных в кучу.</li>
+<li><strong>Макро-тестирование и фиксированный Baseline:</strong> Микро-бенчмарки слепы к Lock Contention. Сочетайте их с нагрузочными тестами на изолированном стенде (Staging), сравнивая задержки <code>p99</code> с неизменной базовой линией релиза, а не с предыдущим коммитом.</li>
 </ol>
-<p>Настроив автоматическое обнаружение регрессий, вы гарантируете, что ваш сервис не станет медленнее. Но сможет ли он выдержать рост трафика, если маркетинг запустит новую рекламную кампанию? Чтобы ответить на этот вопрос, нам нужно перевести наносекунды из бенчмарков в язык денег и серверов. В следующей статье мы разберем, как правильно рассчитывать ресурсы для Highload-проектов: <a href="6-capacity-planning.html" class="wikilink">6. Capacity planning</a>.</p>
+<p>Автоматический контроль производительности защитит кодовую базу от деградаций при разработке. Но как понять, выдержит ли сервис реальный рост бизнеса через полгода или год? Чтобы перевести абстрактные наносекунды и RPS в конкретные ядра процессора и гигабайты памяти, мы переходим к инженерной дисциплине планирования мощностей: <a href="6-capacity-planning.html" class="wikilink">6. Capacity planning</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2354,7 +2402,7 @@ fi
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#1-problema-dispersii-i-utilita-benchstat">1. Проблема дисперсии и утилита benchstat</a></li><li class="toc-item toc-h2"><a href="#2-mechanical-sympathy-apparatnye-lovushki-cicd">2. Mechanical Sympathy: Аппаратные ловушки CI/CD</a></li><li class="toc-item toc-h2"><a href="#3-otslezhivanie-allokatsiy-nulevaya-terpimost">3. Отслеживание аллокаций: Нулевая терпимость</a></li><li class="toc-item toc-h2"><a href="#4-makro-regressii-nepreryvnoe-nagruzochnoe-testirovanie">4. Макро-регрессии: Непрерывное Нагрузочное Тестирование</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#1-problema-dispersii-i-statisticheskiy-arbitr-benchstat">1. Проблема дисперсии и статистический арбитр benchstat</a></li><li class="toc-item toc-h3"><a href="#reshenie-matematicheskaya-statistika-i-benchstat">Решение: Математическая статистика и benchstat</a></li><li class="toc-item toc-h2"><a href="#2-mechanical-sympathy-apparatnye-lovushki-cicd">2. Mechanical Sympathy: Аппаратные ловушки CI/CD</a></li><li class="toc-item toc-h2"><a href="#3-otslezhivanie-allokatsiy-nulevaya-terpimost-k-musoru">3. Отслеживание аллокаций: Нулевая терпимость к мусору</a></li><li class="toc-item toc-h2"><a href="#4-makro-regressii-nepreryvnoe-nagruzochnoe-testirovanie">4. Макро-регрессии: Непрерывное Нагрузочное Тестирование</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

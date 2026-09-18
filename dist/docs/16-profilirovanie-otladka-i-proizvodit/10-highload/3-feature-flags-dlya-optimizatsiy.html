@@ -2169,28 +2169,31 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~20 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Feature flags для оптимизаций</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В прошлой статье <a href="2-profiling-v-production.html" class="wikilink">2. Profiling в production</a> мы выяснили, как найти узкое место на живом сервере. Допустим, профилировщик показал, что 40% CPU тратится на стандартный <code>encoding/json</code>. Вы, как хардкорный инженер, переписали этот кусок на кодогенерацию или применили <a href="../09-prakticheskie-optimizatsii/9-zero-allocation-podkhod.html" class="wikilink">9. Zero allocation подход</a>. Локальные бенчмарки показывают ускорение в 10 раз. </p>
-<p>Казалось бы, пора выкатывать код в Production. Но реальность жестока: ваша "идеальная" оптимизация может не учесть редкий корнер-кейс, упасть с паникой на битом JSON или привести к утечке памяти из-за неправильной работы с <code>sync.Pool</code>. В Highload выкат радикальных оптимизаций напрямую — это игра в русскую рулетку. </p>
-<p>Для безопасного внедрения изменений мы используем <strong>Feature Flags (Флаги функций)</strong>. В контексте производительности они выступают как <strong>Kill Switches (Рубильники)</strong>, позволяя моментально откатить код на старую (медленную, но надежную) версию без пересборки и редеплоя микросервиса.</p>
+            <h2 id="feature-flags-dlya-optimizatsiy-bezopasnyy-vykat-i-avariynye-rubilniki">Feature flags для оптимизаций: безопасный выкат и аварийные рубильники</h2>
+
+<p>В предыдущей главе <a href="2-profiling-v-production.html" class="wikilink">2. Profiling в production</a> мы научились точно локализовать узкие места на живых серверах. Допустим, профилировщик показал, что 40% процессорного времени сгорает в стандартном <code>encoding/json</code>. Вы, как опытный инженер, переписали критический маршрут на кодогенерацию или внедрили бескомпромиссный <a href="../09-prakticheskie-optimizatsii/9-zero-allocation-podkhod.html" class="wikilink">9. Zero allocation подход</a>. Локальные микробенчмарки фиксируют десятикратный прирост производительности.</p>
+<p>Казалось бы, пора немедленно отправлять код в Production. Однако в промышленном Highload реальность сурова: радикальная микрооптимизация может не учесть редкий пограничный случай (Edge Case), упасть с паникой на поврежденном сетевом пакете или устроить лавинообразную утечку памяти из-за ошибки работы с <code>sync.Pool</code>. Выкатывать масштабные оптимизации напрямую на весь входящий трафик — это неоправданная игра в русскую рулетку.</p>
+<p>Для безопасного внедрения низкоуровневых оптимизаций мы используем <strong>Feature Flags (Флаги функций)</strong>. В контексте высоконагруженной производительности они выступают в роли <strong>Kill Switches (Аварийных рубильников)</strong>, позволяя мгновенно переключить исполнение на старую, пусть более медленную, но железобетонно проверенную версию кода — без пересборки бинарников и без перезапуска подов.</p>
+<hr />
 <h2 id="mechanical-sympathy-tsena-proverki-flaga">Mechanical Sympathy: Цена проверки флага</h2>
 
-<p>Feature Flag — это, по сути, ветвление (<code>if flag { ... } else { ... }</code>). <br />
-Когда мы говорим о бизнес-логике (например, включить новую кнопку в UI), флаг можно проверять хоть походом в Redis или базу данных, так как сеть занимает миллисекунды.</p>
-<p>Но когда мы защищаем микрооптимизацию, которая экономит сотни наносекунд, поход в сеть (и даже захват мьютекса) <strong>убьет всю производительность</strong>.</p>
+<p>Feature Flag в коде — это всегда условное ветвление (<code>if flag { ... } else { ... }</code>).</p>
+<p>Когда речь идет о высокоуровневой продуктовой бизнес-логике (например, показать ли новую кнопку в веб-интерфейсе), флаг допустимо проверять сетевым запросом к Redis, Consul или базе данных: сетевая задержка в 1–2 мс на фоне общего рендеринга страницы незаметна.</p>
+<p>Но когда мы защищаем микрооптимизацию, которая экономит сотни наносекунд в горячем цикле, сетевой запрос (и даже захват мьютекса <code>sync.Mutex</code>) <strong>мгновенно уничтожит всю производительность</strong>.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Сетевые проверки в горячем пути</span>
   </div>
   <div class="callout-body">
-    <p>Типичная ошибка Junior-разработчиков: </p>
+    <p>Классическая ошибка неопытных разработчиков:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2201,8 +2204,8 @@
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func process(data []byte) {
-    // УЖАСНО: Поход в сеть/Redis на каждый пакет! 
-    // Это замедлит функцию в тысячи раз.
+    // УЖАСНО: Сетевой запрос к Redis на каждый входящий сетевой пакет!
+    // Это замедлит функцию в тысячи раз и создаст шторм запросов к кэшу.
     if redisClient.Get(&quot;use_fast_parser&quot;) == &quot;true&quot; { 
         fastParse(data)
     } else {
@@ -2215,24 +2218,26 @@
   </div>
 </div>
 
-<p>Проверка флага для оптимизации должна происходить исключительно в оперативной памяти (In-Memory) и быть потокобезопасной (Thread-Safe).</p>
-<p>Идеальный инструмент для этого — пакет <code>sync/atomic</code>.</p>
+<p>Проверка флага в Hot Path обязана происходить <strong>исключительно в оперативной памяти (In-Memory)</strong> и быть абсолютно потокобезопасной (Thread-Safe) без использования блокировок ядра ОС.</p>
+<p>Идеальным инструментом для этой задачи является стандартный пакет <strong><code>sync/atomic</code></strong>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
-    <span class="callout-title">Под капотом</span>
+    <span class="callout-title">Под капотом: аппаратная цена atomic.Bool</span>
   </div>
   <div class="callout-body">
-    <p>Почему <code>atomic.Bool</code> (или <code>atomic.LoadInt32</code> в старых версиях Go) так хорош? <br />
-Когда горутина вызывает атомарное чтение переменной, которая редко меняется, процессор сохраняет эту кэш-линию в L1/L2 кэше в состоянии <code>Shared</code> (по протоколу когерентности MESI). <br />
-Атомарное чтение из L1 кэша стоит всего ~1-2 наносекунды. А благодаря аппаратному предсказателю ветвлений (о котором мы говорили в <a href="../03-cpu-profiling/6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>), процессор со 100% вероятностью угадывает, по какому пути пойдет <code>if</code>, выполняя код вообще без задержек.<br />
-Нагрузка на шину памяти возникает <em>только</em> в момент записи (<code>atomic.Store</code>), когда мы переключаем флаг, что происходит крайне редко.</p>
+    <p>Почему атомарный флаг <code>atomic.Bool</code> (или <code>atomic.LoadInt32</code> в старых версиях Go) настолько эффективен?<br />
+1. <strong>Кэш процессора:</strong> Когда горутины на разных ядрах CPU непрерывно считывают переменную флага, которая меняется крайне редко, кэш-линия с этой переменной оседает в L1/L2 кэшах всех ядер в состоянии <strong>Shared</strong> (согласно аппаратному протоколу когерентности MESI).<br />
+2. <strong>Наносекундный доступ:</strong> Атомарное чтение <code>atomic.Load</code> из горячего L1-кэша занимает всего 1–2 наносекунды (1–3 такта CPU).<br />
+3. <strong>Предсказание ветвлений:</strong> Благодаря аппаратному Branch Predictor (<a href="../03-cpu-profiling/6-branch-prediction-i-kod.html" class="wikilink">6. Branch prediction и код</a>), процессор со 100% вероятностью предугадывает результат <code>if</code>, исполняя код по конвейеру вообще без задержек.<br />
+Системная инвалидация кэш-линий и нагрузка на шину памяти возникают <em>исключительно</em> в момент записи (<code>atomic.Store</code>), когда администратор переключает рубильник, что происходит считанные разы за все время жизни сервиса.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="idiomatichnaya-realizatsiya-in-memory-flagov">Идиоматичная реализация In-Memory флагов</h2>
 
-<p>Мы создаем структуру конфигурации, которая хранится в памяти, и фоновую горутину, которая обновляет ее (например, слушая Consul, etcd или простой HTTP-эндпоинт конфигурации).</p>
+<p>Правильный подход заключается в хранении состояния флагов в локальной структуре с фоновым обновлением из внешней системы конфигурации (Consul, etcd или внутреннего административного HTTP API):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2248,7 +2253,7 @@ import (
     &quot;sync/atomic&quot;
 )
 
-// GlobalFlags хранит состояние рубильников
+// GlobalFlags хранит состояние рубильников оптимизаций
 type GlobalFlags struct {
     UseZeroAllocParser atomic.Bool
     EnableCache        atomic.Bool
@@ -2256,7 +2261,7 @@ type GlobalFlags struct {
 
 var activeFlags GlobalFlags
 
-// IsZeroAllocParserEnabled - сверхбыстрое O-от-1 чтение
+// IsZeroAllocParserEnabled - сверхбыстрое O(1) чтение из L1 кэша
 func IsZeroAllocParserEnabled() bool {
     return activeFlags.UseZeroAllocParser.Load()
 }
@@ -2282,17 +2287,20 @@ func SetZeroAllocParser(enabled bool) {
   </div>
   <pre class="mermaid">
 flowchart TD
-A[&quot;Входящий HTTP запрос&quot;] --&gt; B{&quot;atomic.Load&lt;br&gt;Флаг включен?&quot;}
-B -- &quot;Да&quot; --&gt; C[&quot;Вызов zero-alloc функции&quot;]
-B -- &quot;Нет&quot; --&gt; D[&quot;Вызов старой проверенной функции&quot;]
-E[&quot;Фоновая горутина Consul/HTTP&quot;] -.-&gt;|&quot;atomic.Store&lt;br&gt;Мгновенное переключение&quot;| B
+Req[&quot;Входящий HTTP-запрос&quot;] --&gt; Check{&quot;atomic.Load&lt;br/&gt;Флаг включен?&quot;}
+Check -- &quot;Да (true)&quot; --&gt; Fast[&quot;Вызов zero-alloc функции (быстрый путь)&quot;]
+Check -- &quot;Нет (false)&quot; --&gt; Slow[&quot;Вызов старой проверенной функции&quot;]
 
-style B fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
+Admin[&quot;Фоновый watcher (Consul/etcd/API)&quot;] -.-&gt;|&quot;atomic.Store (на лету)&quot;| Check
+
+style Check fill:#6366f1,stroke:#4338ca,stroke-width:2px,color:#fff
+style Fast fill:#10b981,stroke:#047857,stroke-width:1px,color:#fff
+style Slow fill:#f59e0b,stroke:#b45309,stroke-width:1px,color:#fff
   </pre>
 </div>
 
 
-<p>Теперь в горячем пути (Hot Path) вы можете безопасно использовать флаг:</p>
+<p>Теперь в горячем пути выполнения (Hot Path) вы можете безопасно изолировать новый код:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2306,29 +2314,30 @@ style B fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
     if flags.IsZeroAllocParserEnabled() {
         return fastParse(data) // Новая сверхбыстрая версия
     }
-    return slowParse(data)     // Старая версия
+    return slowParse(data)     // Старая надежная версия
 }
 </code></pre>
 </div>
 
-<p>Если графики покажут рост потребления памяти или ошибки 500 после включения флага, SRE-инженер делает один API-вызов, <code>atomic.Store</code> переключает <code>bool</code> в <code>false</code>, и <strong>на следующем же такте процессора</strong> весь трафик возвращается на безопасный маршрут. Никакого рестарта подов в Kubernetes, никаких простоев.</p>
+<p>Если мониторинг зафиксирует аномальный всплеск потребления памяти, рост ошибок 500 или паники в рантайме, дежурный инженер выполняет один curl-запрос. Метод <code>atomic.Store</code> переключает флаг в <code>false</code>, и <strong>на следующем же такте процессора</strong> весь входящий трафик мгновенно возвращается на безопасный маршрут. Никаких откатов деплоя, перезапуска контейнеров и простоев сервиса.</p>
 <hr />
 <h2 id="kontekstnye-flagi-zamorozka-sostoyaniya">Контекстные флаги (Заморозка состояния)</h2>
 
-<p>Для некоторых оптимизаций глобальный <code>atomic.Bool</code> таит в себе скрытую угрозу. Представьте распределенную транзакцию (Saga) или долгий пайплайн обработки.</p>
-<p>Что будет, если в начале пайплайна флаг "Новый формат БД" был <code>true</code>, мы создали объект нового типа, а на середине пайплайна SRE-инженер выключил флаг? Вторая половина пайплайна прочитает <code>false</code>, попытается обработать объект по-старому и вызовет <code>panic</code> или Data Corruption (повреждение данных).</p>
+<p>Для многоэтапных операций прямое чтение глобального <code>atomic.Bool</code> несет в себе скрытую опасность. Представьте длинный пайплайн обработки данных или распределенную транзакцию (Saga).</p>
+<p>Что произойдет, если в начале обработки входящего запроса флаг «Использовать новый формат сериализации» был <code>true</code>, сервис создал объект новой структуры, а в середине пайплайна дежурный инженер переключил флаг в <code>false</code>? Вторая половина пайплайна прочитает <code>false</code>, попытается десериализовать данные по старому алгоритму и вызовет <code>panic</code> или повреждение данных (Data Corruption).</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как избежать ситуации "рассинхрона", когда глобальный фитча-флаг переключается прямо во время выполнения долгого запроса пользователя?<br />
-<strong>Ответ:</strong> Состояние флага должно "замораживаться" на входе в систему и передаваться по всей цепочке вызовов через <code>context.Context</code>.</p>
+    <p><strong>Вопрос:</strong> Как исключить рассинхронизацию логики, если глобальный фича-флаг переключается прямо во время выполнения длинного пользовательского запроса?<br />
+<strong>Ответ:</strong> Состояние всех критических флагов должно <strong>замораживаться</strong> ровно один раз на входе в систему (в HTTP/gRPC Middleware) и транслироваться по всему дереву вызовов внутри объекта <code>context.Context</code>.</p>
   </div>
 </div>
 
-<p><strong>Реализация через Middleware:</strong></p>
+<h3 id="realizatsiya-cherez-middleware">Реализация через Middleware:</h3>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2338,22 +2347,31 @@ style B fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type contextKey string
+  <pre class="language-go"><code class="language-go">package middleware
+
+import (
+    &quot;context&quot;
+    &quot;net/http&quot;
+
+    &quot;myproject/flags&quot;
+)
+
+type contextKey string
 const flagsKey contextKey = &quot;feature_flags&quot;
 
-// Снапшот флагов на момент начала запроса
+// RequestFlags - снимок состояния флагов на момент входа запроса
 type RequestFlags struct {
     UseFastParser bool
 }
 
 func FlagsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Читаем из atomic один раз в начале запроса!
+        // Читаем из atomic ровно один раз на входе в систему!
         currentFlags := RequestFlags{
             UseFastParser: flags.IsZeroAllocParserEnabled(),
         }
 
-        // Кладем в контекст
+        // Замораживаем снимок в контексте запроса
         ctx := context.WithValue(r.Context(), flagsKey, currentFlags)
         next.ServeHTTP(w, r.WithContext(ctx))
     })
@@ -2361,13 +2379,13 @@ func FlagsMiddleware(next http.Handler) http.Handler {
 </code></pre>
 </div>
 
-<p>Дальше в бизнес-логике мы читаем флаг из контекста. Даже если глобальный флаг изменится, текущий запрос гарантированно завершится с тем же набором правил, с которым начался.</p>
+<p>Далее в бизнес-логике обработчик читает флаг исключительно из контекста. Даже если глобальный флаг изменится на лету, текущий активный запрос гарантированно отработает по тем правилам, с которыми он стартовал.</p>
 <hr />
 <h2 id="pattern-tenevoe-chtenie-dark-launch-shadowing">Паттерн "Теневое чтение" (Dark Launch / Shadowing)</h2>
 
-<p>Это высший пилотаж внедрения оптимизаций. <br />
-Допустим, вы переписали алгоритм поиска или парсер, и хотите быть <strong>на 100% уверенными</strong>, что новая быстрая версия возвращает <em>абсолютно такие же</em> результаты, как и старая. </p>
-<p>С помощью фитча-флага <code>EnableShadowParsing</code> вы запускаете <strong>обе</strong> функции одновременно! Старая функция возвращает результат пользователю (бизнес в безопасности), а новая работает "в тени".</p>
+<p>Это высший стандарт надежности при внедрении критических оптимизаций в финансовом секторе и Highload.</p>
+<p>Допустим, вы переписали сложный алгоритм матчинга заказов или парсер протокола. Вы хотите быть <strong>на 100% уверенными</strong>, что новая быстрая версия возвращает <em>бит в бит</em> те же результаты, что и старая, на реальном боевом трафике.</p>
+<p>С помощью флага <code>EnableShadowParsing</code> вы запускаете <strong>обе</strong> функции одновременно: старая функция формирует ответ клиенту (бизнес-процесс защищен от сбоев), а новая версия исполняется «в тени»:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2378,18 +2396,18 @@ func FlagsMiddleware(next http.Handler) http.Handler {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">func parseDataShadow(ctx context.Context, data []byte) (Result, error) {
-    // Основной (медленный, но верный) путь
+    // Основной (медленный, но гарантированно надежный) путь
     res, err := slowParse(data)
 
-    // Если включено теневое тестирование
+    // Если активировано теневое тестирование
     if flags.IsShadowParsingEnabled() {
-        // Запускаем новую версию асинхронно, чтобы не тормозить ответ пользователю
+        // Запуск асинхронно в фоне, чтобы не увеличивать задержку ответа клиенту
         go func(d []byte, expectedRes Result, expectedErr error) {
             fastRes, fastErr := fastParse(d)
 
-            // Сравниваем результаты
+            // Сверка результатов старого и нового алгоритмов
             if fastErr != expectedErr || !reflect.DeepEqual(fastRes, expectedRes) {
-                // Если результаты расходятся - бьем тревогу в логи/метрики!
+                // Расхождение зафиксировано: бьем тревогу в метрики!
                 metrics.Inc(&quot;parser_mismatch_errors&quot;)
                 log.Printf(&quot;Mismatch: expected %v, got %v&quot;, expectedRes, fastRes)
             }
@@ -2401,16 +2419,18 @@ func FlagsMiddleware(next http.Handler) http.Handler {
 </code></pre>
 </div>
 
-<p>Как только вы видите, что метрика <code>parser_mismatch_errors</code> равна нулю на протяжении нескольких суток, вы можете с чистой совестью переключить основной рубильник на <code>fastParse</code>, удалив теневой запуск.</p>
+<p>Когда метрика <code>parser_mismatch_errors</code> стабильно показывает ровно 0 на протяжении нескольких суток под нагрузкой в миллионы вызовов, инженер с абсолютной уверенностью переключает основной рубильник на <code>fastParse</code>, удаляя старый код и теневой запуск.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Feature Flags</strong> (в контексте Highload) — это ваш парашют при выкате микрооптимизаций.</li>
-<li>Проверки в горячих путях должны быть строго <strong>In-Memory и без блокировок</strong>. Используйте пакет <code>sync/atomic</code> (<code>atomic.Bool</code>).</li>
-<li>Применяйте <strong>Заморозку состояния</strong> (чтение флага в <code>context.Context</code> на уровне Middleware), чтобы защититься от несогласованности при смене флага в процессе обработки запроса.</li>
-<li>Используйте паттерн <strong>Теневого чтения (Shadowing)</strong> для валидации консистентности данных между старым и новым оптимизированным кодом перед финальным переключением.</li>
+<li><strong>Feature Flags в Highload</strong> — это спасательный круг и аварийный рубильник (Kill Switch) при внедрении рискованных микрооптимизаций.</li>
+<li><strong>Проверки в горячих путях:</strong> строго In-Memory и без блокировок ядра. Используйте <code>sync/atomic</code> (<code>atomic.Bool</code>), читаемый за 1–2 нс из L1 кэша.</li>
+<li><strong>Заморозка состояния (Context Snapshot):</strong> считывайте флаги один раз на входе в Middleware и пробрасывайте через <code>context.Context</code>, чтобы исключить рассинхрон посреди выполнения длинного запроса.</li>
+<li><strong>Теневое тестирование (Shadowing):</strong> параллельный запуск нового кода без влияния на клиента позволяет доказать 100% математическую эквивалентность оптимизированного алгоритма старому.</li>
 </ol>
-<p>Feature flags позволяют нам безопасно переключать код <em>внутри</em> одного запущенного приложения. Но что если изменение затрагивает саму структуру БД или настолько масштабно, что мы хотим пустить на него лишь 1-5% реальных пользователей, чтобы проверить нагрузку на ОС? В таком случае рубильников в коде уже недостаточно, и мы переходим к инфраструктурному уровню маршрутизации трафика. Об этом — в нашей следующей статье: <a href="4-canary-releases.html" class="wikilink">4. Canary releases</a>.</p>
+<p>Feature flags позволяют безопасно переключать логику <em>внутри</em> одного процесса. Но что делать, если изменение настолько фундаментально, что затрагивает схему базы данных, системные зависимости или сетевые протоколы? В таких сценариях рубильников в коде недостаточно, и мы поднимаемся на уровень сетевой маршрутизации кластера.</p>
+<p>Об этом мы поговорим в следующей статье: <a href="4-canary-releases.html" class="wikilink">4. Canary releases</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2438,7 +2458,7 @@ func FlagsMiddleware(next http.Handler) http.Handler {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-proverki-flaga">Mechanical Sympathy: Цена проверки флага</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-realizatsiya-in-memory-flagov">Идиоматичная реализация In-Memory флагов</a></li><li class="toc-item toc-h2"><a href="#kontekstnye-flagi-zamorozka-sostoyaniya">Контекстные флаги (Заморозка состояния)</a></li><li class="toc-item toc-h2"><a href="#pattern-tenevoe-chtenie-dark-launch-shadowing">Паттерн &quot;Теневое чтение&quot; (Dark Launch / Shadowing)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#feature-flags-dlya-optimizatsiy-bezopasnyy-vykat-i-avariynye-rubilniki">Feature flags для оптимизаций: безопасный выкат и аварийные рубильники</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-tsena-proverki-flaga">Mechanical Sympathy: Цена проверки флага</a></li><li class="toc-item toc-h2"><a href="#idiomatichnaya-realizatsiya-in-memory-flagov">Идиоматичная реализация In-Memory флагов</a></li><li class="toc-item toc-h2"><a href="#kontekstnye-flagi-zamorozka-sostoyaniya">Контекстные флаги (Заморозка состояния)</a></li><li class="toc-item toc-h3"><a href="#realizatsiya-cherez-middleware">Реализация через Middleware:</a></li><li class="toc-item toc-h2"><a href="#pattern-tenevoe-chtenie-dark-launch-shadowing">Паттерн &quot;Теневое чтение&quot; (Dark Launch / Shadowing)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
