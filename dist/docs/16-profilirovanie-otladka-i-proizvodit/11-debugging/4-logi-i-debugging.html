@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~30 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Логи и debugging</h1>
           </header>
@@ -2178,25 +2178,40 @@
           <div class="article-markdown">
             <h2 id="logi-i-debugging-pochemu-fmt-println-ne-strategiya">Логи и debugging: почему `fmt.Println` — не стратегия</h2>
 
-<p>В предыдущих статьях мы рассмотрели интерактивную отладку (<a href="2-delve-debugger.html" class="wikilink">2. Delve debugger</a>), которая требует остановки процесса, и детектор гонок (<a href="3-race-detector-v-prode.html" class="wikilink">3. Race detector в проде</a>), который меняет поведение программы. Оба инструмента либо неприменимы в production, либо искажают картину. Остаётся самый древний, универсальный и при этом самый недооценённый инструмент — <strong>логи</strong>. Правильно спроектированная система логирования — это не просто «записывать в файл», а полноценный источник данных для отладки, позволяющий восстановить состояние программы в момент ошибки без остановки мира.</p>
-<p>Для Senior Go-инженера логи — это интерфейс наблюдаемости первого уровня. Когда метрики сигналят о росте ошибок, когда распределённая трассировка (из раздела <span class="wikilink-unresolved" title="Заметка в разработке">18. Observability</span>) показывает аномалию, вы идёте в логи и по Correlation ID восстанавливаете точную последовательность событий. Логи не заменяют профилировщик или трейс, но без них эти инструменты — микроскоп без подсветки.</p>
-<p>В этой статье мы разберём, как превратить логи из потока текста в отладочный инструмент: структурированное логирование в Go (<code>slog</code>), контекст и Correlation ID, уровни и фильтрация, и — что критически важно — влияние логирования на производительность с точки зрения механической эмпатии (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>). Мы свяжем это с аллокациями (<a href="../04-memory-profiling/4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>), сборщиком мусора (<a href="../05-garbage-collector/1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a>) и выбором правильного логгера.</p>
+<p>В предыдущих главах мы детально рассмотрели интерактивную пошаговую отладку с помощью Delve (<a href="2-delve-debugger.html" class="wikilink">2. Delve debugger</a>), требующую жесткой остановки процесса системным вызовом <code>ptrace</code>, и специализированный детектор гонок (<a href="3-race-detector-v-prode.html" class="wikilink">3. Race detector в проде</a>), замедляющий исполнение в 10 раз. Оба эти инструмента либо категорически неприменимы на живом боевом трафике продакшена, либо до неузнаваемости искажают временные характеристики системы.</p>
+<p>Что же остается в распоряжении инженера, когда сервис обрабатывает 30 000 RPS в распределенном кластере Kubernetes? Остается самый древний, универсальный и при этом наиболее часто недооцениваемый инструмент — <strong>логи</strong>.</p>
+<p>Правильно спроектированная система логирования — это не хаотичный сброс отладочных строк на диск, а высокопроизводительный, структурированный поток телеметрии первого уровня. Когда глобальные метрики сигнализируют о всплеске серверных ошибок, а распределенная трассировка (подробно разобранная в разделе <span class="wikilink-unresolved" title="Заметка в разработке">18. Observability</span>) указывает на деградацию конкретного микросервиса, именно логи позволяют по сквозному Correlation ID посекундно восстановить причинно-следственную цепочку событий в момент сбоя. Без логов любые метрики и трейсы — это мощный микроскоп с выключенной подсветкой.</p>
+<p>В этой статье мы превратим логирование из источника тормозов в высокоточный отладочный инструмент: разберем стандарт <code>log/slog</code>, архитектуру Correlation ID, динамическое переключение уровней детализации на лету и механическое сочувствие к процессору (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>) при профилировании аллокаций (<a href="../04-memory-profiling/4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>) и сборке мусора (<a href="../05-garbage-collector/1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a>).</p>
+<hr />
 <h2 id="ot-fmt-println-k-strukturirovannomu-logirovaniyu">От `fmt.Println` к структурированному логированию</h2>
 
-<p>Традиционный подход — <code>fmt.Println("error:", err)</code> — имеет право на жизнь в скриптах, но в высоконагруженном сервисе он создаёт три проблемы:</p>
+<p>Среди начинающих разработчиков распространена привычка расставлять по коду вызовы вроде <code>fmt.Println("error:", err)</code> или <code>log.Printf("user %d failed: %v", userID, err)</code>. В учебных скриптах это допустимо, но в боевом высоконагруженном сервисе такой подход гарантирует три катастрофических последствия:</p>
 <ol>
-<li><strong>Нечитаемость для машин.</strong> Парсить неструктурированный текст дорого и ненадёжно.</li>
-<li><strong>Отсутствие контекста.</strong> Непонятно, к какому запросу относится сообщение, если их перекрывают сотни горутин.</li>
-<li><strong>Высокий overhead.</strong> <code>fmt.Sprintf</code> порождает аллокации на каждое сообщение, создавая лавину работы для GC (<a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>).</li>
+<li><strong>Непригодность для машинного анализа:</strong> Неструктурированный текст требует медленного парсинга через регулярные выражения (RegEx), что в разы удорожает работу систем агрегации (Grafana Loki, Elasticsearch, ClickHouse).</li>
+<li><strong>Утрата контекста в конкурентной среде:</strong> Когда 10 000 параллельных горутин одновременно пишут в поток <code>stdout</code>, текстовые строки хаотично перемешиваются, и понять, к какой транзакции или пользователю относится конкретное сообщение об ошибке, становится физически невозможно.</li>
+<li><strong>Колоссальный оверхед по памяти и CPU:</strong> Вызовы <code>fmt.Sprintf</code> внутри классических логеров упаковывают аргументы в интерфейсы <code>interface{}</code> (boxing), порождают непрерывные аллокации строк в куче и запускают лавину циклов сборки мусора (см. <a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>).</li>
 </ol>
-<p>Решение — <strong>структурированное логирование</strong> (structured logging). Вместо строки формируется запись с типизированными ключами и значениями: <code>{"level":"error","msg":"failed to fetch","user_id":42,"trace_id":"abc"}</code>. Такие записи легко индексируются системами агрегации (Loki, Elasticsearch), позволяя выполнять точные запросы: «все ошибки по пользователю 42 за последние 5 минут».</p>
-<p>В Go стандартом стал пакет <strong><code>log/slog</code></strong>, появившийся в Go 1.21. Он предлагает:</p>
-<ul>
-<li>Уровни логирования (Debug, Info, Warn, Error).</li>
-<li>Структурированные атрибуты (<code>slog.String</code>, <code>slog.Int</code>, <code>slog.Any</code>).</li>
-<li>Поддержку контекста (<code>slog.InfoContext</code>, <code>slog.ErrorContext</code>).</li>
-<li>Архитектуру Handler'ов, позволяющую менять формат вывода (JSON, Text) и бэкенд без изменения кода логирования.</li>
-</ul>
+<h3 id="zolotoy-standart-industrii-paket-logslog">Золотой стандарт индустрии: пакет `log/slog`</h3>
+
+<p>Решением является <strong>структурированное логирование (Structured Logging)</strong>. Вместо произвольной текстовой строки формируется строгая JSON-запись со стандартизированными типизированными атрибутами:</p>
+
+<div class="code-block" data-lang="json">
+  <div class="code-header">
+    <span class="code-lang-tag">JSON</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-json"><code class="language-json">{&quot;time&quot;:&quot;2026-09-18T12:00:00Z&quot;,&quot;level&quot;:&quot;ERROR&quot;,&quot;msg&quot;:&quot;failed to process&quot;,&quot;user_id&quot;:42,&quot;trace_id&quot;:&quot;a1b2c3d4&quot;,&quot;error&quot;:&quot;connection reset&quot;}
+</code></pre>
+</div>
+
+<p>Начиная с версии Go 1.21, в стандартную библиотеку вошел пакет <strong><code>log/slog</code></strong>, объединивший лучшие наработки индустрии:<br />
+- Четыре стандартизированных уровня: <code>Debug</code>, <code>Info</code>, <code>Warn</code>, <code>Error</code>.<br />
+- Строго типизированные конструкторы полей (<code>slog.String</code>, <code>slog.Int</code>, <code>slog.Any</code>, <code>slog.Duration</code>), минимизирующие аллокации.<br />
+- Нативная поддержка контекста вызовов (<code>slog.InfoContext</code>, <code>slog.ErrorContext</code>).<br />
+- Модульная архитектура обработчиков (<strong>Handlers</strong>), позволяющая разделять формат вывода (JSONHandler, TextHandler) и транспорт.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2206,23 +2221,66 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">import &quot;log/slog&quot;
+  <pre class="language-go"><code class="language-go">package main
 
-func handler(w http.ResponseWriter, r *http.Request) {
+import (
+    &quot;log/slog&quot;
+    &quot;net/http&quot;
+)
+
+func orderHandler(w http.ResponseWriter, r *http.Request) {
+    // Обогащаем логер идентификатором запроса
     logger := slog.With(&quot;trace_id&quot;, r.Header.Get(&quot;X-Request-Id&quot;))
+
     logger.InfoContext(r.Context(), &quot;request started&quot;, &quot;path&quot;, r.URL.Path)
-    // ...
+
+    err := processOrder(r.Context())
     if err != nil {
         logger.ErrorContext(r.Context(), &quot;failed to process&quot;, &quot;error&quot;, err)
+        http.Error(w, &quot;internal error&quot;, http.StatusInternalServerError)
+        return
     }
+
+    w.WriteHeader(http.StatusOK)
 }
 </code></pre>
 </div>
 
-<h2 id="correlation-id-v-logakh">Correlation ID в логах</h2>
+<hr />
+<h2 id="correlation-id-rasputyvanie-klubka-v-raspredelennykh-sistemakh">Correlation ID: распутывание клубка в распределенных системах</h2>
 
-<p>В распределённой системе (<a href="../../14-raspredelennye-sistemy-na-go/08-praktika/8-debugging-distributed-systems.html" class="wikilink">8. Debugging distributed systems</a>) каждый запрос проходит через несколько сервисов. Без общего идентификатора логи разных сервисов бесполезны для отладки. <strong>Correlation ID</strong> (или Trace ID) — это уникальный идентификатор, присваиваемый запросу на входе и передаваемый через все вызовы (HTTP-заголовки, gRPC metadata, атрибуты сообщений).</p>
-<p>В Go ID помещается в <code>context.Context</code> через middleware и автоматически подхватывается логгером:</p>
+<p>В современных микросервисных архитектурах (<a href="../../14-raspredelennye-sistemy-na-go/08-praktika/8-debugging-distributed-systems.html" class="wikilink">8. Debugging distributed systems</a>) единый пользовательский клик порождает цепочку из десятков синхронных и асинхронных вызовов через HTTP, gRPC и брокеры сообщений. Логи изолированного сервиса без глобального идентификатора бесполезны для отладки системных сбоев.</p>
+<p><strong>Correlation ID (Trace ID)</strong> — это глобальный уникальный идентификатор, генерируемый на периметре системы (API Gateway / Ingress) и транзитивно передаваемый через все сетевые границы.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+Client[&quot;Клиентский запрос&quot;] --&gt;|&quot;X-Request-Id: 9f8e7d&quot;| GW[&quot;API Gateway&quot;]
+GW --&gt;|&quot;gRPC Metadata: 9f8e7d&quot;| Auth[&quot;Микросервис Auth&quot;]
+GW --&gt;|&quot;HTTP Header: 9f8e7d&quot;| Orders[&quot;Микросервис Orders&quot;]
+Orders --&gt;|&quot;Kafka Message Header: 9f8e7d&quot;| Billing[&quot;Воркер Billing&quot;]
+
+Auth -.-&gt;|&quot;Лог: 9f8e7d&quot;| Loki[(&quot;Хранилище Grafana Loki / ELK&quot;)]
+Orders -.-&gt;|&quot;Лог: 9f8e7d&quot;| Loki
+Billing -.-&gt;|&quot;Лог: 9f8e7d&quot;| Loki
+
+style GW fill:#161e31,stroke:#3b82f6,stroke-width:2px
+style Loki fill:#132d29,stroke:#10b981,stroke-width:2px
+  </pre>
+</div>
+
+
+<p>В Go Correlation ID идиоматично прокидывается через стандартный <code>context.Context</code> с помощью HTTP-Middleware:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2232,20 +2290,35 @@ func handler(w http.ResponseWriter, r *http.Request) {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type contextKey string
+  <pre class="language-go"><code class="language-go">package middleware
+
+import (
+    &quot;context&quot;
+    &quot;log/slog&quot;
+    &quot;net/http&quot;
+
+    &quot;github.com/google/uuid&quot;
+)
+
+type contextKey string
+
 const traceIDKey contextKey = &quot;traceID&quot;
 
+// TraceIDMiddleware извлекает или генерирует уникальный Correlation ID
 func TraceIDMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         id := r.Header.Get(&quot;X-Request-Id&quot;)
         if id == &quot;&quot; {
             id = uuid.New().String()
         }
+        // Помещаем идентификатор в контекст запроса
         ctx := context.WithValue(r.Context(), traceIDKey, id)
+        w.Header().Set(&quot;X-Request-Id&quot;, id)
         next.ServeHTTP(w, r.WithContext(ctx))
     })
 }
 
+// LoggerFromContext извлекает TraceID и возвращает обогащенный логер
 func LoggerFromContext(ctx context.Context, base *slog.Logger) *slog.Logger {
     if id, ok := ctx.Value(traceIDKey).(string); ok {
         return base.With(&quot;trace_id&quot;, id)
@@ -2255,21 +2328,23 @@ func LoggerFromContext(ctx context.Context, base *slog.Logger) *slog.Logger {
 </code></pre>
 </div>
 
-<p>Теперь каждая запись лога несёт trace_id, что позволяет в Kibana или Grafana Loki одним запросом вытащить полную цепочку событий по проблемному запросу. Детальнее о Correlation ID — в разделе «Распределённые системы» (<span class="wikilink-unresolved" title="Заметка в разработке">14. Распределенные системы на Go/08. Практика/7. Correlation ID</span>).</p>
+<p>Подробнее о передаче сквозных контекстов см. в материале <span class="wikilink-unresolved" title="Заметка в разработке">14. Распределенные системы на Go/08. Практика/7. Correlation ID</span>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p><code>context.WithValue</code> создаёт новый узел в цепочке контекстов (аллокация ~80-100 байт). Поиск по цепочке при каждом извлечении — O(N), но глубина редко превышает 3-5. Это пренебрежимо мало, если ID извлекается один раз на входе и передаётся логгеру явно, а не дёргается через <code>context.Value</code> в горячем цикле.</p>
+    <p>Вызов <code>context.WithValue</code> порождает новый узел в иммутабельном связном дереве контекстов (аллокация около 80–100 байт в куче). Поиск значения по ключу в цепочке контекстов имеет алгоритмическую сложность $O(N)$, где $N$ — глубина вложенности (обычно не более 3–5). Извлекайте Correlation ID один раз на входе в хендлер, а не дёргайте через <code>context.Value</code> в горячем цикле.</p>
   </div>
 </div>
 
-<h2 id="urovni-logirovaniya-i-dinamicheskaya-filtratsiya">Уровни логирования и динамическая фильтрация</h2>
+<hr />
+<h2 id="urovni-logirovaniya-i-dinamicheskaya-perenastroyka-na-letu">Уровни логирования и динамическая перенастройка на лету</h2>
 
-<p>Стандартные уровни: <strong>Debug, Info, Warn, Error</strong>. В production обычно устанавливают порог <code>Info</code>, чтобы не генерировать гигабайты отладочных данных. Однако при инциденте хочется поднять уровень до <code>Debug</code> для конкретного сервиса или даже для конкретного Correlation ID. Современные логгеры (slog, zerolog) позволяют это через динамическую настройку Handler'а.</p>
-<p><code>slog</code> поддерживает <code>LevelHandler</code> с атомарным уровнем:</p>
+<p>В штатном режиме в продакшене выставляется фильтрация уровня <strong><code>slog.LevelInfo</code></strong>, чтобы не перегружать сетевые каналы и дисковые массивы гигабайтами отладочной информации.</p>
+<p>Однако в момент возникновения аварийного инцидента инженеру критически важно заглянуть глубже и активировать уровень <code>Debug</code>. Перезапуск сервиса с изменением конфига недопустим: рестарт сбросит текущее ошибочное состояние памяти и уничтожит воспроизводимость бага.</p>
+<p>Пакет <code>log/slog</code> элегантно решает эту задачу: он поддерживает специализированный <code>LevelHandler</code> или атомарный уровень <code>slog.LevelVar</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2279,103 +2354,119 @@ func LoggerFromContext(ctx context.Context, base *slog.Logger) *slog.Logger {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">var level atomicLevel
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;log/slog&quot;
+    &quot;net/http&quot;
+    &quot;os&quot;
+)
+
+// Атомарный уровень логирования
+var level = new(slog.LevelVar)
 
 func init() {
-    level.Store(slog.LevelInfo)
-    slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{
-        Level: &amp;level, // динамический уровень
-    })))
+    // Устанавливаем базовый уровень Info
+    level.Set(slog.LevelInfo)
+
+    // Настраиваем глобальный JSON-логер с поддержкой динамического изменения уровня
+    handler := slog.NewJSONHandler(os.Stdout, &amp;slog.HandlerOptions{
+        Level: level,
+    })
+    slog.SetDefault(slog.New(handler))
 }
 
-// по HTTP-админке можно вызвать
+// Эндпоинт внутренней административной панели для смены уровня на лету
 func setLogLevel(w http.ResponseWriter, r *http.Request) {
     newLevel := r.URL.Query().Get(&quot;level&quot;)
     switch newLevel {
     case &quot;debug&quot;:
-        level.Store(slog.LevelDebug)
+        level.Set(slog.LevelDebug)
+        slog.Warn(&quot;ВНИМАНИЕ: Активирован детальный отладочный уровень DEBUG!&quot;)
     case &quot;info&quot;:
-        level.Store(slog.LevelInfo)
+        level.Set(slog.LevelInfo)
+        slog.Info(&quot;Уровень логирования возвращен к INFO&quot;)
+    default:
+        http.Error(w, &quot;недопустимый уровень&quot;, http.StatusBadRequest)
+        return
     }
+    w.WriteHeader(http.StatusOK)
 }
 </code></pre>
 </div>
 
-<p>Это мощный инструмент: во время инцидента вы через админку включаете <code>Debug</code> на 30 секунд и получаете детальные логи без перезапуска.</p>
-<h2 id="proizvoditelnost-logirovaniya-allokatsii-i-gc">Производительность логирования: аллокации и GC</h2>
+<p>Во время аварии дежурный инженер отправляет простой запрос <code>POST /admin/log-level?level=debug</code>, собирает исчерпывающий отладочный лог в течение двух минут и возвращает уровень в <code>info</code> без единого рестарта подов.</p>
+<hr />
+<h2 id="proizvoditelnost-logirovaniya-allokatsii-bufery-i-gc">Производительность логирования: аллокации, буферы и GC</h2>
 
-<p>Логирование в горячем пути — один из главных источников скрытых аллокаций. Каждый вызов <code>slog.Info</code> с атрибутами создаёт:</p>
-<ul>
-<li>Слайс атрибутов (<code>[]slog.Attr</code>).</li>
-<li>Сами атрибуты (строки, значения).</li>
-<li>Итоговый буфер сообщения (если не async).</li>
-</ul>
-<p>При 10 000 RPS и 5 строках лога на запрос это 50 000 аллокаций в секунду. Неоптимизированный логгер может стать главным драйвером GC и расширить p99 latency на десятки процентов.</p>
-<h3 id="oblegchyonnye-loggery-zerolog-i-zap">Облегчённые логгеры: zerolog и zap</h3>
+<p>В системах класса Highload логирование в горячем пути (Hot Path) — один из главных скрытых убийц производительности.</p>
+<p>Давайте посчитаем: если сервис обрабатывает $10\,000 \text{ RPS}$, и на каждый запрос генерируется всего 5 строк логов, система формирует <strong>50 000 записей в секунду</strong>.<br />
+Если каждая запись создает временный срез атрибутов <code>[]slog.Attr</code> и конкатенирует строки, сервис будет генерировать сотни тысяч паразитных аллокаций в секунду, приводя к непрерывному Stop-The-World и взрывному росту <code>p99 latency</code>.</p>
+<h3 id="sravnenie-logerov-slog-zap-i-zerolog">Сравнение логеров: `slog`, `zap` и `zerolog`</h3>
 
-<p>До появления <code>slog</code> сообщество использовало <strong>zerolog</strong> (аллокации близки к нулю) и <strong>zap</strong> (аллокации минимизированы, высокая пропускная способность). Оба достигают zero-allocation или near-zero за счёт:</p>
-<ul>
-<li>Переиспользования буферов (<code>sync.Pool</code>, <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</li>
-<li>Сериализации JSON без рефлексии.</li>
-<li>Избегания <code>interface{}</code> для простых типов.</li>
-</ul>
-<p><code>slog</code> также имеет оптимизированный путь, но его стандартный JSON-обработчик пока уступает zerolog по zero-allocation-метрикам. В latency-критичных сервисах стоит бенчмаркать конкретный логгер под свою нагрузку.</p>
-<h3 id="asinkhronnoe-logirovanie">Асинхронное логирование</h3>
+<p>Для максимальной производительности в экстремальных нагрузках применяются специализированные библиотеки:<br />
+- <strong><code>uber-go/zap</code>:</strong> Пионер высокоскоростного логирования. Использует предварительно выделенные пулы буферов через <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>) и строгую типизацию без упаковки в <code>interface{}</code>.<br />
+- <strong><code>rs/zerolog</code>:</strong> Архитектура с абсолютным Zero Allocation. Пишет JSON напрямую в байтовые буферы без создания промежуточных структур.</p>
+<p>Стандартный <code>slog</code> из Go 1.21 спроектирован с учетом этих практик, однако его дефолтный <code>JSONHandler</code> может немного уступать <code>zerolog</code> по чистым аллокациям. В latency-критичных узлах всегда бенчмаркайте альтернативные реализации бэкендов для <code>slog.Handler</code>.</p>
+<h3 id="asinkhronnoe-logirovanie-i-koltsevye-bufery">Асинхронное логирование и кольцевые буферы</h3>
 
-<p>Запись в файл или отправка по сети через <code>syscall.Write</code> (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>) может блокировать горутину на миллисекунды при заполнении буферов ядра. Асинхронные логгеры сбрасывают сообщения в кольцевой буфер, а отдельная горутина пишет их в вывод. Это изолирует hotspot, но добавляет задержку доставки и risk потери сообщений при падении.</p>
+<p>Прямой синхронный вызов системного вывода через <code>syscall.Write</code> (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>) может блокировать горутину на миллисекунды, если буфер пайпа ядра Linux или сокет агента сбора логов переполнен.</p>
+<p>Асинхронные логгеры решают эту проблему: вызывающая горутина лишь помещает сформированное сообщение в неблокирующий кольцевой буфер в памяти (<code>RingBuffer</code>), а отдельная фоновая горутина сбрасывает данные на диск порциями (Batching).</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
+    <span class="callout-title">Ловушка / Gotcha: Переполнение асинхронного буфера</span>
   </div>
   <div class="callout-body">
-    <p>Асинхронное логирование маскирует проблему: если диск медленный, буфер будет расти, потребляя память. Необходимо мониторить размер буфера и устанавливать <code>RingBuffer</code> с политикой сброса (drop oldest) для защиты от OOM.</p>
+    <p>Если скорость генерации логов превышает пропускную способность дисковой подсистемы или сборщика логов (FluentBit / Vector), асинхронный буфер начнет расти, пожирая оперативную память вплоть до падения сервиса по OOM.</p>
+<p><strong>Решение:</strong> Необходимо мониторить размер буфера и настраивать <code>RingBuffer</code> с политикой сброса (drop oldest — отбрасывать самые старые записи при переполнении) для защиты от OOM, с обязательным экспортом счетчика отброшенных логов <code>logs_dropped_total</code> в Prometheus.</p>
   </div>
 </div>
 
-<h3 id="semplirovanie-logov">Сэмплирование логов</h3>
-
-<p>Не каждый запрос достоин детального лога. Сэмплирование (логировать только 1% запросов или каждый N-й ошибочный) кратно снижает объём данных и накладные расходы. Реализуется через счётчик и <code>rand.Intn(100) == 0</code> на уровне Handler'а.</p>
-<h2 id="mechanical-sympathy-chto-proiskhodit-s-protsessorom-pri-zapisi-loga">Mechanical Sympathy: что происходит с процессором при записи лога</h2>
+<h3 id="semplirovanie-logov-log-sampling">Сэмплирование логов (Log Sampling)</h3>
+<p>Когда трафик исчисляется десятками тысяч запросов в секунду, писать 100% успешных сообщений не имеет смысла. Применяется <strong>сэмплирование</strong>: сохраняется лишь 1% успешных операций (<code>rand.Intn(100) == 0</code>), но 100% сообщений об ошибках (<code>level &gt;= Error</code>).</p>
+<hr />
+<h2 id="mechanical-sympathy-chto-proiskhodit-v-kremnii-pri-zapisi-loga">Mechanical Sympathy: Что происходит в кремнии при записи лога</h2>
 
 <p>Каждая запись лога — это путь от строки в памяти до системного вызова <code>write</code> (или <code>sendto</code> для сети). С точки зрения процессора:</p>
-<ul>
-<li><strong>Форматирование.</strong> Конкатенация строк, сериализация в JSON — это копирования памяти. Если буфер не переиспользуется, каждое копирование трогает новые кэш-линии, вытесняя полезные данные (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
-<li><strong>Системный вызов.</strong> <code>write</code> в файл (даже если это <code>stdout</code>, перенаправленный в пайп) — это переход в ядро, копирование данных в буфер ядра, возможное ожидание при заполненном буфере (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>). Это не только такты, но и загрязнение L1-кэша кодом ядра.</li>
-<li><strong>GC.</strong> Если каждый лог создаёт временные слайсы, они быстро умирают, учащая GC-циклы и mark assist (<a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>).</li>
-</ul>
-<p>Именно поэтому Senior-инженер, проектируя логирование, думает о:<br />
-- Минимизации аллокаций (пулы буферов).<br />
-- Батчинге записей (буферизация перед <code>Flush</code>).<br />
-- Ограничении объёма (сэмплирование, уровни).</p>
-<h2 id="konfiguratsiya-logirovaniya-v-raznykh-sredakh">Конфигурация логирования в разных средах</h2>
-
-<ul>
-<li><strong>Локальная разработка:</strong> текстовый формат (<code>slog.NewTextHandler</code>), уровень <code>Debug</code>, вывод в stderr.</li>
-<li><strong>CI/тесты:</strong> уровень <code>Warn</code> или <code>Error</code>, чтобы не зашумлять вывод, но ловить проблемы.</li>
-<li><strong>Production:</strong> JSON-формат, уровень <code>Info</code>, отправка в агрегатор (Loki через HTTP или stdout с агентом), асинхронный или буферизированный вывод, обязательный Correlation ID.</li>
-</ul>
-<h2 id="prakticheskiy-primer-refaktoring-logirovaniya-dlya-otladki-intsidenta">Практический пример: рефакторинг логирования для отладки инцидента</h2>
-
-<p>Сервис на Go падает с паникой раз в несколько часов. Логи — классический <code>fmt.Println</code> с кучей мусора. Что делаем:</p>
 <ol>
-<li>Внедряем <code>slog</code> с JSON-форматом и Correlation ID.</li>
-<li>Добавляем Middleware, проставляющий <code>trace_id</code> во все контексты.</li>
-<li>Устанавливаем уровень <code>Info</code> по умолчанию, <code>Debug</code> — по сигналу из админки.</li>
-<li>В момент следующего падения по логам (уже структурированным) находим <code>trace_id</code>, востанавливаем цепочку запросов, видим аномалию за 2 секунды до паники.</li>
-<li>Гипотеза подтверждается, фикс деплоится. Логи стали не просто шумом, а диагностическим инструментом.</li>
+<li><strong>Форматирование и локальность данных:</strong> Сериализация JSON-структуры требует копирования байт. Если логер использует пулы <code>sync.Pool</code>, память остается «горячей» в кэше процессора L1d/L2, исключая промахи (подробнее в <a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
+<li><strong>Переход в режим ядра (Syscall Overhead):</strong> Системный вызов <code>write</code> (или <code>sendto</code> при отправке по UDP/UNIX-сокету) переключает контекст процессора из User Space в Kernel Space. Ядро копирует данные в системный буфер <code>Page Cache</code>. Этот контекстный переход не только расходует сотни тактов CPU, но и вымывает строки инструкций из L1i кэша. Батчинг записей (буферизация перед вызовом <code>Flush</code>) многократно снижает эти накладные расходы.</li>
+<li><strong>Нагрузка на сборщик мусора:</strong> Если форматирование логов выполнено небрежно (конкатенация через <code>+</code> или неявный <code>fmt.Sprintf</code>), миллионы короткоживущих объектов моментально перегружают молодые арены аллокатора Go, провоцируя частые циклы GC и фазы <code>mark assist</code> (см. <a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>).</li>
 </ol>
-<h2 id="itog">Итог</h2>
+<hr />
+<h2 id="konfiguratsiya-logirovaniya-po-konturam-razvertyvaniya">Конфигурация логирования по контурам развертывания</h2>
 
 <ul>
-<li><strong>Логи</strong> — фундаментальный инструмент отладки в production, не заменяемый ни Delve, ни race detector.</li>
-<li><strong>Структурированное логирование</strong> (<code>slog</code>) с Correlation ID превращает поток текста в запрашиваемый источник данных.</li>
-<li><strong>Уровни и динамическая фильтрация</strong> позволяют менять детализацию без перезапуска.</li>
-<li><strong>Производительность:</strong> логирование может быть дорогим; необходимо применять zero-allocation логгеры (zerolog, zap), переиспользование буферов, сэмплирование и асинхронный вывод.</li>
-<li><strong>Механическая эмпатия:</strong> каждое записанное сообщение стоит тактов процессора, трогает кэш и создаёт давление на GC; Senior-инженер балансирует информативность и стоимость.</li>
-<li>В распределённых системах логи без Correlation ID бесполезны; их интеграция с трассировкой и метриками даёт полноту наблюдаемости.</li>
+<li><strong>Локальная разработка:</strong> Текстовый человекочитаемый формат (<code>slog.NewTextHandler</code>), уровень <code>Debug</code>, вывод в консоль терминала <code>stderr</code>.</li>
+<li><strong>CI / Интеграционные тесты:</strong> Уровень <code>Warn</code> или <code>Error</code>, чтобы не загрязнять вывод конвейера сборки, но гарантированно фиксировать непредвиденные сбои.</li>
+<li><strong>Production:</strong> Строгий JSON-формат (<code>slog.NewJSONHandler</code>), уровень <code>Info</code> с возможностью динамического повышения до <code>Debug</code>, обязательный Correlation ID, вывод в <code>stdout</code> для сбора локальными демонами (Vector, FluentBit) и отправки в централизованные хранилища (Grafana Loki, ClickHouse).</li>
 </ul>
-<p>Следующая статья раскрывает, как системно подходить к разбору уже случившихся инцидентов, объединяя логи, дампы и профили: <a href="5-postmortem-analiz.html" class="wikilink">5. Postmortem анализ</a>.</p>
+<hr />
+<h2 id="prakticheskiy-primer-rassledovanie-intsidenta-cherez-strukturirovannye-logi">Практический пример: расследование инцидента через структурированные логи</h2>
+
+<p><strong>Проблема:</strong> В распределенной платформе электронных платежей сервис чекаута спорадически падал с ошибкой таймаута при списании средств. В старых неструктурированных логах царил хаос из перемешанных строк <code>fmt.Println</code>.</p>
+<p><strong>Инженерный план действий:</strong><br />
+1. Кодовая база была переведена на <code>log/slog</code> с JSON-выводом.<br />
+2. Внедрен <code>TraceIDMiddleware</code>, прокидывающий сквозной заголовок <code>X-Request-Id</code> во все исходящие HTTP- и gRPC-запросы.<br />
+3. Базовый уровень был зафиксирован как <code>Info</code>, а на эндпоинт админки выведено управление <code>level.Set(slog.LevelDebug)</code>.<br />
+4. В момент повторения аномалии уровень был временно переключен в <code>Debug</code>.<br />
+5. По уникальному <code>trace_id</code> из сообщения об ошибке в Grafana Loki был выполнен точный поисковый запрос:<br />
+<code>logql
+   {app="checkout-service"} |= "trace_id=f47ac10b-58cc-4372-a567-0e02b2c3d479"</code><br />
+6. Была мгновенно восстановлена посекундная хронология: за 2 секунды до падения внешний сервис курсов валют ответил с задержкой 1.9 с, что исчерпало общий дедлайн контекста родительской горутины.<br />
+7. Логи перестали быть бесполезным шумом и превратились в точнейший измерительный инструмент.</p>
+<hr />
+<h2 id="rezyume">Резюме</h2>
+
+<ol>
+<li><strong><code>fmt.Println</code> не является инженерной стратегией:</strong> Неструктурированные логи не парсятся машинами, перемешиваются между параллельными горутинами и генерируют горы мусора для GC.</li>
+<li><strong>Используйте стандарт <code>log/slog</code>:</strong> Структурированный JSON-формат, типизированные атрибуты и нативная интеграция с <code>context.Context</code> обеспечивают максимальную наблюдаемость.</li>
+<li><strong>Correlation ID обязателен:</strong> Без сквозного идентификатора трассировки логи распределенных микросервисов превращаются в разрозненный шум.</li>
+<li><strong>Управляйте уровнями на лету:</strong> Используйте <code>slog.LevelVar</code> для динамического переключения уровня в <code>Debug</code> во время аварий без перезапуска подов.</li>
+<li><strong>Помните о механической цене:</strong> В горячих путях минимизируйте аллокации с помощью типизированных полей, переиспользования буферов (<code>sync.Pool</code>), асинхронного сброса и сэмплирования.</li>
+</ol>
+<p>Мы научились превращать логи в прецизионный отладочный инструмент. Но что делать, когда авария уже произошла, процесс скоропостижно скончался, а в логах осталась лишь лаконичная запись о краше ядра? Как заглянуть внутрь мертвого процесса? Переходим к фундаментальной методологии ретроспективного расследования: <a href="5-postmortem-analiz.html" class="wikilink">5. Postmortem анализ</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2403,7 +2494,7 @@ func setLogLevel(w http.ResponseWriter, r *http.Request) {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#logi-i-debugging-pochemu-fmt-println-ne-strategiya">Логи и debugging: почему fmt.Println — не стратегия</a></li><li class="toc-item toc-h2"><a href="#ot-fmt-println-k-strukturirovannomu-logirovaniyu">От fmt.Println к структурированному логированию</a></li><li class="toc-item toc-h2"><a href="#correlation-id-v-logakh">Correlation ID в логах</a></li><li class="toc-item toc-h2"><a href="#urovni-logirovaniya-i-dinamicheskaya-filtratsiya">Уровни логирования и динамическая фильтрация</a></li><li class="toc-item toc-h2"><a href="#proizvoditelnost-logirovaniya-allokatsii-i-gc">Производительность логирования: аллокации и GC</a></li><li class="toc-item toc-h3"><a href="#oblegchyonnye-loggery-zerolog-i-zap">Облегчённые логгеры: zerolog и zap</a></li><li class="toc-item toc-h3"><a href="#asinkhronnoe-logirovanie">Асинхронное логирование</a></li><li class="toc-item toc-h3"><a href="#semplirovanie-logov">Сэмплирование логов</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-proiskhodit-s-protsessorom-pri-zapisi-loga">Mechanical Sympathy: что происходит с процессором при записи лога</a></li><li class="toc-item toc-h2"><a href="#konfiguratsiya-logirovaniya-v-raznykh-sredakh">Конфигурация логирования в разных средах</a></li><li class="toc-item toc-h2"><a href="#prakticheskiy-primer-refaktoring-logirovaniya-dlya-otladki-intsidenta">Практический пример: рефакторинг логирования для отладки инцидента</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#logi-i-debugging-pochemu-fmt-println-ne-strategiya">Логи и debugging: почему fmt.Println — не стратегия</a></li><li class="toc-item toc-h2"><a href="#ot-fmt-println-k-strukturirovannomu-logirovaniyu">От fmt.Println к структурированному логированию</a></li><li class="toc-item toc-h3"><a href="#zolotoy-standart-industrii-paket-logslog">Золотой стандарт индустрии: пакет log/slog</a></li><li class="toc-item toc-h2"><a href="#correlation-id-rasputyvanie-klubka-v-raspredelennykh-sistemakh">Correlation ID: распутывание клубка в распределенных системах</a></li><li class="toc-item toc-h2"><a href="#urovni-logirovaniya-i-dinamicheskaya-perenastroyka-na-letu">Уровни логирования и динамическая перенастройка на лету</a></li><li class="toc-item toc-h2"><a href="#proizvoditelnost-logirovaniya-allokatsii-bufery-i-gc">Производительность логирования: аллокации, буферы и GC</a></li><li class="toc-item toc-h3"><a href="#sravnenie-logerov-slog-zap-i-zerolog">Сравнение логеров: slog, zap и zerolog</a></li><li class="toc-item toc-h3"><a href="#asinkhronnoe-logirovanie-i-koltsevye-bufery">Асинхронное логирование и кольцевые буферы</a></li><li class="toc-item toc-h3"><a href="#semplirovanie-logov-log-sampling">Сэмплирование логов (Log Sampling)</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-proiskhodit-v-kremnii-pri-zapisi-loga">Mechanical Sympathy: Что происходит в кремнии при записи лога</a></li><li class="toc-item toc-h2"><a href="#konfiguratsiya-logirovaniya-po-konturam-razvertyvaniya">Конфигурация логирования по контурам развертывания</a></li><li class="toc-item toc-h2"><a href="#prakticheskiy-primer-rassledovanie-intsidenta-cherez-strukturirovannye-logi">Практический пример: расследование инцидента через структурированные логи</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 

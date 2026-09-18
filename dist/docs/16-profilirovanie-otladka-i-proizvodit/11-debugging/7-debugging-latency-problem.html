@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~53 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Debugging latency проблем</h1>
@@ -2178,22 +2178,46 @@
           <div class="article-markdown">
             <h2 id="debugging-latency-problem-kogda-programma-ne-lomaetsya-no-tormozit">Debugging Latency проблем: когда программа не ломается, но «тормозит»</h2>
 
-<p>В предыдущих статьях подраздела мы разобрали инструменты для отладки «жёстких» отказов: интерактивный Delve (<a href="2-delve-debugger.html" class="wikilink">2. Delve debugger</a>), детектор гонок (<a href="3-race-detector-v-prode.html" class="wikilink">3. Race detector в проде</a>), postmortem-анализ падений (<a href="5-postmortem-analiz.html" class="wikilink">5. Postmortem анализ</a>) и core dump'ов (<a href="6-core-dumps.html" class="wikilink">6. Core dumps</a>). Но самые коварные проблемы в высоконагруженных Go-сервисах — это не падения, а <strong>задержки</strong>. Программа работает корректно, возвращает правильные ответы, но p99 latency внезапно улетает с 10 мс до 500 мс, бюджет ошибок SLO тает на глазах, а CPU и память выглядят нормально. Это не баг в логике — это сбой <strong>временных характеристик</strong>.</p>
-<p>Отладка задержек (latency debugging) — самостоятельная дисциплина, находящаяся на стыке профилирования производительности (раздел <span class="wikilink-unresolved" title="Заметка в разработке">16. Профилирование, отладка и производительность</span>) и классической отладки (раздел <span class="wikilink-unresolved" title="Заметка в разработке">11. Debugging</span>). Она не сводится к запуску <code>pprof</code> и поиску горячей функции. Она требует <strong>временной корреляции</strong> событий: понимания, в какой момент и почему горутина «заснула», кто её разбудил, и сколько она простояла в очередях планировщика. Senior Go-инженер видит за задержкой не просто «медленный код», а цепочку взаимодействий: GC → mark assist → планировщик → contention → сеть.</p>
-<p>В этой завершающей статье подраздела Debugging мы выстроим системный фреймворк для отладки проблем задержек в Go-сервисах. Мы свяжем метрики (<a href="../01-fundament/6-metriki-p50-p95-p99.html" class="wikilink">6. Метрики. p50, p95, p99</a>), профилировщики (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>, <a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>, <a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>, <a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>), execution tracer (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>), scheduler trace (<a href="../08-runtime-i-instrumenty/7-scheduler-trace.html" class="wikilink">7. scheduler trace</a>) и логи (<a href="4-logi-i-debugging.html" class="wikilink">4. Логи и debugging</a>) в единый алгоритм расследования, основанный на механической эмпатии (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>).</p>
+<blockquote>
+<p><em>"There are two ways of constructing a software design: One way is to make it so simple that there are obviously no deficiencies, and the other way is to make it so complicated that there are no obvious deficiencies."</em><br />
+— C.A.R. Hoare</p>
+</blockquote>
+<p>В предыдущих статьях подраздела мы вооружались инструментами для расследования катастрофических сбоев: препарировали упавшие процессы в Delve (<a href="2-delve-debugger.html" class="wikilink">2. Delve debugger</a>), искали гонки данных (<a href="3-race-detector-v-prode.html" class="wikilink">3. Race detector в проде</a>), анализировали посмертные логи (<a href="5-postmortem-analiz.html" class="wikilink">5. Postmortem анализ</a>) и вскрывали «черные ящики» системных аварий (<a href="6-core-dumps.html" class="wikilink">6. Core dumps</a>). Катастрофа с грохотом роняет сервис, оставляя четкий след: сигнал <code>SIGSEGV</code>, фатальную панику, стектрейс и дамп памяти.</p>
+<p>Но спросите любого опытного дежурного инженера, и он признается: падения сервиса — это благословение по сравнению с <strong>деградацией задержек (Latency Spikes)</strong>.</p>
+<p>Представьте картину: сервис работает, код возвращает статус <code>200 OK</code>, процессор загружен на скромные 25%, оперативная память в норме, логи чисты от ошибок. Но клиенты в ярости: время отклика 99-го перцентиля ($p99$) внезапно подскочило с комфортных 10 мс до мучительных 800 мс. Бюджет ошибок SLO сгорает за считанные минуты, upstream-сервисы начинают отваливаться по таймаутам, порождая лавину повторных запросов (retry storm). Программа не сломалась — сломались ее <strong>временные характеристики</strong>.</p>
+<p>Отладка задержек (latency debugging) — высший пилотаж бэкенд-инженерии, находящийся на стыке профилирования производительности (раздел <span class="wikilink-unresolved" title="Заметка в разработке">16. Профилирование, отладка и производительность</span>) и классической отладки (раздел <span class="wikilink-unresolved" title="Заметка в разработке">11. Debugging</span>). Здесь недостаточно запустить <code>pprof</code> и найти «самую тяжелую функцию». Задержка — это не количество выполненных инструкций, а <strong>время, проведенное в вынужденном ожидании</strong>. </p>
+<p>В этой завершающей статье подраздела мы построим строгий инженерный фреймворк расследования задержек в Go-сервисах. Мы объединим метрики (<a href="../01-fundament/6-metriki-p50-p95-p99.html" class="wikilink">6. Метрики. p50, p95, p99</a>), профилировщики (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>, <a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>, <a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>, <a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>), execution tracer (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>), scheduler trace (<a href="../08-runtime-i-instrumenty/7-scheduler-trace.html" class="wikilink">7. scheduler trace</a>) и логи с трассировкой (<a href="4-logi-i-debugging.html" class="wikilink">4. Логи и debugging</a>) в единую систему поиска узких мест, опираясь на принципы механического сочувствия к машине (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>).</p>
+<hr />
 <h2 id="pochemu-problemy-zaderzhek-samye-slozhnye">Почему проблемы задержек — самые сложные</h2>
 
-<p>Краш программы однозначен: есть core dump (<a href="6-core-dumps.html" class="wikilink">6. Core dumps</a>), стек-трейс, строка кода, на которой всё остановилось. Задержка же субъективна и многомерна:</p>
-<ul>
-<li><strong>Нет точки отказа.</strong> Система жива, просто медленна. Неясно, <em>что именно</em> задерживается: все запросы или только 1%? На каком этапе: приём соединения, парсинг, бизнес-логика, вызов к БД?</li>
-<li><strong>Требуется временная шкала.</strong> Статический профиль CPU покажет, что 30% времени ушло на <code>json.Unmarshal</code>, но не скажет, <em>почему</em> именно сейчас этот вызов стал занимать 100 мс вместо 1 мс. Возможно, в это время работал GC (<a href="../05-garbage-collector/6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>), или горутина была вытеснена планировщиком (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>).</li>
-<li><strong>Эффект накопления.</strong> Задержка в 1 мс на каждом из 10 последовательных вызовов микросервисов даёт 10 мс; если один из них «выпал» в хвост (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>), общая задержка экспоненциально растёт.</li>
-<li><strong>Многопричинность.</strong> Задержка может быть вызвана комбинацией: contention на мьютексе (<a href="../06-konkurentnost/7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>), вызванный этим рост аллокаций, который запускает GC, который включает mark assist, замедляющий основную горутину.</li>
-</ul>
-<p>Поэтому для отладки задержек нужен не единый инструмент, а <strong>фреймворк</strong> — последовательность шагов и набор коррелирующих инструментов.</p>
+<p>Если краш программы бинарен (сервис либо жив, либо мертв), то задержка многомерна, коварна и часто сопротивляется прямолинейным методам наблюдения:</p>
+<ol>
+<li><strong>Отсутствие явной точки отказа:</strong> Процесс функционирует. 95% пользователей не замечают проблем, и лишь каждый сотый запрос застревает в неизвестности. Где именно? На сетевом сокете, в очереди ОС, на парсинге JSON или на дисковом I/O базы данных?</li>
+<li><strong>Искажение статических профилей (Sample Bias):</strong> Классический CPU-профиль сэмплирует работающие потоки 100 раз в секунду. Но если горутина <em>спит</em>, ожидая мьютекс, сетевой ответ или квант времени процессора, CPU-профилировщик ее просто не видит! Он покажет, что 30% времени ушло на <code>json.Unmarshal</code>, создавая ложное впечатление виновника, хотя на самом деле запрос провел 95% времени в состоянии блокировки.</li>
+<li><strong>Эффект накопления в распределенных системах:</strong> В микросервисной архитектуре запрос проходит через цепочку из $N$ сервисов. Если каждый сервис имеет $p99 = 10$ мс, то вероятность того, что сложный запрос из 10 вызовов столкнется с медленным ответом, составляет не 1%, а почти $10\%$ ($1 - (1 - 0.01)^{10} \approx 9.56\%$). Хвосты задержек (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>) каскадно мультиплицируются.</li>
+<li><strong>Нелинейная многопричинность (Feedback Loops):</strong> Задержка редко возникает из-за одной изолированной строчки кода. Обычно это порочный круг: кратковременный всплеск трафика увеличивает аллокации → сборщик мусора чаще запускает фазу разметки (<a href="../05-garbage-collector/6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>) → рантайм принудительно переводит горутины в режим <code>mark assist</code> → горутины дольше удерживают мьютексы (<a href="../06-konkurentnost/7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>) → растет очередь блокировок → планировщик истощает локальные очереди P (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>).</li>
+</ol>
+
+<div class="code-block" data-lang="ascii">
+  <div class="code-header">
+    <span class="code-lang-tag">DIAGRAM</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-ascii"><code class="language-ascii">Порочный круг деградации задержек:
+[ Всплеск аллокаций ] ──► [ GC Mark Assist ] ──► [ Замедление обработчиков ]
+         ▲                                                 │
+         │                                                 ▼
+[ Рост очередей и задержки ] ◄── [ Конфликты на мьютексах (Contention) ]
+</code></pre>
+</div>
+
+<hr />
 <h2 id="freymvork-otladki-zaderzhek-latency-debugging-framework">Фреймворк отладки задержек (Latency Debugging Framework)</h2>
 
-<p>Предлагаемый алгоритм состоит из пяти этапов, последовательно сужающих круг поиска.</p>
+<p>Хаотичные попытки оптимизировать все подряд при росте $p99$ напоминают стрельбу в темноте. Чтобы локализовать причину за минимальное время, senior-инженер использует пятиэтапный алгоритм сужения области поиска.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2219,94 +2243,208 @@ Fix --&gt; Verify[&quot;Верификация под нагрузкой&quot;]
 </div>
 
 
+<hr />
 <h3 id="shag-1-analiz-metrik-gde-imenno-zaderzhka">Шаг 1. Анализ метрик — где именно задержка?</h3>
 
-<p>Инцидент начинается с графика в Grafana или алерта. Необходимо быстро ответить на вопросы:</p>
+<p>Расследование всегда начинается с верхнеуровневой телеметрии в Prometheus и дашбордов Grafana по методологии RED (Rate, Errors, Duration):</p>
 <ul>
-<li><strong>Какая метрика деградировала?</strong> p50, p95, p99? Если вырос только p99, а p50 стабилен — проблема в хвосте (GC-паузы, эпизодический contention, перезагрузка пула соединений). Если p50 тоже вырос — проблема системная (CPU исчерпан, медленная зависимость).</li>
-<li><strong>На каком сегменте?</strong> Если есть разбивка latency по этапам (парсинг, вызов БД, сериализация), смотрим, какой этап стал занимать больше времени.</li>
-<li><strong>Коррелирует ли с другими метриками?</strong> <code>go_gc_duration_seconds</code> (GC), <code>go_goroutines</code> (утечка горутин), <code>go_memstats_heap_inuse_bytes</code> (рост кучи), <code>container_cpu_throttling</code> (троттлинг CPU).</li>
-<li><strong>Только один сервис или несколько?</strong> Если latency выросла у нескольких upstream-сервисов, вероятно, проблема в общем зависимом сервисе (БД, кэш) или в сети (<a href="../07-io-i-sistemnyy-uroven/3-network-latency.html" class="wikilink">3. Network latency</a>).</li>
+<li><strong>Какая именно квантиль деградировала?</strong></li>
+<li>Если вырос только $p99$, а медиана $p50$ осталась неизменной (например, 5 мс против 600 мс) — ищите редкие выбросы: фазы Stop-The-World в GC, эпизодический lock contention, переподключение пула соединений БД, троттлинг cgroups или длинные полезные нагрузки.</li>
+<li>Если синхронно выросли и $p50$, и $p99$ — деградация системная: процессор физически перегружен, закончились потоки/дескрипторы, либо downstream-зависимость (БД) замедлилась для всех.</li>
+<li><strong>На каком сегменте конвейера растет задержка?</strong></li>
+<li>Изучите гистограммы времени отдельных стадий: <code>read_request_body</code>, <code>auth_validation</code>, <code>db_query</code>, <code>json_serialization</code>.</li>
+<li><strong>Корреляция с системными метриками Go и ядра:</strong></li>
+<li><code>go_gc_duration_seconds</code> — длительность фаз сборщика мусора.</li>
+<li><code>go_memstats_heap_inuse_bytes</code> — динамика заполнения кучи.</li>
+<li><code>go_goroutines</code> — аномальный рост числа горутин свидетельствует об их зависании.</li>
+<li><code>container_cpu_cfs_throttled_seconds_total</code> (а также метрики <code>container_cpu_throttling</code>) — скрытый убийца в Kubernetes: принудительное замораживание контейнера ядром Linux из-за исчерпания CPU-квоты.</li>
+<li><strong>Локальная или сетевая проблема?</strong></li>
+<li>Если задержка возросла одновременно у нескольких независимых сервисов, причина почти наверняка лежит в инфраструктуре: общая сеть (<a href="../07-io-i-sistemnyy-uroven/3-network-latency.html" class="wikilink">3. Network latency</a>), сетевая карта (NIC drop) или общая перегруженная СУБД.</li>
 </ul>
-<p><strong>Инструменты:</strong> Prometheus + Grafana, метрики RED (Rate, Errors, Duration), <code>GODEBUG=gctrace=1</code> (<a href="../05-garbage-collector/7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>).</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># Быстрая проверка GC в реальном времени через логирование рантайма
+GODEBUG=gctrace=1 ./my-service
+</code></pre>
+</div>
+
+<p>О параметрах настройки сборщика мусора см. <a href="../05-garbage-collector/7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>.</p>
+<hr />
 <h3 id="shag-2-snyatie-profiley-chto-delaet-protsessor-i-pamyat">Шаг 2. Снятие профилей — что делает процессор и память?</h3>
 
-<p>Когда временной промежуток определён, снимаем <strong>мгновенные срезы</strong> состояния на пике проблемы.</p>
+<p>Когда временной интервал проблемы зафиксирован, снимаются срезы профилирования непосредственно под нагрузкой:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash"># 1. CPU profile за 10 секунд
+go tool pprof http://localhost:6060/debug/pprof/profile?seconds=10
+
+# 2. Профиль аллокаций памяти кучи
+go tool pprof http://localhost:6060/debug/pprof/heap
+
+# 3. Дамп активных горутин
+curl -s http://localhost:6060/debug/pprof/goroutine?debug=2 &gt; goroutines.txt
+
+# 4. Профили блокировок и конкуренции
+go tool pprof http://localhost:6060/debug/pprof/block
+go tool pprof http://localhost:6060/debug/pprof/mutex
+</code></pre>
+</div>
+
 <ul>
-<li><strong>CPU profile</strong> (<code>/debug/pprof/profile?seconds=10</code>): видим, куда расходуются такты. Если в топе <code>runtime.mallocgc</code>, <code>runtime.gcAssistAlloc</code> — проблема в аллокациях и GC (<a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>). Если <code>sync.(*Mutex).Lock</code> — contention (<a href="../06-konkurentnost/7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>). Если <code>runtime.netpollblock</code> — ожидание сети (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>).</li>
-<li><strong>Heap profile</strong> (<code>/debug/pprof/heap</code>): резкий рост <code>inuse_space</code> указывает на утечку или накопление объектов. <code>alloc_space</code> покажет источники временного мусора.</li>
-<li><strong>Goroutine profile</strong> (<code>/debug/pprof/goroutine</code>): аномальное количество горутин в состоянии <code>[chan receive]</code>, <code>[sync.Mutex.Lock]</code> или <code>[runnable]</code> — ключ к поиску дедлоков, contention и нехватки CPU соответственно.</li>
+<li><strong>CPU profile:</strong> ищем характерные сигнатуры:</li>
+<li>Если в верхних строках <code>runtime.mallocgc</code> или <code>runtime.gcAssistAlloc</code> — процессор сжигает такты на раздачу памяти и помощь сборщику мусора (<a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>).</li>
+<li>Если в топе <code>sync.(*Mutex).Lock</code> или <code>sync.(*RWMutex).RLock</code> — потоки выжигают такты в спинлоках или блокируются в futex (<a href="../06-konkurentnost/7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>).</li>
+<li>Если доминирует <code>runtime.netpollblock</code> — приложение ожидает сетевого ввода-вывода от клиентов или внешних API (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>).</li>
+<li><strong>Heap profile:</strong> анализируем <code>alloc_space</code> (суммарный объем выделенной памяти) и <code>inuse_space</code> (живая память). Если <code>alloc_space</code> растет на гигабайты за секунды при стабильном <code>inuse_space</code>, сервис генерирует шквал короткоживущих объектов, заставляя GC циклически пожирать процессорное время.</li>
+<li><strong>Goroutine profile:</strong> ищем массовые скопления горутин со статусами:</li>
+<li><code>[chan receive]</code> / <code>[chan send]</code> — перегрузка внутренних очередей или утечка фоновых воркеров.</li>
+<li><code>[sync.Mutex.Lock]</code> — конкуренция за общую память.</li>
+<li><code>[runnable]</code> — катастрофический признак: горутины готовы исполняться, но операционная система или планировщик Go не дают им процессорного времени (голодание).</li>
 </ul>
-<p>Профили дают <strong>агрегированную</strong> картину, но не временную динамику. Они отвечают «кто виноват», но не «когда и в какой последовательности».</p>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p>Профили дают превосходный статистический срез «кто потребил больше всего ресурсов», но они слепы к фактору времени. Они не отвечают на вопрос: «почему запрос #4812 ждал ответа 2 секунды, если средняя функция занимает 50 микросекунд?». Для ответа на этот вопрос требуется хронологическая лента событий.</p>
+  </div>
+</div>
+
+<hr />
 <h3 id="shag-3-execution-trace-vosstanovlenie-vremennoy-shkaly">Шаг 3. Execution trace — восстановление временной шкалы</h3>
 
-<p>Самый мощный инструмент для отладки задержек — <strong>execution tracer</strong> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>). Он записывает хронологию событий рантайма: запуск/остановка горутин, блокировки, миграция между P, GC-фазы, syscall'ы.</p>
-<p>Трассировка на 5-10 секунд, снятая в момент проблемы, позволяет:</p>
-<ul>
-<li>Увидеть <strong>STW-паузы</strong> как красные вертикальные полосы, пересекающие все P. Измерить их длительность выделением.</li>
-<li>Увидеть <strong>mark assist</strong>: горутина помечается как <code>MARK ASSIST</code>. Если обработчики запросов проводят значительное время в этом режиме, GC не успевает за аллокациями.</li>
-<li>Увидеть <strong>долгое ожидание на канале или мьютексе</strong> (полосы <code>Waiting</code>). Execution tracer покажет, какая конкретно горутина разблокировала ожидающую.</li>
-<li>Увидеть <strong>миграцию горутин</strong> между P. Если latency-чувствительная горутина часто мигрирует, каждый раз теряется локальность кэша (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
-</ul>
+<p>Самое мощное оружие против задержек в арсенале Go-инженера — <strong>execution tracer</strong> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>). Он сохраняет микросекундную летопись всех событий в рантайме: смена состояний горутин (Running, Runnable, Waiting), переключения между логическими процессорами P, системные вызовы ядра, этапы работы сборщика мусора и активность потоков ОС (M).</p>
+<p>Снятие 5-секундного следа:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">curl -o trace.out http://localhost:6060/debug/pprof/trace?seconds=5
+go tool trace trace.out
+</code></pre>
+</div>
+
+
+<div class="code-block" data-lang="ascii">
+  <div class="code-header">
+    <span class="code-lang-tag">DIAGRAM</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-ascii"><code class="language-ascii">Визуализация Execution Trace во времени:
+Proc 0: [  Goroutine 101 (HTTP)  ] [ MARK ASSIST ] [ Goroutine 101 ]
+Proc 1: [           GC: Mark Termination (STW)             ]
+Proc 2: [ Goroutine 102 ] [ Waiting on Mutex ]──► [ Runnable ] [ Goroutine 102 ]
+Proc 3: [ Syscall: epoll_wait ] ────────────────────────► [ Goroutine 105 ]
+        ├─────────────────────────────────────────────────────────────► Время (t)
+</code></pre>
+</div>
+
+<p>Что мгновенно проявляется на временной шкале трассировщика:<br />
+1. <strong>Фазы Stop-The-World (STW):</strong> Отображаются как сплошные вертикальные полосы, блокирующие исполнение на всех логических процессорах P. Выделив полосу курсором, можно мгновенно узнать точную длительность остановки мира (например, 3.2 мс).<br />
+2. <strong>Mark Assist:</strong> Если пользовательская горутина вместо выполнения бизнес-логики подсвечена статусом <code>MARK ASSIST</code>, значит, она превысила выделенный лимит аллокаций и рантайм принудил ее маркировать объекты кучи в наказание за расточительность.<br />
+3. <strong>Длительные блокировки на мьютексах и каналах:</strong> Трассировщик показывает отрезки ожидания (<code>Waiting</code>) и связывает стрелкой событие разблокировки: видно, какая именно горутина освободила мьютекс или отправила сообщение в канал.<br />
+4. <strong>Миграции горутин между P:</strong> Если чувствительная к задержкам горутина постоянно перепрыгивает с одного P на другой, она непрерывно сбрасывает аппаратный L1/L2 кэш процессора (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</p>
+<hr />
 <h3 id="shag-4-korrelyatsiya-soedinenie-tochek">Шаг 4. Корреляция — соединение точек</h3>
 
-<p>Теперь у нас есть: профили (агрегированные горячие точки), execution trace (хронология), логи с Correlation ID (события уровня приложения). Соединяем их:</p>
+<p>На четвертом этапе данные агрегированных профилей, временной шкалы и распределенных логов объединяются:</p>
 <ul>
-<li><strong>Если CPU profile показывает <code>gcAssistAlloc</code>, а trace — частые GC-циклы:</strong> первопричина — высокий темп аллокаций. Уменьшаем аллокации (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</li>
-<li><strong>Если goroutine profile показывает тысячи горутин в <code>[sync.Mutex.Lock]</code>, а mutex profile (<a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>) — долгое удержание в <code>updateCache</code>:</strong> первопричина — длительная критическая секция. Выносим тяжёлые операции за мьютекс, или шардируем кэш.</li>
-<li><strong>Если trace показывает, что горутины долго в состоянии <code>Runnable</code> при занятых P, а CPU profile не показывает явных горячих точек:</strong> возможно, CPU throttling контейнера или конкуренция с другими процессами. Проверяем <code>container_cpu_cfs_throttled_seconds_total</code>.</li>
-<li><strong>Логи с Correlation ID</strong> (<a href="../../14-raspredelennye-sistemy-na-go/08-praktika/7-correlation-id.html" class="wikilink">7. Correlation ID</a>) позволяют вытащить конкретный медленный запрос, пройти по его trace id и увидеть, на каком сервисе он задержался.</li>
+<li><strong>Сценарий 1: GC-индуцированные задержки.</strong></li>
+<li><em>Симптомы:</em> В CPU-профиле доминирует <code>gcAssistAlloc</code>, в Execution Trace видны частые полосы <code>MARK ASSIST</code> прямо в контексте HTTP-обработчиков.</li>
+<li><em>Первопричина:</em> Интенсивная генерация мусора в куче.</li>
+<li><em>Лечение:</em> Устранение аллокаций через предварительное выделение слайсов (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>) и переиспользование объектов через <code>sync.Pool</code> (<a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</li>
+<li><strong>Сценарий 2: Мьютексный затор (Lock Contention).</strong></li>
+<li><em>Симптомы:</em> Goroutine profile показывает тысячи горутин в <code>[sync.Mutex.Lock]</code>, mutex profile (<a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a>) и block profile (<a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>) указывают на конкретный метод (например, <code>updateCache</code>).</li>
+<li><em>Первопричина:</em> Выполнение долгого I/O или тяжелых вычислений внутри критической секции мьютекса.</li>
+<li><em>Лечение:</em> Сокращение критической секции, переход на шардированные структуры (<code>ShardedMap</code>) или lock-free атомики.</li>
+<li><strong>Сценарий 3: Зависание в Runnable (CPU Throttling в Kubernetes).</strong></li>
+<li><em>Симптомы:</em> Трассировщик фиксирует, что горутины проводят десятки миллисекунд в статусе <code>Runnable</code> при свободных или заблокированных P. При этом CPU-профиль приложения полупустой.</li>
+<li><em>Первопричина:</em> Ядро Linux обрубает процессорное время контейнеру по механизму CFS (Completely Fair Scheduler) из-за жестких CPU limits (<code>resources.limits.cpu</code>).</li>
+<li><em>Лечение:</em> Увеличение CPU limits, снятие limits с оставлением requests, либо тюнинг <code>cfs_quota_us</code> / <code>cfs_period_us</code>.</li>
+<li><strong>Сквозные цепочки с Correlation ID:</strong></li>
+<li>По логам с единым Correlation ID (<a href="../../14-raspredelennye-sistemy-na-go/08-praktika/7-correlation-id.html" class="wikilink">7. Correlation ID</a>) вычисляется конкретный аномальный запрос. По OpenTelemetry Trace ID мы сопоставляем микросекунды в коде Go с таймлайном сетевых запросов к БД или внешним микросервисам.</li>
 </ul>
+<hr />
 <h3 id="shag-5-gipoteza-ispravlenie-verifikatsiya">Шаг 5. Гипотеза, исправление, верификация</h3>
 
-<p>Формулируем гипотезу: «Рост p99 вызван GC-паузами из-за всплеска аллокаций после деплоя новой фичи». Проверяем: профили памяти подтверждают рост alloc_space в новом коде. Исправляем: добавляем <code>sync.Pool</code>. Верифицируем нагрузочным тестированием (<a href="../10-highload/1-load-testing.html" class="wikilink">1. Load testing</a>) и сравнением p99 до/после.</p>
+<p>Научный подход исключает правки наугад:<br />
+1. <strong>Формулировка гипотезы:</strong> «Рост $p99$ задержки до 400 мс вызван режимом Mark Assist при сериализации аналитических отчетов из-за создания временных <code>[]byte</code> буферов».<br />
+2. <strong>Проверка гипотезы:</strong> Профиль памяти подтверждает 1.8 ГБ аллокаций в функции отчетов.<br />
+3. <strong>Локальное исправление:</strong> Внедрение кольцевого буфера или пула байтовых срезов <code>sync.Pool</code>.<br />
+4. <strong>Верификация под нагрузкой:</strong> Запуск нагрузочного генератора (<a href="../10-highload/1-load-testing.html" class="wikilink">1. Load testing</a>) с профилированием до и после рефакторинга. Контроль возвращения $p99$ в границы SLA.</p>
+<hr />
 <h2 id="klyuchevye-istochniki-zaderzhek-v-go">Ключевые источники задержек в Go</h2>
 
-<p>Ниже — карта типичных «тормозов» с указанием симптомов и инструментов диагностики.</p>
+<p>В таблице систематизированы наиболее частые причины проседания времени отклика в продакшене:</p>
 <div class="table-container"><table>
 <thead>
 <tr>
 <th>Источник задержки</th>
-<th>Симптомы</th>
-<th>Инструменты</th>
+<th>Симптомы и проявления</th>
+<th>Инструменты диагностики</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><strong>GC-паузы и mark assist</strong></td>
-<td><code>go_gc_duration_seconds</code> растёт, в CPU profile — <code>gcAssistAlloc</code>, в trace — красные полосы STW и <code>MARK ASSIST</code>.</td>
+<td><strong>GC-паузы и Mark Assist</strong></td>
+<td>Рост <code>go_gc_duration_seconds</code>, пики в <code>gcAssistAlloc</code>, широкие полосы STW и <code>MARK ASSIST</code> в трассировщике.</td>
 <td><a href="../05-garbage-collector/6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>, <a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>, <code>GODEBUG=gctrace=1</code></td>
 </tr>
 <tr>
 <td><strong>Contention на мьютексах</strong></td>
-<td>В goroutine dump — много в <code>[sync.Mutex.Lock]</code>, block profile — <code>sync.(*Mutex).Lock</code>, mutex profile показывает holder'ов.</td>
+<td>Массовое зависание в <code>[sync.Mutex.Lock]</code>, высокий contention delay в block profile, задержки в <code>runtime.chansend</code>.</td>
 <td><a href="../06-konkurentnost/7-contention-i-lock-profiling.html" class="wikilink">7. Contention и lock profiling</a>, <a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a>, <a href="../08-runtime-i-instrumenty/6-mutex-profile.html" class="wikilink">6. mutex profile</a></td>
 </tr>
 <tr>
-<td><strong>Перегрузка планировщика</strong></td>
-<td><code>schedtrace</code> показывает большой <code>runqueue</code>, много <code>runnable</code> при <code>idleprocs=0</code>. Trace — долгое <code>Runnable</code>.</td>
+<td><strong>Перегрузка планировщика (Runqueue Saturation)</strong></td>
+<td><code>schedtrace</code> рапортует о гигантском <code>runqueue</code>, десятки горутин в <code>runnable</code> при <code>idleprocs=0</code>.</td>
 <td><a href="../08-runtime-i-instrumenty/7-scheduler-trace.html" class="wikilink">7. scheduler trace</a>, <a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a></td>
 </tr>
 <tr>
-<td><strong>Сетевые задержки</strong></td>
-<td><code>http_client_request_duration_seconds</code> растёт на этапе подключения, trace — долгое <code>Waiting</code> на <code>netpoll</code>.</td>
+<td><strong>Сетевые задержки и Netpoller</strong></td>
+<td>Рост <code>http_client_request_duration_seconds</code>, долгое пребывание в <code>runtime.netpollblock</code>, исчерпание пула TCP-соединений.</td>
 <td><a href="../07-io-i-sistemnyy-uroven/3-network-latency.html" class="wikilink">3. Network latency</a>, <a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>, <a href="../08-runtime-i-instrumenty/5-block-profile.html" class="wikilink">5. block profile</a></td>
 </tr>
 <tr>
-<td><strong>Блокирующие syscall</strong></td>
-<td><code>threads</code> в schedtrace растёт, trace — долгое <code>syscall</code>.</td>
+<td><strong>Блокирующие системные вызовы</strong></td>
+<td>Резкий рост количества потоков ОС (<code>threads</code> в <code>schedtrace</code>), горутины в статусе <code>syscall</code> блокируют потоки M.</td>
 <td><a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a></td>
 </tr>
 <tr>
-<td><strong>CPU Throttling</strong></td>
-<td><code>container_cpu_cfs_throttled_seconds_total</code> &gt; 0 при низком <code>cpu/utilization</code> от Go.</td>
-<td>Linux cgroup metrics</td>
+<td><strong>CFS CPU Throttling</strong></td>
+<td><code>container_cpu_cfs_throttled_seconds_total</code> &gt; 0 при низком <code>cpu/utilization</code> от Go, горутины замирают в <code>Runnable</code>.</td>
+<td>Метрики Linux cgroup, <code>node_exporter</code></td>
 </tr>
 </tbody>
 </table></div>
+<hr />
 <h2 id="polzovatelskie-annotatsii-v-trassirovke">Пользовательские аннотации в трассировке</h2>
 
-<p>Для связывания бизнес-логики с событиями рантайма в <code>runtime/trace</code> существуют <strong>пользовательские задачи и регионы</strong> (tasks / regions). Они позволяют разметить обработку одного запроса и увидеть её на временной шкале в <code>go tool trace</code>.</p>
+<p>Стандартная трассировка рантайма фиксирует низкоуровневые события (память, потоки, планировщик), но ничего не знает о контексте вашего приложения: каком пользователю принадлежит запрос, какой заказ обрабатывается и какой SQL-запрос выполняется.</p>
+<p>Для бесшовного соединения бизнес-контекста с хронологией рантайма стандартная библиотека предоставляет пакет <code>runtime/trace</code>. Он позволяет встраивать <strong>пользовательские задачи (Tasks), регионы (Regions) и лог-события (Logs)</strong>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2316,70 +2454,178 @@ Fix --&gt; Verify[&quot;Верификация под нагрузкой&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">ctx, task := trace.NewTask(r.Context(), &quot;handleOrder&quot;)
-defer task.End()
+  <pre class="language-go"><code class="language-go">package main
 
-region := trace.StartRegion(ctx, &quot;validatePayment&quot;)
-// ... валидация
-region.End()
+import (
+    &quot;context&quot;
+    &quot;net/http&quot;
+    &quot;runtime/trace&quot;
+)
+
+func handleOrder(w http.ResponseWriter, r *http.Request) {
+    // 1. Создаем пользовательскую задачу, привязанную к жизненному циклу запроса
+    ctx, task := trace.NewTask(r.Context(), &quot;handleOrder&quot;)
+    defer task.End()
+
+    // 2. Логируем метаданные заказа прямо в трассировку
+    trace.Log(ctx, &quot;orderID&quot;, r.Header.Get(&quot;X-Order-ID&quot;))
+
+    // 3. Выделяем критический этап в именованный регион
+    processPayment(ctx)
+
+    w.WriteHeader(http.StatusOK)
+}
+
+func processPayment(ctx context.Context) {
+    // Регион отобразится на временной шкале отдельным цветным блоком
+    region := trace.StartRegion(ctx, &quot;validatePayment&quot;)
+    defer region.End()
+
+    // Имитация валидации и взаимодействия с платежным шлюзом
+    // Любая GC-пауза или блокировка мьютекса внутри этого региона
+    // будет визуально наложена на отрезок времени 'validatePayment'
+}
 </code></pre>
 </div>
 
-<p>В <code>go tool trace</code> эти задачи появляются в разделе <strong>User-defined tasks</strong>. Можно выбрать конкретный запрос и увидеть, сколько времени занял каждый этап, и как он пересекался с GC или contention. Это превращает трассировку из «простыни событий» в карту задержек конкретного запроса.</p>
+<p>Когда вы откроете такой файл через <code>go tool trace</code>, в интерфейсе появится специализированная панель <strong>User-defined Tasks</strong>:<br />
+* Вы можете кликнуть на конкретную транзакцию <code>handleOrder</code>.<br />
+* Браузер отобразит полную диаграмму Ганта (Gantt chart) для данного запроса: сколько микросекунд ушло на регион <code>validatePayment</code>, где именно запрос был прерван сборщиком мусора, и сколько времени он ожидал ответа сокета.</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Вопрос с собеседования</span>
+  </div>
+  <div class="callout-body">
+    <p>Пользовательские регионы <code>trace.StartRegion</code> обладают околонулевым оверхедом при отключенной трассировке. Их можно и нужно оставлять в критических путях высоконагруженных сервисов: при включении трассировки на 5 секунд в продакшене вы мгновенно получаете рентгеновский снимок работы бизнес-логики.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="prakticheskiy-primer-rassledovanie-rosta-p99">Практический пример: расследование роста p99</h2>
 
-<p><strong>Инцидент:</strong> Сервис <code>order-api</code> внезапно показал рост p99 с 50 мс до 300 мс. p50 остался 20 мс. Нагрузка не менялась.</p>
-<p><strong>Шаг 1. Метрики:</strong><br />
-- <code>go_gc_duration_seconds</code> — всплески до 50 мс.<br />
-- <code>go_memstats_heap_alloc_bytes</code> — пилообразный график, частые GC.<br />
-- <code>go_goroutines</code> — стабильно.</p>
-<p><strong>Шаг 2. Профили:</strong><br />
-- CPU profile на 10 сек: <code>runtime.gcAssistAlloc</code> — 25%, <code>json.Unmarshal</code> — 35% (с учётом потомков).<br />
-- Memory profile (alloc_space): <code>json.Unmarshal</code> — 60% аллокаций.</p>
-<p><strong>Шаг 3. Execution trace (5 сек):</strong><br />
-- Каждые ~200 мс красные полосы STW по 1-2 мс.<br />
-- Многие горутины-обработчики в <code>MARK ASSIST</code> по 2-4 мс.<br />
-- Сеть (<code>Waiting</code> на netpoll) незначительна.<br />
-- Локальные очереди P не перегружены.</p>
-<p><strong>Шаг 4. Корреляция:</strong><br />
-- Высокий темп аллокаций в <code>json.Unmarshal</code> вызывает частые GC.<br />
-- Частые GC приводят к mark assist, который забирает время у обработчиков.<br />
-- STW-паузы напрямую добавляют задержку.</p>
-<p><strong>Шаг 5. Гипотеза и исправление:</strong><br />
-- Гипотеза: JSON-десериализация генерирует слишком много мусора.<br />
-- Решение: заменить <code>encoding/json</code> на <code>sonic</code> и добавить переиспользование буферов через <code>sync.Pool</code>.<br />
-- Верификация: нагрузочное тестирование показало снижение alloc_space на 70%, GC-паузы уменьшились до микросекунд, p99 вернулся к 50 мс.</p>
+<p>Рассмотрим реальный кейс из практики высоконагруженного сервиса оформления заказов.</p>
+<p><strong>Инцидент:</strong><br />
+Сервис <code>order-api</code> при стабильной нагрузке в 3 000 RPS внезапно показал взрывной рост задержки: $p50$ остался стабильным на уровне 20 мс, но $p99$ подскочил с 50 мс до 300 мс. Появились единичные таймауты клиентов.</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">Хронология расследования инцидента:
+
+1. МЕТРИКИ (Prometheus / Grafana):
+   - go_gc_duration_seconds: пилообразные всплески STW до 48 мс каждые 2 секунды.
+   - go_memstats_heap_alloc_bytes: куча пилообразно взлетает до 1.2 ГБ и падает до 200 МБ.
+   - go_goroutines: стабильно ~1500 (утечки горутин нет).
+
+2. ПРОФИЛИРОВАНИЕ (pprof):
+   - CPU profile (10 сек):
+     * 25% — runtime.gcAssistAlloc
+     * 35% — json.Unmarshal (включая служебные функции runtime.slicebytetostring)
+   - Memory profile (alloc_space):
+     * 60% всех аллокаций процесса генерирует функция parseOrderPayload() в json.Unmarshal.
+
+3. EXECUTION TRACE (5 сек):
+   - Каждые 200 мс наблюдаются паузы STW длительностью до 2 мс.
+   - Горутины HTTP-воркеров проводят по 3-5 мс в статусе MARK ASSIST, не выполняя бизнес-код.
+   - Время сетевого ожидания (netpoll) и очереди планировщика (runqueue) находятся в норме.
+
+4. КОРРЕЛЯЦИЯ И ДИАГНОЗ:
+   - Стандартный парсер `encoding/json` при разборе тяжелых входящих JSON-массивов аллоцирует миллионы промежуточных объектов в куче.
+   - Сборщик мусора перегружается и мобилизует горутины-обработчики на помощь в маркировке (`mark assist`).
+   - Запросы, попавшие в фазу Mark Assist + STW, получают кумулятивную задержку 250-300 мс.
+
+5. ИСПРАВЛЕНИЕ И ВЕРИФИКАЦИЯ:
+   - Замена рефлексивного `encoding/json` на высокопроизводительную SIMD-библиотеку `sonic` (или кодогенерацию `easyjson`).
+   - Внедрение пула буферов `sync.Pool` для временных байтовых срезов парсера.
+   - Результат: объем аллокаций (alloc_space) снизился на 70%, GC-паузы упали до субмиллисекундных значений, метрика $p99$ вернулась к эталонным 45 мс.
+</code></pre>
+</div>
+
+<hr />
 <h2 id="mechanical-sympathy-kak-zaderzhka-skladyvaetsya-iz-taktov">Mechanical Sympathy: как задержка складывается из тактов</h2>
 
-<p>С точки зрения процессора, задержка обработки запроса — это сумма:</p>
+<p>С точки зрения кремниевого кристалла процессора, общее время отклика сервиса — это не абстрактные «миллисекунды». Это сумма элементарных аппаратных событий, в которых процессор либо выполняет полезные инструкции, либо простаивает:</p>
+<p>$$\text{Latency} = T_{\text{useful}} + T_{\text{cache_miss}} + T_{\text{sync}} + T_{\text{gc}} + T_{\text{syscall}} + T_{\text{scheduler}}$$</p>
 <ol>
-<li><strong>Полезных тактов</strong> (исполнение бизнес-логики).</li>
-<li><strong>Тактов ожидания кэша</strong> (cache miss) — когда данные не в L1/L2 (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
-<li><strong>Тактов ожидания синхронизации</strong> — spinning на мьютексе или ожидание <code>futex</code> (<a href="../06-konkurentnost/4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>).</li>
-<li><strong>Тактов, украденных GC</strong> (mark assist, STW) (<a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>).</li>
-<li><strong>Тактов, потраченных на переходы в ядро</strong> (системные вызовы) (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>).</li>
-<li><strong>Тактов ожидания в очередях планировщика</strong> (runnable) (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>).</li>
+<li><strong>Полезные такты ($T_{\text{useful}}$):</strong> Непосредственное вычисление бизнес-правил, работа алгоритмов, арифметические операции в регистрах CPU.</li>
+<li><strong>Такты простоя кэша ($T_{\text{cache_miss}}$):</strong> Процессор ожидает выборки данных из оперативной памяти DRAM при промахе мимо кэша L1/L2/L3 (до 200 тактов на каждый промах, см. <a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
+<li><strong>Такты ожидания синхронизации ($T_{\text{sync}}$):</strong> Бесплодное вращение в спинлоке (CPU spinning) или перевод потока в спячку через <code>futex</code> при конфликте за мьютекс (<a href="../06-konkurentnost/4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>).</li>
+<li><strong>Такты, экспроприированные сборщиком мусора ($T_{\text{gc}}$):</strong> Работа потоков GC-маркировки, фазы полной остановки мира (STW) и принудительный режим <code>mark assist</code> (<a href="../05-garbage-collector/9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>).</li>
+<li><strong>Такты перехода в пространство ядра ($T_{\text{syscall}}$):</strong> Сброс конвейера инструкций, переключение контекста процессора при системных вызовах <code>epoll_wait</code>, <code>read</code>, <code>write</code> (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>).</li>
+<li><strong>Такты голодания в очереди ($T_{\text{scheduler}}$):</strong> Время, когда готовая к работе горутина находится в статусе <code>Runnable</code> в локальной очереди $P$, ожидая, пока освободится поток ОС (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>).</li>
 </ol>
-<p>Execution tracer и scheduler trace позволяют разложить общее время на эти компоненты. Senior-инженер, глядя на trace, видит не просто «красную полосу GC», а понимает: «этот запрос ждал 2 мс mark termination, потому что куча была грязной из-за временных буферов, которые не пулятся». Это и есть mechanical sympathy в действии.</p>
+<p>Инженер, обладающий механическим сочувствием к железу, глядя на полосы трассировщика, видит физическую реальность: запрос завис не потому, что «Go медленный», а потому что поток M был вытеснен ядром Linux из-за исчерпания квантов времени CFS, а горутина ждала освобождения мьютекса, удерживаемого другой горутиной, отрабатывающей mark assist.</p>
+<hr />
 <h2 id="kogda-nichego-ne-pomoglo-evristiki-dlya-slozhnykh-sluchaev">Когда ничего не помогло: эвристики для сложных случаев</h2>
 
+<p>Бывают инциденты, когда очевидных всплесков в метриках нет, а редкие клиенты продолжают жаловаться на зависания. В таких ситуациях помогают продвинутые эвристики:</p>
 <ul>
-<li><strong>Дифференциальные профили:</strong> сравните CPU profile здорового периода и проблемного через <code>pprof -diff_base</code>. Это выявит функции, которые <em>появились</em> или <em>стали дороже</em> (<a href="../02-benchmarking/8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>).</li>
-<li><strong>Логи с таймстемпами внутри запроса:</strong> расставьте в коде <code>time.Since(start)</code> и логируйте с уровнями Debug. В момент инцидента включите Debug для проблемного Correlation ID и получите точные времена этапов.</li>
-<li><strong>Детерминированное воспроизведение:</strong> если проблема проявляется на 0.1% запросов, запишите входящий трафик (например, через <code>gor/m replay</code>) и повторите на стейджинге с включённым trace.</li>
-<li><strong>Исключение влияния сети:</strong> добавьте заглушку (mock) для внешних зависимостей и проверьте, воспроизводится ли задержка. Это изолирует проблему внутри сервиса.</li>
+<li><strong>Дифференциальные профили (Differential Profiling):</strong><br />
+  Сохраните CPU-профиль в период нормальной работы сервиса и сравните его с профилем во время инцидента с помощью флага <code>-diff_base</code>:<br />
+<code>bash
+  go tool pprof -diff_base=normal_cpu.pb.gz incident_cpu.pb.gz</code><br />
+  Это визуализирует исключительно <strong>дельту</strong>: функции, которые стали потреблять аномально больше времени или появились в стеке впервые (<a href="../02-benchmarking/8-sravnenie-versiy-koda.html" class="wikilink">8. Сравнение версий кода</a>).</li>
+<li><strong>Точечное логирование задержек по Correlation ID:</strong><br />
+  Внедрите замер времени контрольных участков:<br />
+<code>go
+  start := time.Now()
+  // ... подозрительный блок ...
+  if elapsed := time.Since(start); elapsed &gt; 50*time.Millisecond {
+      logger.Warn("slow operation detected", "elapsed", elapsed, "trace_id", traceID)
+  }</code><br />
+  В момент деградации можно динамически понизить уровень логирования для конкретного Correlation ID и собрать детальный хронометраж каждого шага.</li>
+<li><strong>Детерминированное воспроизведение нагрузки:</strong><br />
+  Если аномалия проявляется лишь на 0.05% запросов, используйте инструменты дублирования сетевого трафика с продакшена (например, <code>GoReplay</code> / <code>gor/m replay</code>). Запись и воспроизведение реального трафика на тестовом стенде с включенным execution trace позволяет воспроизвести гонку или краевой случай без риска для живых пользователей.</li>
+<li><strong>Изоляция внешних сетевых зависимостей:</strong><br />
+  Замените сетевые вызовы к внешним сервисам или СУБД на локальные in-memory заглушки (mock). Если задержка воспроизводится на заглушках — проблема строго внутри процесса Go; если исчезает — фокус поиска смещается на сеть и внешние базы данных.</li>
 </ul>
+<hr />
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Вопрос с собеседования</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> «На проде подскочил p99 latency HTTP-сервиса с 20 мс до 1.5 секунд. При этом CPU utilisation всего 15%, а память стабильна. С чего вы начнете расследование и какие инструменты примените?»<br />
+<strong>Ответ кандидата Senior-уровня:</strong><br />
+«Низкий CPU при высоком latency прямо указывает на то, что потоки не выполняют полезную работу, а проводят время в <strong>ожидании (блокировках)</strong>.<br />
+1. Сначала проверю метрику <code>container_cpu_cfs_throttled_seconds_total</code> — если контейнер задушен квотой cgroups, CPU будет низким, но горутины будут простаивать в <code>Runnable</code>.<br />
+2. Сниму <code>goroutine profile</code> (<code>debug=2</code>) и <code>block/mutex profile</code>. Это покажет, заблокированы ли сотни горутин на <code>sync.Mutex</code>, ожидании каналов или на сетевых вызовах базы данных (<code>runtime.netpollblock</code>).<br />
+3. Сниму 5-секундный <code>execution trace</code> (<code>curl /debug/pprof/trace?seconds=5</code>). На временной шкале сразу станет видно распределение: если горутины висят в <code>Waiting</code> на системных вызовах — узкое место в I/O или downstream-сервисе; если в <code>Runnable</code> — планировщик Go или ядро ОС не дают квантов времени; если видны паузы STW или <code>MARK ASSIST</code> — проблема в сборщике мусора из-за пикового темпа временных аллокаций».</p>
+  </div>
+</div>
+
+<hr />
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка на проде: коварство CFS Throttling в контейнерах</span>
+  </div>
+  <div class="callout-body">
+    <p>Одна из самых частых причин необъяснимого взрыва $p99$ в Kubernetes — это механизм ядра Linux CFS Quota.<br />
+Если для пода задан лимит <code>resources.limits.cpu: 1</code> при периоде CFS <code>100ms</code>, то процессу разрешено утилизировать суммарно 100 мс процессорного времени за каждые 100 мс астрономического времени. Если Go-сервис запустил 8 горутин на 8 ядрах одновременно, они израсходуют лимит 100 мс всего за 12.5 мс!<br />
+В оставшиеся 87.5 мс периода ядро Linux принудительно усыпляет весь контейнер. В этот момент задержка любого входящего запроса мгновенно подскакивает на 80–90 мс на ровном месте. При этом средний CPU сервиса за 1 минуту в Prometheus будет выглядеть как безопасные 40–50%! Решение — регулярный мониторинг троттлинга и отказ от заниженных CPU limits в пользу правильно рассчитанных CPU requests.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Отладка задержек</strong> — это дисциплина на стыке observability и понимания рантайма Go, требующая корреляции метрик, профилей, execution trace и логов.</li>
-<li>Фреймворк: метрики → профили → execution trace → корреляция (GC, contention, IO, scheduler) → гипотеза → верификация.</li>
-<li>Ключевые источники задержек: GC (паузы, mark assist), contention (мьютексы, каналы), перегрузка планировщика, сеть, блокирующие syscall, CPU throttling.</li>
-<li>Execution tracer — самый мощный инструмент для visual latency debugging, особенно с пользовательскими задачами и регионами.</li>
-<li>Mechanical sympathy объясняет задержку как сумму потерянных тактов на кэш, синхронизацию и ядро; trace декомпозирует эту сумму.</li>
-<li>Навык debugging latency — маркер Senior-инженера: это не поиск бага, а восстановление временной картины сложной системы.</li>
+<li><strong>Отладка задержек</strong> — фундаментальная дисциплина на стыке наблюдаемости (Observability) и глубинного понимания рантайма Go. Она требует сопоставления агрегированных метрик, моментальных профилей, хронологических трассировок и структурированных логов.</li>
+<li><strong>Строгий пятиэтапный фреймворк:</strong> Метрики (RED) → Профили (CPU, Heap, Goroutine) → Execution Trace (временная шкала) → Корреляция (GC, Contention, I/O, Scheduler) → Формулирование гипотезы и верификация под нагрузкой.</li>
+<li><strong>Главные виновники задержек в Go:</strong> Фазы сборщика мусора и режим <code>mark assist</code>, конкуренция за мьютексы и каналы (Lock Contention), насыщение очередей планировщика (Runqueue Saturation), сетевые задержки ввода-вывода и CFS CPU Throttling в контейнерах.</li>
+<li><strong>Execution Tracer (<code>go tool trace</code>)</strong> — непревзойденный инструмент для визуализации задержек во времени. Пользовательские задачи и регионы (<code>runtime/trace</code>) позволяют транслировать бизнес-транзакции непосредственно на временную шкалу рантайма.</li>
+<li><strong>Механическое сочувствие:</strong> Задержка складывается из тактов процессора, растраченных на ожидание кэша, системные вызовы, переключения контекста и сборку мусора. Понимание этого аппарата превращает отладку из гадания на кофейной гуще в строгую инженерную науку.</li>
 </ul>
-<p>С этой статьёй мы завершаем подраздел «Debugging». Мы прошли путь от интерактивной отладки и race detector до postmortem-анализа и core dump'ов, замкнув его на системном подходе к проблемам задержек. Следующий раздел — итоговый, где мы обобщим все изученные темы и сформируем Performance Engineering Mindset: <a href="../12-itog/1-itogi-razdela-performance-engineering-mindset.html" class="wikilink">1. Итоги раздела. Performance engineering mindset</a>.</p>
+<p>С этой статьей мы завершаем подраздел «Debugging». Мы прошли путь от низкоуровневой интерактивной отладки и выявления гонок данных до патологоанатомического анализа падений ядра и системного обуздания сетевых и процессорных задержек.</p>
+<p>Впереди нас ждет заключительный аккорд всего 16-го модуля: обобщение изученного фундамента и формирование инженерного мышления в статье <a href="../12-itog/1-itogi-razdela-performance-engineering-mindset.html" class="wikilink">1. Итоги раздела. Performance engineering mindset</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

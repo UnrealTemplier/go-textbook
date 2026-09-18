@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~26 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">6. Core dumps</h1>
@@ -2178,40 +2178,48 @@
           <div class="article-markdown">
             <h2 id="core-dumps-chyornyy-yashchik-upavshey-programmy">Core dumps: «чёрный ящик» упавшей программы</h2>
 
-<p>В <a href="5-postmortem-analiz.html" class="wikilink">5. Postmortem анализ</a> мы выстроили общую методологию расследования инцидентов по артефактам. Главный из них — <strong>core dump</strong> (дамп памяти) — образ виртуальной памяти процесса в момент аварийного завершения. Если логи (<a href="4-logi-i-debugging.html" class="wikilink">4. Логи и debugging</a>) отвечают на вопрос «что происходило перед падением?», а профили памяти — «сколько памяти было занято?», то core dump позволяет заглянуть в самый эпицентр катастрофы: восстановить точное состояние всех горутин, значения переменных, стек вызовов и даже регистры процессора на момент падения.</p>
-<p>Для Senior Go-инженера умение получать и анализировать core dump'ы — обязательный навык. Паника с nil pointer dereference, сегфолт при вызове CGO, дедлок, который не воспроизводится локально — всё это оставляет следы в core dump, которые можно прочитать с помощью Delve (<a href="2-delve-debugger.html" class="wikilink">2. Delve debugger</a>). Без core dump'а расследование внезапных падений на продакшене превращается в гадание, с ним — в строгий анализ.</p>
-<p>В этой статье мы разберём, как рантайм Go генерирует core dump, как настроить окружение для его сохранения, как анализировать дамп через Delve и какие ограничения у этого механизма. Завершим механической эмпатией: что происходит с процессом и ОС во время записи многогигабайтного дампа.</p>
-<h2 id="chto-takoe-core-dump">Что такое core dump</h2>
+<p>В предыдущей главе <a href="5-postmortem-analiz.html" class="wikilink">5. Postmortem анализ</a> мы выстроили целостную методологию расследования инцидентов по сохраненным цифровым следам. Но среди всех возможных артефактов существует один абсолютный источник истины — <strong>Core Dump (дамп ядра / дамп памяти)</strong>. Это исчерпывающий побайтовый снимок виртуальной памяти процесса, зафиксированный операционной системой в наносекунду физической гибели программы.</p>
+<p>Если структурированные логи (<a href="4-logi-i-debugging.html" class="wikilink">4. Логи и debugging</a>) отвечают на вопрос: <em>«Что происходило за мгновение до катастрофы?»</em>, а профили аллокаций — <em>«Какой общий объем памяти был занят кучей?»</em>, то Core Dump позволяет заглянуть в самый эпицентр взрыва. Он позволяет восстановить точнейшее состояние всех горутин, значения абсолютно всех локальных переменных в стеке, содержимое срезов, хэш-таблиц и даже машинные регистры процессора на момент падения.</p>
+<p>Для Senior Go-инженера владение техникой генерации и анализа Core Dump'ов — обязательный стандарт. Спорадические паники с разыменованием <code>nil pointer</code>, фатальные сегфолты в CGO-библиотеках, скрытые повреждения памяти через <code>unsafe.Pointer</code> или дедлоки, которые невозможно воспроизвести локально под отладчиком Delve (<a href="2-delve-debugger.html" class="wikilink">2. Delve debugger</a>) — всё это оставляет неизгладимые улики в Core Dump. </p>
+<p>В этой статье мы препарируем анатомию Core Dump: разберем, как рантайм Go и ядро Linux создают дамп, как правильно сконфигурировать серверы и поды Kubernetes, как провести расследование через Delve и с какими аппаратными ограничениями операционной системы предстоит столкнуться инженеру.</p>
+<hr />
+<h2 id="chto-predstavlyaet-soboy-core-dump-v-arkhitekture-go">Что представляет собой Core Dump в архитектуре Go</h2>
 
-<p><strong>Core dump</strong> (файл ядра, дамп памяти) — это файл, содержащий полный или частичный образ виртуальной памяти процесса, а также состояние регистров процессора и информацию о потоках на момент аварийного завершения. Он создаётся операционной системой, когда процесс получает сигнал, приводящий к завершению (SIGSEGV, SIGABRT, SIGQUIT в определённых случаях), и настроен <code>ulimit -c</code> (лимит размера core-файла) в значение, отличное от нуля.</p>
-<p>В контексте Go core dump включает:</p>
+<p><strong>Core Dump</strong> (дамп ядра) — это системный бинарный файл стандарта ELF (Executable and Linkable Format в Linux) или Mach-O (в macOS), содержащий точный снимок адресного пространства виртуальной памяти процесса на момент получения фатального сигнала ядра (<code>SIGSEGV</code>, <code>SIGABRT</code>, <code>SIGBUS</code>, <code>SIGQUIT</code>), при условии, что лимит <code>ulimit -c</code> разрешает запись на диск.</p>
+<p>В контексте среды выполнения Go Core Dump сохраняет фундаментальные пласты рантайма:</p>
+
+<div class="code-block" data-lang="ascii">
+  <div class="code-header">
+    <span class="code-lang-tag">DIAGRAM</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-ascii"><code class="language-ascii">Анатомия Core Dump процесса Go:
+┌────────────────────────────────────────────────────────────────────────┐
+│ 1. Стеки всех горутин (runtime.g): Локальные переменные, фреймы, адреса│
+├────────────────────────────────────────────────────────────────────────┤
+│ 2. Динамическая куча (Heap): Все живые структуры, слайсы, мапы, строки │
+├────────────────────────────────────────────────────────────────────────┤
+│ 3. Метаданные типов и кода: .text, .rodata, глобальные переменные      │
+├────────────────────────────────────────────────────────────────────────┤
+│ 4. Аппаратный контекст: Регистры CPU (RAX, RSP, RIP) для всех тредов M │
+└────────────────────────────────────────────────────────────────────────┘
+</code></pre>
+</div>
+
 <ul>
-<li><strong>Стеки всех горутин.</strong> Каждая горутина имеет свой стек в адресном пространстве процесса. По core dump можно восстановить состояние всех горутин: где они были остановлены, какие значения имели локальные переменные.</li>
-<li><strong>Кучу (heap).</strong> Все объекты, аллоцированные в куче, включая их содержимое — строки, структуры, слайсы, мапы.</li>
-<li><strong>Сегменты данных и кода.</strong> Глобальные переменные, const-данные и исполняемый код.</li>
-<li><strong>Регистры процессора</strong> для каждого потока ОС (M) на момент краша.</li>
+<li><strong>Стеки всех горутин:</strong> Каждая легковесная горутина имеет свой непрерывный стек памяти. В дампе сохраняются все стековые фреймы: где горутина была остановлена, какие аргументы передавались в функции и какие локальные структуры лежали на стеке.</li>
+<li><strong>Динамическая куча (Heap):</strong> Все объекты, выделенные аллокатором Go, сохраняются со своим содержимым — сырые байты строк, внутренние бакеты хэш-таблиц <code>runtime.hmap</code>, заголовки слайсов.</li>
+<li><strong>Сегменты данных и кода:</strong> Глобальные переменные, константы и машинный код.</li>
+<li><strong>Аппаратные регистры процессора:</strong> Содержимое регистров CPU для каждого активного потока операционной системы (M-треда).</li>
 </ul>
-<p>В отличие от дампа горутин (<a href="../08-runtime-i-instrumenty/4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>), который содержит только текст стек-трейсов, core dump содержит <strong>бинарный образ памяти</strong>, что позволяет инспектировать значения переменных, обходом кучи находить утечки (через профилирование offline) и диагностировать повреждения памяти (например, из-за CGO).</p>
-<h2 id="kak-go-sozdayot-core-dump">Как Go создаёт core dump</h2>
+<p>В отличие от текстового дампа горутин (<a href="../08-runtime-i-instrumenty/4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>), содержащего лишь плоские стек-трейсы, Core Dump — это <strong>полноценный замороженный бинарный слепок</strong>. Это позволяет инспектировать реальные значения в структурах данных, обходить граф объектов кучи и диагностировать повреждения памяти, вызванные CGO.</p>
+<hr />
+<h2 id="kak-go-upravlyaet-sozdaniem-core-dump-peremennaya-gotraceback">Как Go управляет созданием Core Dump: переменная `GOTRACEBACK`</h2>
 
-<p>Рантайм Go управляет аварийным завершением через переменную окружения <strong><code>GOTRACEBACK</code></strong> и внутреннюю логику обработки паники. Возможные сценарии:</p>
-<h3 id="1-neobrabotannaya-panika-panic">1. Необработанная паника (panic)</h3>
-
-<p>Когда в программе возникает паника, и она не перехвачена <code>recover()</code>, рантайм вызывает <code>runtime.fatalpanic</code>. Поведение зависит от <code>GOTRACEBACK</code>:</p>
-<ul>
-<li><strong><code>GOTRACEBACK=none</code></strong> — процесс завершается без вывода стеков и без core dump.</li>
-<li><strong><code>GOTRACEBACK=single</code></strong> (по умолчанию) — выводит стек упавшей горутины, затем вызывает <code>exit(2)</code>. Core dump <strong>не создаётся</strong>.</li>
-<li><strong><code>GOTRACEBACK=all</code></strong> — выводит стеки всех горутин, затем <code>exit(2)</code>. Core dump не создаётся.</li>
-<li><strong><code>GOTRACEBACK=crash</code></strong> — выводит стеки всех горутин, затем вызывает <code>abort()</code>, что приводит к сигналу <code>SIGABRT</code> и созданию core dump (если разрешено ulimit).</li>
-<li><strong><code>GOTRACEBACK=system</code></strong> — аналогично <code>all</code>, но включает и горутины рантайма. Без <code>crash</code> core dump не создаётся.</li>
-</ul>
-<p>Только с ключом <code>crash</code> гарантируется создание дампа памяти при панике.</p>
-<h3 id="2-signaly-os-sigsegv-sigbus">2. Сигналы ОС (SIGSEGV, SIGBUS)</h3>
-
-<p>При аппаратных исключениях (разыменование нулевого указателя через unsafe, ошибка в CGO) ОС посылает процессу сигнал <code>SIGSEGV</code>. Рантайм Go перехватывает этот сигнал, пытается преобразовать его в панику (<code>panic: runtime error: invalid memory address</code>), но если восстановление невозможно или программа собрана без поддержки паники на сигналах, процесс завершается с <code>SIGSEGV</code>. Если в этот момент установлен <code>GOTRACEBACK=crash</code>, рантайм вызывает <code>abort()</code>. Если нет — ОС может создать core dump напрямую при получении <code>SIGSEGV</code>, если настроена.</p>
-<h3 id="3-prinuditelnaya-generatsiya">3. Принудительная генерация</h3>
-
-<p>Можно принудительно вызвать <code>abort()</code> через <code>runtime.Breakpoint()</code> или <code>syscall.Kill(syscall.Getpid(), syscall.SIGABRT)</code>, но это экстремальные меры для отладки. В production предпочтительнее снимать дамп горутин через <code>SIGQUIT</code>.</p>
+<p>Рантайм Go перехватывает аварийные сигналы и паники. Поведение рантайма при падении напрямую определяется системной переменной окружения <strong><code>GOTRACEBACK</code></strong>:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2226,28 +2234,57 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Panic[&quot;Необработанная panic&quot;] --&gt; GOTRACEBACK{&quot;GOTRACEBACK?&quot;}
-GOTRACEBACK -- &quot;crash&quot; --&gt; PrintStacks[&quot;Вывод стеков всех горутин&quot;]
-PrintStacks --&gt; Abort[&quot;abort&quot;]
-Abort --&gt; Core[&quot;ОС создаёт core dump&quot;]
-GOTRACEBACK -- &quot;single / all&quot; --&gt; Exit[&quot;exit2&lt;br&gt;Без core dump&quot;]
-Signal[&quot;SIGSEGV из CGO&quot;] --&gt; Abort
+Panic[&quot;Необработанная паника (panic)&quot;] --&gt; Check{&quot;Значение GOTRACEBACK?&quot;}
+
+Check -- &quot;none&quot; --&gt; ExitNone[&quot;Тихий выход exit(2)&lt;br&gt;0 информации&quot;]
+Check -- &quot;single (дефолт)&quot; --&gt; ExitSingle[&quot;Стек только упавшей горутины&lt;br&gt;exit(2) — БЕЗ core dump&quot;]
+Check -- &quot;all / system&quot; --&gt; ExitAll[&quot;Стеки всех горутин рантайма&lt;br&gt;exit(2) — БЕЗ core dump&quot;]
+Check -- &quot;crash&quot; --&gt; ActionCrash[&quot;1. Вывод стеков всех горутин&lt;br&gt;2. Системный вызов abort()&quot;]
+
+ActionCrash --&gt; Kernel[&quot;Ядро Linux ловит SIGABRT&quot;]
+Kernel --&gt; CheckUlimit{&quot;ulimit -c &gt; 0?&quot;}
+CheckUlimit -- &quot;Да&quot; --&gt; DumpFile[&quot;Генерация файла core.&lt;pid&gt; ✅&quot;]
+CheckUlimit -- &quot;Нет&quot; --&gt; Drop[&quot;Дамп отброшен ОС ❌&quot;]
+
+CGO[&quot;Аппаратный SIGSEGV из CGO / unsafe&quot;] --&gt; ActionCrash
+
+style ActionCrash fill:#161e31,stroke:#3b82f6,stroke-width:2px
+style DumpFile fill:#132d29,stroke:#10b981,stroke-width:2px
+style Drop fill:#2a1b1b,stroke:#f43f5e,stroke-width:2px
   </pre>
 </div>
 
 
+<h3 id="1-neobrabotannaya-panika-panic">1. Необработанная паника (panic)</h3>
+<p>Когда в программе возникает паника, и она не перехвачена <code>recover()</code>, рантайм вызывает внутреннюю процедуру <code>runtime.fatalpanic</code>. Поведение рантайма при этом напрямую зависит от переменной <code>GOTRACEBACK</code>:</p>
+<ul>
+<li><strong><code>GOTRACEBACK=none</code>:</strong> Процесс завершается молча, без вывода стека и без core dump.</li>
+<li><strong><code>GOTRACEBACK=single</code> (значение по умолчанию):</strong> Рантайм выводит стек вызовов только той горутины, в которой произошла паника, и завершает процесс через <code>exit(2)</code>. <strong>Core dump не создается!</strong></li>
+<li><strong><code>GOTRACEBACK=all</code>:</strong> Выводит в <code>stderr</code> стеки всех горутин сервиса, но завершается через <code>exit(2)</code>. Core dump не генерируется.</li>
+<li><strong><code>GOTRACEBACK=system</code>:</strong> Аналогично <code>all</code>, но дополнительно включает системные горутины рантайма (GC background workers, scavenger, finalizer). Без дампа.</li>
+<li><strong><code>GOTRACEBACK=crash</code>:</strong> <strong>Единственный режим, создающий дамп!</strong> Рантайм сначала печатает стеки всех горутин, а затем намеренно инициирует системный сбой вызовом <code>abort()</code>. Процесс получает сигнал <code>SIGABRT</code>, и ядро ОС генерирует Core Dump.</li>
+</ul>
+<h3 id="apparatnye-signaly-sigsegv-sigbus">Аппаратные сигналы (SIGSEGV, SIGBUS)</h3>
+<p>При возникновении аппаратных исключений ядра (ошибка адресации памяти в CGO или разыменование невалидного указателя через <code>unsafe.Pointer</code>) ядро Linux отправляет процессу сигнал <code>SIGSEGV</code>. </p>
+<p>Рантайм Go перехватывает сигнал и пытается преобразовать его в стандартную панику <code>panic: runtime error: invalid memory address</code>. Если восстановление невозможно или установлен <code>GOTRACEBACK=crash</code>, рантайм вызывает <code>abort()</code>, гарантируя сохранение дампа памяти.</p>
+<h3 id="prinuditelnaya-generatsiya-dampa">Принудительная генерация дампа</h3>
+<p>В критических ситуациях инженер может принудительно заставить процесс сбросить дамп:<br />
+* Программно: через <code>runtime.Breakpoint()</code> или прямой системный вызов <code>syscall.Kill(syscall.Getpid(), syscall.SIGABRT)</code>.<br />
+* Из терминала: отправкой сигнала завершения с дампом <code>kill -SIGQUIT &lt;PID&gt;</code> (в Linux по умолчанию сигнал <code>SIGQUIT</code> генерирует core dump, если разрешено системой).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Функция <code>runtime.abort()</code> в Linux вызывает системный вызов <code>tgkill(getpid(), gettid(), SIGABRT)</code> или просто <code>abort()</code>. ОС по умолчанию обрабатывает <code>SIGABRT</code> созданием core dump, если <code>ulimit -c</code> не равен нулю. Важно, что до вызова <code>abort()</code> рантайм уже вывел стек-трейс в stderr. Поэтому core dump содержит полный образ памяти, но не дублирует текстовые логи.</p>
+    <p>Внутренняя процедура <code>runtime.abort()</code> в Linux выполняет системный вызов <code>tgkill(getpid(), gettid(), SIGABRT)</code> либо инструкцию завершения <code>UD2</code> (Undefined Instruction). Ядро ОС перехватывает <code>SIGABRT</code> и запускает ядерную процедуру сброса памяти процесса <code>do_coredump()</code>. Важно: рантайм Go успевает записать стек вызовов в <code>stderr</code> <em>до</em> вызова <code>abort()</code>, поэтому текстовый лог и бинарный дамп идеально дополняют друг друга.</p>
   </div>
 </div>
 
-<h2 id="nastroyka-okruzheniya-dlya-core-dump">Настройка окружения для core dump</h2>
+<hr />
+<h2 id="nastroyka-infrastruktury-dlya-sokhraneniya-core-dump">Настройка инфраструктуры для сохранения Core Dump</h2>
 
+<p>По умолчанию большинство дистрибутивов Linux блокируют запись дампов ради экономии дискового пространства (<code>ulimit -c 0</code>).</p>
 <h3 id="lokalno-i-na-serverakh">Локально и на серверах</h3>
 
 
@@ -2259,16 +2296,20 @@ Signal[&quot;SIGSEGV из CGO&quot;] --&gt; Abort
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash"># Разрешить создание core dump неограниченного размера
+  <pre class="language-bash"><code class="language-bash"># 1. Разрешаем создание core dump неограниченного объема
 ulimit -c unlimited
 
-# Задать шаблон пути для core-файлов (Linux)
+# 2. Настраиваем канонический шаблон именования в ядре Linux
 echo &quot;/var/coredumps/core.%e.%p.%t&quot; | sudo tee /proc/sys/kernel/core_pattern
 </code></pre>
 </div>
 
-<p>Переменные в шаблоне: <code>%e</code> — имя исполняемого файла, <code>%p</code> — PID, <code>%t</code> — timestamp. Рекомендуется выделить отдельную директорию с достаточным местом, так как дампы могут занимать гигабайты.</p>
-<p>Для сжатия на лету можно использовать pipe в <code>core_pattern</code>:</p>
+<p>Специальные спецификаторы в шаблоне <code>core_pattern</code>:<br />
+* <code>%e</code> — имя исполняемого бинарного файла.<br />
+* <code>%p</code> — идентификатор процесса (PID).<br />
+* <code>%t</code> — Unix-timestamp момента падения.</p>
+<h3 id="szhatie-na-letu-cherez-konveyer-pipe-compression">Сжатие на лету через конвейер (Pipe Compression)</h3>
+<p>Поскольку дамп 16-гигабайтного процесса может мгновенно забить диск, ядро Linux поддерживает передачу дампа через pipe в скрипт сжатия:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2282,15 +2323,12 @@ echo &quot;/var/coredumps/core.%e.%p.%t&quot; | sudo tee /proc/sys/kernel/core_p
 </code></pre>
 </div>
 
-<p>где <code>core_compressor</code> — скрипт, принимающий дамп через stdin, сжимающий его и записывающий в хранилище.</p>
-<h3 id="v-konteynerakh-dockerkubernetes">В контейнерах Docker/Kubernetes</h3>
+<p>Где <code>/usr/local/bin/core_compressor</code> принимает бинарный поток дампа из <code>stdin</code>, сжимает его на лету с помощью <code>zstd</code> или <code>gzip</code> и асинхронно сбрасывает в сетевое хранилище (NFS / S3).</p>
+<hr />
+<h3 id="2-nastroyka-v-konteynerakh-kubernetes-i-docker">2. Настройка в контейнерах Kubernetes и Docker</h3>
 
-<p>Core dump по умолчанию создаётся в рабочей директории контейнера, но часто она недоступна после падения и pod удаляется. Рекомендации:</p>
-<ul>
-<li><strong><code>kernel.core_pattern</code></strong> на хосте влияет на все контейнеры. Если она не настроена, core файл останется в файловой системе контейнера и может быть извлечён до удаления pod'а через <code>kubectl cp</code>.</li>
-<li>Использовать <strong>emptyDir</strong> том, смонтированный в <code>/var/coredumps</code>, и установить <code>core_pattern</code> внутри контейнера (требует привилегий или sysctl). Альтернатива — направить core dump в stdout/stderr через <code>/proc/sys/kernel/core_pattern = |/bin/cat</code>, но это нестандартно.</li>
-<li>Установить <strong><code>GOTRACEBACK=crash</code></strong> в манифесте пода для Go-приложений.</li>
-</ul>
+<p>В контейнеризированных окружениях контейнер после краша немедленно уничтожается оркестратором. Если не принять меры, дамп испарится вместе с контейнером.</p>
+<p>Правильная конфигурация пода в Kubernetes:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2300,13 +2338,23 @@ echo &quot;/var/coredumps/core.%e.%p.%t&quot; | sudo tee /proc/sys/kernel/core_p
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">spec:
+  <pre class="language-yaml"><code class="language-yaml">apiVersion: v1
+kind: Pod
+metadata:
+  name: highload-backend
+spec:
   containers:
-  - name: myapp
+  - name: app
+    image: my-company/backend:v1.2.0
     env:
+    # 1. Приказываем рантайму падать через abort()
     - name: GOTRACEBACK
       value: &quot;crash&quot;
+    resources:
+      limits:
+        memory: &quot;4Gi&quot;
     volumeMounts:
+    # 2. Монтируем каталог для дампов на быстрый узел хоста
     - name: coredumps
       mountPath: /var/coredumps
   volumes:
@@ -2315,10 +2363,20 @@ echo &quot;/var/coredumps/core.%e.%p.%t&quot; | sudo tee /proc/sys/kernel/core_p
 </code></pre>
 </div>
 
-<p>После падения pod может перейти в <code>CrashLoopBackOff</code>, что даст время забрать дамп.</p>
-<h2 id="analiz-core-dump-s-pomoshchyu-delve">Анализ core dump с помощью Delve</h2>
+<div class="callout callout-important">
+  <div class="callout-header">
+    <span class="callout-icon">⚡</span>
+    <span class="callout-title">Влияние параметров ядра ноды</span>
+  </div>
+  <div class="callout-body">
+    <p>Параметр <code>sysctl kernel.core_pattern</code> настраивается <strong>на уровне хостовой операционной системы рабочей ноды Kubernetes</strong> и разделяется всеми подами на этом сервере. При падении контейнера дамп сохраняется по пути, заданному хостом, либо попадает в смонтированный volume. Пока под находится в состоянии <code>CrashLoopBackOff</code>, инженер успевает скачать дамп командой <code>kubectl cp</code>.</p>
+  </div>
+</div>
 
-<p>Delve (<a href="2-delve-debugger.html" class="wikilink">2. Delve debugger</a>) умеет открывать core dump'ы как замороженный процесс:</p>
+<hr />
+<h2 id="analiz-core-dump-s-pomoshchyu-otladchika-delve">Анализ Core Dump с помощью отладчика Delve</h2>
+
+<p>Для препарирования посмертного дампа используется специализированный режим Delve (<code>dlv core</code>):</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2332,20 +2390,21 @@ echo &quot;/var/coredumps/core.%e.%p.%t&quot; | sudo tee /proc/sys/kernel/core_p
 </code></pre>
 </div>
 
-<p>После запуска доступны почти все команды живой отладки:</p>
+<p>Отладчик открывает дамп как замороженный процесс в момент его гибели. Инженеру доступны ключевые команды интерактивного исследования:</p>
 <ul>
-<li><strong><code>goroutines</code></strong> — список всех горутин с состояниями на момент краша.</li>
-<li><strong><code>threads</code></strong> — потоки ОС.</li>
-<li><strong><code>goroutine &lt;id&gt;</code></strong> — переключиться на конкретную горутину.</li>
-<li><strong><code>stack</code></strong> — стек выбранной горутины.</li>
-<li><strong><code>frame &lt;N&gt;</code></strong> — переключиться на фрейм стека.</li>
-<li><strong><code>locals</code></strong> — локальные переменные текущего фрейма.</li>
-<li><strong><code>print &lt;variable&gt;</code></strong> — значение переменной, включая структуры, слайсы, мапы.</li>
-<li><strong><code>list</code></strong> — показать исходный код вокруг текущей инструкции.</li>
+<li><strong><code>goroutines</code></strong> — полный список всех горутин с их состояниями на момент аварии.</li>
+<li><strong><code>threads</code></strong> — системные потоки операционной системы (M-треды).</li>
+<li><strong><code>goroutine &lt;id&gt;</code></strong> — переключение контекста на конкретную горутину.</li>
+<li><strong><code>stack</code></strong> — восстановленный стек вызовов выбранной горутины.</li>
+<li><strong><code>frame &lt;N&gt;</code></strong> — переход к стековому фрейму номер $N$.</li>
+<li><strong><code>locals</code></strong> — вывод всех локальных переменных текущего фрейма.</li>
+<li><strong><code>print &lt;variable&gt;</code></strong> (или <code>p variable</code>) — отображение значений полей структур, слайсов, хэш-таблиц.</li>
+<li><strong><code>list</code></strong> — отображение исходного кода вокруг инструкции падения.</li>
 </ul>
-<h3 id="primer-padenie-s-nil-pointer">Пример: падение с nil pointer</h3>
+<hr />
+<h3 id="prakticheskiy-stsenariy-rassledovanie-paniki-nil-pointer-dereference">Практический сценарий: Расследование паники Nil Pointer Dereference</h3>
 
-<p>Сервис упал с <code>panic: runtime error: invalid memory address or nil pointer dereference</code>. Core dump сохранён.</p>
+<p><strong>Ситуация:</strong> Боевой API-сервер упал с ошибкой <code>panic: runtime error: invalid memory address or nil pointer dereference</code>. В логах виден лишь факт паники. Открываем сохраненный Core Dump:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2356,9 +2415,21 @@ echo &quot;/var/coredumps/core.%e.%p.%t&quot; | sudo tee /proc/sys/kernel/core_p
     </button>
   </div>
   <pre class="language-bash"><code class="language-bash">dlv core ./api core.api.5678
-(dlv) goroutines
-  Goroutine 1: Running: main.main
-  Goroutine 34: Running: main.processRecord
+</code></pre>
+</div>
+
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">(dlv) goroutines
+  Goroutine 1: Running: main.main ./main.go:25
+  Goroutine 34: Running: main.processRecord ./handler.go:67
 (dlv) goroutine 34
 (dlv) stack
 0  0x4a1b20 in main.processRecord
@@ -2373,49 +2444,73 @@ nil
 </code></pre>
 </div>
 
-<p>Паника произошла в <code>handler.go:67</code>: обращение к <code>record.Data.Field</code> при <code>Data == nil</code>. Причина — непроверенный nil-интерфейс. Без core dump'а мы бы видели только стек-трейс в логах, но не могли инспектировать значения переменных, чтобы понять, что именно пришло в функцию.</p>
+<p><strong>Диагноз:</strong> На строке <code>handler.go:67</code> выполнялось чтение поля <code>record.Data.Field</code> при значении <code>Data == nil</code> (переменная <code>record.Data</code> оказалась равна <code>nil</code>). Без Core Dump мы бы видели только строку кода, но не знали бы, какое именно поле структуры содержало <code>nil</code>. Core Dump позволил мгновенно увидеть конкретное значение объекта <code>record</code>.</p>
+<hr />
 <h3 id="analiz-dedloka">Анализ дедлока</h3>
 
-<p>Core dump также пригоден для анализа дедлоков, если процесс был принудительно завершён сигналом <code>SIGABRT</code> (например, по health-check тайм-ауту). В core dump видно состояние всех горутин: если сотни из них в <code>[chan send]</code> и ни одной в <code>[running]</code>, это явный дедлок. Delve позволяет переключаться между ними и смотреть, какие каналы они ожидают.</p>
-<h2 id="ogranicheniya-core-dumpov">Ограничения core dump'ов</h2>
+<p>Если сервис завис в мертвом клинче, сборщик мусора и запросы клиентов останавливаются. Внешний мониторинг фиксирует таймаут пробы <code>livenessProbe</code> и завершает процесс сигналом <code>SIGABRT</code> (или администратор посылает <code>kill -ABRT</code>).</p>
+<p>Открыв Core Dump такого процесса в Delve, мы выполняем команду <code>goroutines</code> и видим характерную патологию:<br />
+* 0 горутин со статусом <code>[running]</code>.<br />
+* 500 горутин заблокированы в состоянии <code>[chan send]</code>.<br />
+* 500 горутин заблокированы в состоянии <code>[sync.Mutex.Lock]</code>.</p>
+<p>Переключаясь между горутинами (<code>goroutine 12</code>, <code>goroutine 15</code>), мы исследуем переменные каналов и мьютексов, мгновенно выявляя циклическую зависимость блокировок.</p>
+<hr />
+<h2 id="ogranicheniya-i-riski-ispolzovaniya-core-dump">Ограничения и риски использования Core Dump</h2>
 
-<ul>
-<li><strong>Размер.</strong> Дамп равен объёму виртуальной памяти процесса (RES + swapped). Для Go-приложения с кучей в 2 ГБ и несколькими миллионами горутин дамп может быть сопоставимого размера. Запись такого файла на медленный диск занимает десятки секунд, в течение которых процесс заблокирован в состоянии <code>TASK_UNINTERRUPTIBLE</code>. Это может затянуть перезапуск сервиса.</li>
-<li><strong>Конфиденциальность.</strong> Core dump содержит все данные программы: переменные окружения, строки из БД, пользовательские данные. Файл должен храниться с ограниченным доступом и удаляться после анализа.</li>
-<li><strong>Восстановление.</strong> Core dump не содержит историю исполнения, только последнее состояние. Если повреждение памяти произошло задолго до краша и уже не видно в переменных, core dump может не выявить первопричину (тут нужен race detector, <a href="3-race-detector-v-prode.html" class="wikilink">3. Race detector в проде</a>, и execution tracer).</li>
-<li><strong>Платформенная зависимость.</strong> На macOS core dump'ы по умолчанию записываются в <code>/cores/</code>, но формат Mach-O. Delve поддерживает их, но могут быть нюансы.</li>
-</ul>
-<h2 id="alternativy-kogda-core-dump-izbytochen">Альтернативы: когда core dump избыточен</h2>
+<p>При всей своей мощи Core Dump — это тяжеловесный инструмент, требующий осторожности:</p>
+<ol>
+<li><strong>Гигантский размер на диске:</strong> Объем дампа равен объему виртуальной памяти (RSS + анонимные страницы), выделенной процессу. Для Go-сервиса с 16 ГБ кучи дамп займет 16 ГБ дискового пространства. Если на сервере кончится свободное место, это приведет к падению соседних сервисов.</li>
+<li><strong>Конфиденциальность и безопасность (Security Risk):</strong> Core Dump содержит побайтовый слепок памяти: в нем присутствуют приватные ключи RSA/TLS, пароли к базе данных, пользовательские токены авторизации JWT и персональные данные клиентов. Файлы дампов должны шифроваться и удаляться сразу после завершения расследования инцидента.</li>
+<li><strong>Отсутствие истории (Только срез времени):</strong> Core Dump показывает состояние системы в последнюю миллисекунду. Если повреждение памяти (Data Race, см. <a href="3-race-detector-v-prode.html" class="wikilink">3. Race detector в проде</a>) произошло за 10 минут до краша, а падение случилось позже, Core Dump зафиксирует лишь последствия, но не покажет виновника первоначальной коллизии.</li>
+<li><strong>Специфика платформ:</strong> В macOS дампы сохраняются в директорию <code>/cores/</code> в бинарном формате Mach-O, требующем специфической сборки Delve.</li>
+</ol>
+<hr />
+<h2 id="alternativy-kogda-core-dump-izbytochen">Альтернативы: когда Core Dump избыточен</h2>
 
-<p>В некоторых сценариях core dump можно заменить более лёгкими артефактами:</p>
+<p>Если падения вызваны предсказуемыми логическими дефектами, Core Dump часто можно заменить значительно более легкими инструментами:</p>
 <ul>
-<li><strong>Дамп горутин</strong> (<a href="../08-runtime-i-instrumenty/4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>) через <code>pprof.Lookup("goroutine").WriteTo()</code> или <code>SIGQUIT</code> — даёт состояние всех горутин, но без значений переменных. Для расследования дедлоков часто достаточен.</li>
-<li><strong>Memory profile</strong> (<a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>) — показывает распределение памяти перед падением, если был сохранён по триггеру.</li>
-<li><strong>Execution trace</strong> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>) — записанный за несколько секунд до падения, показывает динамику блокировок и состояний.</li>
+<li><strong>Текстовый дамп горутин (<a href="../08-runtime-i-instrumenty/4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>):</strong> Снимается по сигналу <code>SIGQUIT</code> или через <code>pprof.Lookup("goroutine").WriteTo()</code>. Он весит несколько мегабайт текста и полностью достаточен для распутывания 90% взаимных блокировок (дедлоков).</li>
+<li><strong>Профиль памяти (<a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>):</strong> Показывает точки аллокаций кучи и достаточен для расследования причин утечек памяти (OOM) без сброса гигабайтных дампов ядра.</li>
+<li><strong>Execution Trace (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>):</strong> Фиксирует динамику переключений горутин и планировщика рантайма.</li>
 </ul>
-<p>Эти артефакты намного компактнее core dump и не замораживают процесс на длительное время. Senior-инженер комбинирует их в зависимости от типа проблемы.</p>
-<h2 id="mechanical-sympathy-chto-proiskhodit-s-protsessom-pri-zapisi-dampa">Mechanical Sympathy: что происходит с процессом при записи дампа</h2>
+<hr />
+<h2 id="mechanical-sympathy-chto-proiskhodit-v-yadre-os-pri-zapisi-dampa">Mechanical Sympathy: Что происходит в ядре ОС при записи дампа</h2>
 
-<p>Когда рантайм вызывает <code>abort()</code> и ОС начинает запись core dump:</p>
-<ul>
-<li><strong>Процесс замораживается.</strong> Ядро переводит все потоки в состояние <code>TASK_UNINTERRUPTIBLE</code> и начинает обход виртуальной памяти для записи в файл. Никакие горутины не исполняются, GC не работает, сетевые соединения не обслуживаются.</li>
-<li><strong>Дисковое I/O.</strong> Запись идёт через VFS, с буферизацией ядра, но всё равно генерирует значительный объём операций ввода-вывода. Если диск медленный (HDD, сетевой диск), запись дампа может длиться минуты, конкурируя за пропускную способность с другими процессами.</li>
-<li><strong>Кэш процессора.</strong> Содержимое кэшей не сбрасывается полностью в память до краша, поэтому часть данных может быть потеряна (неактуальна). Однако на архитектурах с когерентностью кэша при обработке сигнала ядро сбрасывает грязные линии.</li>
-<li><strong>Стратегия уменьшения.</strong> Использование <code>core_pattern</code> с pipe в компрессор (gzip) позволяет сократить размер записываемого файла на порядок, но добавляет CPU-нагрузку на сжатие, которая выполняется в контексте ядра (потенциально замедляет завершение). Настройка <code>ulimit -c</code> для ограничения максимального размера предотвращает исчерпание дискового пространства.</li>
-</ul>
-<p>Эти компромиссы — часть проектирования надёжного продакшен-сервиса. Если падения редки, допустимо записывать полный дамп. Если часты — лучше сначала полагаться на дамп горутин и профайлы, а core dump включать только на ограниченном числе экземпляров.</p>
-<h2 id="itog">Итог</h2>
+<p>Когда рантайм Go выполняет <code>abort()</code>, процессор переходит в режим обработки исключения:</p>
 
-<ul>
-<li><strong>Core dump</strong> — полный образ памяти процесса в момент аварийного завершения, создаваемый ОС.</li>
-<li>В Go для генерации core dump при панике необходимо установить <strong><code>GOTRACEBACK=crash</code></strong> и <code>ulimit -c unlimited</code>.</li>
-<li>Core dump сохраняет стеки и значения переменных всех горутин, кучу, сегменты кода и данных; анализируется с помощью <strong>Delve</strong> (<code>dlv core</code>).</li>
-<li>Используется для postmortem-анализа паник, сегфолтов, дедлоков и загадочных крашей, не воспроизводимых локально.</li>
-<li>Имеет существенные ограничения: большой размер, время записи, конфиденциальность данных. В альтернативу часто используют дамп горутин, memory profile и execution trace.</li>
-<li>Механическая эмпатия: запись core dump замораживает процесс на значительное время, конкурирует за дисковый I/O и требует настройки сжатия/лимитов.</li>
-<li>Навык работы с core dump — завершающий элемент отладочного арсенала Senior-инженера, связывающий логи, профили и интерактивную отладку в единую картину.</li>
-</ul>
-<p>Следующая статья закрывает подраздел Debugging, фокусируясь на особом классе проблем, которые не роняют сервис, но превращают его в «тормоз»: <a href="7-debugging-latency-problem.html" class="wikilink">7. Debugging latency проблем</a>.</p>
+<div class="code-block" data-lang="ascii">
+  <div class="code-header">
+    <span class="code-lang-tag">DIAGRAM</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-ascii"><code class="language-ascii">Аппаратный путь генерации Core Dump:
+[ runtime.abort() ] ──► [ Инструкция UD2 / SIGABRT ] ──► [ Переход в ядро Linux: do_coredump() ]
+                                                                     │
+                                                                     ▼
+[ Диск: VFS write ] ◄── [ Заморозка тредов: TASK_UNINTERRUPTIBLE ] ◄── [ Обход страниц VMA ]
+</code></pre>
+</div>
+
+<ol>
+<li><strong>Заморозка процесса (D-State):</strong> Ядро Linux переводит все системные потоки M в состояние непрерываемого сна <strong><code>TASK_UNINTERRUPTIBLE</code></strong> (состояние <code>D</code> в выводе <code>ps</code>). Процесс перестает реагировать на любые сигналы, включая <code>SIGKILL</code>.</li>
+<li><strong>Сброс виртуальных областей памяти (VMA):</strong> Ядро последовательно обходит таблицы страниц (Page Tables) процесса и сбрасывает все анонимные страницы памяти через подсистему VFS на диск.</li>
+<li><strong>Конкуренция за дисковый I/O:</strong> Если дамп пишется на медленный диск или сетевой том (NFS/EBS), запись может продолжаться 60–120 секунд. В это время дисковый контроллер утилизирован на 100%, блокируя операции ввода-вывода других контейнеров на этой же ноде.</li>
+<li><strong>Кэш-когерентность:</strong> При генерации дампа ядро сбрасывает модифицированные строки аппаратного кэша процессора L1/L2 обратно в оперативную память, гарантируя актуальность данных.</li>
+</ol>
+<hr />
+<h2 id="rezyume">Резюме</h2>
+
+<ol>
+<li><strong>Core Dump — абсолютный черный ящик:</strong> Это полный побайтовый снимок виртуальной памяти процесса (стеки всех горутин, куча, код, регистры CPU).</li>
+<li><strong>Активация через <code>GOTRACEBACK=crash</code>:</strong> Только с этим параметром рантайм Go вызывает системный <code>abort()</code>, инициируя генерацию дампа при панике.</li>
+<li><strong>Подготовка инфраструктуры обязательна:</strong> Снимайте лимиты через <code>ulimit -c unlimited</code> и настраивайте шаблон <code>/proc/sys/kernel/core_pattern</code> с конвейерным сжатием на лету.</li>
+<li><strong>Delve (<code>dlv core</code>) — главный инструмент патологоанатома:</strong> Позволяет восстановить значения локальных переменных, стековые фреймы и состояние горутин в момент гибели процесса.</li>
+<li><strong>Помните об аппаратной цене:</strong> Запись многогигабайтного дампа замораживает процесс в <code>TASK_UNINTERRUPTIBLE</code> и перегружает дисковую подсистему. Контролируйте лимиты и защищайте конфиденциальные данные.</li>
+</ol>
+<p>Core Dump позволяет распутать самые глубокие аварии, приводящие к физической гибели процесса. Но что делать, если сервис не падает, не паникует и не течет по памяти, но при этом отдельные пользовательские запросы внезапно зависают на секунды? Чтобы победить скрытые хвосты задержек, мы переходим к финальной теме подраздела: <a href="7-debugging-latency-problem.html" class="wikilink">7. Debugging latency проблем</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2443,7 +2538,7 @@ nil
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#core-dumps-chyornyy-yashchik-upavshey-programmy">Core dumps: «чёрный ящик» упавшей программы</a></li><li class="toc-item toc-h2"><a href="#chto-takoe-core-dump">Что такое core dump</a></li><li class="toc-item toc-h2"><a href="#kak-go-sozdayot-core-dump">Как Go создаёт core dump</a></li><li class="toc-item toc-h3"><a href="#1-neobrabotannaya-panika-panic">1. Необработанная паника (panic)</a></li><li class="toc-item toc-h3"><a href="#2-signaly-os-sigsegv-sigbus">2. Сигналы ОС (SIGSEGV, SIGBUS)</a></li><li class="toc-item toc-h3"><a href="#3-prinuditelnaya-generatsiya">3. Принудительная генерация</a></li><li class="toc-item toc-h2"><a href="#nastroyka-okruzheniya-dlya-core-dump">Настройка окружения для core dump</a></li><li class="toc-item toc-h3"><a href="#lokalno-i-na-serverakh">Локально и на серверах</a></li><li class="toc-item toc-h3"><a href="#v-konteynerakh-dockerkubernetes">В контейнерах Docker/Kubernetes</a></li><li class="toc-item toc-h2"><a href="#analiz-core-dump-s-pomoshchyu-delve">Анализ core dump с помощью Delve</a></li><li class="toc-item toc-h3"><a href="#primer-padenie-s-nil-pointer">Пример: падение с nil pointer</a></li><li class="toc-item toc-h3"><a href="#analiz-dedloka">Анализ дедлока</a></li><li class="toc-item toc-h2"><a href="#ogranicheniya-core-dumpov">Ограничения core dump&#x27;ов</a></li><li class="toc-item toc-h2"><a href="#alternativy-kogda-core-dump-izbytochen">Альтернативы: когда core dump избыточен</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-proiskhodit-s-protsessom-pri-zapisi-dampa">Mechanical Sympathy: что происходит с процессом при записи дампа</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#core-dumps-chyornyy-yashchik-upavshey-programmy">Core dumps: «чёрный ящик» упавшей программы</a></li><li class="toc-item toc-h2"><a href="#chto-predstavlyaet-soboy-core-dump-v-arkhitekture-go">Что представляет собой Core Dump в архитектуре Go</a></li><li class="toc-item toc-h2"><a href="#kak-go-upravlyaet-sozdaniem-core-dump-peremennaya-gotraceback">Как Go управляет созданием Core Dump: переменная GOTRACEBACK</a></li><li class="toc-item toc-h3"><a href="#1-neobrabotannaya-panika-panic">1. Необработанная паника (panic)</a></li><li class="toc-item toc-h3"><a href="#apparatnye-signaly-sigsegv-sigbus">Аппаратные сигналы (SIGSEGV, SIGBUS)</a></li><li class="toc-item toc-h3"><a href="#prinuditelnaya-generatsiya-dampa">Принудительная генерация дампа</a></li><li class="toc-item toc-h2"><a href="#nastroyka-infrastruktury-dlya-sokhraneniya-core-dump">Настройка инфраструктуры для сохранения Core Dump</a></li><li class="toc-item toc-h3"><a href="#lokalno-i-na-serverakh">Локально и на серверах</a></li><li class="toc-item toc-h3"><a href="#szhatie-na-letu-cherez-konveyer-pipe-compression">Сжатие на лету через конвейер (Pipe Compression)</a></li><li class="toc-item toc-h3"><a href="#2-nastroyka-v-konteynerakh-kubernetes-i-docker">2. Настройка в контейнерах Kubernetes и Docker</a></li><li class="toc-item toc-h2"><a href="#analiz-core-dump-s-pomoshchyu-otladchika-delve">Анализ Core Dump с помощью отладчика Delve</a></li><li class="toc-item toc-h3"><a href="#prakticheskiy-stsenariy-rassledovanie-paniki-nil-pointer-dereference">Практический сценарий: Расследование паники Nil Pointer Dereference</a></li><li class="toc-item toc-h3"><a href="#analiz-dedloka">Анализ дедлока</a></li><li class="toc-item toc-h2"><a href="#ogranicheniya-i-riski-ispolzovaniya-core-dump">Ограничения и риски использования Core Dump</a></li><li class="toc-item toc-h2"><a href="#alternativy-kogda-core-dump-izbytochen">Альтернативы: когда Core Dump избыточен</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-proiskhodit-v-yadre-os-pri-zapisi-dampa">Mechanical Sympathy: Что происходит в ядре ОС при записи дампа</a></li><li class="toc-item toc-h2"><a href="#rezyume">Резюме</a></li>
   </ul>
 </aside>
 
