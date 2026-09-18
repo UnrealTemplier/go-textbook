@@ -2169,30 +2169,52 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~36 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. GC в Go. Обзор</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="pochemu-sborshchik-musora-tsentralnyy-element-rantayma">Почему сборщик мусора — центральный элемент рантайма</h2>
+            <h1>GC в Go. Обзор</h1>
+<blockquote>
+<p><em>«В классических системах со сборщиком мусора уборка напоминала комендантский час: полиция перекрывала все улицы города, жизнь полностью замирала, пока армия дворников мела мостовые. Создатели Go выбрали иной путь: мусоровозы едут прямо в общем потоке машин, не перекрывая движение. Город не стоит в пробках, но водители должны делить полосу с грузовиками, а если кто-то выбрасывает слишком много мусора, его принудительно заставляют взять в руки лопату».</em><br />
+— Брайан Керниган</p>
+</blockquote>
+<hr />
+<h2 id="pochemu-sborshchik-musora-tsentralnyy-element-rantayma">Почему сборщик мусора — центральный элемент рантайма</h2>
 
-<p>В предыдущем подразделе мы детально разобрали управление памятью в Go: где живут переменные (<a href="../04-memory-profiling/2-heap-vs-stack.html" class="wikilink">2. Heap vs stack</a>), как компилятор решает их судьбу (<a href="../04-memory-profiling/3-escape-analysis.html" class="wikilink">3. Escape analysis</a>) и как измерять аллокации (<a href="../04-memory-profiling/4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>, <a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>). Все эти темы сходятся в одной точке — <strong>сборщике мусора</strong> (Garbage Collector, GC). Именно GC отвечает за автоматическое освобождение памяти в куче, позволяя разработчику не думать о <code>free()</code>. Но за это удобство приходится платить процессорным временем, паузами и усложнением рантайма.</p>
-<p>Go GC — это не классический stop-the-world сборщик, который замораживает приложение на сотни миллисекунд. Начиная с версии 1.5, Go использует <strong>конкурентный mark-sweep</strong> с короткими паузами, нацеленный на минимальную latency даже под высокой нагрузкой. Понимание его устройства — обязательный навык Senior-инженера, позволяющий настраивать сервис (<a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>, <a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>), диагностировать хвостовые задержки (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>) и принимать архитектурные решения, снижающие нагрузку на GC (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/9-zero-allocation-podkhod.html" class="wikilink">9. Zero allocation подход</a>).</p>
-<p>Эта статья открывает подраздел «Garbage Collector» обзором фундаментальных концепций: зачем нужен GC, как он устроен на высоком уровне, как влияет на производительность и какими метриками измеряется. Детали фаз (<a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a>, <a href="3-stop-the-world.html" class="wikilink">3. Stop the world</a>, <a href="4-concurrent-gc.html" class="wikilink">4. Concurrent GC</a>), механизмов (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>) и тюнинга будут раскрыты в последующих статьях.</p>
+<p>В предыдущем подразделе мы детально исследовали управление памятью в Go: где физически рождаются данные (<a href="../04-memory-profiling/2-heap-vs-stack.html" class="wikilink">2. Heap vs stack</a>), как компилятор выносит вердикт об их эвакуации (<a href="../04-memory-profiling/3-escape-analysis.html" class="wikilink">3. Escape analysis</a>) и как находить расточительные участки с помощью аллокационного профилирования (<a href="../04-memory-profiling/4-allocation-profiling.html" class="wikilink">4. Allocation profiling</a>, <a href="../04-memory-profiling/5-pprof-memory-profile.html" class="wikilink">5. pprof memory profile</a>).</p>
+<p>Все эти темы неизбежно сходятся в одной ключевой точке архитектуры: <strong>сборщике мусора (Garbage Collector, GC)</strong>.</p>
+<p>Именно сборщик мусора берет на себя рутинный и опасный труд автоматического освобождения кучевой памяти, навсегда избавляя программиста от необходимости вызывать системную функцию <code>free()</code>. Однако за этот комфорт и гарантию безопасности памяти (Memory Safety) закон сохранения заставляет платить: процессорными тактами, микроскопическими паузами, накладными расходами на барьеры записи и загрязнением кэшей процессора.</p>
+<p>Сборщик мусора Go — это не архаичный Stop-The-World монолит. Начиная с революционного релиза Go 1.5, рантайм использует <strong>высококонкурентный трехцветный алгоритм Mark-Sweep</strong>, спроектированный с одной фанатичной целью: <strong>минимизация задержки (Ultra-Low Latency)</strong> даже под экстремальной нагрузкой.</p>
+<p>Понимание внутреннего устройства GC — обязательный признак Senior-инженера, позволяющий осознанно настраивать параметры памяти (<a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>, <a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>), защищать SLA сервиса от деградации хвостовых задержек (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>) и проектировать эффективные алгоритмы с нулевыми аллокациями (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/9-zero-allocation-podkhod.html" class="wikilink">9. Zero allocation подход</a>).</p>
+<p>Эта статья открывает подраздел «Garbage Collector» фундаментальным обзором: мы разберем философию сборщика, его базовые фазы, ключевых действующих лиц и системные метрики, подготовив почву для глубокого погружения в триколорный маркинг (<a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a>), паузы мира (<a href="3-stop-the-world.html" class="wikilink">3. Stop the world</a>), конкурентные воркеры (<a href="4-concurrent-gc.html" class="wikilink">4. Concurrent GC</a>) и барьеры записи (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>).</p>
+<hr />
 <h2 id="filosofiya-gc-v-go-nizkaya-latency-kak-prioritet">Философия GC в Go: низкая latency как приоритет</h2>
 
-<p>Создатели Go проектировали сборщик мусора с чёткой целью: <strong>минимальные паузы для интерактивных сервисов</strong>. Типичное веб-приложение обрабатывает тысячи запросов в секунду, и даже 10-миллисекундная остановка всех горутин может испортить p99 latency. Поэтому Go GC жертвует пиковой пропускной способностью (throughput) ради низкой и предсказуемой задержки.</p>
-<p>Ключевые принципы:<br />
-- <strong>Конкурентность.</strong> Mark-фаза выполняется одновременно с рабочими горутинами (mutator), не блокируя их.<br />
-- <strong>Короткие stop-the-world.</strong> Только начальная настройка и финальная очистка требуют глобальной паузы, которая обычно измеряется микросекундами (подробнее в <a href="3-stop-the-world.html" class="wikilink">3. Stop the world</a>).<br />
-- <strong>Отсутствие поколений.</strong> В отличие от JVM HotSpot, Go GC не разделяет объекты на молодые и старые. Все объекты проходят полный цикл mark-sweep. Это упрощает рантайм и исключает паузы, связанные с эвакуацией поколений.<br />
-- <strong>Автоматический тюнинг.</strong> Целевой размер кучи задаётся через <code>GOGC</code> (по умолчанию 100), и GC сам решает, когда запускаться, основываясь на темпе аллокаций.<br />
-- <strong>Помощь мутатора (assist).</strong> Если горутина выделяет память слишком быстро, она принудительно помогает GC маркировать объекты, предотвращая неконтролируемый рост кучи.</p>
+<p>При проектировании сборщика мусора для Go Роб Пайк и команда рантайма встали перед классическим трилеммой компромиссов: <strong>Throughput</strong> (пиковая пропускная способность вычислений), <strong>Latency</strong> (минимальное время отклика на запрос) и <strong>Footprint</strong> (объем потребляемой оперативной памяти).</p>
+<p>В то время как разработчики виртуальных машин Java (JVM HotSpot) исторически отдавали предпочтение максимальному Throughput (соглашаясь на периодические стоп-паузы в сотни миллисекунд), создатели Go сделали бескомпромиссную ставку на <strong>Latency</strong>:</p>
+<blockquote>
+<p><em>«В распределенных микросервисах задержка на одном узле каскадно разрушает p99 latency всей системы. Мы предпочтем потратить чуть больше CPU в фоне, но никогда не позволим приложению замереть на миллисекунды».</em></p>
+</blockquote>
+<h3 id="klyuchevye-arkhitekturnye-printsipy-go-gc">Ключевые архитектурные принципы Go GC:</h3>
+<ol>
+<li><strong>Конкурентность исполнения (Concurrent Mark):</strong><br />
+   Фаза разметки графа живых объектов выполняется параллельно на отдельных ядрах CPU, пока рабочие горутины приложения (Mutator) продолжают беспрепятственно отвечать на сетевые запросы.</li>
+<li><strong>Микроскопические паузы STW (Stop-The-World):</strong><br />
+   Глобальная остановка мира требуется только на доли мгновения для инициализации структур и завершения цикла (обычно менее <strong>10–50 микросекунд</strong>; подробнее в <a href="3-stop-the-world.html" class="wikilink">3. Stop the world</a>).</li>
+<li><strong>Отказ от поколений (Non-Generational):</strong><br />
+   В отличие от JVM или V8, в Go нет разделения объектов на «молодые» (Young Gen) и «старые» (Old Gen). Все объекты кучи равноправны и сканируются единым конвейером. Это исключило необходимость сложных межпоколенческих барьеров чтения/записи (Card Tables) и тяжелых операций перемещения (эвакуации) памяти.</li>
+<li><strong>Автоматический пропорциональный пейсер (GC Pacer):</strong><br />
+   Внутренний регулятор ритма рантайма динамически оценивает темп выделения памяти и заранее стартует фоновую сборку так, чтобы размер кучи достиг целевой отметки <code>GOGC</code> (по умолчанию 100%) ровно к моменту окончания маркировки.</li>
+<li><strong>Помощь мутатора (Mark Assist):</strong><br />
+   Если безумная горутина аллоцирует память быстрее, чем фоновый сборщик успевает ее маркировать, рантайм принудительно заставляет эту горутину помогать сборщику, замедляя аллокатора и предотвращая взрывной рост памяти.</li>
+</ol>
+<hr />
 <h2 id="osnovnye-fazy-gc-mark-i-sweep">Основные фазы GC: Mark и Sweep</h2>
 
-<p>Упрощённо, жизненный цикл Go GC состоит из двух больших фаз — <strong>Mark</strong> и <strong>Sweep</strong>, плюс вспомогательные паузы.</p>
+<p>Жизненный цикл сборщика мусора Go представляет собой замкнутый четырехтактный цикл:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2207,64 +2229,82 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-STW1[&quot;STW: старт&lt;br&gt;Подготовка&lt;br&gt;Остановка всех горутин&quot;] --&gt; MarkStart[&quot;Mark фаза&lt;br&gt;Конкурентная&lt;br&gt;Поиск живых объектов&quot;]
-MarkStart --&gt; MarkTerm[&quot;STW: mark termination&lt;br&gt;Завершение маркировки&lt;br&gt;Краткая пауза&quot;]
-MarkTerm --&gt; Sweep[&quot;Sweep фаза&lt;br&gt;Конкурентная&lt;br&gt;Освобождение мёртвой памяти&quot;]
-Sweep --&gt; Idle[&quot;Ожидание&lt;br&gt;до следующего цикла&quot;]
+STW1[&quot;1. STW: Mark Setup&lt;br&gt;Инициализация структур&lt;br&gt;Включение Write Barrier (~10-20 мкс)&quot;] --&gt; MarkStart[&quot;2. Concurrent Mark&lt;br&gt;Параллельное сканирование графа&lt;br&gt;Фоновые воркеры + Mark Assist&quot;]
+MarkStart --&gt; MarkTerm[&quot;3. STW: Mark Termination&lt;br&gt;Окончание маркировки&lt;br&gt;Выключение Write Barrier (~10-30 мкс)&quot;]
+MarkTerm --&gt; Sweep[&quot;4. Concurrent Sweep&lt;br&gt;Параллельное освобождение спанов mspan&lt;br&gt;Ленивый возврат памяти&quot;]
+Sweep --&gt; Idle[&quot;5. Состояние покоя (Idle)&lt;br&gt;Ожидание достижения цели Pacer&quot;]
 Idle --&gt; STW1
   </pre>
 </div>
 
 
-<h3 id="mark-markirovka">Mark (маркировка)</h3>
-<p>Цель — найти все объекты, которые ещё достижимы из корней GC (глобальные переменные, стеки горутин, регистры). Алгоритм называется <strong>триколорный маркинг</strong> (<a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a>). Объекты помечаются как белые (не посещённые), серые (посещённые, но потомки не проверены), чёрные (посещён полностью). В конце живые объекты — чёрные, мёртвые — белые и будут удалены.</p>
-<p>Маркировка конкурентна: она идёт параллельно с работой приложения. Однако мутатор может менять граф объектов, поэтому используется <strong>write barrier</strong> (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>) — небольшой кусочек кода, который срабатывает при каждой записи указателя и гарантирует, что GC не пропустит живой объект.</p>
-<h3 id="sweep-ochistka">Sweep (очистка)</h3>
-<p>После завершения mark GC знает, какие объекты мусор. Фаза sweep освобождает память и возвращает её в списки свободных спанов. Sweep тоже выполняется конкурентно и может быть ленивым: память освобождается не сразу, а по мере необходимости (при следующей аллокации). Это амортизирует затраты.</p>
-<h3 id="stop-the-world-pauzy">Stop-the-world паузы</h3>
-<p>Несмотря на конкурентность, два момента требуют глобальной остановки:<br />
-1. <strong>Mark setup</strong> в начале цикла — подготовка структур, включение write barrier.<br />
-2. <strong>Mark termination</strong> — завершение маркировки, проверка очередей, выключение write barrier.</p>
-<p>Длительность этих пауз в хорошо настроенном приложении составляет единицы-десятки микросекунд. Именно они ограничивают минимальную задержку (<a href="6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>).</p>
+<h3 id="1-mark-markirovka">1. Mark (маркировка)</h3>
+<p>Цель фазы — обойти весь граф достижимых структур данных, начиная от корней (GC Roots: глобальные переменные, активные стеки всех горутин, регистры CPU), и пометить живые объекты.</p>
+<p>Go использует алгоритм <strong>триколорного маркинга (Tri-color Marking)</strong> (<a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a>):<br />
+- <strong>Белые объекты:</strong> Кандидаты на уничтожение (еще не посещенные);<br />
+- <strong>Серые объекты:</strong> Обнаруженные живые объекты, чьи дочерние поля еще не исследованы;<br />
+- <strong>Черные объекты:</strong> Гарантированно живые объекты, все ссылки из которых полностью просканированы.</p>
+<p>Поскольку маркировка идет конкурентно, пока приложение работает, горутины могут переписывать указатели прямо под ногами сборщика. Чтобы не допустить ошибочного удаления живых данных, рантайм активирует <strong>барьер записи (Write Barrier)</strong> (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>), перехватывающий любые мутации указателей.</p>
+<h3 id="2-sweep-ochistka">2. Sweep (очистка)</h3>
+<p>Когда маркировка завершена, все оставшиеся белыми ячейки памяти признаются мусором.</p>
+<p>Фаза Sweep выполняется полностью конкурентно и <strong>лениво (Lazy Sweeping)</strong>: рантайм не обходит всю память немедленно. Вместо этого спаны <code>mspan</code> очищаются по мере необходимости — ровно тогда, когда логический процессор $P$ запрашивает новый спан для аллокации. Если спан целиком состоит из мертвых объектов, он возвращается в глобальный пул за один машинный такт.</p>
+<h3 id="3-stop-the-world-pauzy">3. Stop-The-World паузы</h3>
+<p>Несмотря на предельную конкурентность, два момента требуют кратковременной синхронизации всех ядер:<br />
+- <strong>Mark Setup:</strong> Остановка мира для включения барьера записи и фиксации начального состояния корней;<br />
+- <strong>Mark Termination:</strong> Остановка мира для проверки завершения очередей и отключения барьера записи.</p>
+<p>В современной версии Go обе паузы укладываются в диапазон <strong>от 5 до 50 микросекунд</strong>, что делает их практически незаметными для большинства сетевых SLA (<a href="6-gc-pause-i-latency.html" class="wikilink">6. GC pause и latency</a>).</p>
+<hr />
 <h2 id="evolyutsiya-gc-v-go-ot-stw-k-konkurentnomu">Эволюция GC в Go: от STW к конкурентному</h2>
 
-<p>Понимание истории помогает оценить текущий дизайн.</p>
+<p>Чтобы осознать совершенство современного рантайма, стоит взглянуть на исторический путь эволюции:</p>
 <ul>
-<li><strong>Go 1.0 – 1.4:</strong> Классический mark-sweep с полной остановкой мира на всё время GC. Паузы достигали сотен миллисекунд, что исключало использование Go в latency-чувствительных системах.</li>
-<li><strong>Go 1.5:</strong> Революция. Внедрён конкурентный mark и sweep с короткими STW. Паузы уменьшились до единиц миллисекунд.</li>
-<li><strong>Go 1.6 – 1.8:</strong> Улучшение алгоритмов, добавление write barrier (Dijkstra + Yuasa), ассистентов (assist), настройка планировщика GC.</li>
-<li><strong>Go 1.12:</strong> Введение <code>GOMEMLIMIT</code> в экспериментальном режиме, улучшение обработки больших куч.</li>
-<li><strong>Go 1.19:</strong> Стабилизация <code>GOMEMLIMIT</code>, ставшего ключевым инструментом контроля памяти.</li>
+<li><strong>Go 1.0 – 1.4: Эпоха примитивного STW.</strong><br />
+  Классический однопоточный mark-sweep. При каждой сборке мир намертво замирал. На кучах в несколько гигабайт паузы достигали <strong>сотен миллисекунд и даже секунд</strong>, что делало Go непригодным для высоконагруженного финтеха и телекома.</li>
+<li><strong>Go 1.5: Революция низкой задержки.</strong><br />
+  Полный пересмотр архитектуры: переход на конкурентный триколорный алгоритм с барьерами записи Dijkstra. Паузы упали до 10–40 миллисекунд.</li>
+<li><strong>Go 1.6 – 1.8: Оттачивание конвейера.</strong><br />
+  Внедрен гибридный барьер записи (<strong>Dijkstra + Yuasa</strong>), устранивший необходимость повторного STW-сканирования стеков горутин. Паузы сократились до субмиллисекундного уровня (менее 1 мс).</li>
+<li><strong>Go 1.12: Улучшение пейсера.</strong><br />
+  Оптимизирован возврат свободной памяти ОС через системный вызов <code>MADV_FREE</code>.</li>
+<li><strong>Go 1.19 – 1.24+: Эпоха GOMEMLIMIT.</strong><br />
+  Внедрен и стабилизирован механизм мягкого лимита памяти <code>GOMEMLIMIT</code>, окончательно решивший проблему OOM-падений в контейнерах Docker/Kubernetes.</li>
 </ul>
-<p>Сегодня Go GC — зрелый, низколатентный сборщик, способный обслуживать кучи в десятки гигабайт с паузами менее 100 микросекунд.</p>
+<p>Сегодня сборщик мусора Go способен комфортно управлять кучами размером в десятки и сотни гигабайт, удерживая STW-паузы в пределах микросекунд!</p>
+<hr />
 <h2 id="klyuchevye-terminy-i-deystvuyushchie-litsa">Ключевые термины и действующие лица</h2>
 
+<p>В документации и исходниках рантайма Go принята классическая терминология теории компиляторов:</p>
 <ul>
-<li><strong>Mutator (мутатор)</strong> — ваши горутины, которые выделяют память и меняют граф объектов (пишут в указатели). GC работает на фоне, пока мутатор продолжает выполнение.</li>
-<li><strong>Collector (сборщик)</strong> — горутины самого GC, выполняющие mark и sweep.</li>
-<li><strong>Write barrier (барьер записи)</strong> — инструкции, вставляемые компилятором при записи указателей в кучу. Оповещают GC, что объект мог измениться, и он должен быть перепроверен.</li>
-<li><strong>Mark assist (помощь мутатора)</strong> — когда горутина выделяет память, а GC не успевает за ней, горутина принудительно помогает маркировать объекты, замедляя себя, но предотвращая безграничный рост кучи.</li>
-<li><strong>STW (stop-the-world)</strong> — моменты, когда все горутины приостанавливаются для выполнения критической фазы GC.</li>
+<li><strong>Mutator (мутатор):</strong> Прикладной код вашей программы. Любая работающая горутина является мутатором: она беспрерывно выделяет память и «мутирует» граф указателей.</li>
+<li><strong>Collector (сборщик):</strong> Служебные горутины рантайма (<code>gcBgMarkWorker</code>), выполняющие сканирование памяти и маркировку.</li>
+<li><strong>Write Barrier (барьер записи):</strong> Специальный пролог, компилируемый перед каждой инструкцией записи указателя в кучу. Предотвращает разрыв связей живых объектов во время конкурентной маркировки.</li>
+<li><strong>Mark Assist (помощь мутатора):</strong> Механизм принудительного привлечения горутины-мутатора к работе сборщика, если темп ее аллокаций превышает пропускную способность фоновых воркеров.</li>
+<li><strong>STW (Stop-The-World):</strong> Кратковременная глобальная пауза всех логических процессоров $P$, необходимая для атомарного переключения фаз рантайма.</li>
 </ul>
+<hr />
 <h2 id="kak-gc-vliyaet-na-proizvoditelnost-prilozheniya">Как GC влияет на производительность приложения</h2>
 
-<p>GC не бесплатен. Его влияние многогранно:</p>
+<p>Сборщик мусора обеспечивает безопасность памяти, но оказывает комплексное микроархитектурное давление на систему:</p>
 <ol>
-<li><strong>CPU overhead.</strong> Конкурентный mark потребляет ядра процессора. Если GC работает на том же физическом ядре, что и горячая горутина, throughput сервиса снижается.</li>
-<li><strong>Паузы.</strong> STW-фазы добавляют микроскопические остановки, которые напрямую ухудшают p99 latency. При плохом тюнинге или огромной куче эти паузы могут выходить за рамки SLO.</li>
-<li><strong>Write barrier cost.</strong> Каждая запись указателя в кучу слегка дороже из-за барьера. Это увеличивает <code>ns/op</code> для мутатора, даже когда GC не активен.</li>
-<li><strong>Mark assist замедляет аллокации.</strong> Если приложение аллоцирует быстрее, чем GC успевает освобождать, горутины-аллокаторы принудительно тратят своё время на маркировку, что ощущается как внезапное замедление.</li>
-<li><strong>Вымывание кэша.</strong> GC сканирует огромные объёмы памяти, загружая их в кэш и вытесняя полезные данные мутатора. После GC производительность может временно просесть, пока рабочий набор снова прогреется (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>).</li>
+<li><strong>Конкуренция за процессорные ядра (CPU Overhead):</strong><br />
+   По умолчанию рантайм резервирует под фоновые воркеры сборщика ровно <strong>25% вычислительной мощности CPU</strong> ($GOMAXPROCS / 4$). Если на 4-ядерном сервере запускается GC, одно ядро целиком переключается на маркировку, снижая пиковый throughput сервиса.</li>
+<li><strong>Хвостовые задержки (Tail Latency):</strong><br />
+   Даже микросекундные паузы STW и кратковременное торможение мутаторов в Mark Assist растягивают распределение задержек p99 и p99.9.</li>
+<li><strong>Накладные расходы Write Barrier:</strong><br />
+   Пока активна фаза маркировки, каждое присваивание указателя <code>ptr.field = val</code> превращается в выполнение дополнительного кода барьера, увеличивая чистое процессорное время операций и показатель <code>ns/op</code> в бенчмарках для мутатора.</li>
+<li><strong>Вымывание кэша данных (Cache Pollution):</strong><br />
+   В фазе Mark фоновые воркеры обходят миллионы объектов в куче. Этот шквал обращений к памяти безжалостно вытесняет из кэшей L1d, L2 и L3 рабочие данные мутатора. В результате сразу после окончания GC прикладной код временно проседает по скорости, страдая от промахов кэша (<a href="../01-fundament/5-mechanical-sympathy-v-backend-razrabotke.html" class="wikilink">5. Mechanical sympathy в backend разработке</a>).</li>
 </ol>
+<hr />
 <h2 id="metriki-gc-kak-zaglyanut-vnutr">Метрики GC: как заглянуть внутрь</h2>
 
+<p>Для объективного контроля за сборщиком мусора в Go предусмотрен развитый арсенал телеметрии:</p>
 <h3 id="1-godebuggctrace1">1. GODEBUG=gctrace=1</h3>
-
-<p>Самый простой способ увидеть работу GC. При запуске приложения с этой переменной в stderr выводятся строки каждого цикла:</p>
+<p>Запуск сервиса с переменной окружения <code>GODEBUG=gctrace=1</code> заставляет рантайм выводить в поток <code>stderr</code> подробную сводку по каждому завершенному циклу:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
@@ -2274,61 +2314,82 @@ Idle --&gt; STW1
 </code></pre>
 </div>
 
-<p>Расшифровка (упрощённо):<br />
-- <code>gc 1</code> — номер цикла.<br />
-- <code>@0.001s</code> — время от старта.<br />
-- <code>0.015+0.13+0.007 ms clock</code> — время STW-mark, concurrent mark, STW-mark termination в миллисекундах процессорного времени.<br />
-- <code>1-&gt;1-&gt;1 MB</code> — размер кучи до GC, после GC, размер живых объектов.<br />
-- <code>4 MB goal</code> — целевой размер кучи, после которого запустится следующий GC.<br />
-- <code>8 P</code> — количество логических процессоров.</p>
-<p>Растущий goal при стабильной нагрузке сигнализирует об утечке (<a href="../04-memory-profiling/6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>) или необходимости тюнинга.</p>
+<p>Расшифровка лога:<br />
+- <code>gc 1</code> — порядковый номер цикла сборки;<br />
+- <code>@0.001s</code> — время от старта процесса;<br />
+- <code>0%</code> — процент процессорного времени, потраченный на GC с момента старта;<br />
+- <code>0.015+0.13+0.007 ms clock</code> — реальное астрономическое время фаз: STW Mark Setup (0.015 мс) + Concurrent Mark (0.13 мс) + STW Mark Termination (0.007 мс);<br />
+- <code>0.12+0.10/0.13/0.05+0.05 ms cpu</code> — совокупное процессорное время ядер на различных стадиях (включая Mark Assist);<br />
+- <code>1-&gt;1-&gt;1 MB</code> — размер кучи до старта GC, размер кучи после очистки и объем реально живых структур;<br />
+- <code>4 MB goal</code> — целевой размер кучи, при котором Pacer запустит следующий цикл;<br />
+- <code>8 P</code> — число активных логических процессоров <code>GOMAXPROCS</code>.</p>
+<p>Если целевой объем <code>goal</code> монотонно растет при неизменной входящей нагрузке — в программе присутствует утечка памяти (<a href="../04-memory-profiling/6-utechki-pamyati.html" class="wikilink">6. Утечки памяти</a>) либо накапливается долгоживущий кэш.</p>
 <h3 id="2-debugpprof">2. /debug/pprof/</h3>
-<p>Эндпоинт <code>http://localhost:6060/debug/pprof/gc</code> показывает историю GC-циклов и затраты. Полезно для корреляции с latency.</p>
+<p>Эндпоинт <code>/debug/pprof/gc</code> (или <code>http://localhost:6060/debug/pprof/gc</code>) предоставляет исторический дамп длительности и частоты циклов, позволяя сопоставить всплески задержек с фазами GC.</p>
 <h3 id="3-runtime-readmemstats">3. runtime.ReadMemStats()</h3>
-<p>Структура <code>MemStats</code> содержит детальную информацию: <code>NumGC</code>, <code>PauseTotalNs</code>, <code>PauseNs</code> (циклический буфер последних пауз), <code>GCCPUFraction</code> и другие. Подходит для экспорта в метрики.</p>
+<p>Вызов <code>runtime.ReadMemStats(&amp;m)</code> заполняет структуру <code>MemStats</code>, предоставляя программный доступ к метрикам:<br />
+- <code>m.NumGC</code> — общий счетчик завершенных циклов сборки;<br />
+- <code>m.PauseTotalNs</code> — суммарное время всех пауз STW в наносекундах;<br />
+- <code>m.PauseNs</code> — кольцевой буфер последних 256 значений задержек STW;<br />
+- <code>m.GCCPUFraction</code> — накопительная доля ресурсов процессора, потраченная на работу GC.</p>
 <h3 id="4-prometheus-clientgolang">4. Prometheus + client_golang</h3>
-<p>Стандартный подход для production: экспорт метрик через <code>promhttp</code>. Ключевые:<br />
-- <code>go_gc_duration_seconds</code> — гистограмма длительности GC-циклов.<br />
-- <code>go_memstats_heap_alloc_bytes</code> — текущий размер кучи.<br />
-- <code>go_memstats_gc_cpu_fraction</code> — доля CPU, потраченная на GC.<br />
-- <code>go_memstats_heap_objects</code> — количество живых объектов.</p>
-<p>Эти метрики критичны для дашбордов и алертов (<a href="../10-highload/8-observability-i-performance.html" class="wikilink">8. Observability и performance</a>).</p>
+<p>В боевом продакшене телеметрия экспортируется в Prometheus с помощью пакета <code>promhttp</code>:<br />
+- <code>go_gc_duration_seconds</code> — гистограмма распределения длительности пауз сборщика;<br />
+- <code>go_memstats_heap_alloc_bytes</code> — объем памяти живых объектов кучи;<br />
+- <code>go_memstats_gc_cpu_fraction</code> — мгновенная доля CPU, потребляемая сборщиком;<br />
+- <code>go_memstats_heap_objects</code> — количество активных объектов в куче.</p>
+<p>Эти метрики являются основой для построения дашбордов и алертинга в Grafana (<a href="../10-highload/8-observability-i-performance.html" class="wikilink">8. Observability и performance</a>).</p>
+<hr />
 <h2 id="tyuning-gc-osnovnye-rychagi">Тюнинг GC: основные рычаги</h2>
 
-<p>Go предоставляет два главных параметра, управляемых окружением:</p>
-<ul>
-<li><strong>GOGC</strong> (по умолчанию 100) — процентный порог. Если живых объектов X, GC запустится, когда куча достигнет X * (1 + GOGC/100). Увеличение GOGC (например, 200) означает, что GC будет реже запускаться, куча будет больше, но паузы реже. Уменьшение (например, 50) — чаще, куча меньше, но больше CPU на GC. Подробнее в <a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>.</li>
-<li><strong>GOMEMLIMIT</strong> (появился в Go 1.19, стабилен с 1.21) — мягкий лимит на общий размер кучи в байтах. Если куча приближается к лимиту, GC становится агрессивнее, включая дополнительные циклы, чтобы не превысить лимит. Это критично для контейнеров с ограниченной памятью и предотвращения OOM. Подробнее в <a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>.</li>
-</ul>
-<p>Третий, косвенный рычаг — <strong>уменьшение аллокаций</strong>. Каждый избежанный байт в куче снижает давление на GC (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/9-zero-allocation-podkhod.html" class="wikilink">9. Zero allocation подход</a>).</p>
+<p>Рантайм Go сознательно минималистичен: в нем нет сотен запутанных флагов, как в JVM. Инженеру доступны два фундаментальных рычага:</p>
+<ol>
+<li><strong>GOGC (по умолчанию 100):</strong><br />
+   Определяет процентный прирост кучи до старта следующего цикла:<br />
+   $$\text{Target} = \text{LiveBytes} \times \left(1 + \frac{\text{GOGC}}{100}\right)$$<br />
+   - При <code>GOGC=100</code> следующий сборщик запустится, когда размер новых аллокаций сравняется с объемом живых данных (куча вырастет вдвое);<br />
+   - Увеличение (например, <code>GOGC=200</code>): GC запускается вдвое реже, процессор разгружается, но куча занимает больше RAM;<br />
+   - Уменьшение (например, <code>GOGC=50</code>): куча держится компактно, но сборщик запускается вдвое чаще, отбирая ресурсы CPU (подробнее в <a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>).</li>
+<li><strong>GOMEMLIMIT (Go 1.19+, стабилен в 1.21+):</strong><br />
+   Задает мягкий предел суммарного потребления памяти процессом в байтах (например, <code>GOMEMLIMIT=3GiB</code>). При приближении кучи к лимиту пейсер GC автоматически увеличивает интенсивность сборок, предотвращая падение по OOM в контейнерах с жесткими лимитами памяти (<a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>).</li>
+</ol>
+<p>Третий и самый эффективный рычаг — <strong>уменьшение аллокаций в коде</strong>: каждый байт, оставшийся на стеке или переиспользованный в пуле, снижает нагрузку на сборщик мусора абсолютно бесплатно (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/9-zero-allocation-podkhod.html" class="wikilink">9. Zero allocation подход</a>).</p>
+<hr />
 <h2 id="mechanical-sympathy-gc-i-ierarkhiya-pamyati">Mechanical Sympathy: GC и иерархия памяти</h2>
 
-<p>Сборщик мусора активно взаимодействует с кэш-памятью и TLB:<br />
-- Во время mark фазы GC сканирует живые объекты. Это приводит к массовым загрузкам кэш-линий. Полезные данные мутатора вытесняются, вызывая cache miss после GC.<br />
-- Write barrier при каждой записи в указатель добавляет инструкции, которые могут трогать глобальный буфер GC. Этот буфер, скорее всего, будет в L3 или RAM, вызывая промахи.<br />
-- Большая куча в сотни гигабайт приводит к TLB промахам, так как число страниц превышает ёмкость TLB. GC, обходящий эту кучу, платит огромную цену за каждую непопавшую страницу.<br />
-- Поэтому оптимизация памяти — это не только про меньшее потребление RAM, но и про уменьшение работы GC и улучшение локальности данных.</p>
+<p>Взаимодействие сборщика мусора с кремниевой архитектурой — яркий пример того, почему Senior обязан обладать механическим сочувствием к процессору:</p>
+<ul>
+<li><strong>Вытеснение кэш-линий:</strong> Фаза Mark заставляет процессор считывать терабайты указателей со скоростью шины памяти. Полезный рабочий набор горутин немедленно вымывается из кэшей L1d/L2, заставляя последующие сетевые запросы буксовать на холодных кэшах.</li>
+<li><strong>Накладные расходы Write Barrier:</strong> Барьер записи выполняет логику проверки серого цвета при каждой мутации указателя. Эти инструкции конкурируют за слоты конвейера CPU и буфер переупорядочивания ROB.</li>
+<li><strong>Промахи буфера TLB:</strong> Если куча разрослась до десятков гигабайт, обход разрозненных спанов вызывает лавину промахов TLB, требуя медленного обхода 4-уровневых таблиц страниц операционной системы.</li>
+</ul>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
+    <span class="callout-title">Собеседование: Деградация p99 при микроскопических STW</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Объясните, как конкурентный GC в Go может вызвать увеличение p99 latency, даже если STW-паузы микроскопичны.<br />
-<strong>Ответ:</strong> Конкурентный mark потребляет CPU, конкурируя с горутинами за ядра. Это замедляет обработку запросов. Write barrier добавляет такты при каждой записи указателя. Mark assist при агрессивных аллокациях заставляет горутину тратить время на помощь GC. Кроме того, после GC кэш процессора вымывается, и запросы временно испытывают больше cache miss. Всё вместе расширяет хвост распределения задержек.</p>
+    <p><strong>Вопрос:</strong> Почему конкурентный сборщик мусора Go способен вызывать заметный рост задержек p99 и p99.9 в высоконагруженном API, несмотря на то, что паузы STW длятся всего десятки микросекунд?<br />
+<strong>Ответ:</strong> Деградация хвостовой задержки p99 вызвана четырьмя факторами:<br />
+1. <strong>Отбор процессорных ядер:</strong> Фоновые воркеры GC резервируют 25% CPU, отбирая такты у горутин, обрабатывающих запросы;<br />
+2. <strong>Троттлинг Mark Assist:</strong> Горутины, создающие высокий поток аллокаций, принудительно переключаются рантаймом на маркировку памяти, замедляя ответ клиенту;<br />
+3. <strong>Накладные расходы Write Barrier:</strong> Каждая мутация указателя в куче выполняет дополнительные инструкции барьера;<br />
+4. <strong>Вымывание кэша процессора:</strong> Сканирование кучи вытесняет рабочие данные из кэшей L1/L2/L3, заставляя ядро ждать выборки из медленной оперативной памяти DRAM.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Go GC</strong> — конкурентный mark-sweep с упором на низкую latency. Основные фазы: Mark (поиск живых объектов) и Sweep (освобождение мусора), с короткими STW-паузами.</li>
-<li>Ключевые механизмы: триколорный маркинг, write barrier, mark assist. Они детализируются в следующих статьях.</li>
-<li>GC потребляет CPU, создаёт паузы, влияет на кэш и требует тюнинга через GOGC и GOMEMLIMIT.</li>
-<li>Диагностика через GODEBUG, pprof и Prometheus метрики — обязательный инструментарий Senior-инженера.</li>
-<li>Понимание работы GC необходимо для достижения целевых SLO по latency и throughput.</li>
+<li><strong>Go GC</strong> — низколатентный конкурентный сборщик мусора Mark-Sweep, оптимизированный под предсказуемое время отклика (Ultra-Low Latency).</li>
+<li>Основные фазы: кратковременный <strong>STW Mark Setup</strong> -&gt; параллельный <strong>Concurrent Mark</strong> -&gt; кратковременный <strong>STW Mark Termination</strong> -&gt; ленивый <strong>Concurrent Sweep</strong>.</li>
+<li>Архитектурные столпы: триколорная раскраска графа, барьеры записи <code>write barrier</code>, алгоритм помощи мутатора <code>mark assist</code> и пейсер кучи.</li>
+<li>Сборщик мусора потребляет до 25% вычислительной мощности CPU, создает микропаузы STW и вымывает данные из кэш-линий процессора.</li>
+<li>Основные инструменты контроля: телеметрия <code>GODEBUG=gctrace=1</code>, HTTP-эндпоинты pprof и метрики Prometheus <code>promhttp</code>.</li>
+<li>Главные рычаги тюнинга: процентный порог <code>GOGC</code>, лимит памяти <code>GOMEMLIMIT</code> и оптимизация аллокаций в коде.</li>
 </ul>
-<p>Теперь, разобрав общую картину, мы погрузимся в детали алгоритма, который лежит в основе mark-фазы. Следующая статья: <a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a>.</p>
+<p>Разобравшись с общей картиной сборщика, мы переходим к изучению фундаментального алгоритма, лежащего в сердце фазы Mark: <a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a> — трехцветная разметка графа памяти.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2356,7 +2417,7 @@ Idle --&gt; STW1
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#pochemu-sborshchik-musora-tsentralnyy-element-rantayma">Почему сборщик мусора — центральный элемент рантайма</a></li><li class="toc-item toc-h2"><a href="#filosofiya-gc-v-go-nizkaya-latency-kak-prioritet">Философия GC в Go: низкая latency как приоритет</a></li><li class="toc-item toc-h2"><a href="#osnovnye-fazy-gc-mark-i-sweep">Основные фазы GC: Mark и Sweep</a></li><li class="toc-item toc-h3"><a href="#mark-markirovka">Mark (маркировка)</a></li><li class="toc-item toc-h3"><a href="#sweep-ochistka">Sweep (очистка)</a></li><li class="toc-item toc-h3"><a href="#stop-the-world-pauzy">Stop-the-world паузы</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-gc-v-go-ot-stw-k-konkurentnomu">Эволюция GC в Go: от STW к конкурентному</a></li><li class="toc-item toc-h2"><a href="#klyuchevye-terminy-i-deystvuyushchie-litsa">Ключевые термины и действующие лица</a></li><li class="toc-item toc-h2"><a href="#kak-gc-vliyaet-na-proizvoditelnost-prilozheniya">Как GC влияет на производительность приложения</a></li><li class="toc-item toc-h2"><a href="#metriki-gc-kak-zaglyanut-vnutr">Метрики GC: как заглянуть внутрь</a></li><li class="toc-item toc-h3"><a href="#1-godebuggctrace1">1. GODEBUG=gctrace=1</a></li><li class="toc-item toc-h3"><a href="#2-debugpprof">2. /debug/pprof/</a></li><li class="toc-item toc-h3"><a href="#3-runtime-readmemstats">3. runtime.ReadMemStats()</a></li><li class="toc-item toc-h3"><a href="#4-prometheus-clientgolang">4. Prometheus + clientgolang</a></li><li class="toc-item toc-h2"><a href="#tyuning-gc-osnovnye-rychagi">Тюнинг GC: основные рычаги</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-gc-i-ierarkhiya-pamyati">Mechanical Sympathy: GC и иерархия памяти</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#pochemu-sborshchik-musora-tsentralnyy-element-rantayma">Почему сборщик мусора — центральный элемент рантайма</a></li><li class="toc-item toc-h2"><a href="#filosofiya-gc-v-go-nizkaya-latency-kak-prioritet">Философия GC в Go: низкая latency как приоритет</a></li><li class="toc-item toc-h3"><a href="#klyuchevye-arkhitekturnye-printsipy-go-gc">Ключевые архитектурные принципы Go GC:</a></li><li class="toc-item toc-h2"><a href="#osnovnye-fazy-gc-mark-i-sweep">Основные фазы GC: Mark и Sweep</a></li><li class="toc-item toc-h3"><a href="#1-mark-markirovka">1. Mark (маркировка)</a></li><li class="toc-item toc-h3"><a href="#2-sweep-ochistka">2. Sweep (очистка)</a></li><li class="toc-item toc-h3"><a href="#3-stop-the-world-pauzy">3. Stop-The-World паузы</a></li><li class="toc-item toc-h2"><a href="#evolyutsiya-gc-v-go-ot-stw-k-konkurentnomu">Эволюция GC в Go: от STW к конкурентному</a></li><li class="toc-item toc-h2"><a href="#klyuchevye-terminy-i-deystvuyushchie-litsa">Ключевые термины и действующие лица</a></li><li class="toc-item toc-h2"><a href="#kak-gc-vliyaet-na-proizvoditelnost-prilozheniya">Как GC влияет на производительность приложения</a></li><li class="toc-item toc-h2"><a href="#metriki-gc-kak-zaglyanut-vnutr">Метрики GC: как заглянуть внутрь</a></li><li class="toc-item toc-h3"><a href="#1-godebuggctrace1">1. GODEBUG=gctrace=1</a></li><li class="toc-item toc-h3"><a href="#2-debugpprof">2. /debug/pprof/</a></li><li class="toc-item toc-h3"><a href="#3-runtime-readmemstats">3. runtime.ReadMemStats()</a></li><li class="toc-item toc-h3"><a href="#4-prometheus-clientgolang">4. Prometheus + clientgolang</a></li><li class="toc-item toc-h2"><a href="#tyuning-gc-osnovnye-rychagi">Тюнинг GC: основные рычаги</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-gc-i-ierarkhiya-pamyati">Mechanical Sympathy: GC и иерархия памяти</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

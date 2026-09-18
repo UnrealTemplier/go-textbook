@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~45 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Stop the world</h1>
@@ -2178,34 +2178,42 @@
           <div class="article-markdown">
             <h2 id="pochemu-mir-vsyo-eshchyo-ostanavlivaetsya">Почему мир всё ещё останавливается</h2>
 
-<p>В <a href="1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a> мы определили Go GC как конкурентный сборщик с низкими паузами. В <a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a> разобрали алгоритм, позволяющий маркировать живые объекты без остановки мутатора. Однако полностью избавиться от глобальных пауз не удалось — <strong>Stop The World (STW)</strong> остаётся неотъемлемой частью цикла сборки мусора.</p>
-<p>STW в Go — это не баг и не пережиток прошлого, а осознанная инженерная необходимость. Без кратких точек полной согласованности невозможно инициализировать конкурентный обход, финализировать маркировку и обеспечить корректность write barrier. Задача Senior-инженера — понимать, когда и почему происходят эти паузы, как измерять их длительность и как минимизировать их влияние на p99 latency (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</p>
-<p>Эта статья вскрывает механику STW: что происходит с горутинами, как рантайм добивается глобальной остановки, как паузы зависят от параметров кучи и как на них реагирует планировщик. Мы свяжем теорию с метриками (<code>GODEBUG=gctrace=1</code>, execution tracer, <code>runtime.ReadMemStats</code>) и подведём к практическому тюнингу в <a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a> и <a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>.</p>
+<p>В симфоническом оркестре перед кульминационным вступлением солиста дирижёр на долю секунды замирает с поднятой палочкой. На мгновение воцаряется абсолютная тишина: музыканты не извлекают звуков, сверяют темп и переворачивают страницу партитуры. Это не срыв концерта, а строгая синхронизация, без которой полифоническое многоголосие превратилось бы в какофонию.</p>
+<p>В <a href="1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a> мы определили сборщик мусора Go как высококонкурентную систему с минимальными задержками, а в <a href="2-tri-color-marking.html" class="wikilink">2. Tri color marking</a> детально разобрали триколорный алгоритм, позволяющий инспектировать память параллельно с исполнением прикладных горутин. Однако полностью исключить глобальные остановки инженерам рантайма не удалось (да и теоретически невозможно без катастрофической деградации пропускной способности) — <strong>Stop The World (STW)</strong> остаётся фундаментальной фазой жизненного цикла Go.</p>
+<p>STW в Go — это не архитектурный дефект и не рудимент ранних версий языка, а осознанный инженерный компромисс. Без кратких миллисекундных и микросекундных точек строгой глобальной согласованности невозможно корректно инициализировать структуры данных сборщика, переключить фазы гибридного барьера записи и зафиксировать финальное состояние графа памяти. Профессиональная задача Senior-инженера — глубоко понимать анатомию этих пауз, знать, какие процессы происходят на кремниевых ядрах при заморозке горутин, уметь инструментально измерять задержки и устранять аномалии, бьющие по p99 latency (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</p>
+<p>В этой статье мы подробно вскроем внутреннюю механику STW: как рантайм и планировщик взаимодействуют с операционной системой для остановки потоков, почему длительность пауз может неожиданно возрастать при неграмотной архитектуре структур данных, как читать метрики (<code>GODEBUG=gctrace=1</code>, execution tracer, <code>runtime.ReadMemStats</code>) и как подготовить фундамент для тонкого тюнинга в <a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a> и <a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>.</p>
+<hr />
 <h2 id="chto-takoe-stop-the-world-v-go">Что такое Stop The World в Go</h2>
 
-<p><strong>Stop The World</strong> — это глобальная пауза, во время которой <strong>все горутины</strong> останавливаются, и рантайм выполняет критическую секцию, не опасаясь изменений со стороны мутатора. В этот момент:</p>
+<p><strong>Stop The World</strong> — это состояние рантайма, при котором исполнение <strong>абсолютно всех пользовательских горутин</strong> временно замораживается, позволяя системному потоку сборщика мусора выполнить критическую секцию в условиях абсолютной неизменяемости памяти. В период STW:</p>
 <ul>
-<li>Ни одна горутина не исполняет пользовательский код.</li>
-<li>Все P (логические процессоры) приостановлены, новые горутины не планируются.</li>
-<li>Системные вызовы, которые были в процессе, завершаются или перехватываются.</li>
+<li>Ни одна горутина не исполняет инструкции пользовательского кода.</li>
+<li>Все логические процессоры <code>P</code> (в количестве <code>GOMAXPROCS</code>) переводятся в служебное состояние ожидания, новые горутины не планируются на исполнение.</li>
+<li>Системные вызовы ядра ОС, которые выполнялись потоками <code>M</code> в момент инициации STW, изолируются: при выходе из syscall поток не возвращается к исполнению Go-кода, а блокируется до отмены глобальной паузы.</li>
 </ul>
-<p>STW не следует путать с обычной блокировкой горутины на мьютексе или канале — это глобальное событие уровня рантайма, затрагивающее всю программу.</p>
-<p>В современном Go GC (начиная с 1.5) STW используется точечно, а не на весь период сборки. Основные точки:</p>
+<p>STW кардинально отличается от локальной блокировки горутины на мьютексе <code>sync.Mutex</code> или чтении из пустого канала: это глобальное скоординированное событие уровня всего рантайма, затрагивающее каждую строчку кода процесса.</p>
+<p>В современном Go (начиная с революционного релиза Go 1.5 и последующих улучшений Go 1.8–1.24) STW используется точечно, а не растягивается на весь период сканирования памяти. В полном цикле сборки существуют ровно две точки глобальной остановки:</p>
 <ol>
-<li><strong>Mark setup</strong> — подготовка к конкурентной mark-фазе.</li>
-<li><strong>Mark termination</strong> — завершение mark, обработка очередей write barrier, выключение барьеров.</li>
+<li><strong>Mark setup</strong> — подготовка структур данных к конкурентной mark-фазе и активация барьера записи.</li>
+<li><strong>Mark termination</strong> — финализация маркировки, обработка остаточных очередей write barrier и отключение барьеров.</li>
 </ol>
-<p>Ранее существовал <strong>sweep termination</strong>, но сейчас sweep полностью конкурентный и ленивый, не требующий STW.</p>
-<p>Длительность этих пауз, как правило, измеряется микросекундами, но может возрастать при неблагоприятных условиях (огромная куча, миллионы горутин).</p>
+<p>Исторически в Go существовала третья пауза — <strong>sweep termination</strong>, во время которой блокировался весь мир для подготовки очистки спанов. В современном рантайме sweep стал полностью конкурентным и ленивым: он выполняется фоновой горутиной <code>bgsweep</code> и самими аллоцирующими горутинами по требованию (on-demand allocation assist), не требуя STW.</p>
+<p>В подавляющем большинстве штатно работающих Go-сервисов суммарная длительность обеих пауз укладывается в диапазон от 10 до 100 микросекунд. Однако при неблагоприятных факторах (сотни миллионов указателей, невытесняемые циклы, нехватка системных ресурсов) микросекунды могут превращаться в десятки миллисекунд.</p>
+<hr />
 <h2 id="kak-rantaym-ostanavlivaet-mir">Как рантайм останавливает мир</h2>
 
-<p>Механика STW в Go — элегантный пример взаимодействия планировщика и ОС. Процесс реализован в <code>runtime/proc.go</code> функцией <code>stopTheWorldWithSema</code> (внутренняя). Упрощённо:</p>
+<p>Остановка десятков тысяч легковесных горутин, распределённых по десяткам потоков ОС <code>M</code> и логических процессоров <code>P</code>, представляет собой сложнейшую задачу координации. Этот механизм реализован в файле <code>runtime/proc.go</code> низкоуровневой функцией <code>stopTheWorldWithSema</code>.</p>
+<p>Последовательность действий рантайма при инициации STW:</p>
 <ol>
-<li>Поток, запросивший STW (обычно GC worker), устанавливает глобальный флаг <code>stopTheWorld</code>.</li>
-<li>Каждый P, когда достигает точки безопасной остановки (safe point), видит флаг и переходит в состояние <code>_Pgcstop</code>.</li>
-<li>Safe points — это места, где планировщик проверяет флаги: вызов функций, переходы в каналах, выделение памяти. Горутина, выполняющая длительный syscall, не достигает safe point быстро; тогда рантайм посылает сигнал, чтобы вывести её из syscall.</li>
-<li>Когда все P остановлены, STW началась. Выполняется критическая работа (mark setup, mark termination).</li>
-<li>После завершения флаг снимается, P пробуждаются, горутины продолжают выполнение.</li>
+<li>Горутина-координатор GC захватывает глобальный мьютекс планировщика и выставляет флаг запроса остановки: <code>sched.gcwaiting.Store(true)</code> (логически <code>stopTheWorld</code>).</li>
+<li>Для каждого логического процессора <code>P</code> выставляется статус ожидания остановки. Координатор проверяет каждый <code>P</code>:<br />
+   - Если <code>P</code> выполняет горутину, ей необходимо дойти до ближайшей безопасной точки — <strong>safe point</strong>.<br />
+   - Если <code>P</code> находится в состоянии ожидания (<code>_Pidle</code>), рантайм немедленно переводит его в состояние <code>_Pgcstop</code>.<br />
+   - Если поток выполняет системный вызов (<code>_Psyscall</code>), процессор отбирается у потока и также переводится в <code>_Pgcstop</code>.</li>
+<li><strong>Механизм Safe Points и Preemption:</strong><br />
+   Рантайм не может грубо оборвать поток посреди ассемблерной инструкции записи указателя — это приведёт к разрушению структур данных. Остановка возможна только в строго определённых safe points. Исторически (до Go 1.14) safe points размещались компилятором исключительно в прологах функций (проверка переполнения стека <code>morestack</code>). Если горутина застревала в плотном цикле численных расчётов без вызовов функций (<code>for i := 0; i &lt; 1e9; i++ {}</code>), мир не мог остановиться секундами! Начиная с Go 1.14, рантайм использует <strong>асинхронную сигнальную преемпцию</strong>: фоновый системный монитор (<code>sysmon</code>) отправляет зависшему потоку сигнал ОС <code>SIGURG</code> (в Linux/macOS), обработчик которого безопасно сохраняет регистры горутины и передаёт управление планировщику.</li>
+<li>Когда последний <code>P</code> переходит в состояние <code>_Pgcstop</code>, мир официально считается остановленным. Координатор сборщика выполняет критическую секцию.</li>
+<li>После завершения критических работ флаг <code>gcwaiting</code> сбрасывается, планировщик пробуждает все <code>P</code> через семафор <code>sched.stopnote</code> (системный вызов futex в Linux), и горутины возвращаются к работе.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2221,16 +2229,20 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Req[&quot;Поток GC запрашивает STW&quot;] --&gt; Flag[&quot;Установка флага&lt;br&gt;stopTheWorld&quot;]
-Flag --&gt; P1[&quot;P1 обнаруживает флаг&lt;br&gt;на safe point&lt;br&gt;переходит в _Pgcstop&quot;]
+Req[&quot;Поток GC запрашивает STW&lt;br&gt;(stopTheWorldWithSema)&quot;] --&gt; Flag[&quot;Установка флага&lt;br&gt;stopTheWorld (sched.gcwaiting=true)&quot;]
+Flag --&gt; P1[&quot;P1 обнаруживает флаг&lt;br&gt;на safe point / по SIGURG&lt;br&gt;переходит в _Pgcstop&quot;]
 Flag --&gt; P2[&quot;P2 ... P_n аналогично&quot;]
-P1 --&gt; AllStop{&quot;Все P остановлены?&quot;}
+P1 --&gt; AllStop{&quot;Все P перешли в _Pgcstop?&lt;br&gt;(sched.stopwait == 0)&quot;}
 P2 --&gt; AllStop
-AllStop -- &quot;Да&quot; --&gt; Critical[&quot;Выполнение критической секции&lt;br&gt;mark setup или mark termination&quot;]
-AllStop -- &quot;Нет, ждём&quot; --&gt; Wait[&quot;Рантайм ждёт&lt;br&gt;или посылает сигналы&lt;br&gt;для выхода из syscall&quot;]
+AllStop -- &quot;Нет, ждём&quot; --&gt; Wait[&quot;Рантайм ждёт потоки&lt;br&gt;или шлёт SIGURG сигналами ОС&lt;br&gt;для выхода из syscall/циклов&quot;]
 Wait --&gt; AllStop
-Critical --&gt; Resume[&quot;Снятие флага&lt;br&gt;Пробуждение P&quot;]
-Resume --&gt; Normal[&quot;Нормальное выполнение&quot;]
+AllStop -- &quot;Да, мир замер&quot; --&gt; Critical[&quot;Выполнение критической секции&lt;br&gt;(mark setup или mark termination)&quot;]
+Critical --&gt; Resume[&quot;Снятие флага&lt;br&gt;Пробуждение P (futex / sched.stopnote)&quot;]
+Resume --&gt; Normal[&quot;Нормальное выполнение горутин&quot;]
+
+style Req fill:#1e293b,stroke:#6366f1,stroke-width:2px,color:#f8fafc
+style Critical fill:#f43f5e,stroke:#991b1b,stroke-width:2px,color:#f8fafc
+style Normal fill:#0f172a,stroke:#10b981,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
@@ -2241,50 +2253,209 @@ Resume --&gt; Normal[&quot;Нормальное выполнение&quot;]
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Ключевые структуры: <code>sched.stopwait</code> — счётчик P, которые ещё не остановлены; <code>sched.stopnote</code> — sleep/wake механизм (futex) для ожидания. Safe points расставлены компилятором в прологах функций и перед некоторыми операциями. Без них остановка была бы асинхронной и опасной (прерывание в середине записи).</p>
+    <p>Ключевые структуры синхронизации STW сосредоточены в глобальной структуре <code>sched</code> (<code>runtime/runtime2.go</code>):<br />
+- <code>sched.stopwait</code> — атомарный счётчик процессоров <code>P</code>, которые ещё не достигли safe point и продолжают крутиться на ядрах CPU.<br />
+- <code>sched.stopnote</code> — легковесная нотификационная структура на базе системного примитива futex (в Linux). Поток-инициатор засыпает на <code>notesleep(&amp;sched.stopnote)</code>, пока последний процессор, декрементируя <code>stopwait</code> до нуля, не вызовет <code>notewakeup</code>.<br />
+Безопасные точки (safe points) расставляются компилятором не случайно: они гарантируют, что состояние локальных переменных на стеке строго зафиксировано в картах указателей (stack maps), и сборщик может безошибочно отличить указатель на кучу от обычного 64-битного числа <code>int64</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mark-setup-stw-podgotovka-markirovki">Mark setup STW: подготовка маркировки</h2>
 
-<p>Эта пауза происходит перед началом конкурентной mark-фазы. Её задачи:</p>
+<p>Первая пауза цикла GC наступает, когда объем выделенной памяти пересекает триггерный порог, рассчитанный алгоритмом GC Pacer. Её задача — подготовить глобальное окружение к конкурентному сканированию:</p>
 <ul>
-<li>Сбросить состояние mark-битов (цветов) для всех объектов в куче (массово обнулить битовые карты).</li>
-<li>Инициализировать рабочие очереди GC (пулы горутин-маркеров).</li>
-<li>Включить write barrier (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>) — теперь любая запись указателя будет уведомлять GC.</li>
-<li>Установить флаг <code>worldStopped</code> и подготовить стеки горутин к сканированию (корни).</li>
+<li><strong>Сброс битовых карт:</strong> Инициализация и обнуление рабочих битовых карт <code>gcBits</code> для всех спанов в аренах кучи.</li>
+<li><strong>Активация Write Barrier:</strong> Рантайм переводит глобальную переменную <code>runtime.writeBarrier.enabled</code> в состояние <code>true</code>. С этого микросекундного момента любая операция модификации указателя в пользовательском коде начинает регистрироваться барьером записи (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>).</li>
+<li><strong>Фиксация корней:</strong> Устанавливается состояние сборщика, подготавливаются дескрипторы корневых указателей (глобальные переменные BSS/Data и стеки горутин).</li>
+<li>Устанавливается флаг <code>worldStopped</code> и переключается фаза рантайма в <code>_GCmark</code>.</li>
 </ul>
-<p>Длительность mark setup зависит от:<br />
-- Размера кучи (количества спанов, для которых нужно сбросить биты).<br />
-- Количества горутин (у каждой нужно сохранить стек как корень).<br />
-- Количества P (нужно синхронизировать остановку).</p>
-<p>Типичная длительность: от единиц до сотен микросекунд.</p>
+<p>Длительность фазы Mark setup зависит от:<br />
+- Объёма виртуальной памяти кучи и количества спанов (необходимость сброса структур).<br />
+- Общего количества активных горутин в системе (подготовка метаданных стеков).<br />
+- Количества логических процессоров <code>P</code> (<code>GOMAXPROCS</code>): чем больше ядер, тем больше времени требуется на взаимную синхронизацию остановки и сброс локальных кэшей аллокатора <code>mcache</code>.</p>
+<p>В хорошо настроенном сервисе время Mark setup составляет от <strong>5 до 30 микросекунд</strong>.</p>
+<hr />
 <h2 id="mark-termination-stw-finalizatsiya-markirovki">Mark termination STW: финализация маркировки</h2>
 
-<p>Вторая пауза — <strong>mark termination</strong> — наступает, когда конкурентный маркинг считает, что серых объектов не осталось, но требуется глобальная проверка. Задачи:</p>
-<ul>
-<li>Убедиться, что очереди маркеров пусты (drain all work queues).</li>
-<li>Обработать оставшиеся буферы write barrier (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>) — те указатели, которые были записаны мутатором в последние мгновения.</li>
-<li>Выключить write barrier.</li>
-<li>Вычислить статистику (размер живых объектов, цель для следующего GC).</li>
-<li>Подготовиться к sweep-фазе (освобождению мусора).</li>
-</ul>
-<p>Mark termination обычно дороже setup, так как требует опорожнения всех очередей. Длительность также измеряется микросекундами, но может возрастать при большом количестве указателей, накопленных в буфере барьеров.</p>
+<p>Вторая фаза глобальной остановки наступает тогда, когда конкурентные воркеры рантайма докладывают, что серое множество пусто: видимые корни и связанные объекты просканированы. Однако из-за того, что мутатор работал параллельно, в системе остаются «хвосты». </p>
+<p>Критические задачи Mark termination:<br />
+- <strong>Drain work queues:</strong> Окончательное вычерпывание и обработка локальных очередей маркеров всех процессоров <code>P</code>.<br />
+- <strong>Flush write barrier buffers:</strong> Опорожнение буферов барьера записи (<code>wbBuf</code>) каждого процессора. Если горутина в последнюю наносекунду перед остановкой переставила указатель, этот указатель лежит в буфере ядра — сборщик извлекает его и докрашивает оставшиеся белые объекты (<a href="5-write-barriers.html" class="wikilink">5. Write barriers</a>).<br />
+- <strong>Деактивация Write Barrier:</strong> Перевод флага барьера записи обратно в <code>false</code>. С этого момента мутатор больше не платит штраф накладных расходов за запись указателей.<br />
+- <strong>Расчёт метрик и следующего триггера:</strong> Анализ фактического объёма живой памяти (survived heap), обновление коэффициента pacing и вычисление следующего порога срабатывания GC (с учётом <code>GOGC</code> и <code>GOMEMLIMIT</code>).<br />
+- Перевод фазы рантайма в <code>_GCmarktermination</code>, а затем в <code>_GCoff</code>. Подготовка арены к ленивой фазе sweep.</p>
+<p>Mark termination почти всегда длится чуть дольше Mark setup, поскольку требует синхронного опорожнения всех буферов барьеров. Типичная продолжительность: от <strong>15 до 80 микросекунд</strong>.</p>
+<hr />
 <h2 id="faktory-vliyayushchie-na-prodolzhitelnost-stw">Факторы, влияющие на продолжительность STW</h2>
 
+<p>Если архитектура приложения спроектирована без учёта Mechanical Sympathy, длительность пауз может деградировать на порядки. Главные факторы риска:</p>
 <ol>
-<li><strong>Размер кучи.</strong> Больше спанов → дольше сброс бит в setup и сканирование метаданных в termination.</li>
-<li><strong>Количество горутин.</strong> Каждая горутина — это стек, который нужно просканировать как корень. Стеки растут при глубоких рекурсиях и крупных фреймах, увеличивая время STW.</li>
-<li><strong>Количество указателей в объектах.</strong> Чем больше ссылочная структура, тем больше работы у write barrier, и тем объёмнее буферы для обработки в termination.</li>
-<li><strong>Настройка <code>GOMAXPROCS</code>.</strong> Большее число P может ускорить параллельную часть STW (некоторые вещи делаются конкурентно даже в STW), но увеличивает время на синхронизацию остановки и старта.</li>
-<li><strong>Системные вызовы.</strong> Горутины, застрявшие в долгом syscall без safe point, задерживают остановку, пока рантайм не вытащит их сигналом.</li>
-<li><strong>Особенности платформы и ОС:</strong> прерывания, планировщик ОС, частота таймера.</li>
+<li><strong>Размер кучи и количество спанов:</strong> Чем больше гигабайт занимает куча, тем больше служебных структур метаданных приходится обнулять и синхронизировать.</li>
+<li><strong>Количество горутин:</strong> Каждая созданная горутина обладает собственным стеком, который в момент остановки должен быть зарегистрирован рантаймом. Миллион спящих горутин в микросервисе — прямой путь к STW-паузам в десятки миллисекунд.</li>
+<li><strong>Количество указателей в структурах данных:</strong> Чем плотнее граф ссылок, тем больше работы приходится выполнять write barrier и тем больше накопленных указателей приходится сбрасывать в Mark termination.</li>
+<li><strong>Конфигурация <code>GOMAXPROCS</code>:</strong> На многоядерных машинах (128–256 vCPU) время достижения фазы <code>_Pgcstop</code> растёт: рантайму требуется скоординировать остановку 256 аппаратных потоков, что увеличивает время ожидания (Stop-The-World Latency = время остановки последнего <code>P</code> + полезная работа).</li>
+<li><strong>Системные вызовы ядра ОС:</strong> Потоки, заблокированные в операциях дискового I/O или сетевых вызовах ядра, отключаются от своих <code>P</code>. Если поток вовремя не отдал процессор, сборщик тратит драгоценное время на ожидание и перехват контекста.</li>
+<li><strong>Особенности ОС и виртуализации:</strong> Троттлинг процессорного времени со стороны Linux cgroups (CPU Quota), кража процессорных тактов гипервизором (Steal Time в облаках AWS/GCP) и планировщик ОС могут искусственно затягивать пробуждение потоков после STW.</li>
 </ol>
+<hr />
 <h2 id="izmerenie-stw-metriki-i-instrumenty">Измерение STW: метрики и инструменты</h2>
 
+<p>Профессиональный инженер никогда не гадает о длительности пауз — он оперирует инструментальными данными с точностью до наносекунды.</p>
 <h3 id="godebuggctrace1">GODEBUG=gctrace=1</h3>
 
-<p>Каждый цикл GC выводит строку:</p>
+<p>Самый доступный и легковесный способ увидеть пульс сборщика мусора в реальном времени — запуск приложения с переменной окружения <code>GODEBUG=gctrace=1</code>:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">GODEBUG=gctrace=1 ./my-service
+</code></pre>
+</div>
+
+<p>Каждый цикл GC выводит в <code>stderr</code> компактную строку телеметрии:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">gc 1 @0.001s 0%: 0.015+0.13+0.007 ms clock, 0.12+0.10/0.13/0.05+0.05 ms cpu, 4-&gt;4-&gt;2 MB, 5 MB goal, 0 MB stacks, 0 MB globals, 16 P
+</code></pre>
+</div>
+
+<p>Расшифровка временных интервалов первой группы (<code>clock</code> — астрономическое время по настенным часам):<br />
+- <code>0.015</code> (или 0.015 ms) — <strong>STW Mark setup</strong> (15 микросекунд полной остановки мира).<br />
+- <code>0.13</code> (или 0.13 ms) — <strong>Конкурентная фаза маркировки</strong> (время, пока шёл mark параллельно с работой приложения).<br />
+- <code>0.007</code> (или 0.007 ms) — <strong>STW Mark termination</strong> (7 микросекунд финальной остановки мира).</p>
+<p>Реальные паузы Stop The World для приложения — это сумма первого и третьего чисел: <code>0.015 + 0.007 = 0.022 ms</code> (22 микросекунды). Вторая группа (<code>cpu</code>: <code>0.12+0.10/0.13/0.05+0.05 ms cpu</code>) отражает процессорное время, суммированное по всем ядрам (включая выделенные воркеры, assist и idle-потоки).</p>
+<h3 id="execution-tracer">execution tracer</h3>
+
+<p>Утилита <code>go tool trace</code> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>) — абсолютный золотой стандарт для микрохирургического анализа пауз. Запустив трассировку выполнения, вы увидите полную временную шкалу каждого процессорного ядра:</p>
+
+<div class="code-block" data-lang="bash">
+  <div class="code-header">
+    <span class="code-lang-tag">Bash</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-bash"><code class="language-bash">go test -trace=trace.out
+go tool trace trace.out
+</code></pre>
+</div>
+
+<p>В интерактивном веб-интерфейсе фазы STW наглядно визуализируются как монолитные вертикальные столбцы, в которых приостанавливаются все дорожки пользовательских горутин, а системные полосы рантайма переходят в режим <code>GC Mark Termination</code> или <code>GC Mark Setup</code>. Трейсер позволяет моментально определить, какой именно <code>P</code> дольше всех задерживал наступление STW и почему.</p>
+<h3 id="runtime-readmemstats">runtime.ReadMemStats</h3>
+
+<p>Для мониторинга здоровья приложения в production без накладных расходов трассировки используется структура <code>runtime.MemStats</code>:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;fmt&quot;
+    &quot;runtime&quot;
+    &quot;time&quot;
+)
+
+func main() {
+    var m runtime.MemStats
+    runtime.ReadMemStats(&amp;m)
+
+    // PauseNs — циклический буфер на 256 элементов (в наносекундах)
+    // PauseEnd — временные метки Unix epoch (в наносекундах)
+    if m.NumGC &gt; 0 {
+        lastPauseIdx := (m.NumGC - 1) % 256
+        lastPauseNs := m.PauseNs[lastPauseIdx]
+        lastPauseEnd := time.Unix(0, int64(m.PauseEnd[lastPauseIdx]))
+
+        fmt.Printf(&quot;Количество сборок: %d\n&quot;, m.NumGC)
+        fmt.Printf(&quot;Последняя пауза STW: %v (%s)\n&quot;, 
+            time.Duration(lastPauseNs), lastPauseEnd.Format(time.RFC3339Nano))
+    }
+}
+</code></pre>
+</div>
+
+<p>Поля <code>MemStats.PauseNs</code> и <code>PauseEnd</code> экспортируются через Prometheus/OpenTelemetry для построения графиков и дашбордов Grafana (<a href="../10-highload/8-observability-i-performance.html" class="wikilink">8. Observability и performance</a>).</p>
+<h3 id="pprof">pprof</h3>
+
+<p>Эндпоинт <code>/debug/pprof/trace?seconds=5</code> пакета <code>net/http/pprof</code> даёт возможность снять живую трассу задержек прямо с боевого продакшн-сервера без перезапуска процесса.</p>
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Как программно в работающем Go-сервисе узнать точную длительность последней STW-паузы без остановки процесса и без использования pprof-файлов?<br />
+<strong>Ответ:</strong> Вызвать функцию <code>runtime.ReadMemStats(&amp;m)</code> и извлечь значение из циклического буфера задержек: <code>m.PauseNs[(m.NumGC-1)%256]</code>. Значение возвращается в наносекундах (<code>time.Duration(lastPauseNs)</code>).</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="vliyanie-stw-na-proizvoditelnost">Влияние STW на производительность</h2>
+
+<p>Хотя 50 микросекунд кажутся незаметным мгновением на фоне сетевого round-trip time, их кумулятивный эффект на высоконагруженные системы носит взрывной характер:</p>
+<ul>
+<li><strong>Деградация хвостовых квантилей (Tail Latency):</strong> Запрос, попавший в момент наступления STW, принудительно задерживается на время паузы. Если сборщик мусора запускается 100 раз в секунду, десятки тысяч сетевых пакетов неизбежно ловят эту задержку, взвинчивая метрики p99 и p99.9 (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</li>
+<li><strong>Каскадные задержки в распределённых микросервисах:</strong> В цепочке вызовов $A \to B \to C \to D$ кратковременная пауза сервиса $B$ приводит к переполнению очередей сокетов в сервисе $A$, росту длины очереди задач и каскадному росту латентности всей платформы.</li>
+<li><strong>Ложные срабатывания таймаутов (Heartbeat Drops):</strong> В кластерных распределённых системах (Raft, etcd, Consul, Apache Kafka) узлы обмениваются периодическими ping/heartbeat сообщениями. Аномально затянувшаяся STW-пауза (например, на 500 мс из-за сканирования огромной 100 ГБ кучи) может привести к тому, что лидер кластера будет признан упавшим, спровоцировав пагубный процесс перевыборов лидера (Split-Brain / Leader Re-election).</li>
+<li><strong>Потеря пропускной способности (Throughput Penalty):</strong> На время STW полезная работа приложения полностью замирает. В сервисах с агрессивным созданием мусора рантайм может тратить до 5–10% всего астрономического времени на синхронизацию пауз.</li>
+</ul>
+<hr />
+<h2 id="kak-umenshit-stw-pauzy">Как уменьшить STW-паузы</h2>
+
+<p>Инженерная борьба со сверхнормативными STW-паузами всегда строится на снижении объёма метаданных, сканируемых рантаймом:</p>
+<ol>
+<li><strong>Снижение числа аллокаций и живых объектов:</strong> Чем меньше блоков памяти выделено в куче, тем быстрее рантайм сбрасывает битовые карты в Mark setup и тем меньше объектов чернеет в Mark termination. Применяйте пулы объектов <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>, предвыделение капасити <a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a> и техники ухода от кучи <a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>.</li>
+<li><strong>Контроль пула горутин:</strong> Избегайте бесконтрольного порождения миллионов горутин по принципу «одна горутина на каждое мелкое событие». Используйте пулы фиксированного размера (Worker Pools). Меньше стеков — быстрее фаза синхронизации safe points.</li>
+<li><strong>Устранение глубоких стеков и гигантских фреймов:</strong> Рекурсивные алгоритмы раздувают стеки горутин до мегабайтных размеров. Заменяйте рекурсию на итеративные циклы с плоскими буферами.</li>
+<li><strong>Грамотная калибровка <code>GOGC</code> и <code>GOMEMLIMIT</code>:</strong> Увеличение коэффициента <code>GOGC</code> позволяет GC срабатывать реже, снижая суммарную частоту STW-событий. А установка порога <code>GOMEMLIMIT</code> предотвращает разрастание кучи вблизи лимитов контейнера Linux (<a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>, <a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>).</li>
+<li><strong>Устранение лишних указателей (Pointer-free Structs):</strong> Чем меньше указателей содержат структуры данных, тем меньше работы для <code>gcWriteBarrier</code> и тем быстрее завершается опорожнение очередей в Mark termination. Применяйте встраивание по значению (value-embedding) и компактные бинарные форматы (<a href="../09-prakticheskie-optimizatsii/6-cache-friendly-struktury.html" class="wikilink">6. Cache friendly структуры</a>).</li>
+</ol>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Миф: «Конкурентный GC в Go полностью лишён пауз Stop-the-World».</strong><br />
+Это распространённое заблуждение маркетологов и начинающих разработчиков. Go GC является конкурентным исключительно на фазах сканирования графа и очистки (Mark и Sweep). Точки входа и выхода (Mark setup и Mark termination) являются абсолютно строгими STW-паузами. Игнорирование их существования приводит к катастрофическим архитектурным ошибкам в latency-critical системах.</p>
+  </div>
+</div>
+
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Зависание в Unsafe-коде, CGO или плотных циклах ядра.</strong><br />
+Если горутина вызывает длительную блокирующую функцию на языке Си через cgo или выполняет низкоуровневый платформенный ассемблерный код, рантайм не может безопасно внедрить туда safe point. Сборщик мусора отправляет сигналы прерывания, но если код не возвращает управление в рантайм Go, фаза STW будет висеть, блокируя все остальные потоки сервиса!</p>
+  </div>
+</div>
+
+<hr />
+<h2 id="mechanical-sympathy-ostanovka-i-protsessor">Mechanical Sympathy: остановка и процессор</h2>
+
+<p>С точки зрения кремниевой архитектуры CPU, фаза Stop The World наносит тяжелейший удар по микроархитектурному конвейеру процессора:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2294,98 +2465,31 @@ Resume --&gt; Normal[&quot;Нормальное выполнение&quot;]
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text">gc 1 @0.001s 0%: 0.015+0.13+0.007 ms clock, 0.12+0.10/0.13/0.05+0.05 ms cpu, ...
+  <pre class="language-text"><code class="language-text">[Инструкции горутины] --&gt; [STW Signal / Safe Point] --&gt; [Сброс конвейера (Pipeline Flush)]
+                                                                  |
+[Вымывание L1i / L1d] &lt;-- [Инструкции сборщика GC] &lt;--------------+
+         |
+[Возобновление горутины] --&gt; [Cold Cache Misses (~200 тактов)] --&gt; [Прогрев кэша и BTB]
 </code></pre>
 </div>
 
-<ul>
-<li><code>0.015</code> — STW mark setup (clock time, ms).</li>
-<li><code>0.13</code> — конкурентный mark (clock time, wall clock — время, пока шёл mark, но не STW).</li>
-<li><code>0.007</code> — STW mark termination (clock time, ms).</li>
-</ul>
-<p>То есть паузы — это первое и третье числа. Сумма типично &lt; 100 микросекунд для хорошо настроенного приложения.</p>
-<h3 id="execution-tracer">execution tracer</h3>
-
-<p><code>go tool trace</code> (<a href="../08-runtime-i-instrumenty/3-execution-tracer.html" class="wikilink">3. execution tracer</a>) показывает временную диаграмму, где STW-участки выделены красным. Можно увидеть, в какой момент произошла пауза и как долго она длилась.</p>
-<h3 id="runtime-readmemstats">runtime.ReadMemStats</h3>
-
-<p><code>MemStats.PauseNs</code> — циклический буфер последних пауз (последние 256 циклов). <code>PauseEnd</code> — временные метки окончания пауз. Это можно экспортировать в Prometheus для мониторинга (см. <a href="../10-highload/8-observability-i-performance.html" class="wikilink">8. Observability и performance</a>).</p>
-<h3 id="pprof">pprof</h3>
-
-<p>Эндпоинт <code>/debug/pprof/trace?seconds=5</code> позволяет снять трассу, содержащую GC-события, для последующего анализа.</p>
-<div class="callout callout-interview">
-  <div class="callout-header">
-    <span class="callout-icon">🎯</span>
-    <span class="callout-title">Собеседование</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как узнать длительность последней STW-паузы в работающем Go-приложении без остановки?<br />
-<strong>Ответ:</strong> Использовать <code>runtime.ReadMemStats(&amp;m)</code> и посмотреть <code>m.PauseNs[(m.NumGC-1)%256]</code>. Это покажет последнюю паузу в наносекундах.</p>
-  </div>
-</div>
-
-<h2 id="vliyanie-stw-na-proizvoditelnost">Влияние STW на производительность</h2>
-
-<p>Микросекундные паузы могут казаться незначительными, но их эффект накапливается:</p>
-<ul>
-<li><strong>Прямое увеличение latency.</strong> Все запросы, обрабатываемые в момент STW, задерживаются на длительность паузы. Для p50 это незаметно, но p99 чувствует каждую паузу.</li>
-<li><strong>Каскадный эффект в цепочках вызовов.</strong> Если сервис A ждёт ответа от B, который в момент STW замер, общая задержка растёт (<a href="../01-fundament/7-tail-latency-i-pochemu-ona-vazhna.html" class="wikilink">7. Tail latency и почему она важна</a>).</li>
-<li><strong>Пропуск heartbeats.</strong> Системы координации (etcd, consul) могут счесть узел мёртвым при паузе &gt; нескольких миллисекунд.</li>
-<li><strong>Снижение throughput.</strong> Пока мир остановлен, ни один запрос не обрабатывается. Частые паузы (при агрессивном GC) снижают общую пропускную способность.</li>
-</ul>
-<p>Современный Go GC нацелен на паузы &lt; 100 мкс для большинства приложений. Однако при кучах &gt; 100 ГБ и миллионах горутин паузы могут превышать 1 мс, что требует ручного тюнинга.</p>
-<h2 id="kak-umenshit-stw-pauzy">Как уменьшить STW-паузы</h2>
-
-<ol>
-<li><strong>Уменьшить размер кучи и количество живых объектов.</strong> Меньше данных → быстрее mark termination. Достигается через <a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>, <a href="../09-prakticheskie-optimizatsii/4-predvydelenie-pamyati.html" class="wikilink">4. Предвыделение памяти</a>.</li>
-<li><strong>Снизить количество горутин.</strong> Каждая горутина добавляет стек для сканирования. Паттерны с фиксированным пулом воркеров вместо неограниченных горутин помогают.</li>
-<li><strong>Избегать глубоких стеков.</strong> Рекурсии и большие фреймы увеличивают стоимость сканирования стека. Переписывайте на итеративные алгоритмы.</li>
-<li><strong>Тюнинг <code>GOGC</code> и <code>GOMEMLIMIT</code>.</strong> Повышение <code>GOGC</code> даёт реже паузы, но кучу больше. <code>GOMEMLIMIT</code> предотвращает неконтролируемый рост, делая паузы более предсказуемыми (<a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a>, <a href="8-gomemlimit.html" class="wikilink">8. GOMEMLIMIT</a>).</li>
-<li><strong>Уменьшать ссылочность структур.</strong> Меньше указателей → меньше работы write barrier и меньше буферов в termination. Value-embedding вместо указателей в горячих структурах (<a href="../09-prakticheskie-optimizatsii/6-cache-friendly-struktury.html" class="wikilink">6. Cache friendly структуры</a>).</li>
-</ol>
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>«Конкурентный GC = нет пауз».</strong><br />
-Маркетинговый миф. Конкурентный GC — это GC с <em>конкурентной mark-фазой</em>, но STW-паузы присутствуют всегда. Их длительность может быть пренебрежимо мала, но игнорировать их нельзя.</p>
-  </div>
-</div>
-
-<div class="callout callout-warning">
-  <div class="callout-header">
-    <span class="callout-icon">⚠️</span>
-    <span class="callout-title">Ловушка / Gotcha</span>
-  </div>
-  <div class="callout-body">
-    <p><strong>Блокировка в unsafe-коде или CGO.</strong><br />
-Горутина, выполняющая код без safe points (например, C-функцию без co-operative многозадачности), может задержать STW. Рантайм посылает сигнал для прерывания, но это добавляет задержку.</p>
-  </div>
-</div>
-
-<h2 id="mechanical-sympathy-ostanovka-i-protsessor">Mechanical Sympathy: остановка и процессор</h2>
-
-<p>STW не только задерживает логику, но и разрушает микроархитектурное состояние. После возобновления мира:</p>
-<ul>
-<li>Кэш-память частично вымыта работой GC (маркировка, сброс бит).</li>
-<li>TLB мог быть частично сброшен (если GC затрагивал много страниц).</li>
-<li>Предсказатель ветвлений сброшен (новый контекст исполнения после паузы).</li>
-<li>Планировщик ОС мог мигрировать горутины на другие ядра.</li>
-</ul>
-<p>Всё это приводит к временному снижению производительности сразу после STW, пока кэши прогреваются заново. Это ещё одна причина минимизировать как длительность, так и частоту STW-пауз.</p>
+<p>Когда процессорные ядра принудительно останавливают потоки мутатора:<br />
+- <strong>Сброс конвейера инструкций и BTB:</strong> Аппаратный предсказатель ветвлений (Branch Target Buffer) и конвейер исполнения инструкций сбрасываются.<br />
+- <strong>Опустошение L1-кэша инструкций (L1i):</strong> Ядра переключаются на исполнение служебного кода рантайма (<code>stopTheWorldWithSema</code>, <code>futex</code>), полностью вытесняя из L1i кэша циклы вашего бизнес-кода.<br />
+- <strong>Инвалидация линий кэша данных (L1d / L2):</strong> Сборщик мусора производит запись в системные битовые карты и служебные массивы спанов. Межъядерный протокол когерентности кэшей (MESI) вынужден инвалидировать сотни кэш-линий на всех ядрах.<br />
+- <strong>Миграция потоков ОС:</strong> После пробуждения планировщик операционной системы Linux может переместить поток <code>M</code> на совершенно другое физическое ядро (или другой сокет NUMA), где его локальный кэш полностью пуст.</p>
+<p>В результате сервис после завершения 50-микросекундной паузы STW может ещё 1–2 миллисекунды испытывать «просадку» производительности: процессору приходится заново прогревать кэши и восстанавливать аппаратную предвыборку данных (Hardware Prefetching).</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>STW</strong> — обязательные точки глобальной остановки в Go GC: mark setup и mark termination, обеспечивающие корректную инициализацию и финализацию конкурентной маркировки.</li>
-<li>Остановка осуществляется через safe points в планировщике и занимает от единиц до сотен микросекунд.</li>
-<li>Длительность зависит от размера кучи, числа горутин, глубины их стеков и объёма указателей.</li>
-<li>Паузы измеряются через <code>GODEBUG=gctrace=1</code>, execution tracer и <code>runtime.ReadMemStats</code>.</li>
-<li>Уменьшение STW — это уменьшение аллокаций, числа горутин и ссылочности, а также грамотный тюнинг <code>GOGC</code>/<code>GOMEMLIMIT</code>.</li>
-<li>STW влияет на p99 latency и общую пропускную способность, а также на микроархитектурное состояние процессора.</li>
+<li><strong>STW (Stop The World)</strong> — обязательные точки глобальной синхронизации в Go GC (фазы Mark setup и Mark termination), гарантирующие целостность структур сборщика и корректное переключение write barrier.</li>
+<li>Остановка потоков осуществляется координацией планировщика через safe points и асинхронные сигналы прерывания <code>SIGURG</code>.</li>
+<li>Длительность STW напрямую зависит от размера кучи, общего числа горутин, глубины их стеков и насыщенности структур указателями.</li>
+<li>Реальные задержки легко контролируются через <code>GODEBUG=gctrace=1</code>, микросекундную телеметрию <code>go tool trace</code> и метрики <code>runtime.MemStats.PauseNs</code>.</li>
+<li>Ключ к подавлению STW-пауз — Mechanical Sympathy: плоские бездатчиковые структуры памяти, минимизация аллокаций, использование пулов объектов и точная настройка параметров <code>GOGC</code> и <code>GOMEMLIMIT</code>.</li>
 </ul>
-<p>Теперь, понимая моменты остановки, мы готовы разобрать, как именно GC выполняет свою работу, не мешая приложению, и какие механизмы обеспечивают конкурентность: <a href="4-concurrent-gc.html" class="wikilink">4. Concurrent GC</a>.</p>
+<p>Теперь, разобравшись с моментами глобальной паузы, мы переходим к исследованию того, как рантайм умудряется выполнять основную массу работы параллельно с вашей программой: <a href="4-concurrent-gc.html" class="wikilink">4. Concurrent GC</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">8. GOMEMLIMIT</h1>
@@ -2178,18 +2178,21 @@
           <div class="article-markdown">
             <h2 id="gomemlimit-myagkiy-limit-dlya-zhyostkikh-ogranicheniy">GOMEMLIMIT: мягкий лимит для жёстких ограничений</h2>
 
-<p>В <a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a> мы освоили управление частотой GC через относительный целевой размер кучи. Однако в эпоху контейнеров и оркестраторов одного GOGC недостаточно. Процессу в контейнере выделен жёсткий лимит памяти, и если куча превысит его, последует OOMKill. GOGC лишь откладывает следующий цикл GC, но не гарантирует, что пиковое потребление не выйдет за границу. Для решения этой проблемы в Go 1.19 появился <strong>GOMEMLIMIT</strong> — мягкий лимит, который заставляет GC активизироваться при приближении к заданному потолку.</p>
-<p>GOMEMLIMIT не заменяет GOGC, а дополняет его. Вместе они образуют полную систему управления памятью, позволяющую балансировать между использованием CPU, пиковым размером кучи и риском OOM. Senior Go-инженер обязан уметь выставлять этот лимит, понимать его механику и интерпретировать метрики, чтобы контейнеризированные сервисы работали стабильно и предсказуемо.</p>
+<p>В эпоху физических серверов (Bare-metal) программисты привыкли считать оперативную память бескрайней равниной: если серверу установлено 128 ГБ RAM, кратковременный всплеск аллокаций до 30 ГБ никого не пугал. Но облачная революция и контейнеризация загнали бэкенд в тесные железобетонные боксы Kubernetes и cgroups. В контейнере с лимитом <code>512Mi</code> лишний выделенный мегабайт карается безжалостным расстрелом: ядро Linux посылает сигнал <code>SIGKILL</code> через механизм OOM Killer (Out Of Memory), оставляя в логах лишь сухую запись <code>OOMKilled exit code 137</code>.</p>
+<p>В <a href="7-gogc-i-tuning.html" class="wikilink">7. GOGC и tuning</a> мы освоили управление ритмом сборщика через относительный коэффициент <code>GOGC</code>. Однако в контейнерах одного <code>GOGC</code> трагически недостаточно. Поскольку <code>GOGC</code> оперирует исключительно процентами от размера выжившей кучи, внезапное удвоение живых данных приводит к пропорциональному взлёту целевого потолка, пробивающему лимиты контейнера. Исторически разработчикам приходилось прибегать к отчаянным костылям — так называемому паттерну «балластной памяти» (Memory Ballast).</p>
+<p>Всё изменилось с выходом Go 1.19 (и окончательной стабилизацией в Go 1.21), когда Майкл Нисвандер (Michael Knyszek) из команды Go реализовал фундаментальный механизм — <strong>GOMEMLIMIT</strong>. Это мягкий лимит памяти, который заставляет рантайм динамически форсировать сборку мусора при приближении к аппаратному потолку контейнера.</p>
+<p>GOMEMLIMIT не заменяет GOGC, а образует с ним идеальный гармоничный тандем. Вместе они формируют комплексную двухконтурную систему управления динамической памятью: <code>GOGC</code> задаёт комфортный ритм в штатных условиях, а <code>GOMEMLIMIT</code> выступает надёжным кремниевым демпфером, защищающим процесс от аварийной гибели.</p>
+<hr />
 <h2 id="chto-takoe-gomemlimit">Что такое GOMEMLIMIT</h2>
 
-<p><strong>GOMEMLIMIT</strong> — это переменная, задающая мягкий лимит на общий объём памяти, занятой Go-кучей. Устанавливается через окружение <code>GOMEMLIMIT=&lt;bytes&gt;</code> или в коде через <code>debug.SetMemoryLimit(limit int64)</code>. Значение указывается в байтах; можно использовать суффиксы KiB, MiB, GiB (например, <code>GOMEMLIMIT=200MiB</code>).</p>
-<p>В отличие от cgroups-лимита, который является жёстким и при превышении вызывает OOMKill, GOMEMLIMIT — это <strong>рекомендательный порог</strong> для рантайма. При приближении к нему GC:</p>
-<ul>
-<li>Чаще запускает циклы сборки, игнорируя обычную цель <code>GOGC</code>.</li>
-<li>Усиливает mark assist, чтобы сдержать рост кучи.</li>
-<li>Может временно ограничить темп аллокаций (backpressure).</li>
-</ul>
-<p>Таким образом, GOMEMLIMIT позволяет «мягко» удерживать кучу в пределах, не доводя до аварийного завершения.</p>
+<p><strong>GOMEMLIMIT</strong> — это системный параметр рантайма Go, задающий целевой абсолютный порог совокупного потребления памяти процессом. Он конфигурируется через переменную окружения <code>GOMEMLIMIT=&lt;bytes&gt;</code> или программно в коде через вызов функции <code>debug.SetMemoryLimit(limit int64)</code>. Значение задаётся в байтах либо с использованием канонических суффиксов <code>KiB</code>, <code>MiB</code>, <code>GiB</code> (например, <code>GOMEMLIMIT=200MiB</code> или <code>GOMEMLIMIT=400MiB</code>).</p>
+<p>Принципиальное отличие от лимита ядра Linux cgroups:<br />
+- Лимит cgroups — <strong>жёсткий (Hard Limit)</strong>: при его превышении ядро ОС немедленно уничтожает процесс без права на перехват сигнала.<br />
+- GOMEMLIMIT — <strong>мягкий целевой ориентир (Soft Limit)</strong> для встроенного планировщика памяти рантайма.</p>
+<p>При приближении совокупного объёма памяти к порогу GOMEMLIMIT сборщик мусора плавно меняет своё поведение:<br />
+1. <strong>Игнорирование GOGC:</strong> Рантайм перестаёт пассивно дожидаться планового удвоения кучи и форсированно запускает конкурентную маркировку раньше времени.<br />
+2. <strong>Усиление Mark Assist:</strong> Горутинам мутатора, активно создающим объекты, начисляется повышенный штраф, замедляющий генерацию мусора и помогающий сборщику.<br />
+3. <strong>Защита от зацикливания (Backpressure &amp; Throttle):</strong> Вспомогательные алгоритмы сдерживают аллокатор, плавно притормаживая рост кучи.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2204,53 +2207,66 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-App[&quot;Go-приложение&quot;] --&gt;|&quot;Аллокации&quot;| Heap[&quot;Куча&quot;]
-GC[&quot;GC&quot;] --&gt;|&quot;Освобождает&quot;| Heap
-Heap --&gt;|&quot;Размер&quot;| Check{&quot;Память &gt; GOMEMLIMIT?&quot;}
-Check -- &quot;Нет&quot; --&gt; Normal[&quot;GOGC управляет частотой GC&quot;]
-Check -- &quot;Приближается&quot; --&gt; Aggressive[&quot;Игнорировать GOGC&lt;br&gt;Чаще GC&lt;br&gt;Усилить mark assist&quot;]
+App[&quot;Go-приложение&lt;br&gt;(Горутины мутатора)&quot;] --&gt;|&quot;Аллокации в куче&quot;| Heap[&quot;Куча (Heap)&quot;]
+GC[&quot;Сборщик GC&quot;] --&gt;|&quot;Освобождает спаны&quot;| Heap
+Heap --&gt;|&quot;Текущий размер&quot;| Check{&quot;Память &gt; GOMEMLIMIT?&lt;br&gt;(или близка к порогу)&quot;}
+Check -- &quot;Нет&quot; --&gt; Normal[&quot;Нормальный режим:&lt;br&gt;GOGC управляет частотой GC&quot;]
+Check -- &quot;Приближается&quot; --&gt; Aggressive[&quot;Агрессивный режим:&lt;br&gt;Игнорировать GOGC&lt;br&gt;Чаще GC&lt;br&gt;Усилить mark assist&quot;]
 Aggressive --&gt; GC
+
+style App fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc
+style Heap fill:#0f172a,stroke:#6366f1,stroke-width:2px,color:#f8fafc
+style Aggressive fill:#f43f5e,stroke:#991b1b,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
+<hr />
 <h2 id="pochemu-odnogo-gogc-nedostatochno-v-konteynerakh">Почему одного GOGC недостаточно в контейнерах</h2>
 
-<p>GOGC формулирует цель относительно живых объектов. Если LiveHeap стабилен, куча тоже стабильна, и лимит не нужен. Но в реальном приложении LiveHeap может изменяться:</p>
-<ul>
-<li>На пике нагрузки создаётся больше объектов, LiveHeap растёт, соответственно растёт и HeapTarget, что может превысить лимит контейнера.</li>
-<li>После GC память не всегда возвращается ОС немедленно из-за <code>MADV_FREE</code> (<a href="../04-memory-profiling/7-fragmentation.html" class="wikilink">7. Fragmentation</a>), RSS может оставаться высоким, что опасно при жёстком лимите.</li>
-<li>Внешние факторы (cgo, mmap) могут потреблять память помимо кучи, и GOGC об этом не знает.</li>
-</ul>
-<p>GOMEMLIMIT решает эту проблему, устанавливая абсолютный потолок, на который ориентируется рантайм. Он не отменяет GOGC, но действует как предохранительный клапан: если куча приближается к лимиту, GC начинает работать усерднее, даже если по GOGC ещё рано.</p>
+<p>Чтобы оценить гениальность GOMEMLIMIT, полезно вспомнить, почему страдали контейнеризированные сервисы под управлением одного лишь <code>GOGC</code>:</p>
+<ol>
+<li><strong>Непредсказуемость всплесков нагрузки:</strong> Если базовый живой объём <code>LiveHeap</code> составляет 100 МБ, при <code>GOGC=100</code> цель равна 200 МБ. Но если сервис получил пиковый запрос и поднял в память массивный кэш до 250 МБ, сборщик нацелится на 500 МБ. Если лимит контейнера равен 400 МБ — процесс погибнет от OOMKill задолго до запуска следующего планового GC.</li>
+<li><strong>Ленивый возврат страниц в ОС (<code>MADV_FREE</code> vs <code>MADV_DONTNEED</code>):</strong> Рантайм Go не отдаёт освобождённую память ядру ОС каждую секунду (<a href="../04-memory-profiling/7-fragmentation.html" class="wikilink">7. Fragmentation</a>). Память может быть помечена как неиспользуемая в рантайме, но резидентный размер процесса (RSS) в метриках Linux cgroups остаётся высоким.</li>
+<li><strong>Память вне кучи (Non-heap Memory):</strong> <code>GOGC</code> следит исключительно за кучей Go. Он не учитывает память стеков горутин, структуры рантайма, сегменты кода бинарника и аллокации через cgo или системный вызов <code>mmap</code>.</li>
+</ol>
+<p>GOMEMLIMIT устраняет эту слепую зону: он вводит единый абсолютный потолок, гарантируя, что рантайм бросит все силы на сборку мусора до того, как контейнер пересечёт опасную черту.</p>
+<hr />
 <h2 id="kak-gomemlimit-vzaimodeystvuet-s-gogc">Как GOMEMLIMIT взаимодействует с GOGC</h2>
 
-<p>Логика управления GC с учётом обоих параметров (упрощённо) такова:</p>
+<p>В недрах рантайма за расчёт траектории сборки отвечает регулятор темпа — <strong>GC Pacer</strong> (<code>runtime/mgcpacer.go</code>).</p>
+<p>При наличии обоих параметров рантайм на каждом шаге выполняет двухконтурный расчёт:</p>
 <ol>
-<li>Рантайм непрерывно отслеживает <code>heap_marked</code> (объём живых объектов после последнего GC) и текущий размер кучи <code>heap_inuse</code>.</li>
-<li>Рассчитывается цель по GOGC: <code>goal_gc = heap_marked * (1 + GOGC/100)</code>.</li>
-<li>Рассчитывается цель по GOMEMLIMIT: если <code>GOMEMLIMIT</code> установлен, рантайм определяет <code>goal_mem = GOMEMLIMIT - non_heap_memory</code> (не-куча память, оценка).</li>
-<li>Если <code>goal_mem</code> меньше <code>goal_gc</code>, то GC запускается раньше — используется <code>goal_mem</code>.</li>
-<li>При приближении к GOMEMLIMIT также включается дополнительный <strong>throttle</strong> — даже между GC-циклами аллокации могут замедляться, если темп роста кучи слишком высок.</li>
+<li>Непрерывно отслеживается <code>heap_marked</code> (объём живых данных, переживших последний GC) и текущий размер занятой памяти <code>heap_inuse</code>.</li>
+<li>Вычисляется цель по относительному проценту (<code>goal_gc = heap_marked * (1 + GOGC/100)</code>):<br />
+   $$\text{goal_gc} = \text{heap_marked} \times \left(1 + \frac{\text{GOGC}}{100}\right)$$</li>
+<li>Вычисляется цель по абсолютному лимиту: рантайм оценивает накладные расходы структур вне кучи (<code>non_heap_memory</code>: стеки, спаны, арены, кэши) и определяет доступный коридор кучи (<code>goal_mem = GOMEMLIMIT - non_heap_memory</code>):<br />
+   $$\text{goal_mem} = \text{GOMEMLIMIT} - \text{non_heap_memory}$$</li>
+<li><strong>Принцип минимальной цели:</strong> Рантайм выбирает меньшее из двух значений:<br />
+   $$\text{Target} = \min(\text{goal_gc}, \text{goal_mem})$$<br />
+   Если <code>goal_mem</code> меньше <code>goal_gc</code>, рантайм принудительно стартует сборку раньше расписания GOGC.</li>
+<li><strong>Аппаратный ограничитель CPU (The 50% CPU Limiter):</strong><br />
+   Что произойдёт, если приложение аллоцирует память быстрее, чем физически способно освободить, или если <code>LiveHeap</code> превысил <code>GOMEMLIMIT</code>? В наивных сборщиках это вызвало бы бесконечный штопор (GC Thrashing) — процесс тратил бы 100% CPU на непрерывную сборку мусора, полностью парализуя сервис. В Go встроен предохранитель <code>gcCPULimiter</code>: сборщику мусора законодательно запрещено потреблять более <strong>50% суммарной мощности CPU</strong> в скользящем окне времени. Если памяти не хватает даже при 50% CPU — рантайм позволяет куче превысить GOMEMLIMIT и встретить честный OOM, сохраняя отзывчивость оставшихся ядер.</li>
 </ol>
-<p>Таким образом, <strong>GOMEMLIMIT имеет приоритет</strong>: когда памяти мало, GC игнорирует GOGC и учащает циклы. Когда памяти достаточно, действует обычная логика GOGC.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>В исходном коде <code>runtime/mgcpacer.go</code> функция <code>gcController.revise</code> пересчитывает цель для GC на основе <code>gcPercent</code> (GOGC) и <code>memoryLimit</code>. Если <code>memoryLimit</code> включён, вычисляется <code>heapGoalFromMemoryLimit</code>, и если он ниже обычного <code>heapGoal</code>, он становится новым целевым размером. Также есть механизм <code>gcCPULimiter</code>, который приостанавливает аллокации (через вспомогательные задержки), если GC не справляется даже при повышенной частоте.</p>
+    <p>В исходном коде <code>runtime/mgcpacer.go</code> процедура <code>gcController.revise</code> пересчитывает цели планировщика на основе параметров <code>gcPercent</code> (GOGC) и <code>memoryLimit</code>.<br />
+Функция вычисляет служебную величину <code>heapGoalFromMemoryLimit</code>. Если она оказывается строже стандартного <code>heapGoal</code>, именно она замещает расчётную цель в структурах рантайма. Параллельно механизм <code>gcCPULimiter</code> контролирует баланс процессорных тактов, предохраняя систему от паралича при дефиците памяти.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="kak-vybrat-znachenie-gomemlimit">Как выбрать значение GOMEMLIMIT</h2>
 
-<p>Самый распространённый сценарий — контейнер с лимитом памяти. Общая рекомендация:</p>
+<p>Золотое правило настройки GOMEMLIMIT для контейнеров Docker и Kubernetes:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
@@ -2260,27 +2276,26 @@ Aggressive --&gt; GC
 </code></pre>
 </div>
 
-<p>Почему запас? Потому что GOMEMLIMIT контролирует только Go-кучу. Помимо неё память потребляют:</p>
-<ul>
-<li>Стеки горутин (растут динамически).</li>
-<li>Код и данные, загруженные ОС (бинарник, библиотеки).</li>
-<li>Память, выделенная через cgo / mmap.</li>
-<li>Метаданные рантайма (структуры G, M, P, спаны, битовые карты GC).</li>
-<li>Нативный memory overhead ОС.</li>
-</ul>
-<p>Если задать <code>GOMEMLIMIT</code> равным лимиту контейнера, куча может занять почти весь лимит, а остальные компоненты выйдут за границу, и OOMKill случится несмотря на мягкий лимит.</p>
-<p>На практике для сервиса с лимитом 512 МБ можно установить <code>GOMEMLIMIT=400MiB</code>, оставляя 112 МБ на накладные расходы. Точный запас подбирается экспериментально по метрикам.</p>
+<p>Почему резерв в 10–20% жизненно необходим?<br />
+Потому что <code>GOMEMLIMIT</code> держит на контроле только структуры рантайма Go. За пределами его досягаемости находятся:<br />
+- <strong>Динамический рост стеков горутин:</strong> 10 000 глубоких стеков могут занять 50–100 МБ памяти.<br />
+- <strong>Образы бинарников и разделяемые библиотеки:</strong> Сегменты <code>.text</code> и <code>.data</code>, подгружаемые ядром ОС.<br />
+- <strong>Внешние аллокации через CGO и mmap:</strong> Любые буферы Си-библиотек или отображения файлов в память (RocksDB, libvips, compression libraries).<br />
+- <strong>Фрагментация страниц в аллокаторе tcmalloc/mcache</strong> и метаданные рантайма (дескрипторы горутин <code>G</code>, потоков <code>M</code>, процессоров <code>P</code>, спанов <code>mspan</code> и битовых карт <code>gcBits</code>).<br />
+- <strong>Служебный оверхед Linux ядра:</strong> Буферы сетевых сокетов TCP (sk_buff) и дескрипторы открытых файлов.</p>
+<p>Если назначить <code>GOMEMLIMIT</code> впритирку к лимиту контейнера (например, <code>GOMEMLIMIT=512MiB</code> при лимите <code>512Mi</code>), то при заполнении кучи до 510 МБ малейший сетевой пакет ядра вызовет неизбежный OOMKill!</p>
+<p>Для контейнера с лимитом <code>512Mi</code> идеальной отправной точкой является <code>GOMEMLIMIT=400MiB</code> (запас около 20%). Для крупного контейнера на <code>4Gi</code> достаточно оставить 10–15% запаса (<code>GOMEMLIMIT=3500MiB</code>).</p>
+<hr />
 <h2 id="metriki-i-monitoring-gomemlimit">Метрики и мониторинг GOMEMLIMIT</h2>
 
-<p>Рантайм предоставляет метрики в пакете <code>runtime/metrics</code> (и через Prometheus при использовании <code>client_golang</code>):</p>
+<p>Пакет <code>runtime/metrics</code> и стандартный экспортер Prometheus <code>client_golang</code> предоставляют полную прозрачность работы лимита:</p>
 <ul>
-<li><code>/gc/memory/limit:bytes</code> — значение GOMEMLIMIT, известное рантайму.</li>
-<li><code>/gc/memory/bytes:total-hwm</code> (High Water Mark) — максимальный размер кучи, достигнутый с начала работы (или с момента сброса).</li>
-<li><code>/memory/classes/heap/unused:bytes</code> — свободная память в куче, удерживаемая рантаймом.</li>
-<li><code>/memory/classes/heap/released:bytes</code> — память, возвращённая ОС.</li>
+<li><code>/gc/memory/limit:bytes</code> — текущее значение GOMEMLIMIT, зарегистрированное рантаймом.</li>
+<li><code>/gc/memory/bytes:total-hwm</code> (High Water Mark) — исторический пиковый максимум использования памяти с момента запуска приложения.</li>
+<li><code>/memory/classes/heap/unused:bytes</code> — свободная, но удерживаемая рантаймом память в выделенных спанах.</li>
+<li><code>/memory/classes/heap/released:bytes</code> — физическая память, возвращённая ядру операционной системы.</li>
 </ul>
-<p>Отслеживание <code>total-hwm</code> в сравнении с GOMEMLIMIT показывает, насколько близко сервис подходил к лимиту. Если High Water Mark регулярно приближается к лимиту, запас стоит увеличить, либо уменьшить аллокации.</p>
-<p>Также <code>runtime.ReadMemStats</code> возвращает <code>HeapSys</code> (общий размер кучи от ОС) и <code>HeapInuse</code> (используемая память). Разница <code>HeapSys - HeapInuse</code> — свободная, но не возвращённая память.</p>
+<p>В коде приложения базовую оценку состояния можно получить через <code>runtime.ReadMemStats</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2290,20 +2305,36 @@ Aggressive --&gt; GC
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">var m runtime.MemStats
-runtime.ReadMemStats(&amp;m)
-fmt.Printf(&quot;HeapInuse: %d MB, HeapSys: %d MB\n&quot;, m.HeapInuse&gt;&gt;20, m.HeapSys&gt;&gt;20)
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;fmt&quot;
+    &quot;runtime&quot;
+)
+
+func printHeapStatus() {
+    var m runtime.MemStats
+    runtime.ReadMemStats(&amp;m)
+
+    // HeapInuse — память в активных спанах
+    // HeapSys — виртуальная память, запрошенная рантаймом у ОС под кучу
+    fmt.Printf(&quot;HeapInuse: %d MB, HeapSys: %d MB\n&quot;, m.HeapInuse&gt;&gt;20, m.HeapSys&gt;&gt;20)
+}
 </code></pre>
 </div>
 
+<p>Разница <code>HeapSys - HeapInuse</code> демонстрирует объём зарезервированной, но пока не используемой памяти.</p>
+<hr />
 <h2 id="primer-nastroyka-gomemlimit-dlya-konteynera-s-256-mb">Пример: настройка GOMEMLIMIT для контейнера с 256 МБ</h2>
 
-<p>Дано: микросервис, упакованный в контейнер с лимитом 256 МБ. Стабильное потребление живых объектов — около 80 МБ. При GOGC=100 пиковая куча может достигать 160 МБ, но в моменты всплесков наблюдаются эпизодические OOMKill.</p>
-<p>Решение:</p>
+<p><strong>Дано:</strong> Микросервис работает в Kubernetes Pod с лимитом <code>resources.limits.memory: 256Mi</code>. Стабильный объём живых структур приложения составляет <code>LiveHeap = 80 МБ</code>.<br />
+<strong>Проблема:</strong> При стандартном <code>GOGC=100</code> куча пытается вырасти до $80 \times 2 = 160\text{ МБ}$. Во время пиковых всплесков аллокаций потребление стеков и накладных расходов выталкивает совокупный RSS за границу 256 МБ, порождая случайные падения по OOMKill.<br />
+<strong>Решение:</strong><br />
+Выставляем конфигурацию в манифесте Deployment:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Text</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
@@ -2314,11 +2345,32 @@ GOGC=100
 </code></pre>
 </div>
 
-<p>Запас 46 МБ оставлен на стеки, код и прочее. Рантайм теперь будет следить, чтобы куча не превысила 210 МБ. Если при всплеске аллокаций куча начнёт приближаться к этому значению, GC участится, и рост замедлится. В мониторинге показатель <code>/gc/memory/limit:bytes</code> = 210 МБ, High Water Mark будет плавать около 200 МБ, не достигая 256 МБ. OOMKill прекратились.</p>
+<p><strong>Результат:</strong><br />
+Резерв в 46 МБ гарантированно покрывает стеки и метаданные. Рантайм зорко следит за границей в 210 МБ. При всплеске аллокаций сборщик плавно учащает циклы, удерживая High Water Mark на уровне около 200 МБ. Падения по OOMKill полностью прекращаются.</p>
+<hr />
 <h2 id="primer-vysokiy-gogc-s-gomemlimit-dlya-ekonomii-cpu">Пример: высокий GOGC с GOMEMLIMIT для экономии CPU</h2>
 
-<p>Сервис на dedicated-сервере с 16 ГБ RAM. GOGC=400 для снижения частоты GC и экономии CPU. Но есть риск, что при росте LiveHeap до 2 ГБ куча может скакнуть до 10 ГБ и вызвать проблемы с соседними процессами.</p>
-<p>Устанавливаем <code>GOMEMLIMIT=12GiB</code>. Теперь GC будет редко срабатывать по GOGC, но если куча вдруг устремится к 12 ГБ, GOMEMLIMIT включит агрессивный режим и удержит её в пределах. Это даёт лучший баланс между производительностью и безопасностью.</p>
+<p><strong>Дано:</strong> Сервис развёрнут на выделенной ноде с 16 ГБ RAM.<br />
+<strong>Задача:</strong> Минимизировать накладные расходы CPU на сборку мусора, убрав частые паузы и всплески <code>mark assist</code>.<br />
+<strong>Решение:</strong><br />
+Устанавливаем агрессивно высокий процент <code>GOGC=400</code> в паре с защитным потолком:</p>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">Text</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text">GOGC=400
+GOMEMLIMIT=12GiB
+</code></pre>
+</div>
+
+<p><strong>Результат:</strong><br />
+В штатном режиме при стабильном <code>LiveHeap = 1.5 ГБ</code> сборщик мусора запускается предельно редко (куча свободно дышит до $1.5 \times 5 = 7.5\text{ ГБ}$), экономя колоссальное количество процессорных тактов. Если же в системе произойдёт аномальный всплеск данных, <code>GOMEMLIMIT=12GiB</code> перехватит инициативу и не позволит куче захватить всю память сервера, сохранив стабильность соседних сервисов. Это идеальный симбиоз производительности и отказоустойчивости.</p>
+<hr />
 <h2 id="potentsialnye-problemy-i-lovushki">Потенциальные проблемы и ловушки</h2>
 
 <div class="callout callout-warning">
@@ -2327,7 +2379,8 @@ GOGC=100
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>GOMEMLIMIT не замена оптимизации аллокаций.</strong> Если приложение генерирует огромное количество мусора, низкий лимит приведёт к чрезмерно частым GC, mark assist захватит всё процессорное время, latency деградирует вплоть до неработоспособности. GOMEMLIMIT — страховка, а не лекарство. Основной путь — снижение аллокаций (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</p>
+    <p><strong>GOMEMLIMIT — это не замена оптимизации аллокаций!</strong><br />
+Если бизнес-код генерирует терабайты бесполезного мусора в секунду, установка строгого GOMEMLIMIT не решит архитектурных проблем. Рантайм начнёт непрерывно запускать сборку мусора, <code>mark assist</code> заблокирует горутины мутатора, а сервис деградирует по пропускной способности. Главным средством масштабирования остаётся снижение аллокаций (<a href="../09-prakticheskie-optimizatsii/1-umenshenie-allokatsiy.html" class="wikilink">1. Уменьшение аллокаций</a>, <a href="../09-prakticheskie-optimizatsii/2-sync-pool.html" class="wikilink">2. sync Pool</a>).</p>
   </div>
 </div>
 
@@ -2337,7 +2390,8 @@ GOGC=100
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>Слишком низкий лимит вызывает GC-шторм.</strong> При очень малом GOMEMLIMIT куча практически не может расти, GC запускается почти непрерывно, throughput катастрофически падает. Всегда оставляйте достаточно места для рабочего набора (минимум 1.2–1.5 × LiveHeap).</p>
+    <p><strong>Опасность заниженного лимита (GC-шторм).</strong><br />
+Если установить GOMEMLIMIT слишком близко к объёму живых данных <code>LiveHeap</code> (например, лимит 110 МБ при живых 100 МБ), сборщик мусора будет крутиться непрерывно, отнимая предельные 50% CPU. Всегда оставляйте рабочее пространство: лимит должен составлять минимум $1.3 - 1.5 \times \text{LiveHeap}$.</p>
   </div>
 </div>
 
@@ -2347,7 +2401,8 @@ GOGC=100
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>GOMEMLIMIT не контролирует не-кучу.</strong> Стеки горутин, cgo-память, mmap-файлы — всё это вне лимита. Если у вас миллион горутин, даже пустых, они займут 2 ГБ стековой памяти, что может превысить контейнерный лимит без ведома GOMEMLIMIT. Мониторьте <code>StackInuse</code> и общее RSS.</p>
+    <p><strong>Слепота к памяти вне кучи (Non-heap Memory).</strong><br />
+GOMEMLIMIT не контролирует стековую память (<code>StackInuse</code>), нативный код cgo и отображения <code>mmap</code>. Если приложение породит 500 000 горутин, только их стеки займут более 1 ГБ оперативной памяти, что приведёт к OOMKill в обход сборщика мусора. Всегда мониторьте общее RSS процесса!</p>
   </div>
 </div>
 
@@ -2357,20 +2412,25 @@ GOGC=100
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>Не со всеми версиями Go.</strong> GOMEMLIMIT появился в Go 1.19 как <code>runtime/debug.SetMemoryLimit</code>, стабилизирован в 1.21. На старых версиях не работает.</p>
+    <p><strong>Совместимость версий языка.</strong><br />
+Механизм GOMEMLIMIT и системная функция <code>debug.SetMemoryLimit</code> появились в Go 1.19 и получили промышленную стабилизацию в Go 1.21. На устаревших версиях рантайма (Go 1.18 и старше) эта переменная окружения просто игнорируется.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mechanical-sympathy-kak-gomemlimit-vliyaet-na-protsessor">Mechanical Sympathy: как GOMEMLIMIT влияет на процессор</h2>
 
-<p>При срабатывании GOMEMLIMIT GC учащается. Это означает:<br />
-- Больше конкурентных mark-фаз, больше вымывания кэша (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).<br />
-- Частые mark assist заставляют горутины чаще помогать GC, что ухудшает их собственную производительность.<br />
-- Возможен burst-режим: куча подходит под лимит, GC резко активизируется, затем отпускает; такие всплески вносят нестабильность в latency.</p>
-<p>С точки зрения механической эмпатии, GOMEMLIMIT следует настраивать так, чтобы он активировался только в исключительных ситуациях, а не работал постоянно. Основной ритм должен задаваться GOGC. Тогда процессорные кэши большую часть времени остаются «прогретыми» для приложения, и лишь эпизодические всплески GC не разрушают стабильность.</p>
+<p>С точки зрения кремниевой архитектуры процессора, срабатывание GOMEMLIMIT означает переход системы в режим повышенного давления:</p>
+<ul>
+<li><strong>Учащение фаз маркировки:</strong> Сборщик чаще сбрасывает конвейеры и чаще прогоняет данные через кэш-линии L1/L2/L3, снижая локальность данных приложения (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>).</li>
+<li><strong>Всплески Mark Assist:</strong> Рабочие горутины чаще отрываются от исполнения бизнес-инструкций, генерируя кратковременные всплески задержек.</li>
+<li><strong>Burst-эффект:</strong> Когда нагрузка подскакивает, процессор тратит до 50% мощности на стабилизацию памяти, после чего плавно возвращается в крейсерский режим.</li>
+</ul>
+<p>С точки зрения Mechanical Sympathy, GOMEMLIMIT должен быть <strong>страховочным тросом, а не постоянной рабочей точкой опоры</strong>. В идеальной архитектуре ритм задаётся коэффициентом GOGC, а GOMEMLIMIT активируется лишь в моменты редких форс-мажорных аномалий.</p>
+<hr />
 <h2 id="integratsiya-s-orkestratorami-i-infrastructure-as-code">Интеграция с оркестраторами и Infrastructure as Code</h2>
 
-<p>В Kubernetes можно задавать GOMEMLIMIT через переменную окружения, вычисленную от ресурсных лимитов. Например, с использованием Downward API:</p>
+<p>В Kubernetes лимит памяти подаётся в манифест контейнера, однако стандартный Downward API передаёт значение лимита без автоматического пересчёта в 80–85%:</p>
 
 <div class="code-block" data-lang="yaml">
   <div class="code-header">
@@ -2380,17 +2440,14 @@ GOGC=100
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-yaml"><code class="language-yaml">env:
+  <pre class="language-yaml"><code class="language-yaml"># Пример в манифесте Kubernetes:
+env:
 - name: GOMEMLIMIT
-  valueFrom:
-    resourceFieldRef:
-      resource: limits.memory
-      divisor: &quot;0&quot;
+  value: &quot;400MiB&quot;
 </code></pre>
 </div>
 
-<p>К сожалению, GOMEMLIMIT ожидает абсолютное значение в байтах, а лимит подаётся в Mi/Gi, поэтому часто используют скрипты-обёртки (entrypoint), которые вычисляют 80% от лимита и выставляют GOMEMLIMIT.</p>
-<p>Другой подход — выставлять GOMEMLIMIT прямо в коде при старте, анализируя <code>/sys/fs/cgroup/memory/memory.limit_in_bytes</code> (cgroups v1) или <code>/sys/fs/cgroup/memory.max</code> (cgroups v2).</p>
+<p>Для автоматического вычисления порога в современных микросервисах часто внедряют автоопределение лимитов прямо в функцию инициализации <code>init()</code> через чтение параметров ядра Linux cgroups (файлы <code>/sys/fs/cgroup/memory/memory.limit_in_bytes</code> в cgroups v1 или <code>/sys/fs/cgroup/memory.max</code> в cgroups v2):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2400,11 +2457,22 @@ GOGC=100
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func init() {
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;os&quot;
+    &quot;runtime/debug&quot;
+    &quot;strconv&quot;
+    &quot;strings&quot;
+)
+
+func init() {
+    // Автоматическая калибровка GOMEMLIMIT под cgroups v2
     if data, err := os.ReadFile(&quot;/sys/fs/cgroup/memory.max&quot;); err == nil {
-        limit := strings.TrimSpace(string(data))
-        if limit != &quot;max&quot; {
-            if bytes, err := strconv.ParseInt(limit, 10, 64); err == nil {
+        limitStr := strings.TrimSpace(string(data))
+        if limitStr != &quot;max&quot; {
+            if bytes, err := strconv.ParseInt(limitStr, 10, 64); err == nil {
+                // Выделяем 80% от лимита контейнера под рантайм Go
                 target := int64(float64(bytes) * 0.8)
                 debug.SetMemoryLimit(target)
             }
@@ -2414,26 +2482,26 @@ GOGC=100
 </code></pre>
 </div>
 
-<p>Это автоматизирует настройку и уменьшает вероятность ошибки.</p>
+<p>Такой паттерн полностью исключает человеческий фактор при изменении ресурсных лимитов подов в Helm-чартах.</p>
+<hr />
 <h2 id="dinamicheskoe-izmenenie-gomemlimit">Динамическое изменение GOMEMLIMIT</h2>
 
-<p>Функция <code>debug.SetMemoryLimit</code> позволяет менять лимит на лету. Это можно использовать:<br />
-- Для адаптации к изменению лимитов контейнера.<br />
-- Для временного повышения лимита в периоды пиковой нагрузки, если известно, что пик пройдёт.<br />
-- Для плавного уменьшения лимита перед ожидаемым снижением памяти.</p>
-<p>Однако резкие изменения могут спровоцировать внезапный всплеск GC. Динамический тюнинг требует аккуратности и мониторинга.</p>
+<p>Функция <code>debug.SetMemoryLimit</code> (из стандартного пакета <code>runtime/debug.SetMemoryLimit</code>) даёт возможность программно изменять порог памяти во время выполнения:<br />
+- Адаптация к вертикальному автомасштабированию контейнеров (VPA) без перезапуска пода.<br />
+- Временное расширение лимита при выполнении плановых тяжёлых пакетных вычислений.<br />
+- Плавная деэскалация перед освобождением ресурсов.</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>GOMEMLIMIT</strong> — мягкий лимит на размер Go-кучи, заставляющий GC учащаться при приближении к заданному значению, предотвращая превышение жёстких лимитов памяти.</li>
-<li>Устанавливается через <code>GOMEMLIMIT</code> окружение или <code>debug.SetMemoryLimit</code>; обычно задаётся как 80-90% от лимита контейнера.</li>
-<li>Взаимодействует с GOGC: в нормальном режиме управляет GOGC, а GOMEMLIMIT — предохранитель, активирующийся при угрозе превышения.</li>
-<li>Запас необходим, так как GOMEMLIMIT не контролирует стеки, cgo, метаданные и прочую память вне кучи.</li>
-<li>Мониторинг через метрики <code>/gc/memory/limit:bytes</code> и High Water Mark.</li>
-<li>Не заменяет оптимизацию аллокаций; слишком низкий лимит вызывает GC-шторм и деградацию производительности.</li>
-<li>Mechanical sympathy: частое срабатывание GOMEMLIMIT ведёт к вымыванию кэша, учащению mark assist и нестабильности latency.</li>
+<li><strong>GOMEMLIMIT</strong> — мягкий абсолютный лимит потребления памяти рантаймом Go, заставляющий сборщик мусора форсированно активизироваться при приближении к критической отметке.</li>
+<li>Устанавливается через переменную среды <code>GOMEMLIMIT</code> или функцию <code>debug.SetMemoryLimit</code>; стандартная рекомендация для облачной среды — <strong>80–85% от лимита контейнера</strong>.</li>
+<li>Образует гармоничную пару с GOGC: <code>GOGC</code> задаёт рабочий темп сборок, а <code>GOMEMLIMIT</code> защищает от фатального OOMKill при аномальных всплесках живой памяти.</li>
+<li>Необходим запас в 15–20%, поскольку лимит не распространяется на динамические стеки горутин, CGO, бинарный код и структуры ядра операционной системы.</li>
+<li>В рантайм встроен защитный механизм <code>gcCPULimiter</code>, гарантирующий, что GC не захватит более 50% CPU даже при катастрофическом дефиците памяти.</li>
+<li>Мониторинг обеспечивается метриками <code>/gc/memory/limit:bytes</code>, <code>total-hwm</code> и <code>HeapInuse</code>.</li>
 </ul>
-<p>Правильно настроенный GOMEMLIMIT в паре с GOGC даёт уверенность, что сервис не упадёт по OOM, сохраняя приемлемую производительность. Мы завершаем раздел тюнинга GC и переходим к диагностике ситуации, когда даже при правильных настройках GC становится узким местом: <a href="9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>.</p>
+<p>Освоив полный инструментарий управления памятью, мы переходим к финальному и наиболее драматичному вопросу: что делать, когда сборщик мусора становится главным бутылочным горлышком системы — <a href="9-kogda-gc-stanovitsya-bottleneck.html" class="wikilink">9. Когда GC становится bottleneck</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
