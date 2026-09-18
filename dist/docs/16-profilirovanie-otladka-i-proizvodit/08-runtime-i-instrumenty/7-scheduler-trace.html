@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~33 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. scheduler trace</h1>
           </header>
@@ -2178,12 +2178,49 @@
           <div class="article-markdown">
             <h2 id="scheduler-trace-chislovaya-karta-sostoyaniya-planirovshchika-go">Scheduler trace: числовая карта состояния планировщика Go</h2>
 
-<p>Execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>) рисует детальную хронологию событий рантайма: переключения горутин, GC-паузы, миграции между P. Но за эту детализацию приходится платить высоким overhead и сложностью анализа. Часто для быстрой диагностики нужна не полная история, а <strong>мгновенная агрегированная статистика</strong> — сколько горутин в очереди, сколько потоков создано, простаивают ли процессоры. Эту статистику предоставляет <strong>scheduler trace</strong> — текстовый вывод состояния планировщика, включаемый через переменную окружения <code>GODEBUG=schedtrace=...</code>.</p>
-<p>Scheduler trace — это «приборная панель» планировщика. Он не заменяет execution tracer или профили, а дополняет их: позволяет за секунды понять, есть ли глобальный дисбаланс, утечка потоков или перегрузка очередей, и принять решение о необходимости более глубокого анализа.</p>
-<p>В этой статье мы разберём формат вывода <code>schedtrace</code>, научимся интерпретировать его показатели в контексте модели G-M-P (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>), work stealing (<a href="../06-konkurentnost/3-work-stealing.html" class="wikilink">3. Work stealing</a>) и системных вызовов (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html" class="wikilink">1. Системные вызовы и их стоимость</a>), и свяжем цифры с реальными производственными проблемами.</p>
+<p>Трассировщик execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>) воспроизводит богатейшую хронологию событий рантайма Go: переключения горутин, фазы сборщика мусора, миграции между ядрами процессора. Однако за эту филигранную детализацию приходится расплачиваться заметным системным оверхедом (до 10–30% CPU) и необходимостью выгружать и парсить многомегабайтные файлы.</p>
+<p>В боевой эксплуатации часто требуется не покадровая кинолента каждого микросекундного прерывания, а <strong>мгновенная и абсолютно легковесная агрегированная статистика</strong>:<br />
+- Сколько горутин прямо сейчас ожидают свободный процессор?<br />
+- Не размножаются ли системные потоки ОС из-за блокирующих дисковых вызовов?<br />
+- Не простаивают ли логические процессоры <code>P</code>, пока задачи скапливаются в глобальной очереди?</p>
+<p>Эту приборную панель предоставляет <strong>scheduler trace (трассировка планировщика)</strong> — сверхбыстрый текстовый мониторинг внутреннего состояния планировщика Go, активируемый переменной окружения <strong><code>GODEBUG=schedtrace=...</code></strong>.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph SchedString [&quot;Анатомия строки SCHED 1000ms&quot;]
+GMP[&quot;gomaxprocs=8&lt;br/&gt;Лимит логических процессоров P&quot;]
+IdleP[&quot;idleprocs=2&lt;br/&gt;Простаивающие процессоры P&quot;]
+Threads[&quot;threads=15 (spinning=1, idle=6)&lt;br/&gt;Физические потоки ядра ОС (M)&quot;]
+GlobalQ[&quot;runqueue=128&lt;br/&gt;Глобальная очередь sched.runq&quot;]
+LocalQ[&quot;[15 0 23 8 0 14 0 5]&lt;br/&gt;Локальные очереди каждого P (runq)&quot;]
+end
+
+GMP --&gt; Engine[&quot;Планировщик Go (G-M-P Engine)&quot;]
+IdleP --&gt; Engine
+Threads --&gt; Engine
+GlobalQ --&gt; Engine
+LocalQ --&gt; Engine
+  </pre>
+</div>
+
+
+<p>Scheduler trace — это бортовой тахометр и датчик давления масла в двигателе рантайма Go. Он не заменяет детальные профили <code>pprof</code> или execution tracer, но служит великолепным инструментом первого эшелона: позволяет за считанные секунды обнаружить глобальный дисбаланс нагрузки, исчерпание потоков ядра или лавинообразный рост очередей.</p>
+<hr />
 <h2 id="vklyuchenie-scheduler-trace">Включение scheduler trace</h2>
 
-<p>Трассировка планировщика активируется установкой переменной окружения <code>GODEBUG</code> со значением <code>schedtrace=&lt;период в миллисекундах&gt;</code>. Каждые <code>N</code> миллисекунд рантайм выводит в stderr строку состояния.</p>
+<p>Трассировка планировщика не требует изменения ни единой строчки исходного кода и активируется передачей переменной окружения <code>GODEBUG</code> с параметром <code>schedtrace=&lt;период в миллисекундах&gt;</code>.</p>
+<p>Каждые <code>N</code> миллисекунд фоновый системный монитор рантайма (<code>sysmon</code>) формирует и сбрасывает в стандартный поток ошибок <code>stderr</code> лаконичную однострочную сводку:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2197,7 +2234,7 @@
 </code></pre>
 </div>
 
-<p>Вывод (одна строка):</p>
+<p>Пример вывода в консоли:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2211,63 +2248,126 @@
 </code></pre>
 </div>
 
-<p>Также можно включить более детальный вывод (<code>scheddetail=1</code>), который добавляет информацию о каждом P и M, но это создаёт огромный объём данных и используется редко.</p>
+<p>Для глубокой низкоуровневой отладки доступен режим <code>scheddetail=1</code>, который в дополнение к общей строке распечатывает подробнейший статус каждого отдельного процессора <code>P</code>, потока <code>M</code> и даже исполняющейся горутины <code>G</code>:</p>
 
-<div class="code-block" data-lang="text">
+<div class="code-block" data-lang="bash">
   <div class="code-header">
-    <span class="code-lang-tag">TEXT</span>
+    <span class="code-lang-tag">Bash</span>
     <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-text"><code class="language-text">GODEBUG=schedtrace=1000,scheddetail=1 ./my_server
+  <pre class="language-bash"><code class="language-bash">GODEBUG=schedtrace=1000,scheddetail=1 ./my_server
 </code></pre>
 </div>
 
-<p>Scheduler trace практически не влияет на производительность: это чтение нескольких счётчиков из структур планировщика и форматированный вывод. Его можно безопасно использовать в production для периодического мониторинга.</p>
+<div class="callout callout-info">
+  <div class="callout-header">
+    <span class="callout-icon">⚙️</span>
+    <span class="callout-title">Под капотом</span>
+  </div>
+  <div class="callout-body">
+    <p>Генерация вывода <code>schedtrace</code> выполняется фоновым системным потоком <code>sysmon</code>, который работает без привязки к логическим процессорам <code>P</code>. Поток считывает глобальные счетчики структуры <code>sched</code> через быстрые атомарные операции (<code>atomic.Load</code>), не производя полной остановки мира (Stop-The-World) и не блокируя работу прикладных горутин. Именно поэтому накладные расходы <code>schedtrace</code> с интервалом 1000 мс стремятся к нулю: его можно безопасно запускать даже в высоконагруженном продакшене.</p>
+  </div>
+</div>
+
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Ловушка / Gotcha</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Затопление логов при <code>scheddetail=1</code>.</strong> Включение флага <code>scheddetail=1</code> на многоядерном сервере генерирует сотни строк форматированного текста в <code>stderr</code> каждую секунду. Это может вызвать блокировку процесса на записи в небуферизованный терминал или диск и переполнить дисковое пространство системными логами. Используйте <code>scheddetail=1</code> только локально в тестовых средах, а в продакшене ограничивайтесь лаконичным <code>schedtrace=1000</code>.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="razbor-formata-vyvoda">Разбор формата вывода</h2>
 
-<p>Каждая строка содержит несколько полей, разделённых пробелами. Рассмотрим их последовательно.</p>
+<p>Каждая строка <code>schedtrace</code> представляет собой компактный срез метрик. Разберем анатомию каждого поля:</p>
 <h3 id="gomaxprocs">`gomaxprocs`</h3>
 
-<p>Текущее значение <code>GOMAXPROCS</code> — количество логических процессоров P (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>). Это максимальное число горутин, которые могут исполняться одновременно. По умолчанию равно числу ядер CPU. Если это значение изменялось через <code>runtime.GOMAXPROCS()</code>, оно отражает текущую установку.</p>
+<p>Текущее действующее значение <code>GOMAXPROCS</code> — количество логических процессоров <code>P</code> в рантайме (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>). Задает предел аппаратного параллелизма: сколько горутин могут физически одновременно молотить инструкции на ядрах процессора. По умолчанию равно количеству ядер CPU, выделенных процессу. Если это значение изменялось через <code>runtime.GOMAXPROCS()</code>, оно отражает текущую установку.</p>
 <h3 id="idleprocs">`idleprocs`</h3>
 
-<p>Количество P, которые <strong>не заняты</strong> исполнением горутин. P может простаивать, если:<br />
-- У него нет готовых горутин (локальная и глобальная очереди пусты, netpoller не вернул готовых).<br />
-- Он ожидает новый M (после hand-off при блокирующем syscall).</p>
-<p>Высокое число <code>idleprocs</code> при наличии большого количества готовых горутин (<code>runqueue</code> велик) — тревожный сигнал: горутины есть, но P их не подхватывают. Это может означать, что все P застряли в блокирующих системных вызовах и не могут быть использованы, или что <code>GOMAXPROCS</code> искусственно занижен.</p>
+<p>Количество логических процессоров <code>P</code>, которые в данный момент <strong>простаивают без работы</strong>. Процессор <code>P</code> переходит в idle, если:<br />
+- Его локальная очередь задач пуста, в глобальной очереди <code>sched.runq</code> нет работы, а сетевой поллер не возвращает готовых дескрипторов.<br />
+- Все остальные <code>P</code> заняты, и алгоритм Work Stealing (<a href="../06-konkurentnost/3-work-stealing.html" class="wikilink">3. Work stealing</a>) не смог украсть ни одной горутины.<br />
+- Процессор ожидает привязки нового потока <code>M</code> (после процедуры hand-off при системном вызове).</p>
+<div class="callout callout-warning">
+  <div class="callout-header">
+    <span class="callout-icon">⚠️</span>
+    <span class="callout-title">Подводные камни / Gotcha</span>
+  </div>
+  <div class="callout-body">
+    <p>Если <code>idleprocs &gt; 0</code> при огромной очереди <code>runqueue</code> — это признак системного троттлинга или дефицита потоков ОС <code>M</code>! Готовые горутины есть, но их некому исполнять на свободных процессорах.</p>
+  </div>
+</div>
+
 <h3 id="threads">`threads`</h3>
 
-<p>Общее количество потоков ОС (M), созданных рантаймом. Включает:<br />
-- Потоки, исполняющие горутины.<br />
-- Потоки, заблокированные в системных вызовах.<br />
-- Простаивающие потоки (idle).<br />
-- Системные потоки (sysmon, GC workers).</p>
-<p>Нормальное значение — немного больше <code>GOMAXPROCS</code> (плюс несколько потоков для GC и sysmon). Резкий рост <code>threads</code> указывает на лавину блокирующих системных вызовов: каждая такая операция открепляет M от P, и планировщик создаёт новый поток, чтобы не простаивать (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html#hand-off" class="wikilink">1. Системные вызовы и их стоимость</a>). Если потоки не возвращаются в пул, их число может достигнуть сотен или тысяч, создавая давление на планировщик ОС.</p>
+<p>Общее количество физических потоков операционной системы (<code>M</code>), порожденных рантаймом Go за все время жизни процесса. Сюда входят:<br />
+- Потоки, исполняющие пользовательские горутины на процессорах <code>P</code>.<br />
+- Потоки, заблокированные в синхронных системных вызовах ядра (<code>read</code>, <code>write</code>, <code>getaddrinfo</code>).<br />
+- Спящие потоки в пуле ожидания (<code>idlethreads</code>).<br />
+- Служебные потоки рантайма (поток <code>sysmon</code>, потоки сборщика мусора).</p>
+<p>Нормальное значение <code>threads</code> — на 2–5 единиц больше <code>gomaxprocs</code>. Если параметр <code>threads</code> стремительно растет (сотни и тысячи потоков) — сервис захлебывается в блокирующих системных вызовах (<a href="../07-io-i-sistemnyy-uroven/1-sistemnye-vyzovy-i-ikh-stoimost.html#hand-off" class="wikilink">1. Системные вызовы и их стоимость</a>).</p>
 <h3 id="spinningthreads">`spinningthreads`</h3>
 
-<p>Количество потоков M, которые находятся в состоянии <strong>spinning</strong> — активного поиска работы. Spinning-поток крутится в цикле, пытаясь найти готовую горутину (из глобальной очереди, через воровство или netpoller), и не паркуется, даже если работы временно нет.</p>
-<p>Зачем это нужно? Чтобы минимизировать задержки: если работа появится через микросекунду, spinning-поток подхватит её немедленно, без ожидания пробуждения. Но spinning сжигает CPU. Рантайм ограничивает количество spinning-потоков (обычно не более <code>GOMAXPROCS</code>).</p>
-<p>Высокое <code>spinningthreads</code> при низкой загрузке — признак того, что планировщик активно ищет работу, но не находит. Это может быть нормальным кратковременным состоянием.</p>
+<p>Количество потоков <code>M</code>, находящихся в состоянии <strong>активного спиннинга (spinning)</strong>.<br />
+Spinning-поток — это поток, который временно остался без работы, но <strong>не уходит в сон ядра ОС</strong>, а активно опрашивает очереди в цикле (busy-wait), надеясь мгновенно подхватить новую горутину от другого <code>P</code> или из сетевого поллера.</p>
+<p>Смысл spinning — радикальное сокращение задержки (latency): пробуждение спящего потока ОС через <code>futex</code> занимает от 5 до 20 микросекунд, тогда как spinning-поток подхватывает задачу за наносекунды. Рантайм жестко ограничивает количество спиннинг-потоков (не более половины от <code>gomaxprocs</code>), чтобы не сжигать такты CPU вхолостую.</p>
 <h3 id="idlethreads">`idlethreads`</h3>
 
-<p>Количество потоков M, которые находятся в состоянии ожидания (спят). Эти потоки не потребляют CPU, но готовы быть немедленно активированы, если понадобятся новому P после hand-off. Высокое <code>idlethreads</code> говорит о том, что в прошлом был всплеск создания потоков, и теперь они простаивают. Это не проблема, пока <code>threads</code> не превышает разумные пределы.</p>
+<p>Количество потоков <code>M</code>, которые ушли в глубокий сон ядра ОС (<code>futex_wait</code>). Они не потребляют такты процессора, но удерживают стек ядра (от 2 до 8 МБ) и структуру <code>task_struct</code>. Эти потоки держатся в пуле для мгновенного подхвата процессоров <code>P</code>, освободившихся после системных вызовов.</p>
 <h3 id="runqueue">`runqueue`</h3>
 
-<p>Длина <strong>глобальной очереди</strong> горутин (sched.runq). Сюда попадают горутины, когда локальная очередь P переполняется (256 элементов). Также глобальная очередь используется для горутин, пробуждённых из netpoller или системных вызовов, если их родной P недоступен.</p>
-<p>Большая глобальная очередь (<code>runqueue</code> &gt; 1000) означает, что горутины накапливаются, и планировщик не успевает их распределять. Это может быть вызвано:<br />
-- Перегрузкой: горутин создаётся больше, чем система способна обработать.<br />
-- Дисбалансом: какие-то P простаивают, но не крадут работу из глобальной очереди (проблема с work stealing, <a href="../06-konkurentnost/3-work-stealing.html" class="wikilink">3. Work stealing</a>).<br />
-- Все P заняты CPU-bound горутинами и не освобождаются для обработки очереди.</p>
+<p>Длина <strong>глобальной очереди планировщика</strong> (<code>sched.runq</code>).<br />
+Сюда сбрасываются горутины, когда локальная очередь конкретного <code>P</code> переполняется (ее вместимость жестко фиксирована и равна 256 элементам). Также в глобальную очередь попадают горутины после вызова <code>runtime.Gosched()</code> и горутины, пробужденные сетевым поллером или завершившие блокирующий системный вызов, если их исходный <code>P</code> занят.</p>
+<p>Большое значение <code>runqueue</code> (&gt;500–1000) свидетельствует о том, что система работает на пределе пропускной способности, и планировщик не успевает раскидывать задачи по локальным очередям.</p>
 <h3 id="lokalnye-ocheredi-p">Локальные очереди P</h3>
 
-<p>Массив в квадратных скобках <code>[...]</code> показывает длину локальной очереди <code>runq</code> для каждого P. Например, <code>[15 0 23 8 0 14 0 5]</code> означает 8 P, у первого 15 горутин, у второго 0, у третьего 23 и т.д.</p>
-<p>Этот массив — ключ к диагностике дисбаланса. Если у одного P очередь 100, а у остальных 0, work stealing не справляется с перераспределением (редкая ситуация, но возможна при частых блокировках на одном P или при <code>LockOSThread</code>). Если у всех P очереди большие — система перегружена равномерно.</p>
+<p>Массив в квадратных скобках в конце строки:<br />
+<code>[15 0 23 8 0 14 0 5]</code><br />
+Показывает точное количество готовых горутин в персональной кольцевой очереди <code>runq</code> каждого процессора <code>P</code> (в данном примере для 8 логических процессоров).</p>
+<p>Этот массив <code>[...]</code> — ключ к диагностике дисбаланса многопоточной нагрузки:<br />
+- <strong>Равномерное распределение <code>[12 10 14 11 ...]</code>:</strong> Образцовая работа планировщика, горутины равномерно распределены по ядрам CPU.<br />
+- <strong>Резкий перекос <code>[256 0 0 0 ...]</code>:</strong> Локальная очередь переполнена, а остальные процессоры пустуют. Это сигнал об аномалиях work stealing или привязке горутин через <code>LockOSThread</code>.</p>
+<hr />
 <h2 id="interpretatsiya-v-tipichnykh-stsenariyakh">Интерпретация в типичных сценариях</h2>
 
-<h3 id="1-cpu-bound-peregruzka">1. CPU-bound перегрузка</h3>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Start[&quot;Анализ строки schedtrace&quot;] --&gt; CheckP{&quot;idleprocs == 0?&quot;}
+
+CheckP -- &quot;Да (Все P заняты)&quot; --&gt; CheckQ{&quot;runqueue &amp;gt; 500 и&lt;br/&gt;локальные очереди забиты?&quot;}
+CheckQ -- &quot;Да&quot; --&gt; CPUBound[&quot;🔴 Сценарий 1: CPU-bound перегрузка&lt;br/&gt;Исчерпание процессорных ядер&quot;]
+CheckQ -- &quot;Нет&quot; --&gt; Normal[&quot;🟢 Нормальная нагрузка&quot;]
+
+CheckP -- &quot;Нет (Есть idleprocs)&quot; --&gt; CheckThreads{&quot;threads &amp;gt;&amp;gt; gomaxprocs?&lt;br/&gt;(например, threads &amp;gt; 50)&quot;}
+CheckThreads -- &quot;Да&quot; --&gt; IOBound[&quot;🔴 Сценарий 2: Затор в системных вызовах&lt;br/&gt;Hand-off потоков M, блокирующий I/O&quot;]
+CheckThreads -- &quot;Нет&quot; --&gt; CheckImbalance{&quot;Один P забит, остальные пустые?&lt;br/&gt;[100 0 0 0 ...]&quot;}
+
+CheckImbalance -- &quot;Да&quot; --&gt; StealBug[&quot;🟡 Сценарий 3: Дисбаланс Work Stealing&lt;br/&gt;LockOSThread или зависание P&quot;]
+CheckImbalance -- &quot;Нет&quot; --&gt; Idle[&quot;🟢 Естественный простой (низкий RPS)&quot;]
+  </pre>
+</div>
+
+
+<h3 id="1-cpu-bound-peregruzka-defitsit-yader">1. CPU-bound перегрузка (дефицит ядер)</h3>
 
 
 <div class="code-block" data-lang="text">
@@ -2283,12 +2383,14 @@
 </div>
 
 <ul>
-<li><code>idleprocs=0</code> — все P заняты.</li>
-<li><code>runqueue=500</code> — огромная глобальная очередь.</li>
-<li>Локальные очереди забиты (&gt;100).</li>
-<li>Потоков немного, spinning нет.</li>
+<li><code>idleprocs=0</code> — все логические процессоры молотят на 100%.</li>
+<li><code>runqueue=500</code> — глобальная очередь перегружена.</li>
+<li>Локальные очереди каждого <code>P</code> плотно забиты (&gt;100 задач).</li>
+<li>Потоки ядра стабильны (<code>threads=10</code>), спиннинг отсутствует.</li>
 </ul>
-<p><strong>Диагноз:</strong> Система перегружена CPU-bound горутинами. Процессорные ресурсы исчерпаны. Нужно либо оптимизировать код, либо увеличить количество ядер (поднять <code>GOMAXPROCS</code>, если есть свободные ядра).</p>
+<p><strong>Диагноз:</strong> Классическое исчерпание вычислительных ресурсов CPU. Горутины создаются быстрее, чем ядра успевают их обсчитывать.<br />
+<strong>Решение:</strong> Профилирование CPU через <code>pprof</code>, алгоритмическая оптимизация, либо масштабирование хоста / увеличение квоты cgroups и <code>GOMAXPROCS</code>.</p>
+<hr />
 <h3 id="2-io-bound-s-blokiruyushchimi-syscall">2. IO-bound с блокирующими syscall</h3>
 
 
@@ -2305,16 +2407,37 @@
 </div>
 
 <ul>
-<li><code>idleprocs=5</code> — большинство P простаивают.</li>
-<li><code>threads=45</code> — потоков в 5 раз больше, чем P!</li>
-<li><code>runqueue=10</code> — глобальная очередь маленькая.</li>
-<li>Локальные очереди почти пусты.</li>
+<li><code>idleprocs=5</code> — больше половины процессоров <code>P</code> простаивают без полезной работы!</li>
+<li><code>threads=45</code> — количество физических потоков ОС превысило <code>gomaxprocs</code> в 5 раз!</li>
+<li>Очереди <code>runqueue</code> и локальные очереди практически пусты.</li>
 </ul>
-<p><strong>Диагноз:</strong> Много горутин выполняют блокирующие системные вызовы (файловый ввод-вывод, CGO). Потоки M открепляются от P, рантайм создаёт новые потоки, которые тут же блокируются. Простаивающие P не могут найти работу, потому что горутины привязаны к заблокированным M. Решение: ограничить параллелизм файловых операций (пул воркеров), использовать асинхронный ввод-вывод (<code>io_uring</code>).</p>
-<h3 id="3-utechka-gorutin">3. Утечка горутин</h3>
+<p><strong>Диагноз:</strong> Массовый уход горутин в синхронные блокирующие вызовы операционной системы (чтение файлов с диска без netpoller, блокировки в СУБД драйверах или CGO-вызовы). При каждом системном вызове поток <code>M</code> замораживается ядром Linux, рантайм отцепляет процессор <code>P</code> (процедура hand-off) и создает новый поток <code>M</code>. Процессоры <code>P</code> простаивают, так как горутины застряли в ядре.<br />
+<strong>Решение:</strong> Ограничение параллелизма файловых операций пулами воркеров, использование асинхронных библиотек или технологии Linux <code>io_uring</code>.</p>
+<hr />
+<h3 id="3-utechka-gorutin-goroutine-leak">3. Утечка горутин (Goroutine Leak)</h3>
 
-<p>При каждом следующем выводе <code>runqueue</code> и локальные очереди неуклонно растут, количество горутин (видно по сумме очередей) увеличивается, но <code>idleprocs</code> остаётся низким. Это признак того, что горутины создаются, но не завершаются (утечка). Нужно снимать дамп горутин (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>) для поиска источника.</p>
-<h3 id="4-disbalans-work-stealing">4. Дисбаланс work stealing</h3>
+
+<div class="code-block" data-lang="text">
+  <div class="code-header">
+    <span class="code-lang-tag">TEXT</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-text"><code class="language-text"># Т = 0с
+SCHED 1000ms: gomaxprocs=8 idleprocs=2 threads=12 spinningthreads=1 idlethreads=4 runqueue=50 [10 5 8 12 6 9 7 11]
+# Т = 10с
+SCHED 1000ms: gomaxprocs=8 idleprocs=2 threads=12 spinningthreads=1 idlethreads=4 runqueue=350 [80 75 90 85 70 82 78 88]
+# Т = 20с
+SCHED 1000ms: gomaxprocs=8 idleprocs=2 threads=12 spinningthreads=1 idlethreads=4 runqueue=1200 [256 256 256 256 256 256 256 256]
+</code></pre>
+</div>
+
+<p>С каждой секундой суммарная длина очередей неуклонно нарастает, локальные очереди достигают лимита 256, а глобальная очередь пухнет. При этом нагрузка на сервис не менялась.<br />
+<strong>Диагноз:</strong> Утечка горутин. Горутины бесконечно плодятся и застревают в каналах или забытых контекстах. Немедленный шаг: снятие дампа горутин (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>).</p>
+<hr />
+<h3 id="4-disbalans-work-stealing">4. Дисбаланс Work Stealing</h3>
 
 
 <div class="code-block" data-lang="text">
@@ -2329,43 +2452,73 @@
 </code></pre>
 </div>
 
-<p>Один P имеет 100 горутин, остальные пусты. Глобальная очередь пуста. При этом есть простаивающий P (<code>idleprocs=1</code>). Это ненормально: простаивающий P должен украсть работу у занятого. Если это не происходит, возможны проблемы:<br />
-- Занятый P выполняет горутину с <code>LockOSThread</code>, которую нельзя мигрировать.<br />
-- Включена привязка к ядру через <code>taskset</code> или cgroups.<br />
-- Баг в планировщике (крайне маловероятно).</p>
-<h2 id="mechanical-sympathy-chto-tsifry-govoryat-o-zheleze">Mechanical Sympathy: что цифры говорят о «железе»</h2>
+<p>У первого процессора <code>P0</code> в очереди скопилось 100 горутин, а у остальных семи процессоров очереди абсолютно пусты, и даже есть простаивающий <code>P</code> (<code>idleprocs=1</code>).<br />
+<strong>Диагноз:</strong> Алгоритм Work Stealing не может перераспределить задачи.<br />
+Типичная причина: горутины на <code>P0</code> привязаны к конкретному системному потоку через <code>runtime.LockOSThread()</code>, либо процесс ограничен жесткой маской affinity через <code>taskset</code>.</p>
+<hr />
+<h2 id="mechanical-sympathy-chto-tsifry-govoryat-ob-oborudovanii">Mechanical Sympathy: что цифры говорят об оборудовании</h2>
 
-<ul>
-<li><strong>Рост <code>threads</code></strong> → больше потоков ОС → больше kernel context switches (<a href="../06-konkurentnost/4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>). Каждый такой переход вымывает TLB и кэш L1/L2, что замедляет возврат горутины к работе.</li>
-<li><strong>Высокий <code>runqueue</code></strong> при <code>idleprocs &gt; 0</code> → горутины готовы, но P не могут их запустить. Процессорные ядра простаивают не потому, что кода нет, а потому что P лишены потоков (M). Это прямой удар по throughput.</li>
-<li><strong>Spinning threads</strong> сжигают такты вхолостую, гоняя кэш-линии глобальной очереди между ядрами (false sharing на структурах планировщика).</li>
-<li><strong>Локальные очереди</strong> отражают распределение работы. Планировщик старается удерживать горутины на одном P ради локальности кэша (<a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>), поэтому некоторая неравномерность допустима.</li>
-</ul>
+<p>Каждое число в строке <code>schedtrace</code> имеет прямой физический эквивалент в кремнии процессора:</p>
+<ol>
+<li><strong>Многократный рост <code>threads</code>:</strong><br />
+   Порождение десятков потоков ядра Linux ведет к лавинообразному росту переключений контекста уровня ядра (<code>kernel context switches</code>). Каждый такой переход сбрасывает буфер ассоциативной трансляции TLB виртуальной памяти и вымывает быстрые кэши L1/L2 процессора, замедляя выполнение всего микросервиса (<a href="../06-konkurentnost/4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>).</li>
+<li><strong>Низкий <code>idleprocs</code> при высоком <code>runqueue</code>:</strong><br />
+   Ядра процессора не простаивают, но память страдает от частой миграции структур <code>g</code> между процессорными ядрами.</li>
+<li><strong>Паразитный эффект <code>spinningthreads</code>:</strong><br />
+   Пока поток находится в состоянии spinning, он выполняет плотный цикл <code>PAUSE</code> и непрерывно читает глобальную переменную <code>sched.runq</code>. На многосокетных серверах NUMA это приводит к постоянному шторму запросов по межпроцессорной шине (Cache Line Bouncing).</li>
+<li><strong>Локальность очередей <code>[ ... ]</code>:</strong><br />
+   Планировщик Go намеренно держит горутины в локальной очереди <code>P</code> и не спешит отдавать их чужим ядрам. Это делается ради <strong>сохранения горячего кэша CPU</strong> (Cache Friendliness, <a href="../03-cpu-profiling/8-cache-friendliness.html" class="wikilink">8. Cache friendliness</a>): пока горутина исполняется на том же логическом ядре, ее переменные остаются в L1/L2 кэше.</li>
+</ol>
+<hr />
+<h2 id="sobesedovanie-tipichnye-voprosy">Собеседование: типичные вопросы</h2>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> В выводе <code>schedtrace</code> вы видите <code>idleprocs=4</code>, <code>threads=80</code> при <code>gomaxprocs=8</code>. В чем причина такого поведения системы?<br />
+<strong>Ответ:</strong> Это классический паттерн блокирующего системного ввода-вывода (I/O Bottleneck). Потоки <code>M</code> входят в блокирующие системные вызовы ядра (например, синхронный дисковый ввод-вывод или CGO). Рантайм отсоединяет от них процессоры <code>P</code> (hand-off) и создает новые потоки ядра <code>M</code>. Когда горутины зависают в ядре, число потоков разрастается до 80, а освободившиеся процессоры <code>P</code> простаивают (<code>idleprocs=4</code>), так как готовых к исполнению горутин в очередях нет.</p>
+  </div>
+</div>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Почему значение <code>threads</code> в <code>schedtrace</code> обычно больше <code>gomaxprocs</code> даже в идеально ненагруженной системе?<br />
+<strong>Ответ:</strong> Помимо рабочих потоков <code>M</code>, исполняющих пользовательские горутины на процессорах <code>P</code>, рантайм Go запускает служебные потоки: системный монитор <code>sysmon</code> (который не требует <code>P</code>), вспомогательные потоки сборщика мусора и обработчики системных таймеров. Кроме того, несколько потоков <code>M</code> могут находиться в состоянии покоя в пуле <code>idlethreads</code>.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="kombinirovanie-s-drugimi-instrumentami">Комбинирование с другими инструментами</h2>
 
-<p><strong>Scheduler trace</strong> — это «пульс» планировщика. Обнаружив аномалию, следует переходить к более детальным инструментам:</p>
-<ol>
-<li><strong>Рост <code>threads</code></strong> → снять execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>), чтобы увидеть, какие именно syscall'ы вызывают блокировки.</li>
-<li><strong>Большой <code>runqueue</code></strong> → CPU-профиль (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>) для поиска горячих функций и daмп горутин (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>) для понимания, где застряли горутины.</li>
-<li><strong>Неравномерные локальные очереди</strong> → профиль блокировок (<a href="5-block-profile.html" class="wikilink">5. block profile</a>), чтобы понять, не удерживают ли горутины на перегруженном P какой-то ресурс.</li>
-</ol>
+<p><strong>Scheduler trace</strong> — это надежный кардиомонитор. Обнаружив аномальные показания пульса, инженер переходит к специализированным диагностическим приборам:<br />
+1. <strong>Взрывной рост <code>threads</code></strong> ──► запуск execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>), чтобы посекундно увидеть, какие системные вызовы вызывают заторы потоков.<br />
+2. <strong>Раздувание <code>runqueue</code></strong> ──► снятие CPU-профиля (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>) для локализации прожорливых функций и дампа горутин (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>).<br />
+3. <strong>Хронический перекос локальных очередей <code>[ ... ]</code></strong> ──► подключение block profile (<a href="5-block-profile.html" class="wikilink">5. block profile</a>) для поиска удерживаемых блокировок.</p>
+<hr />
 <h2 id="ogranicheniya">Ограничения</h2>
 
 <ul>
-<li>Scheduler trace показывает усреднённую картину за период <code>N</code> мс. Пиковые всплески могут быть смазаны.</li>
-<li>Нет информации о типах горутин (сеть, syscall, running). Для этого нужен execution tracer.</li>
-<li>При очень частом выводе (например, <code>schedtrace=10</code>) overhead на форматирование и запись в stderr может стать заметным (несколько процентов CPU). Рекомендуется 1000 мс для production.</li>
+<li><code>schedtrace</code> фиксирует только агрегированные цифры на момент тика таймера. Кратковременные всплески активности длительностью менее периода дискретизации (например, микропауза в 2 мс внутри 1000-миллисекундного окна) могут остаться незамеченными.</li>
+<li>Вывод не содержит метаданных о типах горутин (сетевые, дисковые или вычислительные).</li>
+<li>Рекомендуемый интервал для продакшена — <strong>1000 мс</strong> (1 секунда). Более частый опрос (например, <code>schedtrace=10</code>) создает паразитный шум в <code>stderr</code> и тратит такты процессора на форматирование строк.</li>
 </ul>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Scheduler trace</strong> (<code>GODEBUG=schedtrace=1000</code>) — лёгкий текстовый мониторинг состояния планировщика Go.</li>
-<li>Ключевые метрики: <code>idleprocs</code> (простаивающие P), <code>threads</code> (потоки ОС), <code>runqueue</code> (глобальная очередь), локальные очереди.</li>
-<li>Позволяет быстро диагностировать перегрузку, дисбаланс, утечки потоков и горутин.</li>
-<li>Незаменим для первоначального скрининга проблем производительности в production без значительного overhead.</li>
-<li>Дополняет execution tracer, профили и дампы, указывая направление для дальнейшего расследования.</li>
+<li><strong>Scheduler trace</strong> (<code>GODEBUG=schedtrace=1000</code>) — легковесный инструмент непрерывного текстового мониторинга планировщика Go, работающий практически с нулевым оверхедом.</li>
+<li>Ключевые показатели: <code>gomaxprocs</code> (лимит параллелизма), <code>idleprocs</code> (свободные процессоры), <code>threads</code> (потоки ядра ОС), <code>runqueue</code> (глобальная очередь) и срез локальных очередей каждого <code>P</code>.</li>
+<li>Позволяет за секунды диагностировать 4 главные системные аномалии: CPU-bound перегрузку, затор в системных вызовах, утечку горутин и дисбаланс Work Stealing.</li>
+<li>Служит идеальным триггером для подключения более тяжелых инструментов глубокого анализа (pprof, execution tracer).</li>
 </ul>
-<p>Теперь, освоив наблюдение за планировщиком, мы перейдём к финальной статье подраздела «Runtime и инструменты» — <a href="8-debug-tools.html" class="wikilink">8. debug tools</a>, где собраны остальные утилиты и переменные отладки (<code>GODEBUG</code>, <code>GOTRACEBACK</code>, <code>net/http/pprof</code> и другие).</p>
+<p>Теперь, освоив наблюдение за планировщиком, мы перейдём к финальной статье подраздела «Runtime и инструменты» — <a href="8-debug-tools.html" class="wikilink">8. debug tools</a>, где систематизируем все остальные флаги отладки, системные переменные (<code>GODEBUG</code>, <code>GOTRACEBACK</code>, эндпоинты <code>net/http/pprof</code> и другие) и вспомогательные утилиты рантайма Go.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2393,7 +2546,7 @@
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#scheduler-trace-chislovaya-karta-sostoyaniya-planirovshchika-go">Scheduler trace: числовая карта состояния планировщика Go</a></li><li class="toc-item toc-h2"><a href="#vklyuchenie-scheduler-trace">Включение scheduler trace</a></li><li class="toc-item toc-h2"><a href="#razbor-formata-vyvoda">Разбор формата вывода</a></li><li class="toc-item toc-h3"><a href="#gomaxprocs">gomaxprocs</a></li><li class="toc-item toc-h3"><a href="#idleprocs">idleprocs</a></li><li class="toc-item toc-h3"><a href="#threads">threads</a></li><li class="toc-item toc-h3"><a href="#spinningthreads">spinningthreads</a></li><li class="toc-item toc-h3"><a href="#idlethreads">idlethreads</a></li><li class="toc-item toc-h3"><a href="#runqueue">runqueue</a></li><li class="toc-item toc-h3"><a href="#lokalnye-ocheredi-p">Локальные очереди P</a></li><li class="toc-item toc-h2"><a href="#interpretatsiya-v-tipichnykh-stsenariyakh">Интерпретация в типичных сценариях</a></li><li class="toc-item toc-h3"><a href="#1-cpu-bound-peregruzka">1. CPU-bound перегрузка</a></li><li class="toc-item toc-h3"><a href="#2-io-bound-s-blokiruyushchimi-syscall">2. IO-bound с блокирующими syscall</a></li><li class="toc-item toc-h3"><a href="#3-utechka-gorutin">3. Утечка горутин</a></li><li class="toc-item toc-h3"><a href="#4-disbalans-work-stealing">4. Дисбаланс work stealing</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-tsifry-govoryat-o-zheleze">Mechanical Sympathy: что цифры говорят о «железе»</a></li><li class="toc-item toc-h2"><a href="#kombinirovanie-s-drugimi-instrumentami">Комбинирование с другими инструментами</a></li><li class="toc-item toc-h2"><a href="#ogranicheniya">Ограничения</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#scheduler-trace-chislovaya-karta-sostoyaniya-planirovshchika-go">Scheduler trace: числовая карта состояния планировщика Go</a></li><li class="toc-item toc-h2"><a href="#vklyuchenie-scheduler-trace">Включение scheduler trace</a></li><li class="toc-item toc-h2"><a href="#razbor-formata-vyvoda">Разбор формата вывода</a></li><li class="toc-item toc-h3"><a href="#gomaxprocs">gomaxprocs</a></li><li class="toc-item toc-h3"><a href="#idleprocs">idleprocs</a></li><li class="toc-item toc-h3"><a href="#threads">threads</a></li><li class="toc-item toc-h3"><a href="#spinningthreads">spinningthreads</a></li><li class="toc-item toc-h3"><a href="#idlethreads">idlethreads</a></li><li class="toc-item toc-h3"><a href="#runqueue">runqueue</a></li><li class="toc-item toc-h3"><a href="#lokalnye-ocheredi-p">Локальные очереди P</a></li><li class="toc-item toc-h2"><a href="#interpretatsiya-v-tipichnykh-stsenariyakh">Интерпретация в типичных сценариях</a></li><li class="toc-item toc-h3"><a href="#1-cpu-bound-peregruzka-defitsit-yader">1. CPU-bound перегрузка (дефицит ядер)</a></li><li class="toc-item toc-h3"><a href="#2-io-bound-s-blokiruyushchimi-syscall">2. IO-bound с блокирующими syscall</a></li><li class="toc-item toc-h3"><a href="#3-utechka-gorutin-goroutine-leak">3. Утечка горутин (Goroutine Leak)</a></li><li class="toc-item toc-h3"><a href="#4-disbalans-work-stealing">4. Дисбаланс Work Stealing</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-chto-tsifry-govoryat-ob-oborudovanii">Mechanical Sympathy: что цифры говорят об оборудовании</a></li><li class="toc-item toc-h2"><a href="#sobesedovanie-tipichnye-voprosy">Собеседование: типичные вопросы</a></li><li class="toc-item toc-h2"><a href="#kombinirovanie-s-drugimi-instrumentami">Комбинирование с другими инструментами</a></li><li class="toc-item toc-h2"><a href="#ogranicheniya">Ограничения</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

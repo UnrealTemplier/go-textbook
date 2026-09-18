@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~27 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~42 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. execution tracer</h1>
           </header>
@@ -2178,23 +2178,18 @@
           <div class="article-markdown">
             <h2 id="execution-tracer-sobytiynaya-letopis-rantayma">Execution Tracer: событийная летопись рантайма</h2>
 
-<p>В предыдущей статье мы освоили <strong><code>go tool trace</code></strong> — инструмент для визуализации трассировки исполнения (<a href="2-trace-tool.html" class="wikilink">2. trace tool</a>). Но сама трассировка рождается глубже: в недрах рантайма, где каждый запуск горутины, каждая блокировка на канале и каждый GC-цикл «записываются» в поток событий. Пакет <strong><code>runtime/trace</code></strong> и стоящий за ним <strong>execution tracer</strong> (трассировщик исполнения) — это та самая машина, которая порождает файл <code>trace.out</code>.</p>
-<p>В отличие от <code>pprof</code>, который сэмплирует состояние (<a href="../03-cpu-profiling/1-pprof-vvedenie.html" class="wikilink">1. pprof. Введение</a>), execution tracer <strong>записывает события во времени</strong>. Он не усредняет, а сохраняет хронологию, что делает его идеальным для расследования недетерминированных проблем: «почему горутина висела 20 мс, хотя CPU был свободен?». Но эта мощь имеет цену: трассировка нагружает рантайм сильнее любого другого профилировщика, а её вывод требует глубокого понимания внутренних структур.</p>
-<p>В этой статье мы вскроем инженерные детали execution tracer: как он генерирует события, взаимодействуя с планировщиком G-M-P (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>), сборщиком мусора (<a href="../05-garbage-collector/1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a>) и сетевым поллером (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>); как устроен кольцевой буфер; почему overhead достигает 30% и как с ним работать. Статья — прямой мост к практике: без этого знания невозможно интерпретировать артефакты на графе <strong>View trace</strong> и отличать реальные задержки от шума трассировщика.</p>
+<p>В предыдущей статье мы освоили веб-интерфейс <strong><code>go tool trace</code></strong> — высокоскоростной осциллограф для изучения динамики рантайма Go (<a href="2-trace-tool.html" class="wikilink">2. trace tool</a>). Но сам бинарный поток событий рождается значительно глубже: в самых раскаленных недрах рантайма, где каждый вызов <code>go func()</code>, каждая блокировка на канале, каждый системный вызов и каждая фаза сборки мусора протоколируются в наносекундную летопись.</p>
+<p>Пакет <strong><code>runtime/trace</code></strong> и стоящий за ним низкоуровневый движок <strong>execution tracer</strong> (трассировщик исполнения) — это тот самый «черный ящик», который непрерывно фиксирует происходящее и формирует файл <code>trace.out</code>.</p>
+<p>В отличие от <code>pprof</code>, который берет периодические случайные срезы состояния методом сэмплирования (<a href="../03-cpu-profiling/1-pprof-vvedenie.html" class="wikilink">1. pprof. Введение</a>), execution tracer <strong>записывает дискретные события во времени</strong>. Он не усредняет и не теряет хронологию, что делает его единственным надежным инструментом для расследования недетерминированных плавающих сбоев: <em>«Почему горутина висела 25 мс, хотя ядра процессора были свободны, а сеть не отвечала?»</em></p>
+<p>Однако эта аналитическая мощь достается недешево: событийная трассировка нагружает процессор и подсистему памяти сильнее любого другого стандартного инструмента, а ее вывод требует досконального понимания внутренних структур Go. В этой статье мы препарируем архитектуру execution tracer: разберем взаимодействие с планировщиком G-M-P (<a href="../06-konkurentnost/1-scheduler-go-g-m-p-model.html" class="wikilink">1. Scheduler Go. G-M-P модель</a>), сборщиком мусора (<a href="../05-garbage-collector/1-gc-v-go-obzor.html" class="wikilink">1. GC в Go. Обзор</a>) и сетевым поллером (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>), изучим устройство кольцевых буферов на каждом <code>P</code> и поймем, как отличать реальные узкие места от шума самого трассировщика.</p>
+<hr />
 <h2 id="arkhitektura-trassirovshchika-ot-sobytiya-do-protobuf">Архитектура трассировщика: от события до protobuf</h2>
 
-<p>Execution tracer — это не одна горутина-наблюдатель, а распределённый по P механизм сбора. Его архитектура отражает главный принцип Go: минимизация блокировок за счёт локальности.</p>
+<p>Execution tracer — это не отдельная фоновая горутина-наблюдатель, пытающаяся уследить за миллионами потоков. Подобная наивная архитектура мгновенно захлебнулась бы в межпоточных блокировках. Архитектура трассировщика построена на фундаментальном принципе Go: <strong>минимизация блокировок за счет жесткой локальности данных</strong>.</p>
 <h3 id="generatsiya-sobytiy-na-kazhdom-p">Генерация событий на каждом P</h3>
 
-<p>Когда трассировка включена, каждый P (логический процессор) владеет <strong>локальным кольцевым буфером</strong> (<code>trace.buf</code>), размером ~32 КБ. Все события, связанные с горутинами, исполняющимися на этом P, пишутся в этот буфер без блокировок — только через atomic-операции. События бывают:</p>
-<ul>
-<li><strong>Состояние горутины</strong>: <code>EvGoCreate</code>, <code>EvGoStart</code>, <code>EvGoEnd</code>, <code>EvGoBlock</code>, <code>EvGoUnblock</code>.</li>
-<li><strong>Планировщик</strong>: <code>EvGoSched</code>, <code>EvGoPreempt</code>.</li>
-<li><strong>GC</strong>: <code>EvGCSweepBegin</code>, <code>EvGCMarkAssistStart</code>, <code>EvGCMarkAssistDone</code>.</li>
-<li><strong>Системные вызовы</strong>: <code>EvGoSyscall</code>, <code>EvGoSyscallEnd</code>.</li>
-<li><strong>Пользовательские</strong>: <code>EvUserTaskCreate</code>, <code>EvUserRegionBegin</code>.</li>
-</ul>
-<p>Каждое событие — это пара (тип, временная метка, идентификатор горутины/потока/P, дополнительные данные). Временная метка снимается с монотонным счётчиком <code>runtime.nanotime()</code> (быстрый вызов, обёртка над <code>clock_gettime</code>), что даёт наносекундную точность.</p>
+<p>Когда трассировка активирована, каждый логический процессор <code>P</code> (структура <code>runtime.p</code>) получает в монопольное владение <strong>локальный кольцевой буфер</strong> (<code>trace.buf</code>) размером около 32–64 КБ.</p>
+<p>Все события, происходящие с горутинами, назначенными на данный <code>P</code>, записываются в его персональный буфер совершенно без блокировок мьютексами — запись осуществляется линейно с использованием быстрых локальных указателей и атомарных инструкций процессора.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2209,119 +2204,135 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-RT[&quot;Рантайм: планировщик, GC, netpoller&quot;] --&gt;|&quot;Генерация события&quot;| P1Buf[&quot;Локальный буфер P1&quot;]
-RT --&gt;|&quot;Генерация события&quot;| P2Buf[&quot;Локальный буфер P2&quot;]
-P1Buf --&gt;|&quot;Заполнен / остановка трассировки&quot;| Central[&quot;Центральный сборщик&quot;]
-P2Buf --&gt;|&quot;Заполнен / остановка трассировки&quot;| Central
-Central --&gt;|&quot;Запись в io.Writer&quot;| File[&quot;trace.out&quot;]
+RT[&quot;События рантайма: планировщик, GC, netpoller, syscall&quot;] --&gt;|&quot;Локальная запись без блокировок&quot;| P1Buf[&quot;Локальный буфер P1 (trace.buf)&quot;]
+RT --&gt;|&quot;Локальная запись без блокировок&quot;| P2Buf[&quot;Локальный буфер P2 (trace.buf)&quot;]
+RT --&gt;|&quot;Локальная запись без блокировок&quot;| PNBuf[&quot;Локальный буфер PN (trace.buf)&quot;]
+
+P1Buf --&gt;|&quot;Буфер заполнен / остановка трассировки&quot;| Central[&quot;Центральный сборщик (trace goroutine)&quot;]
+P2Buf --&gt;|&quot;Буфер заполнен / остановка трассировки&quot;| Central
+PNBuf --&gt;|&quot;Буфер заполнен / остановка трассировки&quot;| Central
+
+Central --&gt;|&quot;Сериализация и сброс в io.Writer&quot;| File[&quot;Файл trace.out / HTTP-стрим&quot;]
   </pre>
 </div>
 
 
-<p>Локальный буфер устроен просто: массив байт, указатели <code>head</code>/<code>tail</code>. Запись очередного события — это сериализация в байты (вручную, без рефлексии) и продвижение <code>head</code>. Когда буфер заполняется, P сбрасывает его в центральный сборщик и получает новый.</p>
+<p>Каждое микрособытие описывается кортежем:<br />
+- <strong>Тип события:</strong> битовый код операции (например, <code>EvGoCreate</code>, <code>EvGoStart</code>).<br />
+- <strong>Временная метка:</strong> монотонное время высокого разрешения, снимаемое ультрабыстрой функцией <code>runtime.nanotime()</code> (аппаратная обертка над системным вызовом <code>clock_gettime(CLOCK_MONOTONIC)</code> или инструкцией <code>RDTSC</code> / <code>vDSO</code>).<br />
+- <strong>Идентификаторы контекста:</strong> идентификатор горутины <code>goid</code>, потока ОС <code>M</code> и процессора <code>P</code>.<br />
+- <strong>Стек вызовов:</strong> программные счетчики <code>PC</code> для последующей символизации.</p>
+<p>Локальный буфер <code>trace.buf</code> устроен предельно аскетично: непрерывный массив байт и указатели <code>head</code>/<code>tail</code>. Сериализация выполняется вручную прямыми побайтовыми операциями без участия рефлексии и без дополнительных динамических аллокаций.</p>
+<hr />
 <h3 id="tsentralnyy-sborshchik-i-svedenie-potokov">Центральный сборщик и сведение потоков</h3>
 
-<p>Фоновая горутина-сборщик (trace goroutine) читает заполненные буферы от всех P и сериализует их в выходной поток (<code>io.Writer</code>, переданный в <code>trace.Start</code>). Формат выходного файла — бинарный protobuf (своя схема, не стандартный <code>proto</code>), оптимизированный под компактность. Каждое событие занимает от 1 до десятков байт, в зависимости от сложности.</p>
-<p>При остановке трассировки (<code>trace.Stop()</code>) все оставшиеся буферы P принудительно сбрасываются, и выходной поток закрывается. <code>go tool trace</code> потом парсит этот файл, восстанавливает временные шкалы и строит визуализацию.</p>
-<h2 id="tipy-sobytiy-i-ikh-svyaz-s-g-m-p">Типы событий и их связь с G-M-P</h2>
+<p>Когда локальный буфер <code>trace.buf</code> на конкретном <code>P</code> заполняется, процессор передает его в глобальную очередь и аллоцирует новый чистый буфер.</p>
+<p>Специальная фоновая системная горутина-сборщик (trace goroutine) просыпается, забирает заполненные буферы от всех <code>P</code> и выполняет их потоковую сериализацию в выходной интерфейс <code>io.Writer</code>, переданный при старте в функцию <code>trace.Start(w io.Writer)</code>.</p>
+<p>Формат выходного потока — компактный бинарный протокол (специализированный внутренний формат рантайма Go, концептуально близкий к protobuf/varint), где числовые идентификаторы и дельты временных меток сжимаются переменной длиной (LEB128). При вызове <code>trace.Stop()</code> все активные буферы <code>P</code> принудительно сбрасываются в <code>io.Writer</code>, гарантируя сохранность последних наносекунд работы перед закрытием файла.</p>
+<hr />
+<h2 id="tipy-sobytiy-i-ikh-svyaz-s-modelyu-g-m-p">Типы событий и их связь с моделью G-M-P</h2>
 
-<p>Execution tracer — это по сути летописец модели G-M-P. Каждый переход горутины между состояниями (<a href="../06-konkurentnost/2-goroutines-pod-kapotom.html" class="wikilink">2. Goroutines под капотом</a>) порождает событие. Вот ключевые события и их роль в диагностике.</p>
+<p>Execution tracer — это прямой биограф модели G-M-P. Каждая смена статуса в жизненном цикле горутины (<a href="../06-konkurentnost/2-goroutines-pod-kapotom.html" class="wikilink">2. Goroutines под капотом</a>) порождает строго типизированное событие:</p>
 <div class="table-container"><table>
 <thead>
 <tr>
 <th>Событие</th>
-<th>Когда происходит</th>
-<th>Что диагностируется</th>
+<th>Момент генерации в рантайме</th>
+<th>Что позволяет диагностировать</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>EvGoCreate</code></td>
 <td>Создание новой горутины (<code>go func()</code>)</td>
-<td>Всплески создания, утечки</td>
+<td>Всплески создания горутин, неконтролируемые утечки памяти</td>
 </tr>
 <tr>
 <td><code>EvGoStart</code></td>
-<td>Горутина начала исполнение на P</td>
-<td>Миграция, задержка запуска</td>
+<td>Горутина перешла из <code>_Grunnable</code> в <code>_Grunning</code> на <code>P</code></td>
+<td>Задержки диспетчеризации планировщика, миграции между ядрами</td>
 </tr>
 <tr>
 <td><code>EvGoEnd</code></td>
-<td>Горутина завершилась</td>
-<td>Утечки, досрочное завершение</td>
+<td>Горутина успешно завершила выполнение</td>
+<td>Преждевременное завершение воркеров, аномальный отток задач</td>
 </tr>
 <tr>
 <td><code>EvGoBlock</code> / <code>EvGoUnblock</code></td>
-<td>Блокировка/разблокировка на канале, мьютексе</td>
-<td>Contention, долгое ожидание</td>
+<td>Переход в <code>_Gwaiting</code> на каналах, мьютексах, сети</td>
+<td>Конфликты блокировок (contention), дедлоки, медленные внешние зависимости</td>
 </tr>
 <tr>
 <td><code>EvGoSyscall</code> / <code>EvGoSyscallEnd</code></td>
-<td>Вход/выход из системного вызова</td>
-<td>Файловый IO, задержки ядра</td>
+<td>Поток <code>M</code> входит в блокирующий системный вызов ядра</td>
+<td>Синхронный файловый ввод-вывод, подвисания в ядре Linux</td>
 </tr>
 <tr>
 <td><code>EvGoSched</code></td>
-<td>Горутина добровольно уступила P</td>
-<td>Кооперативная многозадачность</td>
+<td>Добровольная уступка процессора (<code>runtime.Gosched</code>)</td>
+<td>Эффективность кооперативной многозадачности в горячих циклах</td>
 </tr>
 <tr>
 <td><code>EvGoPreempt</code></td>
-<td>Асинхронная преемпция</td>
-<td>Долгие CPU-участки</td>
+<td>Принудительное асинхронное вытеснение сигналом <code>SIGURG</code></td>
+<td>Длинные монопольные CPU-участки кода, мешающие другим горутинам</td>
 </tr>
 <tr>
-<td><code>EvGCMarkAssistStart</code></td>
-<td>Горутина начала помогать GC</td>
-<td>Давление GC, mark assist bottleneck</td>
+<td><code>EvGCSweepBegin</code></td>
+<td>Старт фазы очистки спанов памяти (Sweeping)</td>
+<td>Нагрузка на аллокатор страниц, фрагментация кучи</td>
+</tr>
+<tr>
+<td><code>EvGCMarkAssistStart</code> / <code>Done</code></td>
+<td>Горутина-мутатор мобилизована помогать GC</td>
+<td>Чрезмерно высокий темп аллокаций, штрафующий бизнес-логику</td>
+</tr>
+<tr>
+<td><code>EvGCStart</code></td>
+<td>Старт фазы маркировки сборщика мусора</td>
+<td>Частота циклов GC под нагрузкой</td>
+</tr>
+<tr>
+<td><code>EvUserTaskCreate</code></td>
+<td>Создание высокоуровневой логической задачи <code>trace.NewTask</code></td>
+<td>Сквозной трекинг обработки сквозного бизнес-запроса</td>
 </tr>
 <tr>
 <td><code>EvUserRegionBegin</code></td>
-<td>Пользовательский регион (см. ниже)</td>
-<td>Разметка бизнес-логики</td>
+<td>Вход в пользовательский интервал <code>trace.StartRegion</code></td>
+<td>Замеры длительности отдельных этапов (парсинг JSON, SQL-запрос)</td>
 </tr>
 </tbody>
 </table></div>
-<p>Каждое событие несёт идентификатор горутины (<code>goid</code>), P и M. Это позволяет <code>go tool trace</code> восстановить хронологию: на каком ядре работала горутина, куда мигрировала, из-за чего была вытеснена. Визуализация <code>View trace</code> (<a href="2-trace-tool.html" class="wikilink">2. trace tool</a>) строит из этих событий цветные полосы.</p>
+<p>Каждое событие несёт идентификатор горутины (<code>goid</code>), P и M. Это позволяет <code>go tool trace</code> восстановить хронологию: на каком ядре работала горутина, куда мигрировала, из-за чего была вытеснена. Визуализация View trace (<a href="2-trace-tool.html" class="wikilink">2. trace tool</a>) строит из этих событий цветные полосы и стрелки причинно-следственных связей: кто породил горутину, кто ее разблокировал и на какое ядро она была украдена алгоритмом Work Stealing.</p>
+<hr />
 <h2 id="vklyuchenie-trassirovki-i-eyo-tsena">Включение трассировки и её цена</h2>
 
-<p>Трассировка включается вызовом <code>trace.Start(w io.Writer)</code> и выключается <code>trace.Stop()</code>. Стандартный HTTP-эндпоинт <code>/debug/pprof/trace?seconds=N</code> просто оборачивает этот механизм.</p>
-<p><strong>Overhead трассировки значителен</strong> — 10–30% CPU и десятки мегабайт памяти на запись событий. Причины:</p>
-<ol>
-<li><strong>Безусловная запись событий.</strong> В отличие от pprof, который сэмплирует с частотой 100 Гц и имеет небольшой постоянный overhead, трассировщик пишет событие на <strong>каждое</strong> переключение горутины, на каждый вход в syscall, на каждую GC-операцию. На насыщенном сервере это могут быть миллионы событий в секунду.</li>
-<li><strong>Аллокации буферов.</strong> Каждый P периодически выделяет новый буфер (если старый ушёл на сброс). Это добавляет работу GC, что искажает картину.</li>
-<li><strong>Синхронизация при сбросе.</strong> При передаче заполненного буфера центральному сборщику используется блокировка (мьютекс), что создаёт микро-contention, особенно при большом числе P.</li>
-</ol>
+<p>Управление трассировщиком осуществляется программно через вызовы <code>trace.Start(w io.Writer)</code> и <code>trace.Stop()</code>. Встроенный в стандартную библиотеку HTTP-эндпоинт <code>/debug/pprof/trace?seconds=N</code> представляет собой тонкую сетевую обертку над этим низкоуровневым механизмом.</p>
+<h3 id="pochemu-trassirovka-samyy-tyazhelyy-instrument-profilirovaniya">Почему трассировка — самый тяжелый инструмент профилирования?</h3>
+
+<p>Накладные расходы включенного execution tracer могут достигать <strong>10–30% CPU</strong> и требовать десятков мегабайт оперативной памяти под буферизацию.</p>
+<p>Причины столь внушительного оверхеда:<br />
+1. <strong>Безусловная фиксация каждого шага:</strong> В отличие от CPU-профилировщика, который опрашивает стек 100 раз в секунду и не зависит от интенсивности переключений, трассировщик обязан записать событие на <strong>абсолютно каждую</strong> операцию планировщика, каждый <code>select</code>, каждую отправку в канал и каждый системный вызов. На высоконагруженном сервере частота генерации событий легко превышает <strong>2–5 миллионов событий в секунду</strong>!<br />
+2. <strong>Аллокации буферов памяти:</strong> Процессоры <code>P</code> непрерывно заполняют буферы и запрашивают новые у аллокатора. Это порождает дополнительную работу для сборщика мусора, создавая паразитный фон.<br />
+3. <strong>Конкуренция при сбросе:</strong> Передача заполненных буферов от нескольких десятков <code>P</code> в центральную очередь сборщика требует синхронизации через мьютекс, порождая микроконфликты (contention) на многоядерных машинах.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Запуск трассировки на 30 секунд в продакшене под высокой нагрузкой может <strong>удвоить latency</strong> и исказить метрики GC, потому что сам трассировщик генерирует аллокации. Всегда ограничивайтесь 3–10 секундами и коррелируйте данные с продакшен-метриками, снятыми без трассировки.</p>
+    <p><strong>Катастрофическое искажение latency и GC.</strong> Запуск 30-секундной трассировки в боевом кластере под пиковой нагрузкой способен удвоить время отклика (p99 latency) и искусственно участить срабатывание сборщика мусора из-за миллионов аллокаций самого трассировщика. В результате вы будете профилировать не поведение вашего приложения, а накладные расходы самого инструмента наблюдения! Всегда ограничивайте съемку короткими окнами (3–10 секунд) и сверяйте результаты с внешними метриками Prometheus, собранными в штатном режиме без трейсера.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="mekhanika-zapisi-v-kriticheskikh-sektsiyakh-rantayma">Механика записи в критических секциях рантайма</h2>
 
-<p>Самые интересные события — те, что записываются в горячих путях планировщика и синхронизации. Рассмотрим, как это реализовано.</p>
+<p>Чтобы оценить инженерное изящество execution tracer, заглянем в исходный код ядра Go (<code>runtime</code>):</p>
 <h3 id="planirovshchik-i-gorutiny">Планировщик и горутины</h3>
 
-<p>Функция <code>execute(g, m, p)</code> в <code>runtime/proc.go</code>, запускающая горутину на P, вызывает <code>traceGoStart(g)</code>. Эта функция проверяет, включена ли трассировка, и если да — атомарно пишет <code>EvGoStart</code>, <code>goid</code>, временную метку в локальный буфер P. Аналогично <code>goexit</code>, <code>gopark</code>, <code>goready</code> генерируют соответствующие события.</p>
-<p>Преемпция (асинхронная, через <code>SIGURG</code>) порождает <code>EvGoPreempt</code> с указанием причины (тайм-аут). Это позволяет увидеть в <code>View trace</code>, что горутина была снята не по своей воле.</p>
-<h3 id="setevoy-poller">Сетевой поллер</h3>
-
-<p>Netpoller (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>) интегрирован в трассировку: когда горутина паркуется в ожидании сети (<code>netpollblock</code>), записывается <code>EvGoBlock</code> с причиной "network". При пробуждении — <code>EvGoUnblock</code>. Это даёт разделение времени ожидания на сеть и на другие причины (каналы, мьютексы) в Goroutine analysis.</p>
-<h3 id="gc-i-mark-assist">GC и mark assist</h3>
-
-<p>Фазы GC (<a href="../05-garbage-collector/4-concurrent-gc.html" class="wikilink">4. Concurrent GC</a>) инструментированы событиями <code>EvGCStart</code>, <code>EvGCSweepBegin</code>, <code>EvGCMarkAssistStart</code> и другими. Mark assist, когда горутина-мутатор помогает маркировке, отображается как <code>EvGCMarkAssistStart</code>/<code>Done</code>, что позволяет измерить его вклад в задержку обработки запроса.</p>
-<h2 id="polzovatelskie-zadachi-i-regiony">Пользовательские задачи и регионы</h2>
-
-<p>Одних системных событий часто недостаточно, чтобы понять, какому запросу принадлежит задержка. Для этого <code>runtime/trace</code> предоставляет <strong>задачи (tasks)</strong> и <strong>регионы (regions)</strong>.</p>
-<ul>
-<li><strong>Task</strong> (<code>trace.NewTask(ctx, "name")</code>) создаёт логическую единицу работы с уникальным идентификатором. Все последующие регионы, созданные с этим контекстом, будут привязаны к задаче. В интерфейсе <code>go tool trace</code> можно выбрать задачу и увидеть её временную шкалу.</li>
-<li><strong>Region</strong> (<code>trace.StartRegion(ctx, "name")</code>) — именованный отрезок внутри задачи. На диаграмме он отображается как полоса, что позволяет измерить длительность бизнес-операции ("парсинг JSON", "запрос к БД") и сравнить её с системными событиями.</li>
-</ul>
+<p>Когда планировщик выбирает готовую горутину и вызывает функцию <code>execute(g, m, p)</code> в <code>src/runtime/proc.go</code>, первым делом проверяется флаг активности трассировки:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2331,26 +2342,92 @@ Central --&gt;|&quot;Запись в io.Writer&quot;| File[&quot;trace.out&quot;
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">ctx, task := trace.NewTask(context.Background(), &quot;handleOrder&quot;)
-defer task.End()
-region := trace.StartRegion(ctx, &quot;queryInventory&quot;)
-// ...
-region.End()
+  <pre class="language-go"><code class="language-go">// Псевдокод рантайма Go
+if trace.enabled {
+    traceGoStart(g)
+}
 </code></pre>
 </div>
 
-<p>Эти аннотации добавляют небольшие накладные расходы (несколько десятков наносекунд каждая), но их также можно селективно включать только для процентного количества запросов.</p>
+<p>Функция <code>traceGoStart(g)</code> считывает монотонный таймер <code>runtime.nanotime()</code>, формирует событие <code>EvGoStart</code> с идентификатором <code>g.goid</code> и атомарно сдвигает указатель в локальном буфере <code>p.trace.buf</code>. Аналогичные вызовы встроены в фундаментальные функции перехода состояний:<br />
+- <code>goexit()</code> генерирует <code>EvGoEnd</code>.<br />
+- <code>gopark()</code> генерирует <code>EvGoBlock</code> с указанием причины блокировки (канал, мьютекс, селектор).<br />
+- <code>goready()</code> генерирует <code>EvGoUnblock</code>, фиксируя точный момент, когда спящая горутина была пробуждена другой горутиной.</p>
+<p>Принудительное вытеснение горутины по таймеру (асинхронная преемпция через сигнал <code>SIGURG</code>) генерирует событие <code>EvGoPreempt</code>. Это позволяет визуализатору отобразить, что горутина покинула процессор не по собственной воле, а была принудительно снята планировщиком из-за истечения 10-миллисекундного кванта времени.</p>
+<hr />
+<h3 id="setevoy-poller-netpoller">Сетевой поллер (Netpoller)</h3>
+
+<p>Подсистема неблокирующего ввода-вывода (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>) глубоко интегрирована с трассировщиком:<br />
+- Когда горутина пытается прочитать данные из незаполненного сокета, рантайм вызывает функцию <code>netpollblock()</code>, которая регистрирует событие <code>EvGoBlock</code> с типом ожидания <code>traceBlockNet</code>.<br />
+- Как только ядро ОС через <code>epoll_wait</code> / <code>kevent</code> сигнализирует о готовности дескриптора, фоновый поток поллера переводит горутину в очередь и записывает <code>EvGoUnblock</code>.</p>
+<p>Именно эта связка позволяет отчету <strong>Goroutine analysis</strong> в <code>go tool trace</code> безупречно отделять время ожидания сокетов (<code>Network Wait</code>) от ожидания каналов и мьютексов (<code>Sync Block</code>).</p>
+<hr />
+<h3 id="sborshchik-musora-i-mark-assist">Сборщик мусора и Mark Assist</h3>
+
+<p>Критические секции сборщика мусора (<a href="../05-garbage-collector/4-concurrent-gc.html" class="wikilink">4. Concurrent GC</a>) инструментированы событиями <code>EvGCStart</code>, <code>EvGCSweepBegin</code> и <code>EvGCMarkAssistStart</code>.</p>
+<p>Когда горутина-мутатор аллоцирует память быстрее, чем фоновый GC успевает сканировать граф объектов, GC Pacer принудительно переводит ее в режим <strong>Mark Assist</strong>: горутина откладывает бизнес-логику и тратит процессорные циклы на маркировку живых объектов. В трассировке эти эпизоды отмечаются парой <code>EvGCMarkAssistStart</code> / <code>EvGCMarkAssistDone</code>. Если вы видите высокую плотность этих событий, сервис страдает от тяжелого дефицита квот памяти.</p>
+<hr />
+<h2 id="polzovatelskie-zadachi-i-regiony-tasks-regions">Пользовательские задачи и регионы (Tasks & Regions)</h2>
+
+<p>При анализе десятков тысяч однотипных горутин легко заблудиться в сырых системных вызовах. Пакет <code>runtime/trace</code> предоставляет средства высокоуровневой контекстной разметки:</p>
+
+<div class="code-block" data-lang="go">
+  <div class="code-header">
+    <span class="code-lang-tag">Go</span>
+    <button class="btn-code-copy" onclick="copyCodeBlock(this)" title="Скопировать">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+      <span>Копировать</span>
+    </button>
+  </div>
+  <pre class="language-go"><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;runtime/trace&quot;
+)
+
+func ProcessOrder(ctx context.Context, orderID string) {
+    // 1. Создаем сквозную задачу Task с уникальным ID
+    ctx, task := trace.NewTask(ctx, &quot;handleOrder&quot;)
+    defer task.End()
+
+    // 2. Логируем текстовую аннотацию (видима в трейсе)
+    trace.Log(ctx, &quot;orderID&quot;, orderID)
+
+    // 3. Выделяем именованный отрезок через StartRegion / End
+    region := trace.StartRegion(ctx, &quot;queryInventory&quot;)
+    checkInventory(orderID)
+    region.End()
+
+    // 4. Или через идиоматичную функцию WithRegion
+    trace.WithRegion(ctx, &quot;processPayment&quot;, func() {
+        chargeCreditCard(orderID)
+    })
+}
+</code></pre>
+</div>
+
+<ul>
+<li><strong>Task</strong> (<code>trace.NewTask(ctx, "name")</code>) создаёт логическую единицу работы с уникальным идентификатором. Все последующие регионы, созданные с этим контекстом, будут привязаны к задаче. В интерфейсе <code>go tool trace</code> можно выбрать задачу и увидеть её временную шкалу.</li>
+<li><strong>Region</strong> (<code>trace.StartRegion(ctx, "name")</code>) — именованный отрезок внутри задачи. На диаграмме он отображается как полоса, что позволяет измерить длительность бизнес-операции ("парсинг JSON", "запрос к БД") и сравнить её с системными событиями.</li>
+</ul>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как вы будете расследовать, что 1% запросов обрабатывается в 10 раз дольше остальных?<br />
-<strong>Ответ:</strong> Включу execution tracer на короткий интервал, добавив пользовательские регионы вокруг ключевых этапов обработки. В <code>goroutine analysis</code> найду горутины с максимальным <code>Scheduler Wait</code> или <code>Sync Block</code>. По <code>User-defined tasks</code> определю, какой этап вызвал задержку, и сопоставлю с GC-активностью или ожиданием сети.</p>
+    <p><strong>Вопрос:</strong> Как вы будете расследовать ситуацию, когда ровно 1% клиентских запросов обрабатывается в 10 раз дольше остальных (проблема p99/p99.9), при этом средний CPU и память в норме?<br />
+<strong>Ответ:</strong><br />
+1. Размечу проблемный обработчик через <code>trace.NewTask</code> и <code>trace.StartRegion</code> вокруг ключевых этапов (вызовы СУБД, обращение к внешним API, сериализация).<br />
+2. Включу execution tracer на короткий промежуток времени (3–5 секунд) непосредственно под нагрузкой через <code>/debug/pprof/trace</code>.<br />
+3. В интерфейсе <code>go tool trace</code> открою раздел <strong>User-defined tasks</strong> и отфильтрую задачи по аномальной длительности.<br />
+4. В <strong>Goroutine analysis</strong> проверю, в каком состоянии находилась горутина во время лага: если это <code>Scheduler Wait</code> — горутина простаивала из-за нехватки свободных <code>P</code>; если <code>Sync Block</code> — боролась за мьютекс; если <code>Network Wait</code> — зависла в ожидании ответа медленной базы данных.<br />
+5. На общем таймлайне проверю, не совпал ли всплеск латентности с фазой Stop-The-World сборщика мусора.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="sravnenie-s-drugimi-instrumentami">Сравнение с другими инструментами</h2>
 
 <div class="table-container"><table>
@@ -2358,50 +2435,51 @@ region.End()
 <tr>
 <th>Инструмент</th>
 <th>Что показывает</th>
-<th>Overhead</th>
-<th>Когда применять</th>
+<th style="text-align: center;">Аппаратный оверхед</th>
+<th>Сценарий применения</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><strong>pprof CPU</strong></td>
-<td>Агрегированное время по функциям</td>
-<td>~1-3%</td>
-<td>Поиск горячих функций</td>
+<td>Агрегированное процессорное время по функциям</td>
+<td style="text-align: center;">~1–3% CPU</td>
+<td>Поиск тяжелых вычислительных функций и горячих циклов</td>
 </tr>
 <tr>
 <td><strong>pprof memory</strong></td>
-<td>Аллокации / живая память</td>
-<td>~1-5%</td>
-<td>Утечки памяти, источники мусора</td>
+<td>Распределение аллокаций и живых байт в куче</td>
+<td style="text-align: center;">~1–5% памяти</td>
+<td>Поиск утечек памяти и источников мусора</td>
 </tr>
 <tr>
-<td><strong>block/mutex profile</strong></td>
-<td>Ожидание на синхронизации</td>
-<td>~1-5% (при rate&gt;1)</td>
-<td>Contention на мьютексах</td>
+<td><strong>block / mutex profile</strong></td>
+<td>Суммарные задержки на примитивах синхронизации</td>
+<td style="text-align: center;">~1–5% CPU</td>
+<td>Локализация конкуренции (contention) за мьютексы и каналы</td>
 </tr>
 <tr>
 <td><strong>execution tracer</strong></td>
-<td>Хронология событий G-M-P, GC, сети</td>
-<td>10-30%</td>
-<td>Динамика задержек, миграция горутин, GC-паузы</td>
+<td>Посекундная хронология G-M-P, GC, сети и пауз</td>
+<td style="text-align: center;"><strong>10–30% CPU</strong></td>
+<td>Задержки планировщика, всплески p99, миграция горутин, фазы STW</td>
 </tr>
 <tr>
 <td><strong>strace</strong></td>
-<td>Системные вызовы процесса</td>
-<td>Низкий-средний</td>
-<td>Отладка взаимодействия с ОС</td>
+<td>Поток системных вызовов ядра ОС (Linux)</td>
+<td style="text-align: center;">Высокий (до 10x)</td>
+<td>Отладка взаимодействия с операционной системой и файловым дескрипторами</td>
 </tr>
 <tr>
 <td><strong>perf sched</strong></td>
-<td>Планирование потоков ядром</td>
-<td>Низкий</td>
-<td>Проблемы на уровне потоков ОС</td>
+<td>Переключения контекста потоков на уровне ядра ОС</td>
+<td style="text-align: center;">Низкий</td>
+<td>Проблемы планирования потоков ядра Linux, CPU affinity</td>
 </tr>
 </tbody>
 </table></div>
-<p>Execution tracer — комплементарен pprof, а не заменяет его. pprof отвечает «где жжёт CPU», tracer — «почему горутина ждала, хотя CPU свободен».</p>
+<p>Трассировщик комплементарен <code>pprof</code>, а не заменяет его: <code>pprof</code> отвечает на вопрос: <em>«Где программа жжет CPU?»</em>, а execution tracer: <em>«Почему программа ждала, когда CPU простаивал?»</em></p>
+<hr />
 <h2 id="lovushki-i-ogranicheniya">Ловушки и ограничения</h2>
 
 <div class="callout callout-warning">
@@ -2410,7 +2488,7 @@ region.End()
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>Переполнение буфера.</strong> Если темп генерации событий превышает пропускную способность записи в <code>io.Writer</code> (например, медленный диск), буферы накапливаются, и рантайм начинает терять события. Внешне это проявляется как «пропуски» на диаграмме и сообщения в stderr: <code>trace: buffer overflow</code>. Решение: уменьшить длительность трассировки, увеличить буфер (неэкспортируемый параметр) или писать в память (<code>bytes.Buffer</code>).</p>
+    <p><strong>Переполнение буферов (<code>trace: buffer overflow</code>).</strong> Если темп генерации микрособытий превышает пропускную способность записи в выходной поток <code>io.Writer</code> (например, при медленной записи на диск или сетевой сокет), промежуточные буферы переполняются, и рантайм начинает отбрасывать события. В выводе консоли появляется сообщение: <code>trace: buffer overflow</code>, а на диаграмме таймлайна возникают пустые разорванные интервалы. Решение: уменьшать длительность записи, либо стримить данные в память через предварительно аллоцированный <code>bytes.Buffer</code>.</p>
   </div>
 </div>
 
@@ -2420,7 +2498,7 @@ region.End()
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>Трассировка меняет поведение.</strong> Из-за значительного overhead'а трассировка может скрыть или, наоборот, создать проблемы: замедлить обработку, заставить GC чаще срабатывать, изменить порядок исполнения горутин. Никогда не делайте выводы только по трассировке — проверяйте гипотезу отключением трассировки и сравнением бизнес-метрик.</p>
+    <p><strong>Эффект наблюдателя (Observer Effect).</strong> Из-за внушительного системного оверхеда трассировщик способен исказить картину: замедлить выполнение критических секций, спровоцировать внеочередные циклы GC и изменить естественный порядок планирования горутин. Никогда не принимайте архитектурных решений на основе единственного трейса — обязательно валидируйте гипотезы после отключения трассировки по бизнес-метрикам сервиса.</p>
   </div>
 </div>
 
@@ -2430,26 +2508,62 @@ region.End()
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>Неверная интерпретация <code>Scheduler Wait</code>.</strong> Высокое время в этом состоянии может означать как нехватку CPU, так и занятость P другими горутинами. Смотрите на совокупность: если Idle-процессов нет — CPU перегружен; если Idle есть, а Scheduler Wait высок — возможно, горутины ждут конкретный P из-за <code>LockOSThread</code>.</p>
+    <p><strong>Неверная интерпретация высокого <code>Scheduler Wait</code>.</strong> Высокое значение <code>Scheduler Wait</code> в отчете горутины не всегда означает глобальную перегрузку CPU. Если в таймлайне дорожки процессоров <code>P</code> окрашены в белый цвет (<code>Idle</code>), но горутины продолжают простаивать в ожидании запуска, проверьте использование <code>runtime.LockOSThread()</code>. Горутина, привязанная к конкретному системному потоку <code>M</code>, не может быть запущена на произвольном <code>P</code> и вынуждена ожидать освобождения именно своего привязанного потока.</p>
   </div>
 </div>
 
-<h2 id="mechanical-sympathy-trassirovshchik-i-zhelezo">Mechanical Sympathy: трассировщик и «железо»</h2>
+<hr />
+<h2 id="mechanical-sympathy-vzaimodeystvie-trassirovshchika-s-zhelezom">Mechanical Sympathy: взаимодействие трассировщика с «железом»</h2>
 
-<p>Локальные буферы P созданы так, чтобы минимизировать межъядерный трафик. Запись в буфер — это обычная инструкция <code>MOV</code> в память, которая попадает в L1-кэш данного ядра. При сбросе буфера центральному сборщику данные приходится передавать через L3 (или через QPI/Infinity Fabric), что вызывает cache line bouncing (<a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>). Поэтому сброс делается не на каждом событии, а пачками (при заполнении буфера или при остановке).</p>
-<p>Также <code>nanotime()</code> — это <code>clock_gettime(CLOCK_MONOTONIC)</code> (системный вызов), который стоит несколько десятков тактов. При миллионах событий в секунду это накапливается. Именно поэтому трассировка так заметно замедляет программу.</p>
+<p>Архитектура буферизации execution tracer демонстрирует глубокое понимание законов современного компьютерного железа:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+LocalWrite[&quot;Запись в локальный trace.buf на P&quot;] --&gt; L1Cache[&quot;Попадание в L1d-кэш локального ядра&lt;br/&gt;(быстрый MOV, ~1 нс)&quot;]
+L1Cache -.-&gt; Flushed[&quot;Передача заполненного буфера&lt;br/&gt;в центральный сборщик&quot;]
+Flushed --&gt; CrossCore[&quot;Синхронизация через L3-кэш / шину QPI&lt;br/&gt;(Cache Line Bouncing, ~40-60 нс)&quot;]
+  </pre>
+</div>
+
+
+<ul>
+<li><strong>Локальность кэшей процессора:</strong><br />
+  Пока процессор <code>P</code> пишет события в свой локальный буфер <code>trace.buf</code>, данные оседают в ультрабыстром кэше L1d текущего ядра процессора (доступ ~1 нс). Никакие другие ядра CPU не конкурируют за эти линии кэша.</li>
+<li><strong>Минимизация Cache Line Bouncing:</strong><br />
+  Передача буфера центральному сборщику сопряжена с передачей владения линией кэша через общий L3-кэш (или межпроцессорную шину Intel UPI / AMD Infinity Fabric), что порождает Cache Line Bouncing (<a href="../06-konkurentnost/8-false-sharing.html" class="wikilink">8. False sharing</a>). Именно поэтому рантайм никогда не передает события поштучно: буферы сбрасываются только крупными блоками по мере заполнения (раз в 32–64 КБ).</li>
+<li><strong>Стоимость монотонного таймера:</strong><br />
+  Каждое событие требует метки времени <code>runtime.nanotime()</code>. На современных архитектурах x86-64 и ARM64 это обращение к аппаратному регистру таймера (через vDSO без дорогостоящего переключения в кольцо ядра Ring 0). Однако при частоте в миллионы вызовов в секунду даже затраты в 10–20 тактов CPU на каждый замер начинают формировать заметную долю энергопотребления процессора.</li>
+</ul>
+<hr />
+<h2 id="revolyutsiya-go-1-22-novyy-dvizhok-trassirovki">Революция Go 1.22+: Новый движок трассировки</h2>
+
+<p>Начиная с Go 1.22, архитектура execution tracer пережила фундаментальное перерождение:<br />
+- <strong>Разделение на поколения (Generations):</strong> Рантайм перешел на секционированные поколения событий. Больше нет необходимости останавливать мир (STW) для глобальной синхронизации состояния трейсера.<br />
+- <strong>Потоковый анализ:</strong> Новый формат трассировки поддерживает непрерывный потоковый парсинг без необходимости предварительной загрузки всего многогигабайтного файла в оперативную память браузера.<br />
+- <strong>Flight Recorder:</strong> Кардинальное снижение накладных расходов (до 1–2%) открыло дорогу встроенному «бортовому самописцу» (Flight Recorder) — режиму, когда рантайм непрерывно ведет кольцевую запись последних секунд работы в памяти, позволяя сбросить детальный след на диск только в момент аварии или фатальной ошибки!</p>
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Execution tracer</strong> (<code>runtime/trace</code>) — это подсистема рантайма Go, записывающая хронологию событий (горутины, планировщик, GC, сеть, syscall) в бинарный файл для последующего анализа <code>go tool trace</code>.</li>
-<li>События генерируются в критических точках рантайма (планировщик, netpoller, GC) и пишутся в локальные кольцевые буферы P без блокировок, затем объединяются центральным сборщиком.</li>
-<li>Ключевые события: <code>EvGoStart</code>, <code>EvGoBlock</code>, <code>EvGoSyscall</code>, <code>EvGCStart</code>, <code>EvUserRegionBegin</code>.</li>
-<li>Пользовательские задачи и регионы (<code>trace.NewTask</code>, <code>trace.StartRegion</code>) позволяют размечать бизнес-логику и связывать задержки с конкретными запросами.</li>
-<li>Overhead трассировки значителен (10-30% CPU), поэтому она применяется кратковременно, только для диагностики динамических проблем.</li>
-<li>Трассировка дополняет pprof, а не заменяет: она вскрывает временную структуру, невидимую в агрегированных профилях.</li>
-<li>Правильное чтение трассировки — навык Senior-инженера, позволяющий преобразовывать «плавающие тормоза» в конкретные цепочки событий.</li>
+<li><strong>Execution tracer</strong> (<code>runtime/trace</code>) — это внутренний механизм рантайма Go, протоколирующий каждое дискретное событие планировщика, сетевого поллера, сборщика мусора и системных вызовов в наносекундную летопись.</li>
+<li>Архитектура инструмента опирается на локальные кольцевые буферы процессоров <code>P</code> (<code>trace.buf</code>), что исключает глобальные блокировки при записи микрособытий.</li>
+<li>Трассировщик регистрирует полный спектр состояний G-M-P: рождение (<code>EvGoCreate</code>), запуск (<code>EvGoStart</code>), вытеснение (<code>EvGoPreempt</code>), блокировки (<code>EvGoBlock</code>/<code>EvGoUnblock</code>) и системные вызовы (<code>EvGoSyscall</code>).</li>
+<li>Механизм пользовательских задач и регионов (<code>trace.NewTask</code>, <code>trace.StartRegion</code>) связывает абстрактные системные события с конкретной бизнес-логикой приложения.</li>
+<li>Высокий оверхед (10–30% CPU в старых версиях, 1–2% в Go 1.22+) требует осмотрительности: съемка должна производиться короткими интервалами (3–10 секунд) непосредственно под нагрузкой.</li>
+<li>Execution tracer отвечает на вопрос: <em>«Почему горутина ждала?»</em>, вскрывая латентность, которую невозможно обнаружить стандартными профилировщиками <code>pprof</code>.</li>
 </ul>
-<p>Теперь, понимая, как устроена трассировка исполнения, мы перейдём к более приземлённому, но не менее важному инструменту анализа состояния приложения в конкретный момент — <a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>.</p>
+<p>Теперь, овладев механикой непрерывной временной трассировки, мы переходим к мгновенным пространственным срезам состояния горутин — анализу дампов стеков в статье <a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2477,7 +2591,7 @@ region.End()
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#execution-tracer-sobytiynaya-letopis-rantayma">Execution Tracer: событийная летопись рантайма</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-trassirovshchika-ot-sobytiya-do-protobuf">Архитектура трассировщика: от события до protobuf</a></li><li class="toc-item toc-h3"><a href="#generatsiya-sobytiy-na-kazhdom-p">Генерация событий на каждом P</a></li><li class="toc-item toc-h3"><a href="#tsentralnyy-sborshchik-i-svedenie-potokov">Центральный сборщик и сведение потоков</a></li><li class="toc-item toc-h2"><a href="#tipy-sobytiy-i-ikh-svyaz-s-g-m-p">Типы событий и их связь с G-M-P</a></li><li class="toc-item toc-h2"><a href="#vklyuchenie-trassirovki-i-eyo-tsena">Включение трассировки и её цена</a></li><li class="toc-item toc-h2"><a href="#mekhanika-zapisi-v-kriticheskikh-sektsiyakh-rantayma">Механика записи в критических секциях рантайма</a></li><li class="toc-item toc-h3"><a href="#planirovshchik-i-gorutiny">Планировщик и горутины</a></li><li class="toc-item toc-h3"><a href="#setevoy-poller">Сетевой поллер</a></li><li class="toc-item toc-h3"><a href="#gc-i-mark-assist">GC и mark assist</a></li><li class="toc-item toc-h2"><a href="#polzovatelskie-zadachi-i-regiony">Пользовательские задачи и регионы</a></li><li class="toc-item toc-h2"><a href="#sravnenie-s-drugimi-instrumentami">Сравнение с другими инструментами</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-ogranicheniya">Ловушки и ограничения</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-trassirovshchik-i-zhelezo">Mechanical Sympathy: трассировщик и «железо»</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#execution-tracer-sobytiynaya-letopis-rantayma">Execution Tracer: событийная летопись рантайма</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-trassirovshchika-ot-sobytiya-do-protobuf">Архитектура трассировщика: от события до protobuf</a></li><li class="toc-item toc-h3"><a href="#generatsiya-sobytiy-na-kazhdom-p">Генерация событий на каждом P</a></li><li class="toc-item toc-h3"><a href="#tsentralnyy-sborshchik-i-svedenie-potokov">Центральный сборщик и сведение потоков</a></li><li class="toc-item toc-h2"><a href="#tipy-sobytiy-i-ikh-svyaz-s-modelyu-g-m-p">Типы событий и их связь с моделью G-M-P</a></li><li class="toc-item toc-h2"><a href="#vklyuchenie-trassirovki-i-eyo-tsena">Включение трассировки и её цена</a></li><li class="toc-item toc-h3"><a href="#pochemu-trassirovka-samyy-tyazhelyy-instrument-profilirovaniya">Почему трассировка — самый тяжелый инструмент профилирования?</a></li><li class="toc-item toc-h2"><a href="#mekhanika-zapisi-v-kriticheskikh-sektsiyakh-rantayma">Механика записи в критических секциях рантайма</a></li><li class="toc-item toc-h3"><a href="#planirovshchik-i-gorutiny">Планировщик и горутины</a></li><li class="toc-item toc-h3"><a href="#setevoy-poller-netpoller">Сетевой поллер (Netpoller)</a></li><li class="toc-item toc-h3"><a href="#sborshchik-musora-i-mark-assist">Сборщик мусора и Mark Assist</a></li><li class="toc-item toc-h2"><a href="#polzovatelskie-zadachi-i-regiony-tasks-regions">Пользовательские задачи и регионы (Tasks &amp; Regions)</a></li><li class="toc-item toc-h2"><a href="#sravnenie-s-drugimi-instrumentami">Сравнение с другими инструментами</a></li><li class="toc-item toc-h2"><a href="#lovushki-i-ogranicheniya">Ловушки и ограничения</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-vzaimodeystvie-trassirovshchika-s-zhelezom">Mechanical Sympathy: взаимодействие трассировщика с «железом»</a></li><li class="toc-item toc-h2"><a href="#revolyutsiya-go-1-22-novyy-dvizhok-trassirovki">Революция Go 1.22+: Новый движок трассировки</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

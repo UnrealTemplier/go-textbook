@@ -2169,8 +2169,8 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 16</span>
-              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
-              
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. block profile</h1>
           </header>
@@ -2178,27 +2178,78 @@
           <div class="article-markdown">
             <h2 id="block-profile-izmerenie-nevidimykh-ozhidaniy">Block Profile: измерение невидимых ожиданий</h2>
 
-<p>CPU-профиль (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>) показывает, на что процессор тратит такты. Execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>) визуализирует временную шкалу событий рантайма. Дамп горутин (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>) даёт мгновенный срез состояний. Но ни один из них не даёт прямого ответа на вопрос: «Сколько времени горутины тратят на ожидание каналов, мьютексов, сетевых операций?». Ответ на него даёт <strong>block profile</strong> — профиль блокировок.</p>
-<p>Block profile — это агрегированная статистика событий блокировки, в отличие от сэмплирующего CPU-профиля. Он записывает каждое (или каждое N-е) событие, когда горутина переходит в состояние ожидания (<a href="../06-konkurentnost/2-goroutines-pod-kapotom.html" class="wikilink">2. Goroutines под капотом</a>) по причинам: отправка/получение из канала, захват мьютекса, сетевое ожидание, ожидание на <code>sync.Cond</code>. Он показывает не только <em>где</em> блокируется программа, но и <em>насколько долго</em>.</p>
-<p>Senior-инженер использует block profile для поиска бутылочных горлышек конкурентности, которые не видны в загрузке CPU: медленных потребителей каналов, контеншна на мьютексах без видимого spinning'а, перекосов в пайплайнах. Это третий по важности профиль после CPU и памяти.</p>
+<p>Стандартный профилировщик CPU (<a href="../03-cpu-profiling/2-cpu-profiling-v-go.html" class="wikilink">2. CPU profiling в Go</a>) подробно рапортует, на какие именно участки кода процессор тратит драгоценные такты. Трассировщик execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>) разворачивает перед глазами полную временную ленту микрособытий. Дамп горутин (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>) дает мгновенную моментальную фотографию статусов.</p>
+<p>Но ни один из этих инструментов не способен дать прямой и компактный ответ на фундаментальный вопрос высоконагруженного бэкенда:<br />
+<strong>«Сколько совокупного времени наши горутины теряют в пустом ожидании каналов, мьютексов и сетевых сокетов, и какие строки кода виновны в этих простоях?»</strong></p>
+<p>Ответ дает <strong>block profile (профиль блокировок)</strong> — специализированный инструмент рантайма Go, измеряющий совокупную задержку нахождения горутин в заблокированном состоянии.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Sources [&quot;Источники блокировок в Go&quot;]
+Chan[&quot;Каналы (Channels)&lt;br/&gt;runtime.chanrecv1 / runtime.chansend1&quot;]
+Select[&quot;Мультиплексирование (Select)&lt;br/&gt;runtime.selectgo&quot;]
+Mutex[&quot;Мьютексы (Sync Primitives)&lt;br/&gt;sync.(*Mutex).Lock / sync.RWMutex&quot;]
+Net[&quot;Сетевой ввод-вывод (Netpoller)&lt;br/&gt;runtime.netpollblock&quot;]
+Cond[&quot;Условные переменные (Cond)&lt;br/&gt;sync.Cond.Wait&quot;]
+Syscall[&quot;Системные вызовы (Syscalls)&lt;br/&gt;дисковый I/O, futex&quot;]
+end
+
+Sources --&gt; Engine[&quot;Подсистема учета блокировок&lt;br/&gt;gopark ──► saveBlockEvent ──► goready&quot;]
+Engine --&gt; Output[&quot;Профиль блокировок: /debug/pprof/block&lt;br/&gt;(Агрегированное время ожидания по стекам)&quot;]
+  </pre>
+</div>
+
+
+<p>В отличие от CPU-профилирования, которое периодически сэмплирует работающие горутины с фиксированной частотой (100 Гц), block profile регистрирует <strong>дискретные события парковки горутин</strong>. Он фиксирует не только <em>место</em> в коде, где выполнение затормозилось, но и точную <em>длительность</em> задержки.</p>
+<p>Senior-инженер опирается на block profile при поиске узких мест конкурентности, принципиально невидимых по графикам утилизации CPU: застрявших воркеров, разбалансированных конвейеров, блокировок небуферизованных каналов и долгого ожидания сетевых ответов.</p>
+<hr />
 <h2 id="chto-izmeryaet-block-profile">Что измеряет block profile</h2>
 
-<p>Block profile регистрирует <strong>события перехода в состояние ожидания</strong> — моменты, когда горутина вызывает <code>gopark</code> и планировщик снимает её с P. Ключевые категории:</p>
-<ul>
-<li><strong>Каналы</strong>: <code>chan send</code>, <code>chan receive</code>.</li>
-<li><strong>Select</strong>: ожидание в <code>select</code> (агрегируется как <code>select</code>).</li>
-<li><strong>Мьютексы</strong>: <code>sync.Mutex.Lock</code>, <code>sync.RWMutex.Lock/RUnlock</code> (только время блокировки, не путать с mutex profile, который измеряет contention — см. <a href="6-mutex-profile.html" class="wikilink">6. mutex profile</a>).</li>
-<li><strong>Сеть</strong>: ожидание на сокете через netpoller (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>).</li>
-<li><strong>Системные вызовы</strong>: блокирующие syscall'ы (файловый ввод-вывод, <code>futex</code>).</li>
-<li><strong>Cond</strong>: ожидание на <code>sync.Cond.Wait</code>.</li>
-</ul>
-<p>Для каждого события записывается:<br />
-- Стек вызовов, приведший к блокировке.<br />
-- Длительность блокировки (от <code>gopark</code> до <code>goready</code>).</p>
-<p>В отличие от mutex profile, который фокусируется на частоте contention и показывает, кто держал мьютекс, block profile показывает <strong>время ожидания</strong>, не различая, кто был виновником. Это делает block profile более общим инструментом для поиска любых узких мест синхронизации.</p>
+<p>Block profile регистрирует события, когда исполняющаяся горутина добровольно или вынужденно уступает процессор и переходит в состояние ожидания <code>_Gwaiting</code> (<a href="../06-konkurentnost/2-goroutines-pod-kapotom.html" class="wikilink">2. Goroutines под капотом</a>) через вызов внутренней функции рантайма <code>gopark</code>:</p>
+<ol>
+<li><strong>Каналы (Channels):</strong><br />
+   - <code>chan receive</code> (в профиле отображается как <code>runtime.chanrecv1</code>) — горутина заблокирована на попытке чтения из пустого канала.<br />
+   - <code>chan send</code> (в профиле отображается как <code>runtime.chansend1</code>) — горутина ожидает освобождения буфера канала или появления читателя в небуферизованном канале.</li>
+<li><strong>Оператор Select:</strong><br />
+   - Ожидание готовности хотя бы одной ветви в операторе <code>select</code> (функция <code>runtime.selectgo</code>).</li>
+<li><strong>Примитивы синхронизации (<code>sync</code>):</strong><br />
+   - Захват взаимоисключающей блокировки <code>sync.Mutex.Lock</code> (в выводе pprof: <code>sync.(*Mutex).Lock</code>).<br />
+   - Захват разделяемой или эксклюзивной блокировки <code>sync.RWMutex.Lock/RUnlock</code>.<br />
+   - Ожидание сигнала на условной переменной <code>sync.Cond.Wait</code> (в профиле отображается как <code>Cond</code>).</li>
+<li><strong>Сетевой поллер:</strong><br />
+   - Ожидание сетевого сокета через системный дескриптор в функции <code>runtime.netpollblock</code> (<a href="../07-io-i-sistemnyy-uroven/4-epoll-kqueue-i-netpoller.html" class="wikilink">4. epoll, kqueue и netpoller</a>).</li>
+<li><strong>Системные вызовы ядра:</strong><br />
+   - Блокирующие системные вызовы операционной системы (файловый ввод-вывод, <code>futex</code>).</li>
+</ol>
+<p>Для каждого события рантайм сохраняет:<br />
+- Полный стек вызовов горутины, приведший к блокировке.<br />
+- Точную физическую длительность простоя (разница времени между вызовами <code>gopark</code> и пробуждающим <code>goready</code>).</p>
+<div class="callout callout-note">
+  <div class="callout-header">
+    <span class="callout-icon">📝</span>
+    <span class="callout-title">Заметка</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Принципиальное отличие от mutex profile:</strong> Block profile измеряет <strong>общее время пассивного ожидания</strong> горутины, независимо от того, кто именно стал причиной затора. Профиль мьютексов (<a href="6-mutex-profile.html" class="wikilink">6. mutex profile</a>) фокусируется исключительно на конкуренции (contention) за мьютексы и показывает стеки тех горутин, которые <em>удерживали</em> ресурс, мешая остальным.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="kak-vklyuchit-i-nastroit-block-profile">Как включить и настроить block profile</h2>
 
-<p>По умолчанию block profile <strong>отключён</strong>. Включение требует установки частоты через <code>runtime.SetBlockProfileRate(rate int)</code> или через HTTP-эндпоинт <code>pprof</code>.</p>
+<p>По умолчанию сбор block profile в Go <strong>полностью отключен</strong>, так как замеры времени на каждом переключении горутин создают дополнительную нагрузку на системные таймеры.</p>
+<p>Для активации профиля необходимо сконфигурировать частоту сэмплирования через функцию <code>runtime.SetBlockProfileRate(rate int)</code>.</p>
 <h3 id="ustanovka-rate">Установка rate</h3>
 
 <p>Параметр <code>rate</code> — это делитель: записывается каждое N-е событие блокировки. <code>rate=1</code> означает «записывать всё», что даёт полную картину, но создаёт значительный overhead (особенно на каналах и сети). <code>rate=1000</code> означает «записывать каждое 1000-е событие», снижая overhead до пренебрежимого, но уменьшая точность.</p>
@@ -2208,22 +2259,25 @@
 <h3 id="sposoby-vklyucheniya">Способы включения</h3>
 
 <ol>
-<li>
-<p><strong>Через HTTP pprof:</strong><br />
-   Импорт <code>_ "net/http/pprof"</code> и установка <code>runtime.SetBlockProfileRate(1)</code> в <code>init()</code> или <code>main</code>.</p>
-</li>
-<li>
-<p><strong>В тестах и бенчмарках:</strong><br />
-<code>bash
-   go test -blockprofile=block.out -bench=.</code><br />
-   При этом рантайм временно устанавливает <code>rate=1</code> на время теста.</p>
-</li>
-<li>
-<p><strong>Программно:</strong><br />
-<code>go
-   runtime.SetBlockProfileRate(1)</code></p>
-</li>
+<li><strong>Через HTTP pprof:</strong><br />
+   Импорт <code>_ "net/http/pprof"</code> и установка <code>runtime.SetBlockProfileRate(1)</code> в <code>init()</code> или <code>main</code>.<br />
+   ```go<br />
+   import (<br />
+       _ "net/http/pprof"<br />
+       "runtime"<br />
+   )</li>
 </ol>
+<p>func init() {<br />
+       // Включаем запись всех блокировок для локального профилирования<br />
+       runtime.SetBlockProfileRate(1)<br />
+   }<br />
+<code>2. **В тестах и бенчмарках:**  
+   Стандартный флаг команды `go test` автоматически включает сбор блокировок с `rate=1` на время прогона:</code>bash<br />
+   go test -blockprofile=block.out -bench=.<br />
+<code>3. **Программно:**</code>go<br />
+   runtime.SetBlockProfileRate(1)<br />
+   defer runtime.SetBlockProfileRate(0) // Отключить сбор<br />
+   ```</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2234,6 +2288,7 @@
   </div>
 </div>
 
+<hr />
 <h2 id="sbor-i-analiz-profilya">Сбор и анализ профиля</h2>
 
 <h3 id="sbor-fayla">Сбор файла</h3>
@@ -2248,11 +2303,12 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-bash"><code class="language-bash">curl -o block.prof &quot;http://localhost:6060/debug/pprof/block&quot;
+  <pre class="language-bash"><code class="language-bash"># Выгрузка бинарного профиля блокировок за последние секунды
+curl -o block.prof &quot;http://localhost:6060/debug/pprof/block&quot;
 </code></pre>
 </div>
 
-<p>Через тесты:</p>
+<p>Или из результатов бенчмарка:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2266,8 +2322,9 @@
 </code></pre>
 </div>
 
-<h3 id="analiz-cherez-go-tool-pprof">Анализ через `go tool pprof`</h3>
+<h3 id="2-analiz-cherez-go-tool-pprof">2. Анализ через `go tool pprof`</h3>
 
+<p>Анализ осуществляется стандартной консольной утилитой:</p>
 
 <div class="code-block" data-lang="bash">
   <div class="code-header">
@@ -2281,13 +2338,11 @@
 </code></pre>
 </div>
 
-<p>Внутри интерактивного режима:</p>
-<ul>
-<li><strong><code>top</code></strong> — показывает функции с наибольшим суммарным временем блокировки. Значения — в наносекундах (или микросекундах, если профиль долгий).</li>
-<li><strong><code>list FuncName</code></strong> — построчный разбор, на какой строке кода произошла блокировка и сколько времени заняла.</li>
-<li><strong><code>web</code></strong> / <strong><code>-http=:8080</code></strong> — визуализация графа вызовов или flamegraph.</li>
-</ul>
-<p>Пример вывода <code>top</code>:</p>
+<p>В интерактивной оболочке доступны привычные команды навигации:<br />
+- <strong><code>top</code></strong> — список функций с максимальным суммарным временем блокировки. Значения выражаются в секундах или наносекундах.<br />
+- <strong><code>list FuncName</code></strong> — детальный построчный листинг исходного кода целевой функции с привязкой потерянного времени к конкретным строкам.<br />
+- <strong><code>web</code></strong> или флаг запуска <code>-http=:8080</code> — генерация интерактивного графа вызовов или flamegraph в браузере.</p>
+<p>Пример вывода команды <code>top</code>:</p>
 
 <div class="code-block" data-lang="text">
   <div class="code-header">
@@ -2308,13 +2363,13 @@ Showing nodes accounting for 5.50s, 85% of 6.47s total
 </code></pre>
 </div>
 
-<p>Здесь видно:<br />
-- 2 секунды (суммарно) горутины провели в ожидании чтения из канала (<code>chanrecv1</code>).<br />
-- 1.5 секунды — в ожидании записи в канал (<code>chansend1</code>).<br />
-- 1 секунда — в <code>select</code>.<br />
-- 0.8 секунды — в ожидании сети (<code>netpollblock</code>).<br />
-- 0.2 секунды — ожидание мьютекса.</p>
-<p>Команда <code>list FuncName</code> покажет точные строки кода:</p>
+<p>Интерпретация отчета:<br />
+- <strong>2.00s</strong> — суммарно горутины провели 2 секунды в состоянии сна при чтении из канала (<code>chanrecv1</code>).<br />
+- <strong>1.50s</strong> — горутины ожидали возможности записать данные в заполненные каналы (<code>chansend1</code>).<br />
+- <strong>1.00s</strong> — время простоя в конструкции <code>selectgo</code>.<br />
+- <strong>0.80s</strong> — паузы в ожидании готовности сокетов в сетевом поллере (<code>netpollblock</code>).<br />
+- <strong>0.20s</strong> — прямое ожидание захвата мьютекса (<code>sync.(*Mutex).Lock</code>).</p>
+<p>Команда <code>list FuncName</code> мгновенно локализует виновника:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2338,107 +2393,164 @@ Showing nodes accounting for 5.50s, 85% of 6.47s total
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Внутри <code>runtime</code> каждое событие блокировки обрабатывается функцией <code>gopark</code>. Перед ней вызывается <code>traceBlockReason</code> и, если block profile активен, <code>saveBlockEvent</code>. Эта функция получает текущий стек, записывает временную метку и при разблокировке (<code>goready</code>) вычисляет дельту. Если <code>rate &gt; 1</code>, срабатывает алгоритм сэмплирования: счётчик событий инкрементируется, и запись происходит только когда <code>count % rate == 0</code>. Таким образом, блокировки не замедляются постоянными аллокациями под профиль — оверхед в основном от учёта времени.</p>
+    <p>Внутри ядра <code>runtime</code> каждое событие блокировки обслуживается функцией <code>gopark</code>. Перед засыпанием вызывается функция <code>traceBlockReason</code> и, если block profile активен, функция <code>saveBlockEvent</code>. Она считывает стек текущей горутины и фиксирует стартовую отметку времени. Когда другая горутина вызывает <code>goready</code>, рантайм вычисляет дельту времени. Если <code>rate &gt; 1</code>, срабатывает алгоритм сэмплирования: внутренний счетчик событий инкрементируется, и запись в профиль производится только при выполнении условия <code>count % rate == 0</code>. Это предотвращает постоянные аллокации памяти в горячих путях.</p>
   </div>
 </div>
 
-<h2 id="interpretatsiya-rezultatov-diagnostika-problem">Интерпретация результатов: диагностика проблем</h2>
+<hr />
+<h2 id="interpretatsiya-rezultatov-tipovye-patterny-problem">Интерпретация результатов: типовые паттерны проблем</h2>
 
 <h3 id="1-vysokoe-vremya-v-chanrecv1-ili-chansend1">1. Высокое время в `chanrecv1` или `chansend1`</h3>
 
-<p>Если в топе <code>chanrecv1</code> с большим временем, значит, горутины-читатели простаивают. Это нормально для потребителей, ожидающих данные. Но если время аномально велико при стабильном потоке данных, возможно:</p>
 <ul>
-<li>Продюсеры не успевают генерировать данные (bottleneck на входе).</li>
-<li>Канал не буферизирован, и продюсеры ждут, пока потребитель освободится (это будет видно по <code>chansend1</code>).</li>
-<li>Горутина зависла из-за утечки (см. пример ниже).</li>
+<li>Если лидирует <strong><code>runtime.chanrecv1</code></strong> с огромным кумулятивным временем: потребители простаивают в ожидании задач. В фоновых воркерах это нормально, однако если под нагрузкой горутины долго ждут данные, значит продюсеры не справляются с генерацией входного потока (bottleneck на входе конвейера).</li>
+<li>Если в топе <strong><code>runtime.chansend1</code></strong>: каналы переполнены. Потребители не успевают разгребать очередь, либо используется небуферизованный канал там, где требуется сглаживание микропакетов.</li>
 </ul>
-<h3 id="2-vysokoe-vremya-v-selectgo">2. Высокое время в `selectgo`</h3>
+<h3 id="2-dominirovanie-runtime-selectgo">2. Доминирование `runtime.selectgo`</h3>
 
-<p>Если много времени в <code>select</code>, скорее всего, горутины ожидают множество каналов, и ни один из них не готов. Например, <code>select</code> с <code>ctx.Done()</code> и рабочим каналом, где контекст никогда не отменяется, а данные приходят редко.</p>
-<h3 id="3-vremya-v-netpollblock">3. Время в `netpollblock`</h3>
+<p>Горутины зависли в ожиданиях нескольких каналов одновременно. Типичный антипаттерн: горутина слушает рабочий канал и <code>ctx.Done()</code>, однако контекст никогда не отменяется, а отправитель перестал посылать сообщения из-за ошибки в логике.</p>
+<h3 id="3-zaderzhki-v-runtime-netpollblock">3. Задержки в `runtime.netpollblock`</h3>
 
-<p>Большое время ожидания сети — норма для серверных горутин, ожидающих запросы. Но если это время составляет секунды, а p99 latency должна быть микросекундами — возможно, сетевые вызовы не имеют тайм-аутов, что приводит к накоплению ожидающих горутин (утечка горутин на сети).</p>
+<p>Большие тайминги ожидания сети типичны для idle-соединений. Однако если <code>netpollblock</code> накапливает сотни секунд на активных RPC-хэндлерах, а внешние вызовы не ограничены таймаутами контекста (<code>context.WithTimeout</code>), сервис накапливает утекшие горутины на зависших сокетах.</p>
 <h3 id="4-vremya-v-sync-mutex-lock">4. Время в `sync.(*Mutex).Lock`</h3>
 
-<p>Block profile показывает время <strong>ожидания</strong> мьютекса, но не причину contention. Он покажет, что горутина долго не могла захватить мьютекс. Для выявления того, кто держал мьютекс, нужно использовать <strong>mutex profile</strong> (<a href="6-mutex-profile.html" class="wikilink">6. mutex profile</a>), который записывает стеки удерживающих горутин. Block profile дополняет его, показывая общее время задержки.</p>
+<p>Отражает чистое время ожидания в очереди за мьютексом. Если мьютекс держится долго (например, внутри критической секции выполняется чтение с диска или сериализация JSON), block profile покажет точку страдания, а точную причину раскроет mutex profile (<a href="6-mutex-profile.html" class="wikilink">6. mutex profile</a>).</p>
 <h3 id="5-kaskadnye-blokirovki">5. Каскадные блокировки</h3>
 
-<p>Если горутина А блокируется на канале, а горутина Б, которая должна разблокировать А, сама заблокирована на мьютексе — block profile покажет два вклада, но не причинно-следственную связь. Здесь на помощь приходит execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>).</p>
-<h2 id="primer-poisk-utechki-gorutin-cherez-block-profile">Пример: поиск утечки горутин через block profile</h2>
+<p>Если горутина A ждет канал от горутины B, а горутина B застряла на мьютексе, block profile отобразит оба простоя. В сложных цепочках зависимостей для выявления первопричины рекомендуется переходить к execution tracer (<a href="3-execution-tracer.html" class="wikilink">3. execution tracer</a>).</p>
+<hr />
+<h2 id="prakticheskiy-keys-poisk-utechki-gorutin-cherez-block-profile">Практический кейс: поиск утечки горутин через block profile</h2>
 
-<p>Сценарий: сервис обрабатывает 1000 RPS, но со временем p99 latency растёт, и количество горутин увеличивается.</p>
+<p><strong>Симптоматика:</strong> Под нагрузкой в 1000 RPS память сервиса медленно утекает, а p99 задержка деградирует.</p>
+<p><strong>Шаги диагностики:</strong></p>
 <ol>
-<li>Снимаем дамп горутин (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>) — видим тысячи горутин в <code>[chan receive]</code> на функции <code>processBatch</code>.</li>
-<li>Включаем block profile: <code>runtime.SetBlockProfileRate(1)</code>.</li>
-<li>Через 30 секунд снимаем профиль: <code>curl -o block.prof http://localhost:6060/debug/pprof/block</code>.</li>
-<li>Анализируем: <code>top</code> показывает <code>runtime.chanrecv1</code> с временем в несколько секунд. <code>list processBatch</code> указывает на строку <code>&lt;-ch</code>.</li>
-<li>Смотрим код: канал <code>ch</code> создаётся для каждого запроса, и в него должен отправить результат воркер. Но при тайм-ауте запроса горутина-читатель уходит, а воркер продолжает висеть, пытаясь отправить в никем не читаемый канал (утечка горутины).</li>
-<li>Решение: использовать буферизированный канал (<code>make(chan Result, 1)</code>) или <code>select</code> с <code>ctx.Done()</code> в воркере.</li>
+<li><strong>Дамп горутин:</strong> Снятие дампа (<a href="4-goroutine-dump.html" class="wikilink">4. goroutine dump</a>) показывает 8 000 горутин в состоянии <code>[chan receive]</code> на функции <code>processBatch</code>.</li>
+<li><strong>Включение профилировщика:</strong> Активируем сбор:<br />
+<code>go
+   runtime.SetBlockProfileRate(1)</code></li>
+<li><strong>Сбор профиля:</strong> Через 30 секунд скачиваем дамп:<br />
+<code>bash
+   curl -o block.prof http://localhost:6060/debug/pprof/block</code></li>
+<li><strong>Анализ стека:</strong> Команда <code>top</code> выводит <code>runtime.chanrecv1</code> с огромным суммарным временем. Вызов <code>list processBatch</code> указывает строго на строку:<br />
+<code>go
+   result := &lt;-ch</code></li>
+<li><strong>Анализ кода:</strong> Канал <code>ch</code> создается динамически на каждый запрос. Воркер должен отправить туда результат. Но при срабатывании таймаута клиентского запроса вызывающая функция досрочно завершается, а фоновый воркер навсегда зависает на попытке записи в канал!</li>
+<li><strong>Исправление:</strong> Замена на буферизованный канал <code>make(chan Result, 1)</code> или добавление проверки <code>select</code> с <code>ctx.Done()</code> в коде воркера полностью устраняет утечку.</li>
 </ol>
-<p>Block profile показал <strong>точку блокировки</strong>, а анализ кода выявил корневую причину.</p>
-<h2 id="mekhanika-zapisi-i-overhead">Механика записи и overhead</h2>
+<hr />
+<h2 id="mekhanika-zapisi-i-sistemnyy-overhead">Механика записи и системный overhead</h2>
 
-<p>При <code>rate=1</code> block profile записывает стек вызовов для <strong>каждой</strong> блокировки. Это означает:</p>
-<ul>
-<li>Вызов <code>runtime.Stack</code> для получения стека (проход по фреймам, ~микросекунда на глубокий стек).</li>
-<li>Запись в хеш-таблицу профиля (с блокировкой, только одна горутина пишет).</li>
-<li>При высокой частоте блокировок (например, небуферизированные каналы в горячем цикле) overhead может достигать 5-10% CPU. Однако обычно блокировки происходят не настолько часто, чтобы стать доминирующим потребителем CPU.</li>
-</ul>
-<p>При <code>rate &gt; 1</code> overhead линейно уменьшается. Для production-мониторинга <code>rate=10000</code> практически незаметен, но даёт представительную выборку.</p>
-<h2 id="otlichie-ot-execution-tracer-i-mutex-profile">Отличие от execution tracer и mutex profile</h2>
+<p>При <code>rate = 1</code> рантайм Go выполняет полноценный сбор стека для <strong>каждого</strong> события блокировки:<br />
+- Вызов внутренней функции <code>runtime.Stack</code> (проход по фреймам стека занимает около 1 микросекунды на глубоких стеках).<br />
+- Поиск и обновление счетчиков в глобальной хэш-таблице профиля (синхронизируется внутренней блокировкой).</p>
+<p>Если в программе происходит миллион блокировок в секунду (например, плотные циклы с небуферизованными каналами), накладные расходы могут составить от 5% до 10% CPU.<br />
+При <code>rate &gt; 1</code> накладные расходы снижаются экспоненциально. Значение <code>rate = 10000</code> практически незаметно для продакшена и идеально подходит для непрерывного мониторинга.</p>
+<hr />
+<h2 id="sravnenie-block-profile-vs-mutex-profile-vs-execution-tracer">Сравнение: Block Profile vs Mutex Profile vs Execution Tracer</h2>
+
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph Comparison [&quot;Сравнительный анализ инструментов&quot;]
+BP[&quot;Block Profile&lt;br/&gt;• Время ожидания по ВСЕМ типам&lt;br/&gt;• Каналы, select, мьютексы, сеть&lt;br/&gt;• Агрегировано по стекам&lt;br/&gt;• Оверхед: Низкий-средний&quot;]
+MP[&quot;Mutex Profile&lt;br/&gt;• Конкуренция ТОЛЬКО за мьютексы&lt;br/&gt;• Стеки УДЕРЖИВАЮЩИХ горутин&lt;br/&gt;• Агрегировано по стекам&lt;br/&gt;• Оверхед: Низкий-средний&quot;]
+ET[&quot;Execution Tracer&lt;br/&gt;• Полная хронология событий во времени&lt;br/&gt;• Причинно-следственные связи&lt;br/&gt;• Посекундный таймлайн&lt;br/&gt;• Оверхед: Высокий (10-30%)&quot;]
+end
+  </pre>
+</div>
+
 
 <div class="table-container"><table>
 <thead>
 <tr>
 <th>Инструмент</th>
 <th>Что измеряет</th>
-<th>Гранулярность</th>
-<th>Overhead</th>
+<th>Гранулярность данных</th>
+<th style="text-align: center;">Системный оверхед</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Block profile</td>
-<td>Время ожидания по типам (каналы, мьютексы, сеть)</td>
-<td>Агрегировано по стекам</td>
-<td>Низкий-средний</td>
+<td><strong>Block profile</strong></td>
+<td>Суммарное время ожидания (каналы, мьютексы, сеть, syscall)</td>
+<td>Агрегировано по стекам вызовов</td>
+<td style="text-align: center;">Низкий / Средний</td>
 </tr>
 <tr>
-<td>Mutex profile</td>
-<td>Contention на мьютексах, стеки удерживающих</td>
-<td>Агрегировано по стекам</td>
-<td>Низкий-средний</td>
+<td><strong>Mutex profile</strong></td>
+<td>Contention на мьютексах, стеки удерживающих горутин</td>
+<td>Агрегировано по стекам вызовов</td>
+<td style="text-align: center;">Низкий / Средний</td>
 </tr>
 <tr>
-<td>Execution tracer</td>
-<td>Хронология всех событий, причины ожидания</td>
-<td>Событийно, во времени</td>
-<td>Высокий</td>
+<td><strong>Execution tracer</strong></td>
+<td>Полная хронология событий, причинно-следственные связи</td>
+<td>Посекундно, по каждому событию</td>
+<td style="text-align: center;">Высокий (10–30%)</td>
 </tr>
 </tbody>
 </table></div>
-<p>Block profile — компромисс между детализацией и overhead'ом. Он даёт точное время ожидания и стек, но не показывает, <em>почему</em> другая сторона не отвечает (для мьютексов — см. mutex profile, для каналов — нужен трейс).</p>
-<h2 id="mechanical-sympathy-kak-protsessor-vidit-blokirovku">Mechanical Sympathy: как процессор видит блокировку</h2>
+<p>Block profile представляет собой золотую середину: он выявляет конкретные строки кода, крадущие время запросов, без необходимости развертывания тяжелого execution tracer.</p>
+<hr />
+<h2 id="mechanical-sympathy-kak-protsessor-perezhivaet-blokirovku">Mechanical Sympathy: как процессор переживает блокировку</h2>
 
-<p>С точки зрения процессора, переход горутины в состояние ожидания — это:</p>
+<p>С точки зрения кремниевого кристалла и операционной системы, переход горутины в состояние ожидания — это сложная цепочка аппаратных событий:</p>
 <ol>
-<li>Вызов <code>gopark</code> — сохранение регистров, вызов планировщика.</li>
-<li>Планировщик снимает G с M и запускает другую G. Это контекстное переключение в userspace (<a href="../06-konkurentnost/4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>).</li>
-<li>Если новая G использует тот же M, переключение дёшево (десятки тактов). Но данные старой G могут быть вытеснены из кэша (особенно если M мигрирует на другое ядро).</li>
-<li>Когда ожидаемая G разблокируется (<code>goready</code>), она встаёт в очередь раннабле. Её данные в кэше, скорее всего, уже холодны — доступ к ним будет с cache miss.</li>
+<li><strong>Сброс регистров:</strong> Вызов <code>gopark</code> сохраняет текущий набор регистров CPU в дескриптор <code>g.sched</code> и переключает стек на системный стек <code>g0</code>.</li>
+<li><strong>Переключение контекста:</strong> Планировщик отвязывает текущую горутину <code>G</code> от логического процессора <code>P</code> и передает конвейер другой готовой задаче (<a href="../06-konkurentnost/4-kontekstnye-pereklyucheniya.html" class="wikilink">4. Контекстные переключения</a>).</li>
+<li><strong>Вымывание L1/L2 кэша:</strong> Пока горутина спит, исполнение чужого кода вытесняет ее горячие рабочие данные из процессорного кэша L1d/L2 в оперативную память.</li>
+<li><strong>Холодный старт при пробуждении:</strong> Когда горутина разблокируется функцией <code>goready()</code>, она встает в очередь runnable. К моменту получения кванта времени ее кэши абсолютно холодны: первые сотни инструкций будут сопровождаться чередой тяжелых Cache Miss (штраф ~50–100 нс на каждое обращение к RAM).</li>
 </ol>
-<p>Block profile фиксирует именно время от <code>gopark</code> до <code>goready</code>. Это время включает не только ожидание, но и накладные расходы на миграцию и холодный старт. Поэтому большое время в block profile — это реальное время, которое запрос «потерял».</p>
+<p>Именно поэтому время блокировки в block profile — это не просто «пассивное ожидание», а прямой индикатор скрытых накладных расходов на вымывание кэшей и переключения контекста.</p>
+<hr />
+<h2 id="sobesedovanie-tipichnye-voprosy">Собеседование: типичные вопросы</h2>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> В чем заключается фундаментальное отличие между <code>block profile</code> и <code>mutex profile</code> в Go?<br />
+<strong>Ответ:</strong><br />
+- <strong>Block profile</strong> измеряет <strong>время ожидания</strong> горутин на любых примитивах синхронизации (каналы, мьютексы, сетевой поллер, системные вызовы) и фиксирует стек <strong>ожидающей</strong> горутины.<br />
+- <strong>Mutex profile</strong> фокусируется исключительно на конкуренции за блокировки (<code>sync.Mutex</code> и <code>sync.RWMutex</code>) и регистрирует стек горутины, которая <strong>удерживала</strong> мьютекс, пока другие ожидали его освобождения.</p>
+  </div>
+</div>
+
+<div class="callout callout-interview">
+  <div class="callout-header">
+    <span class="callout-icon">🎯</span>
+    <span class="callout-title">Собеседование</span>
+  </div>
+  <div class="callout-body">
+    <p><strong>Вопрос:</strong> Что произойдет, если установить <code>runtime.SetBlockProfileRate(1)</code> в сервисе с 50 000 RPS под высокой конкуренцией за каналы?<br />
+<strong>Ответ:</strong> На каждое блокирующее чтение или запись в канал рантайм начнет выполнять обход стека вызовов (<code>runtime.Stack</code>) и захватывать внутреннюю блокировку таблицы профилировщика. Это приведет к лавинообразному росту накладных расходов процессора (до 10–20% CPU) и исказит реальные задержки приложения. В высоконагруженном проде следует использовать сэмплирование (<code>rate = 10000</code>) или кратковременное профилирование.</p>
+  </div>
+</div>
+
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Block profile</strong> — агрегированная статистика времени ожидания горутин на каналах, мьютексах, сети и системных вызовах.</li>
-<li>Включается через <code>runtime.SetBlockProfileRate(rate)</code>; rate=1 — всё, rate&gt;1 — сэмплирование.</li>
-<li>Анализируется через <code>go tool pprof</code>: <code>top</code>, <code>list</code>, <code>web</code> показывают точки, где горутины простаивают.</li>
-<li>Незаменим для поиска утечек горутин, перекосов в пайплайнах и неочевидных ожиданий, которые не видны в CPU-профиле.</li>
-<li>Дополняет mutex profile (contention) и execution tracer (хронология).</li>
-<li>С точки зрения «железа», время блокировки — это потерянные такты и холодный кэш, поэтому оптимизация ожиданий напрямую улучшает latency.</li>
+<li><strong>Block profile</strong> — мощный специализированный инструмент для измерения суммарного времени ожидания горутин на каналах, мьютексах, сетевом поллере и системных вызовах.</li>
+<li>Включается через <code>runtime.SetBlockProfileRate(rate)</code>: при <code>rate = 1</code> собираются 100% событий, при <code>rate &gt; 1</code> включается сэмплирование.</li>
+<li>Анализируется через <code>go tool pprof</code> с помощью команд <code>top</code>, <code>list</code> и интерактивных веб-графов <code>web</code>.</li>
+<li>Незаменим для поиска скрытых бутылочных горлышек конкурентности, перекосов в параллельных конвейерах и утечек горутин.</li>
+<li>С точки зрения Mechanical Sympathy, устранение блокировок стабилизирует кэши L1/L2 процессора и снижает издержки переключения контекста.</li>
 </ul>
-<p>Теперь, освоив измерение времени ожидания, мы перейдём к профилю, который специализируется на конкретном типе синхронизации и отвечает на вопрос «кто виноват в contention?» — <a href="6-mutex-profile.html" class="wikilink">6. mutex profile</a>.</p>
+<p>Изучив измерение времени пассивных ожиданий, мы переходим к профилю, выявляющему истинных виновников конфликтов синхронизации: <a href="6-mutex-profile.html" class="wikilink">6. mutex profile</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2466,7 +2578,7 @@ Showing nodes accounting for 5.50s, 85% of 6.47s total
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#block-profile-izmerenie-nevidimykh-ozhidaniy">Block Profile: измерение невидимых ожиданий</a></li><li class="toc-item toc-h2"><a href="#chto-izmeryaet-block-profile">Что измеряет block profile</a></li><li class="toc-item toc-h2"><a href="#kak-vklyuchit-i-nastroit-block-profile">Как включить и настроить block profile</a></li><li class="toc-item toc-h3"><a href="#ustanovka-rate">Установка rate</a></li><li class="toc-item toc-h3"><a href="#sposoby-vklyucheniya">Способы включения</a></li><li class="toc-item toc-h2"><a href="#sbor-i-analiz-profilya">Сбор и анализ профиля</a></li><li class="toc-item toc-h3"><a href="#sbor-fayla">Сбор файла</a></li><li class="toc-item toc-h3"><a href="#analiz-cherez-go-tool-pprof">Анализ через go tool pprof</a></li><li class="toc-item toc-h2"><a href="#interpretatsiya-rezultatov-diagnostika-problem">Интерпретация результатов: диагностика проблем</a></li><li class="toc-item toc-h3"><a href="#1-vysokoe-vremya-v-chanrecv1-ili-chansend1">1. Высокое время в chanrecv1 или chansend1</a></li><li class="toc-item toc-h3"><a href="#2-vysokoe-vremya-v-selectgo">2. Высокое время в selectgo</a></li><li class="toc-item toc-h3"><a href="#3-vremya-v-netpollblock">3. Время в netpollblock</a></li><li class="toc-item toc-h3"><a href="#4-vremya-v-sync-mutex-lock">4. Время в sync.(Mutex).Lock</a></li><li class="toc-item toc-h3"><a href="#5-kaskadnye-blokirovki">5. Каскадные блокировки</a></li><li class="toc-item toc-h2"><a href="#primer-poisk-utechki-gorutin-cherez-block-profile">Пример: поиск утечки горутин через block profile</a></li><li class="toc-item toc-h2"><a href="#mekhanika-zapisi-i-overhead">Механика записи и overhead</a></li><li class="toc-item toc-h2"><a href="#otlichie-ot-execution-tracer-i-mutex-profile">Отличие от execution tracer и mutex profile</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-protsessor-vidit-blokirovku">Mechanical Sympathy: как процессор видит блокировку</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#block-profile-izmerenie-nevidimykh-ozhidaniy">Block Profile: измерение невидимых ожиданий</a></li><li class="toc-item toc-h2"><a href="#chto-izmeryaet-block-profile">Что измеряет block profile</a></li><li class="toc-item toc-h2"><a href="#kak-vklyuchit-i-nastroit-block-profile">Как включить и настроить block profile</a></li><li class="toc-item toc-h3"><a href="#ustanovka-rate">Установка rate</a></li><li class="toc-item toc-h3"><a href="#sposoby-vklyucheniya">Способы включения</a></li><li class="toc-item toc-h2"><a href="#sbor-i-analiz-profilya">Сбор и анализ профиля</a></li><li class="toc-item toc-h3"><a href="#sbor-fayla">Сбор файла</a></li><li class="toc-item toc-h3"><a href="#2-analiz-cherez-go-tool-pprof">2. Анализ через go tool pprof</a></li><li class="toc-item toc-h2"><a href="#interpretatsiya-rezultatov-tipovye-patterny-problem">Интерпретация результатов: типовые паттерны проблем</a></li><li class="toc-item toc-h3"><a href="#1-vysokoe-vremya-v-chanrecv1-ili-chansend1">1. Высокое время в chanrecv1 или chansend1</a></li><li class="toc-item toc-h3"><a href="#2-dominirovanie-runtime-selectgo">2. Доминирование runtime.selectgo</a></li><li class="toc-item toc-h3"><a href="#3-zaderzhki-v-runtime-netpollblock">3. Задержки в runtime.netpollblock</a></li><li class="toc-item toc-h3"><a href="#4-vremya-v-sync-mutex-lock">4. Время в sync.(Mutex).Lock</a></li><li class="toc-item toc-h3"><a href="#5-kaskadnye-blokirovki">5. Каскадные блокировки</a></li><li class="toc-item toc-h2"><a href="#prakticheskiy-keys-poisk-utechki-gorutin-cherez-block-profile">Практический кейс: поиск утечки горутин через block profile</a></li><li class="toc-item toc-h2"><a href="#mekhanika-zapisi-i-sistemnyy-overhead">Механика записи и системный overhead</a></li><li class="toc-item toc-h2"><a href="#sravnenie-block-profile-vs-mutex-profile-vs-execution-tracer">Сравнение: Block Profile vs Mutex Profile vs Execution Tracer</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-kak-protsessor-perezhivaet-blokirovku">Mechanical Sympathy: как процессор переживает блокировку</a></li><li class="toc-item toc-h2"><a href="#sobesedovanie-tipichnye-voprosy">Собеседование: типичные вопросы</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
