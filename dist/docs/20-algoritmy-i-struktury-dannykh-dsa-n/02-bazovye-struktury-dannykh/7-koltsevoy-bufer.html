@@ -2169,22 +2169,25 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~21 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 3 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. Кольцевой буфер</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы прошли путь от примитивных <a href="1-massivy-i-dinamicheskie-massivy.html" class="wikilink">1. Массивы и динамические массивы</a> до гибридных структур вроде <a href="6-dek-dvustoronnyaya-ochered.html" class="wikilink">6. Дек - двусторонняя очередь</a>. Мы увидели, как динамическое изменение размера (реаллокация) помогает строить универсальные коллекции, но бьет по производительности из-за аллокаций памяти и работы Garbage Collector (GC).</p>
-<p>Однако в ядре любой высоконагруженной системы (будь то сетевой стек Linux, драйверы устройств или рантайм Go) динамические структуры запрещены. Когда вы обрабатываете миллионы сетевых пакетов в секунду, вы не можете позволить себе выделять память на лету. </p>
-<p>Здесь на сцену выходит <strong>Кольцевой буфер (Ring Buffer / Circular Buffer)</strong> — венец эволюции очередей с фиксированным размером.</p>
+            <h2 id="koltsevoy-bufer-venets-ocheredey-fiksirovannogo-razmera-i-magiya-bitovykh-masok">Кольцевой буфер: венец очередей фиксированного размера и магия битовых масок</h2>
+
+<p>В предыдущих статьях мы прошли путь от монолитных <a href="1-massivy-i-dinamicheskie-massivy.html" class="wikilink">1. Массивы и динамические массивы</a> до универсальных конструкций вроде <a href="6-dek-dvustoronnyaya-ochered.html" class="wikilink">6. Дек - двусторонняя очередь</a>. Мы увидели, как техника динамического изменения емкости (реаллокация) выручает при переменном объеме данных, но неизбежно создает скрытую цену в виде фрагментации памяти и циклов сборки мусора (GC Churn).</p>
+<p>Однако в фундаментальных компонентах серверного ядра — будь то сетевой стек ядра Linux, драйверы высокоскоростных сетевых карт (NIC Ring Buffers), дисковый I/O или планировщик рантайма Go — динамические аллокации на лету строго табуированы. Когда сервис принимает миллионы сетевых пакетов в секунду, даже одна дополнительная аллокация в куче на пакет способна парализовать сборщик мусора.</p>
+<p>Здесь вступает в свои права <strong>Кольцевой буфер (Ring Buffer / Circular Buffer)</strong> — вершина инженерной эволюции ограниченных очередей.</p>
+<hr />
 <h2 id="arkhitektura-koltsevogo-bufera">Архитектура кольцевого буфера</h2>
 
-<p>Кольцевой буфер — это статический массив заранее заданного размера, который логически замкнут в кольцо. У него нет конца в традиционном понимании. Когда указатель доходит до последней физической ячейки массива, он перепрыгивает обратно на нулевой индекс.</p>
-<p>Он управляется двумя указателями:<br />
-* <strong>Tail (Хвост / Писатель):</strong> Указывает, куда будет записан следующий элемент.<br />
-* <strong>Head (Голова / Читатель):</strong> Указывает, откуда будет прочитан следующий элемент.</p>
+<p>Кольцевой буфер — это непрерывный статический массив строго фиксированного размера, концы которого логически замкнуты в кольцо. У него нет физического конца в обычном понимании. Когда указатель доходит до последней физической ячейки массива, он бесшовно перепрыгивает обратно на нулевой индекс.</p>
+<p>Буфер управляется двумя независимыми виртуальными указателями:<br />
+*   <strong>Tail (Хвост / Писатель):</strong> позиция, куда будет записан следующий поступающий элемент.<br />
+*   <strong>Head (Голова / Читатель):</strong> позиция, откуда будет извлечен самый старый находящийся в буфере элемент.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2199,40 +2202,71 @@
   </div>
   <pre class="mermaid">
 flowchart LR
-subgraph Физическая память массива
-I0[&quot;Индекс 0&lt;br&gt;Head&quot;] --- I1[&quot;Индекс 1&lt;br&gt;Данные&quot;] --- I2[&quot;Индекс 2&lt;br&gt;Данные&quot;] --- I3[&quot;Индекс 3&lt;br&gt;Tail&quot;]
+subgraph RingMemory[&quot;Физическая память массива (логическое кольцо)&quot;]
+direction LR
+I0[&quot;Индекс 0&lt;br/&gt;[Head: Читатель]&quot;] --- I1[&quot;Индекс 1&lt;br/&gt;[Данные]&quot;] --- I2[&quot;Индекс 2&lt;br/&gt;[Данные]&quot;] --- I3[&quot;Индекс 3&lt;br/&gt;[Tail: Писатель]&quot;]
 end
 
-I3 -.-&gt;|&quot;Замыкание кольца&lt;br&gt;прыжок на старт&quot;| I0
+I3 -.-&gt;|&quot;Замыкание кольца&lt;br/&gt;(прыжок на старт)&quot;| I0
 
-Writer[&quot;Писатель&quot;] --&gt;|&quot;Push элемент&quot;| I3
-I0 --&gt;|&quot;Pop элемент&quot;| Reader[&quot;Читатель&quot;]
+Writer[&quot;Писатель (Producer)&quot;] --&gt;|&quot;Push(elem)&quot;| I3
+I0 --&gt;|&quot;Pop() -&gt; elem&quot;| Reader[&quot;Читатель (Consumer)&quot;]
   </pre>
 </div>
 
 
+<hr />
 <h2 id="mechanical-sympathy-pochemu-eto-tak-bystro">Mechanical Sympathy: Почему это так быстро?</h2>
 
-<p>Кольцевой буфер — это святой Грааль системного программирования по трем причинам:</p>
+<p>Кольцевой буфер признан эталоном системной производительности по трем физическим причинам:</p>
 <ol>
 <li><strong>Zero Allocations (Ноль аллокаций):</strong> Буфер создается один раз при старте приложения (или при установке сетевого соединения). Больше не происходит ни одного вызова <code>malloc</code>. Garbage Collector в Go может спать спокойно — метрика GC Churn равна нулю.</li>
-<li><strong>Perfect Cache Locality (Идеальная локальность):</strong> Так как под капотом лежит непрерывный массив <code>[]T</code>, аппаратный Prefetcher процессора идеально предсказывает паттерн доступа и заранее подтягивает данные в кэш L1/L2.</li>
-<li><strong>Отсутствие сдвигов:</strong> При чтении (Pop) нам не нужно сдвигать остальные элементы влево (как это было в наивной очереди). Мы просто двигаем указатель <code>Head</code> на один шаг вперед.</li>
+<li><strong>Perfect Cache Locality (Безупречная кэш-локальность):</strong> Так как под капотом находится монолитный непрерывный срез <code>[]T</code>, аппаратный Prefetcher процессора легко улавливает линейный шаг обхода и гарантированно удерживает целевые кэш-линии в горячем L1/L2 кэше.</li>
+<li><strong>Отсутствие сдвига памяти:</strong> При чтении (<code>Pop</code>) нам не требуется физически переносить остальные элементы влево (как это происходило в наивной очереди). Мы лишь инкрементируем счетчик <code>Head</code> на единицу.</li>
 </ol>
+<hr />
 <h2 id="khardkornaya-realizatsiya-magiya-stepeni-dvoyki">Хардкорная реализация: Магия степени двойки</h2>
 
 <p>В статье про Дек мы упоминали классический способ зацикливания индексов через остаток от деления: <code>index = tail % capacity</code>. <br />
 Однако операция деления (и взятия остатка <code>%</code>) — одна из самых медленных инструкций в современных процессорах (занимает от 10 до 40 тактов).</p>
-<p><strong>Секрет Senior-инженеров и создателей ядра Linux (алгоритм kfifo):</strong><br />
-Если мы принудительно сделаем размер буфера (capacity) <strong>степенью двойки</strong> (2, 4, 8, 16, 32...), мы можем заменить медленное деление <code>%</code> на сверхбыструю побитовую операцию И (<code>&amp;</code>).<br />
-Инструкция <code>&amp;</code> выполняется процессором ровно за <strong>1 такт</strong>.</p>
-<p>Для массива размером 16 (в двоичном виде <code>10000</code>), маска будет равна 15 (<code>01111</code>).<br />
+<p><strong>Секрет Senior-инженеров и создателей ядра Linux (знаменитый алгоритм <code>kfifo</code>):</strong><br />
+Если принудительно зафиксировать емкость буфера равной <strong>степени двойки</strong> ($2^k$: 2, 4, 8, 16, 32, 64...), то тяжелую операцию остатка от деления можно эквивалентно заменить на мгновенную побитовую операцию И (<code>&amp;</code>):<br />
+$$\text{index} = \text{tail} \ \&amp; \ (\text{capacity} - 1)$$</p>
+<p>Инструкция побитового И (<code>ANDQ</code> в x86-64) выполняется конвейером процессора ровно за <strong>1 такт</strong>!</p>
+<p>Для массива размером 16 ($2^4$, в двоичном виде <code>10000_2</code>), битовая маска <code>capacity - 1</code> равна 15 (<code>01111_2</code>).<br />
 * Если <code>tail</code> растет бесконечно и достигает 17 (<code>10001</code>):<br />
 * <code>17 &amp; 15</code> = <code>10001 &amp; 01111</code> = <code>00001</code> (индекс 1). Мы элегантно "срезали" лишние биты и вернулись в начало кольца!</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+subgraph BitmaskLogic[&quot;Побитовое маскирование вместо деления&quot;]
+tailVal[&quot;tail = 17 (10001 в bin)&quot;]
+maskVal[&quot;mask = 15 (01111 в bin)&quot;]
+andOp[&quot;Побитовое И (&amp;)&quot;]
+res[&quot;Физический индекс: 1 (00001 в bin)&lt;br/&gt;Выполняется за 1 машинный такт!&quot;]
+end
+tailVal --&gt; andOp
+maskVal --&gt; andOp
+andOp --&gt; res
+  </pre>
+</div>
+
+
+<hr />
 <h3 id="production-ready-kod-na-go">Production-Ready код на Go</h3>
 
-<p>Напишем эталонный кольцевой буфер. Мы позволим счетчикам <code>head</code> и <code>tail</code> расти бесконечно (на 64-битных системах <code>uint64</code> переполнится только через сотни лет работы при миллиардах операций в секунду). <br />
-Разница <code>tail - head</code> всегда будет давать точное количество элементов в буфере.</p>
+<p>Напишем эталонный кольцевой буфер. Мы позволим 64-битным счетчикам <code>head</code> и <code>tail</code> расти бесконечно: при обработке миллиарда операций в секунду переполнение <code>uint64</code> наступит более чем через 500 лет непрерывной работы. Разность <code>tail - head</code> в любой момент времени точно отражает количество элементов в буфере.</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2334,39 +2368,71 @@ func (rb *RingBuffer[T]) Len() uint64 {
     <span class="callout-title">Ловушка / Gotcha: Lossy vs Lossless поведение</span>
   </div>
   <div class="callout-body">
-    <p>В нашем коде <code>Push</code> возвращает ошибку <code>ErrBufferFull</code>, когда буфер заполнен (Lossless режим). Это полезно, если мы не хотим терять данные.<br />
-Однако в системах логирования, мониторинга метрик или стриминге аудио/видео часто применяют <strong>Lossy (с потерями)</strong> подход. Если буфер полон, новый элемент просто <strong>перезаписывает</strong> самый старый <code>(head++)</code>. Это позволяет приложению никогда не блокироваться на вводе-выводе логов.</p>
+    <p>В приведенном коде метод <code>Push</code> возвращает ошибку <code>ErrBufferFull</code>, когда свободные слоты исчерпаны — это строгий режим без потерь данных (<strong>Lossless</strong>).<br />
+Однако в распределенных системах телеметрии, сбора логов и медиастриминга часто применяется режим с контролируемой потерей данных (<strong>Lossy</strong>). Если буфер переполнен, новый элемент просто <strong>перезаписывает</strong> самый старый <code>(head++)</code>, сдвигая читателя вперед. Это позволяет приложению никогда не блокироваться на вводе-выводе логов.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="gde-eto-ispolzuetsya-v-go">Где это используется в Go?</h2>
 
 <h3 id="1-buferizirovannye-kanaly-hchan">1. Буферизированные каналы (hchan)</h3>
-<p>Вы уже используете кольцевые буферы каждый день. Конструкция <code>make(chan int, 100)</code> создает внутри рантайма (<code>src/runtime/chan.go</code>) структуру <code>hchan</code>, в основе которой лежит классический кольцевой массив.<br />
-Горутины-писатели инкрементируют <code>sendx</code> (tail), а горутины-читатели — <code>recvx</code> (head). Встроенный мьютекс защищает эти указатели от состояния гонки (race condition).</p>
+
+<p>Каждый Go-разработчик использует кольцевые буферы непрерывно. Конструкция <code>make(chan int, 100)</code> аллоцирует внутри рантайма (<code>src/runtime/chan.go</code>) заголовок <code>hchan</code>, чьим ядром является кольцевой массив:<br />
+*   Горутины-писатели инкрементируют счетчик <code>sendx</code> (tail).<br />
+*   Горутины-читатели инкрементируют счетчик <code>recvx</code> (head).<br />
+*   Встроенный спинлок <code>lock mutex</code> защищает эти указатели от состояния гонки.</p>
 <h3 id="2-setevoy-io-paket-bufio">2. Сетевой I/O (пакет bufio)</h3>
-<p>При чтении данных из TCP-сокета по одному байту вы убьете систему системными вызовами <code>read</code>. Пакет <code>bufio</code> создает кольцевой буфер в User Space. Он читает из ОС сразу 4 КБ данных в буфер, а ваш код затем построчно вычитывает данные уже из оперативной памяти.</p>
+
+<p>Если читать данные из сетевого TCP-сокета по одному байту, сервис захлебнется в накладных расходах системных вызовов <code>read(2)</code> и переключениях контекста ядра. Стандартный пакет <code>bufio</code> создает кольцевой буфер в пространстве пользователя (User Space). Он единым системным вызовом вычитывает сразу блок данных (обычно 4 КБ) в локальный буфер, позволяя приложению парсить строки и токены прямо из оперативной памяти со скоростью L1-кэша.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование на Senior: Lock-Free структуры</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Как сделать этот кольцевой буфер потокобезопасным (Thread-Safe) для работы из множества горутин без использования тяжелого <code>sync.Mutex</code>?<br />
-<strong>Ответ:</strong> Использовать паттерн <strong>Lock-Free Ring Buffer</strong> (например, паттерн Disruptor). <br />
-Идея в том, чтобы использовать атомарные операции (<code>sync/atomic.AddUint64</code> и <code>CompareAndSwap</code>) для инкремента счетчиков <code>head</code> и <code>tail</code>. Горутина атомарно "столбит" за собой слот в массиве, записывает туда данные и затем публикует изменение. Это позволяет достичь пропускной способности в десятки миллионов сообщений в секунду между горутинами, полностью избегая переключений контекста ОС, которые вызывает мьютекс.</p>
+    <p><strong>Вопрос:</strong> Как сделать кольцевой буфер потокобезопасным (Thread-Safe) для параллельного межгорутинного обмена без использования блокирующего <code>sync.Mutex</code>?</p>
+<p><strong>Ответ:</strong> Применить паттерн <strong>Lock-Free Ring Buffer</strong> (классическая архитектура LMAX Disruptor):<br />
+Идея в том, чтобы использовать атомарные операции (<code>sync/atomic.AddUint64</code> и <code>CompareAndSwap</code>) для инкремента счетчиков <code>head</code> и <code>tail</code>. Горутина атомарно "столбит" за собой слот в массиве, записывает туда данные и затем публикует изменение. Это позволяет достичь пропускной способности в десятки миллионов сообщений в секунду между горутинами, полностью избегая переключений контекста ОС, которые вызывает мьютекс.<br />
+1. Для сценария Single-Producer Single-Consumer (SPSC) мьютексы вообще не требуются: достаточно использовать атомарные операции загрузки и сохранения с барьерами памяти Acquire/Release (<code>sync/atomic</code>). Писатель монопольно модифицирует <code>tail</code>, читатель — <code>head</code>.<br />
+2. Для сценария Multi-Producer Multi-Consumer (MPMC) бронирование слотов осуществляется через атомарную инструкцию <code>atomic.CompareAndSwapUint64</code> (CAS). Горутина атомарно «столбит» за собой диапазон индексов, записывает данные и выставляет флаг готовности. Это обеспечивает пропускную способность в десятки миллионов сообщений в секунду, полностью исключая засыпание горутин и переключение контекста планировщика.</p>
   </div>
 </div>
 
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart LR
+subgraph LockFreeSPSC[&quot;SPSC: Lock-Free без мьютексов&quot;]
+Producer[&quot;Producer&lt;br/&gt;atomic.Store(tail)&quot;] --&gt; RingBufferNode[&quot;RingBuffer (64B cache line aligned)&quot;]
+RingBufferNode --&gt; Consumer[&quot;Consumer&lt;br/&gt;atomic.Store(head)&quot;]
+end
+  </pre>
+</div>
+
+
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ol>
-<li><strong>Кольцевой буфер</strong> — это очередь с фиксированным размером (Bounded Queue), закольцованная сама на себя.</li>
-<li><strong>Производительность:</strong> Гарантирует $O(1)$ для вставки и извлечения без единой аллокации памяти, что критически важно для latency-sensitive бэкендов.</li>
-<li><strong>Оптимизация:</strong> Размер буфера, равный степени двойки, позволяет заменить медленную операцию деления <code>%</code> на молниеносное побитовое И <code>&amp;</code>.</li>
-<li>В Go это фундамент для работы буферизированных каналов и системного ввода-вывода (I/O).</li>
+<li><strong>Кольцевой буфер</strong> — это ограниченная очередь фиксированной емкости (Bounded Queue), закольцованная в непрерывном блоке памяти.</li>
+<li><strong>Аппаратная эффективность:</strong> Гарантирует строгое константное время $O(1)$ для всех операций без единой аллокации памяти во время работы.</li>
+<li><strong>Битовая оптимизация ядра:</strong> Выравнивание размера буфера по степени двойки ($2^k$) позволяет заменить медленную инструкцию деления <code>%</code> на побитовую маску <code>&amp; (cap - 1)</code>, выполняемую за 1 такт CPU.</li>
+<li><strong>Защита от утечек:</strong> При извлечении элемента (<code>Pop</code>) обнуление освободившегося слота (<code>rb.buf[idx] = zero</code>) обязательно для снятия нагрузки со сборщика мусора.</li>
+<li><strong>Системный фундамент:</strong> Кольцевые буферы лежат в основе каналов Go (<code>hchan</code>), буферизированного ввода-вывода <code>bufio</code>, драйверов сетевых карт и lock-free очередей LMAX Disruptor.</li>
 </ol>
-<p>На этом мы завершаем блок, посвященный линейным структурам и управлению физической памятью. Впереди нас ждет новый класс структур, которые отказываются от идеи "соседства" данных ради мгновенного поиска по ключу. В следующей статье мы открываем раздел ассоциативных массивов: <a href="../03-kheshirovanie/1-khesh-funktsii-i-ravnomernost-raspredeleniya.html" class="wikilink">1. Хеш функции и равномерность распределения</a>.</p>
+<p>На этом мы полностью завершаем подраздел «Базовые структуры данных», посвященный линейным последовательностям и непосредственному управлению физической памятью. Впереди нас ждет принципиально иной класс структур данных, которые отказываются от идеи пространственного порядка ради мгновенного поиска по ключу.</p>
+<p>В следующем подразделе мы откроем мир ассоциативных структур данных и начнем с математического фундамента: <a href="../03-kheshirovanie/1-khesh-funktsii-i-ravnomernost-raspredeleniya.html" class="wikilink">1. Хеш функции и равномерность распределения</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2394,7 +2460,7 @@ func (rb *RingBuffer[T]) Len() uint64 {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#arkhitektura-koltsevogo-bufera">Архитектура кольцевого буфера</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-eto-tak-bystro">Mechanical Sympathy: Почему это так быстро?</a></li><li class="toc-item toc-h2"><a href="#khardkornaya-realizatsiya-magiya-stepeni-dvoyki">Хардкорная реализация: Магия степени двойки</a></li><li class="toc-item toc-h3"><a href="#production-ready-kod-na-go">Production-Ready код на Go</a></li><li class="toc-item toc-h2"><a href="#gde-eto-ispolzuetsya-v-go">Где это используется в Go?</a></li><li class="toc-item toc-h3"><a href="#1-buferizirovannye-kanaly-hchan">1. Буферизированные каналы (hchan)</a></li><li class="toc-item toc-h3"><a href="#2-setevoy-io-paket-bufio">2. Сетевой I/O (пакет bufio)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#koltsevoy-bufer-venets-ocheredey-fiksirovannogo-razmera-i-magiya-bitovykh-masok">Кольцевой буфер: венец очередей фиксированного размера и магия битовых масок</a></li><li class="toc-item toc-h2"><a href="#arkhitektura-koltsevogo-bufera">Архитектура кольцевого буфера</a></li><li class="toc-item toc-h2"><a href="#mechanical-sympathy-pochemu-eto-tak-bystro">Mechanical Sympathy: Почему это так быстро?</a></li><li class="toc-item toc-h2"><a href="#khardkornaya-realizatsiya-magiya-stepeni-dvoyki">Хардкорная реализация: Магия степени двойки</a></li><li class="toc-item toc-h3"><a href="#production-ready-kod-na-go">Production-Ready код на Go</a></li><li class="toc-item toc-h2"><a href="#gde-eto-ispolzuetsya-v-go">Где это используется в Go?</a></li><li class="toc-item toc-h3"><a href="#1-buferizirovannye-kanaly-hchan">1. Буферизированные каналы (hchan)</a></li><li class="toc-item toc-h3"><a href="#2-setevoy-io-paket-bufio">2. Сетевой I/O (пакет bufio)</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

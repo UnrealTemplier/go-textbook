@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Очередь с приоритетом</h1>
@@ -2178,35 +2178,38 @@
           <div class="article-markdown">
             <h2 id="ochered-s-prioritetom-kak-abstraktnyy-tip-dannykh">Очередь с приоритетом как абстрактный тип данных</h2>
 
-<p>В предыдущих статьях мы детально разобрали <a href="2-binarnaya-kucha.html" class="wikilink">2. Бинарная куча</a> как структуру данных. Теперь перейдём к более высокому уровню абстракции: <strong>Очереди с приоритетом (Priority Queue, PQ)</strong>. Если куча отвечает за физическое хранение и алгоритмы восстановления инварианта, то очередь с приоритетом — это поведенческий контракт. Она определяет, как система должна реагировать на события разного уровня важности, гарантируя, что критичные задачи всегда обрабатываются первыми, независимо от времени их поступления.</p>
-<p>В бэкенде PQ повсюду:<br />
-*   <strong>Планировщики задач</strong>: cron, retry-логика, асинхронные воркеры.<br />
-*   <strong>Сетевые маршрутизаторы</strong>: QoS (Quality of Service), приоритизация пакетов TCP.<br />
-*   <strong>Системы реального времени</strong>: обработка транзакций, алертинг, антифрод.<br />
-*   <strong>Rate Limiting</strong>: токен-бакеты с приоритетным доступом для VIP-клиентов.</p>
-<p>Главная инженерная проблема PQ в продакшене — не сложность алгоритма O(log n), а <strong>конкурентность, управление жизненным циклом элементов и интеграция с планировщиком Go</strong>. Стандартная куча не знает о горутинах, контекстах или отмене операций. Наша задача — построить слой, который превратит математическую структуру в отказоустойчивый инфраструктурный компонент.</p>
+<p>В предыдущих статьях мы подробно изучили <a href="2-binarnaya-kucha.html" class="wikilink">2. Бинарная куча</a> в качестве низкоуровневой структуры данных. Теперь настало время подняться на более высокий уровень архитектурного осмысления: <strong>Очередь с приоритетом (Priority Queue, PQ)</strong>.</p>
+<p>Если сама куча отвечает за компактное размещение в памяти и математические алгоритмы всплытия/погружения, то очередь с приоритетом — это полноценный поведенческий интерфейсный контракт. Она детерминирует дисциплину обслуживания разнородного потока событий, строго гарантируя: критически важные задачи всегда извлекаются и обрабатываются первыми, независимо от хронологического времени их поступления в систему.</p>
+<p>В промышленном бэкенде паттерн PQ применяется повсеместно:<br />
+* <strong>Планировщики фоновых задач:</strong> распределенные cron-демоны, retry-политики с экспоненциальным backoff, пулы асинхронных воркеров.<br />
+* <strong>Сетевой стек и маршрутизация:</strong> механизмы гарантированного качества обслуживания QoS (Quality of Service), приоритизация управляющих TCP-пакетов над тяжелым видеотрафиком.<br />
+* <strong>Высоконагруженные транзакционные движки:</strong> скоринг ордеров в торговых стаканах, алертинг в реальном времени, системы антифрода.<br />
+* <strong>Ограничение нагрузки (Rate Limiting):</strong> токен-бакеты с выделенным приоритетным коридором пропуска для VIP-клиентов.</p>
+<p>Главная инженерная сложность эксплуатации PQ в production — вовсе не алгоритмическая оценка $O(\log N)$, а <strong>конкурентность, надежное управление жизненным циклом записей и гармоничная интеграция с рантаймом планировщика Go</strong>. Голая академическая куча ничего не знает о горутинах, контекстах <code>context.Context</code>, отменах и задержках системных потоков. Наша инженерная задача — построить надежный компонент уровня корпоративной инфраструктуры.</p>
+<hr />
 <h2 id="1-arkhitektura-potokobezopasnoy-realizatsii">1. Архитектура потокобезопасной реализации</h2>
 
-<p>В <span class="wikilink-unresolved" title="Заметка в разработке">конкурентном Go</span> доступ к разделяемой памяти требует синхронизации. Пакет <code>container/heap</code> не потокобезопасен: параллельные вызовы <code>Push</code>/<code>Pop</code> вызовут панику из-за гонок данных. Типичные архитектурные решения:</p>
-<ol>
-<li><strong>Мьютекс-обёртка</strong>: <code>sync.Mutex</code> вокруг кучи. Просто, но создаёт contention. При высокой нагрузке горутины парковкой уходят в ядро ОС (<code>futex</code>), что увеличивает латентность p99.</li>
-<li><strong>Read-Write Mutex</strong>: <code>sync.RWMutex</code> не помогает, так как <code>Pop</code> и <code>Push</code> всегда модифицируют структуру. Только <code>Len()</code> или <code>Peek()</code> могут использовать <code>RLock</code>.</li>
-<li><strong>Sharded Priority Queue</strong>: Разделение на N независимых куч по хешу приоритета или ID задачи. Снижает contention, но ломает глобальный порядок. Подходит для eventually consistent систем.</li>
-<li><strong>Single-Consumer + Channels</strong>: Одна горутина владеет кучей и читает из <code>chan</code>. Отправители пишут в канал. Полностью устраняет блокировки, но требует аккуратного управления backpressure.</li>
-</ol>
+<p>В <span class="wikilink-unresolved" title="Заметка в разработке">конкурентном Go</span> разделяемый изменяемый доступ к памяти строго требует синхронизации. Стандартный пакет <code>container/heap</code> изначально не потокобезопасен: одновременные параллельные вызовы <code>Push</code>/<code>Pop</code> из нескольких горутин гарантированно приведут к гонкам данных (Data Race) и аварийному падению программы.</p>
+<p>В индустрии выработано 4 базовых архитектурных подхода к синхронизации PQ:<br />
+1. <strong>Мьютексная обёртка:</strong> синхронизация всей структуры через <code>sync.Mutex</code>. Просто в реализации, но порождает жесткий contention при высокой частоте запросов. Потоки уходят в блокировку на системных вызовах <code>futex</code>, резко увеличивая задержки хвоста распределения (Latency p99/p99.9).<br />
+2. <strong>Мьютекс на чтение/запись (<code>sync.RWMutex</code>):</strong> не дает выигрыша для очередей, поскольку операции <code>Push</code> и <code>Pop</code> всегда модифицируют структуру слайса и требуют монопольного <code>Lock()</code>. Разделяемый <code>RLock</code> допустим лишь для вызовов <code>Len()</code> или <code>Peek()</code>.<br />
+3. <strong>Шардированная очередь (Sharded Priority Queue):</strong> разделение хранилища на $N$ независимых изолированных куч по хешу ключа или ID задачи. Кардинально снижает contention мьютексов, однако разрушает строгий глобальный порядок приоритетов. Отлично подходит для систем с моделью eventual consistency.<br />
+4. <strong>Модель акторов (Single-Consumer + Channels):</strong> монопольное владение кучей закрепляется за одной выделенной горутиной-диспетчером, принимающей команды из Go-каналов <code>chan</code>. Полностью исключает явные мьютексы, однако требует тщательного управления обратным давлением (Backpressure).</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Когда горутина пытается захватить занятый <code>sync.Mutex</code>, она не сразу делает системный вызов. Рантайм Go сначала крутится в spinlock (несколько тактов CPU). Если не удалось — горутина переводится в состояние <code>Gwaiting</code> и паркуется. Планировщик G-M-P переносит другие горутины на этот тред (M). При освобождении мьютекса разблокируется одна горутина, которая снова становится <code>Grunnable</code>. Этот контекст-свитч на уровне рантайма стоит ~100-300 нс, но при частых блокировках накапливается и вызывает starvation.</p>
+    <p>Когда горутина пытается захватить занятый <code>sync.Mutex</code>, она не обращается сразу к ядру Linux. Рантайм Go сначала пробует несколько тактов выполнить активное ожидание (Spinlock на инструкциях CPU PAUSE). Если мьютекс не освобождается — горутина переводится рантаймом в состояние <code>Gwaiting</code> и принудительно паркуется.<br />
+Планировщик G-M-P немедленно переключает системный тред (M) на выполнение других готовых горутин (<code>Grunnable</code>). При освобождении блокировки одна из ожидающих горутин пробуждается и переводится в состояние готовности. Этот переключатель контекста обходится всего в ~100–300 нс, однако при сотнях конкурирующих горутин микрозадержки накапливаются, приводя к эффекту истощения ресурсов (Thread Starvation).</p>
   </div>
 </div>
 
+<hr />
 <h2 id="2-production-ready-realizatsiya-na-go">2. Production-ready реализация на Go</h2>
 
-<p>Ниже представлена типобезопасная, ограниченная по размеру очередь с поддержкой контекста, отмены и ленивого удаления устаревших элементов.</p>
+<p>Спроектируем типобезопасную, строго ограниченную по емкости (Bounded) очередь с приоритетами с поддержкой отмены через <code>context.Context</code> и ленивым удалением устаревших элементов (Lazy Deletion):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2228,28 +2231,28 @@ import (
 
 // Item представляет элемент очереди
 type Item struct {
-    Priority int
-    Value    any
-    Deadline time.Time
-    Index    int // Индекс в куче (обновляется кучей)
+    Priority  int
+    Value     any
+    Deadline  time.Time
+    Index     int // Индекс в куче (динамически обновляется методами Swap)
     Cancelled bool
 }
 
 // PriorityQueue реализует потокобезопасную очередь с приоритетом
 type PriorityQueue struct {
-    mu      sync.Mutex
-    cond    *sync.Cond
-    heap    priorityHeap
-    cap     int
-    closed  bool
+    mu     sync.Mutex
+    cond   *sync.Cond
+    heap   priorityHeap
+    cap    int
+    closed bool
 }
 
-// priorityHeap внутренняя куча, реализующая heap.Interface
+// priorityHeap — внутренняя куча, реализующая контракт heap.Interface
 type priorityHeap []*Item
 
 func (h priorityHeap) Len() int { return len(h) }
 func (h priorityHeap) Less(i, j int) bool {
-    // Более высокий приоритет идёт первым. При равенстве - раньше дедлайн
+    // Более высокий приоритет идет первым. При равенстве приоритетов — раньше дедлайн
     if h[i].Priority != h[j].Priority {
         return h[i].Priority &gt; h[j].Priority
     }
@@ -2269,9 +2272,9 @@ func (h *priorityHeap) Pop() any {
     old := *h
     n := len(old)
     item := old[n-1]
-    old[n-1] = nil // Очистка ссылки для GC
+    old[n-1] = nil // Критично для GC: очищаем ссылку!
     item.Index = -1
-    *h = old[:n]
+    *h = old[:n-1]
     return item
 }
 
@@ -2284,7 +2287,7 @@ func NewPriorityQueue(capacity int) *PriorityQueue {
     return pq
 }
 
-// Push добавляет элемент. Блокирует если очередь полна или закрыта.
+// Push добавляет элемент в очередь с поддержкой backpressure
 func (pq *PriorityQueue) Push(ctx context.Context, item *Item) error {
     pq.mu.Lock()
     defer pq.mu.Unlock()
@@ -2294,7 +2297,7 @@ func (pq *PriorityQueue) Push(ctx context.Context, item *Item) error {
     }
 
     for len(pq.heap) &gt;= pq.cap {
-        // Backpressure: ждём пока не появится место или контекст не отменится
+        // Backpressure: ожидаем освобождения слота либо отмены контекста
         done := make(chan struct{})
         go func() {
             pq.cond.Wait()
@@ -2311,11 +2314,11 @@ func (pq *PriorityQueue) Push(ctx context.Context, item *Item) error {
     }
 
     heap.Push(&amp;pq.heap, item)
-    pq.cond.Signal() // Уведомляем потребителя
+    pq.cond.Signal() // Будим ожидающего потребителя
     return nil
 }
 
-// Pop извлекает элемент. Игнорирует отменённые (lazy deletion).
+// Pop извлекает наивысший по приоритету элемент, игнорируя отмененные (Lazy Deletion)
 func (pq *PriorityQueue) Pop(ctx context.Context) (*Item, error) {
     pq.mu.Lock()
     defer pq.mu.Unlock()
@@ -2324,7 +2327,7 @@ func (pq *PriorityQueue) Pop(ctx context.Context) (*Item, error) {
         if len(pq.heap) &gt; 0 {
             item := heap.Pop(&amp;pq.heap).(*Item)
             if item.Cancelled {
-                // Ленивое удаление: пропускаем, но не кладём обратно
+                // Ленивое удаление: пропускаем отмененный объект и продолжаем опрос
                 pq.cond.Signal()
                 continue
             }
@@ -2333,7 +2336,7 @@ func (pq *PriorityQueue) Pop(ctx context.Context) (*Item, error) {
         if pq.closed {
             return nil, errors.New(&quot;queue is closed&quot;)
         }
-        // Ждём новых элементов
+        // Ожидаем появления новых элементов
         pq.cond.Wait()
         if ctx.Err() != nil {
             return nil, ctx.Err()
@@ -2341,7 +2344,7 @@ func (pq *PriorityQueue) Pop(ctx context.Context) (*Item, error) {
     }
 }
 
-// Close закрывает очередь и будит все ожидающие горутины
+// Close корректно останавливает очередь и будит все заблокированные горутины
 func (pq *PriorityQueue) Close() {
     pq.mu.Lock()
     defer pq.mu.Unlock()
@@ -2351,16 +2354,17 @@ func (pq *PriorityQueue) Close() {
 </code></pre>
 </div>
 
-<p>Ключевые инженерные решения:<br />
-* <strong><code>sync.Cond</code> вместо чистого <code>chan</code></strong>: Позволяет реализовать bounded queue с backpressure без аллокации дополнительных буферов. <code>cond.Wait()</code> автоматически отпускает мьютекс и паркует горутину, что экономит память по сравнению с буферизованным каналом на тысячи слотов.<br />
-* <strong>Lazy Deletion</strong>: Вместо удаления из середины кучи за O(n) или поддержки мапы индексов, мы помечаем элемент <code>Cancelled = true</code> и пропускаем его при <code>Pop</code>. Это типичный trade-off: O(1) отмена vs потенциальный "мусор" в куче, который очищается при следующем извлечении.<br />
-* <strong>Очистка ссылок в <code>Pop</code></strong>: <code>old[n-1] = nil</code> критически важен для работы <span class="wikilink-unresolved" title="Заметка в разработке">сборщика мусора</span>. Без этого слайс удерживает память, вызывая memory leaks в долгоживущих процессах.</p>
+<p>Ключевые инженерные решения данной реализации:<br />
+* <strong>Связка <code>sync.Mutex</code> и <code>sync.Cond</code>:</strong> Позволяет элегантно реализовать ограниченную емкость (Bounded Queue) с механизмом честного обратного давления (Backpressure) без накладных расходов на создание промежуточных буферизованных каналов. Метод <code>cond.Wait()</code> атомарно освобождает мьютекс и усыпляет горутину.<br />
+* <strong>Lazy Deletion (Ленивое удаление):</strong> Вместо поиска и физического вырезания отмененного элемента из середины массива за $O(N)$ мы выставляем флаг <code>Cancelled = true</code>. Элемент быстро отбрасывается при естественном извлечении через <code>Pop</code>. Это разумный trade-off: моментальная отмена за $O(1)$ в обмен на допустимый временный «балласт» в памяти.<br />
+* <strong>Очистка ссылок в <code>Pop</code>:</strong> Строка <code>old[n-1] = nil</code> фундаментально важна для корректной работы <span class="wikilink-unresolved" title="Заметка в разработке">сборщика мусора</span>. Если оставить ссылку нетронутой, емкость среза памяти продолжит удерживать объект от освобождения в GC.</p>
+<hr />
 <h2 id="3-mekhanicheskaya-simpatiya-pamyat-keshi-i-planirovshchik">3. Механическая симпатия: память, кэши и планировщик</h2>
 
-<p>Поведение PQ под нагрузкой сильно зависит от того, как данные упакованы в памяти и как рантайм управляет горутинами.</p>
-<h3 id="cache-locality-pri-heap-pop">Cache Locality при `heap.Pop`</h3>
-<p>Операция извлечения корня вызывает <code>SiftDown</code>, который прыгает по индексам <code>0 -&gt; 1 -&gt; 3 -&gt; 7...</code>. В массиве указателей <code>[]*Item</code> каждый прыжок — это разыменование в случайное место кучи. Это 2-3 cache miss на уровень. Для кучи размером 100к элементов это может добавить 500-1000 нс к латентности одного <code>Pop</code>.<br />
-<strong>Решение</strong>: Хранить <code>Priority</code> и <code>Value</code> inline, если размер значения мал (≤ 16 байт). Либо использовать <code>sync.Pool</code> для переиспользования <code>Item</code>, чтобы они чаще попадали в "тёплые" страницы памяти.</p>
+<p>Эффективность приоритетной очереди под жесткой нагрузкой определяется тем, как ее структуры согласуются с иерархией кэшей процессора и планировщиком Go.</p>
+<h3 id="cache-locality-pri-heap-pop">Cache Locality при heap.Pop</h3>
+<p>Операция извлечения экстремума запускает процедуру <code>SiftDown</code>, которая пошагово инспектирует индексы <code>0 -&gt; 1 -&gt; 3 -&gt; 7...</code>. В срезе указателей <code>[]*Item</code> каждый такой шаг — это переход по указателю в случайную область виртуальной памяти. Это 2–3 промаха кэша (Cache Miss) на каждый уровень высоты. Для очереди на 100 000 элементов накладные расходы могут добавить до 500–1000 нс к задержке каждого извлечения.<br />
+<strong>Решение:</strong> Хранить компактные структуры данных inline (по значению), если размер полезной нагрузки не превышает 16 байт, либо переиспользовать объекты через пул <code>sync.Pool</code>, гарантируя их попадание в «горячие» кэш-линии.</p>
 <h3 id="escape-analysis-i-allokatsii">Escape Analysis и аллокации</h3>
 
 
@@ -2379,7 +2383,7 @@ func (pq *PriorityQueue) Close() {
 </code></pre>
 </div>
 
-<p>Каждый <code>Push</code> аллоцирует <code>Item</code>. При 10к RPS это 10к аллокаций/сек → давление на GC. В Go 1.21+ с <span class="wikilink-unresolved" title="Заметка в разработке">генерацией кода</span> можно использовать <code>any</code>-боксинг, но для hot path лучше передавать значения по значению или использовать кастомные generic-кучи, как в <a href="2-binarnaya-kucha.html" class="wikilink">2. Бинарная куча</a>.</p>
+<p>Каждый вызов <code>Push</code> создает аллокацию структуры <code>Item</code> в куче процесса. При нагрузке в 10 000 RPS это означает генерацию 10 000 объектов в секунду, создавая мощное давление на рантайм Go. В архитектурах с <span class="wikilink-unresolved" title="Заметка в разработке">генерацией кода</span> и современными дженериками целесообразно передавать элементы по значению через специализированные типизированные кучи, подобные разобранным в <a href="2-binarnaya-kucha.html" class="wikilink">2. Бинарная куча</a>.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2396,51 +2400,58 @@ func (pq *PriorityQueue) Close() {
 flowchart TD
 Start[&quot;Горутина вызывает pq.Push&quot;] --&gt; Lock[&quot;Блокировка sync.Mutex&quot;]
 Lock --&gt; Full{&quot;Очередь полна?&quot;}
-Full --&gt;|Да| Wait[&quot;pq.cond.Wait&lt;br&gt;Парковка в планировщике G-M-P&quot;]
-Full --&gt;|Нет| Push[&quot;heap.Push + SiftUp&quot;]
-Push --&gt; Signal[&quot;pq.cond.Signal&lt;br&gt;Будим потребителя&quot;]
+Full --&gt;|&quot;Да&quot;| Wait[&quot;pq.cond.Wait()&lt;br/&gt;Парковка в планировщике G-M-P&quot;]
+Full --&gt;|&quot;Нет&quot;| Push[&quot;heap.Push + SiftUp&quot;]
+Push --&gt; Signal[&quot;pq.cond.Signal()&lt;br/&gt;Пробуждение потребителя&quot;]
 Signal --&gt; Unlock[&quot;Разблокировка Mutex&quot;]
-Wait --&gt;|Получили место| Lock
-Wait --&gt;|Ctx Done| Abort[&quot;Возврат ctx.Err&quot;]
+Wait --&gt;|&quot;Получили место&quot;| Lock
+Wait --&gt;|&quot;Ctx Done&quot;| Abort[&quot;Возврат ctx.Err()&quot;]
 
-style Wait fill:#ffebee
-style Signal fill:#e8f5e8
+classDef proc fill:#1e293b,stroke:#38bdf8,stroke-width:1.5px,color:#f8fafc;
+classDef check fill:#334155,stroke:#f59e0b,stroke-width:1.5px,color:#f8fafc;
+classDef wait fill:#4c0519,stroke:#f43f5e,stroke-width:1.5px,color:#f8fafc;
+classDef ok fill:#14532d,stroke:#10b981,stroke-width:1.5px,color:#f8fafc;
+
+class Start,Lock,Push,Signal,Unlock proc;
+class Full check;
+class Wait,Abort wait;
   </pre>
 </div>
 
 
 <h3 id="vliyanie-na-g-m-p">Влияние на G-M-P</h3>
-<p>При <code>cond.Wait()</code> горутина уходит в системный тред на парковку. Если потребитель медленно обрабатывает элементы, очередь растёт, отправители начинают парковаться. Планировщик создаёт новые M (треды ОС), что может привести к <code>M</code> bloat и избыточному потреблению памяти стеков. <strong>Бounded queue</strong> спасает от этого, принудительно ограничивая рост и создавая backpressure на отправителей.</p>
+<p>При вызове <code>cond.Wait()</code> горутина уходит в парковку рантайма. Если консьюмер не успевает обрабатывать входящие элементы, очередь переполняется, и продюсеры начинают массово блокироваться. В неконтролируемых условиях это провоцирует планировщик Go аллоцировать новые системные треды <code>M</code>, раздувая потребление оперативной памяти. Ограниченная очередь (<strong>Bounded Queue</strong>) предотвращает деградацию, создавая предсказуемое обратное давление (Backpressure).</p>
+<hr />
 <h2 id="4-kanaly-vs-myuteksy-kogda-chto-vybrat">4. Каналы vs Мьютексы: когда что выбрать</h2>
 
 <div class="table-container"><table>
 <thead>
 <tr>
-<th>Сценарий</th>
-<th>Рекомендуемый примитив</th>
-<th>Обоснование</th>
+<th style="text-align: left;">Архитектурный сценарий</th>
+<th style="text-align: center;">Рекомендуемый примитив</th>
+<th style="text-align: left;">Инженерное обоснование</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><strong>FIFO обработка, producer-consumer</strong></td>
-<td><code>chan</code></td>
-<td>Встроенная синхронизация, нулевой оверхед на аллокации, поддержка select</td>
+<td style="text-align: left;"><strong>Строгая FIFO-диспетчеризация, Producer-Consumer</strong></td>
+<td style="text-align: center;">Канал <code>chan</code></td>
+<td style="text-align: left;">Нативная поддержка рантайма Go, нулевой оверхед, поддержка мультиплексирования через <code>select</code>.</td>
 </tr>
 <tr>
-<td><strong>Приоритетная обработка, динамические приоритеты</strong></td>
-<td><code>sync.Mutex</code> + Куча</td>
-<td>Каналы не поддерживают reordering. Приоритеты требуют перестройки структуры</td>
+<td style="text-align: left;"><strong>Приоритетная обработка, динамический пересчет весов</strong></td>
+<td style="text-align: center;"><code>sync.Mutex</code> + Куча</td>
+<td style="text-align: left;">Каналы принципиально не поддерживают переупорядочивание. Приоритеты требуют древовидной реорганизации.</td>
 </tr>
 <tr>
-<td><strong>Высокая частота операций (&gt;50k/sec), несколько потребителей</strong></td>
-<td><code>sync.Pool</code> + Sharded Heaps или Lock-free очереди</td>
-<td>Один мьютекс станет bottleneck. Шардинг снижает contention ценой потери глобального порядка</td>
+<td style="text-align: left;"><strong>Экстремальный throughput (&gt;50k ops/sec)</strong></td>
+<td style="text-align: center;"><code>sync.Pool</code> + Sharded Heaps</td>
+<td style="text-align: left;">Одиночный мьютекс становится узким местом. Шардирование устраняет contention ценой слабой консистентности.</td>
 </tr>
 <tr>
-<td><strong>Требования к low-latency (&lt;100 мкс p99)</strong></td>
-<td>Атомарные операции + CAS очереди</td>
-<td>Мьютексы и <code>cond</code> вызывают парковку. Lock-free структуры избегают syscalls, но сложнее в реализации</td>
+<td style="text-align: left;"><strong>Сверхнизкая задержка (Low-latency &lt;100 мкс p99)</strong></td>
+<td style="text-align: center;">Lock-free очереди на CAS</td>
+<td style="text-align: left;">Мьютексы и <code>cond</code> порождают системные переключения. Lock-free структуры исключают паузы ценой сложности кода.</td>
 </tr>
 </tbody>
 </table></div>
@@ -2450,18 +2461,20 @@ style Signal fill:#e8f5e8
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p><strong>Priority Inversion в системах реального времени</strong><br />
-Если горутина с низким приоритетом захватила общий ресурс (мьютекс БД, логгер), а горутина с высоким приоритетом ждёт этого же ресурса, произойдёт инверсия: высокоприоритетная задача заблокирована низкоприоритетной. В Go это решается на уровне архитектуры: разделяйте критические секции, используйте <code>sync.TryLock</code> или проектируйте систему так, чтобы приоритетные задачи не зависели от глобальных локов.</p>
+    <p><strong>Инверсия приоритетов (Priority Inversion) в системах реального времени:</strong><br />
+Если низкоприоритетная горутина захватила разделяемый мьютекс, а высокоприоритетная горутина заблокировалась в ожидании этого ресурса, возникает опасная инверсия: критическая задача простаивает по вине второстепенной.<br />
+В Go эта проблема решается архитектурно: минимизируйте время удержания критических секций, применяйте неблокирующий опрос через <code>sync.TryLock</code> либо разделяйте пулы ресурсов, чтобы высокоприоритетный трафик никогда не зависел от глобальных блокировок.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="5-lovushki-production-razrabotki">5. Ловушки production-разработки</h2>
 
 <ol>
-<li><strong>Unbounded Growth</strong>: Бесконечная очередь = Out of Memory. Всегда задавайте <code>cap</code> и обрабатывайте <code>ctx.Done()</code> при <code>Push</code>.</li>
-<li><strong>Stale Entries</strong>: Элементы с истёкшим дедлайном продолжают занимать память. Используйте periodic cleanup или lazy deletion, как в примере выше.</li>
-<li><strong>Global Order vs Throughput</strong>: Глобальная PQ гарантирует порядок, но сериализует доступ. Для микросервисов часто лучше локальные PQ на шардах + eventual consistency.</li>
-<li><strong>GC Spikes</strong>: Если <code>Item</code> содержит большие структуры или указатели, их накопление в куче вызовет длительные паузы <code>STW</code> при <code>GOGC</code>-циклах. Компактируйте данные перед постановкой в очередь.</li>
+<li><strong>Unbounded Growth (Неограниченный рост):</strong> Очередь без верхнего лимита емкости — верный путь к OOM-падению микросервиса при скачке входящего трафика. Всегда задавайте параметр <code>cap</code> и уважайте сигналы <code>ctx.Done()</code>.</li>
+<li><strong>Stale Entries (Устаревшие записи):</strong> Задачи с истекшим сроком актуальности бесцельно поглощают память. Реализуйте периодическую фоновую очистку либо механизм ленивого удаления (Lazy Deletion).</li>
+<li><strong>Global Order vs Throughput (Глобальный порядок против пропускной способности):</strong> Единая глобальная очередь сериализует все входящие потоки в одну точку. В микросервисных архитектурах зачастую эффективнее локальные очереди на независимых шардах в сочетании с Eventual Consistency.</li>
+<li><strong>GC Spikes (Всплески задержек сборщика мусора):</strong> Если <code>Item</code> содержит массивные вложенные структуры или указатели, их накопление удлиняет паузы <code>STW</code> при циклах <code>GOGC</code>. Очищайте и компактируйте данные перед постановкой в очередь.</li>
 </ol>
 <div class="callout callout-interview">
   <div class="callout-header">
@@ -2469,26 +2482,26 @@ style Signal fill:#e8f5e8
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос 1:</strong> «Как реализовать обновление приоритета уже находящегося в очереди элемента за O(log n)?»<br />
-<strong>Ответ:</strong> Поддерживать внешнюю мапу <code>map[TaskID]int</code> для индексации. При изменении приоритета обновляем поле в массиве и вызываем <code>heap.Fix(h, map[id])</code>. Важно блокировать мьютекс на всё время <code>Fix</code>, иначе гонка сломает инвариант кучи.</p>
-<p><strong>Вопрос 2:</strong> «Почему в Go не делают generic Priority Queue в стандартной библиотеке?»<br />
-<strong>Ответ:</strong> Философия Go предоставляет примитивы (<code>container/heap</code>, <code>sync.Mutex</code>, <code>chan</code>), а не готовые фреймворки. Разные домены требуют разных контрактов: bounded/unbounded, lazy deletion, TTL, persistent vs in-memory. Готовый generic-тип заморозил бы API, тогда как композиция примитивов позволяет строить кастомные решения под SLA.</p>
-<p><strong>Вопрос 3:</strong> «Можно ли сделать lock-free Priority Queue на Go?»<br />
-<strong>Ответ:</strong> Теоретически да, используя атомарные указатели и CAS-операции для обхода дерева. Но на практике в Go это крайне сложно из-за отсутствия <code>unsafe</code>-гарантий на порядок выполнения и активного GC. Для 99% задач оптимизированная mpsc-очередь или sharded mutex работают быстрее и надёжнее.</p>
+    <p><strong>Вопрос 1:</strong> «Как реализовать динамическое изменение приоритета уже находящегося в очереди элемента за время $O(\log N)$?»<br />
+<strong>Ответ:</strong> Поддерживать внешнюю вспомогательную хеш-таблицу <code>map[TaskID]int</code> для быстрого поиска текущей позиции элемента в массиве. При изменении веса мы обновляем приоритет в ячейке слайса и вызываем <code>heap.Fix(h, map[id])</code>. Мьютекс очереди должен удерживаться на всем протяжении операции <code>Fix</code>, чтобы избежать состояния гонки.</p>
+<p><strong>Вопрос 2:</strong> «Почему в стандартной библиотеке Go нет готового типа Priority Queue?»<br />
+<strong>Ответ:</strong> Философия Go предоставляет элементарные ортогональные примитивы (<code>container/heap</code>, <code>sync.Mutex</code>, <code>chan</code>), а не перегруженные фреймворки. Различные прикладные задачи требуют диаметрально противоположных контрактов: ограниченные и неограниченные буферы, поддержка TTL, персистентность на диске. Готовый generic-тип сковал бы гибкость API, тогда как интерфейсная композиция позволяет собрать точечное решение под конкретный SLA.</p>
+<p><strong>Вопрос 3:</strong> «Возможно ли построить полностью lock-free Priority Queue на Go?»<br />
+<strong>Ответ:</strong> Теоретически да — с использованием атомарных указателей и CAS-циклов (Compare-And-Swap) для пошаговой модификации дерева. Однако на практике в Go это крайне сложно из-за отсутствия <code>unsafe</code>-гарантий на порядок выполнения и активного вмешательства сборщика мусора. В 99% сценариев шардированная очередь на мьютексах работает быстрее, надежнее и предсказуемее.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Priority Queue</strong> — это абстракция поверх <a href="1-kucha-kak-struktura-dannykh.html" class="wikilink">1. Куча как структура данных</a>, добавляющая семантику обработки, жизненный цикл и потокобезопасность.</li>
-<li>В Go правильная реализация требует комбинации <code>sync.Mutex</code> + <code>sync.Cond</code> для backpressure и <code>context</code> для graceful shutdown.</li>
-<li><strong>Lazy Deletion</strong> предпочтительнее физического удаления из середины кучи: O(1) отмена vs O(n) сдвиг, ценой временного накопления "мусора".</li>
-<li><strong>Механическая симпатия</strong>: избегайте указательных массивов, очищайте ссылки при <code>Pop</code>, контролируйте размер кучи для предсказуемых пауз GC.</li>
-<li><strong>Конкурентность</strong>: один мьютекс масштабируется до ~10-20k RPS. Дальше требуется шардинг или lock-free архитектуры.</li>
+<li><strong>Priority Queue (Очередь с приоритетом)</strong> — это высокоуровневая абстракция над структурой <a href="1-kucha-kak-struktura-dannykh.html" class="wikilink">1. Куча как структура данных</a>, добавляющая диспетчеризацию, жизненный цикл и потокобезопасность.</li>
+<li>В Go эталонная реализация строится на тандеме <code>sync.Mutex</code> и <code>sync.Cond</code> для честного обратного давления (Backpressure) и интеграции с <code>context.Context</code>.</li>
+<li><strong>Паттерн Lazy Deletion</strong> предпочтительнее физического удаления из середины: моментальная отмена за $O(1)$ вместо $O(N)$ перестановок.</li>
+<li><strong>Mechanical Sympathy:</strong> Избегайте лишних аллокаций, обязательно зануляйте висячие ссылки в <code>Pop</code> (<code>old[n-1] = nil</code>) и контролируйте размер кучи для предсказуемых пауз GC.</li>
+<li><strong>Конкурентность:</strong> Одиночный мьютекс эффективно масштабируется до 15 000–25 000 операций в секунду. Для более высоких нагрузок требуется шардирование либо переход на каналы.</li>
 </ul>
-<p>Понимание бинарной кучи и приоритетных очередей покрывает большинство сценариев планирования. Однако в теоретической информатике существуют структуры, которые оптимизированы под специфические паттерны: огромное число операций <code>insert</code> при редких <code>delete-min</code>. В следующей статье мы разберём одну из самых интересных и академичных структур, которая теоретически даёт O(1) на вставку, но требует понимания amortized analysis и указательной алхимии.</p>
-<p><a href="4-fibonacci-heap.html" class="wikilink">4. Fibonacci heap</a></p>
+<p>Мы освоили бинарную кучу и очереди с приоритетами. Однако в фундаментальной теории алгоритмов существуют экзотические структуры, оптимизированные под специфические паттерны: огромное число операций <code>insert</code> при редких <code>delete-min</code>. В следующей статье мы познакомимся со структурой, теоретически дающей невероятный константный $O(1)$ на добавление узлов: <a href="4-fibonacci-heap.html" class="wikilink">4. Fibonacci heap</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->

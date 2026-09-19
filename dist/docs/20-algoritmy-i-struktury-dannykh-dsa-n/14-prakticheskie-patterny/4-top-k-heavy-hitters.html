@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~32 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">4. Top K heavy hitters</h1>
@@ -2178,22 +2178,23 @@
           <div class="article-markdown">
             <h2 id="vvedenie-poisk-slonov-v-stoge-sena">Введение: Поиск слонов в стоге сена</h2>
 
-<p>В высоконагруженном бэкенде мы редко можем позволить себе хранить точные счётчики для миллионов уникальных IP, хешей запросов или сессионных токенов. Структура <code>map[string]int64</code> при росте кардинальности до <code>10⁷</code> элементов съест гигабайты RAM, а обход этой мапы для поиска топ-10 превратится в <code>O(N)</code> операцию, которая заблокирует системный тред и спровоцирует паузы <span class="wikilink-unresolved" title="Заметка в разработке">сборщика мусора</span>.</p>
-<p>Задача поиска наиболее частых элементов (heavy hitters) в потоке данных при жёстком ограничении памяти решается <strong>streaming-алгоритмами</strong>. Space-Saving, Misra-Gries, Count-Min Sketch — это не академические трюки, а индустриальный стандарт для DDoS-фильтров, обнаружения API-абуза, trending-аналитики и защиты кэшей от thrashing. В этой статье мы разберём, как выбрать между детерминированными и вероятностными подходами, реализовать их в Go с учётом кэш-локальности и конкурентности, и правильно масштабировать в кластере Kubernetes.</p>
+<p>В высоконагруженном бэкенде мы практически никогда не можем позволить себе хранить точные целочисленные счетчики для миллионов уникальных IP-адресов, хэшей клиентских запросов или сессионных токенов. Наивная структура <code>map[string]int64</code> при росте кардинальности до <code>10⁷</code> элементов поглотит десятки гигабайт оперативной памяти. Более того, линейный обход такой огромной таблицы для поиска десяти наиболее частых элементов обернется тяжелой операцией со сложностью <code>O(N)</code>, которая заблокирует поток ОС и вызовет мучительные паузы <span class="wikilink-unresolved" title="Заметка в разработке">сборщика мусора</span>.</p>
+<p>Задача детекции наиболее частых элементов (heavy hitters) в непрерывном потоке данных при жестко лимитированном бюджете памяти элегантно решается <strong>streaming-алгоритмами</strong>. Семейство алгоритмов Space-Saving, Misra-Gries и Count-Min Sketch — это не отвлеченные академические курьезы, а признанный индустриальный стандарт для систем фильтрации DDoS-атак, предотвращения абьюза публичных API, аналитики трендов в реальном времени и защиты кэширующих слоев от вымывания (cache thrashing). В этой статье мы исследуем, как сделать осознанный выбор между детерминированными и вероятностными алгоритмами, реализовать их на Go с идеальной кэш-локальностью и потокобезопасностью, а также организовать горизонтальную агрегацию в облачном кластере.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> «Зачем использовать приближённые алгоритмы вроде Space-Saving или Count-Min Sketch, если можно просто писать все ключи в ClickHouse и делать <code>SELECT ... ORDER BY count DESC LIMIT K</code>?»<br />
-<strong>Ответ:</strong> ClickHouse даёт точность, но с задержкой. Batch-агрегация работает за секунды или минуты. Для real-time защиты (например, блокировка IP после 100 запросов за 5 секунд) нужна реакция за миллисекунды на уровне приложения или API-гейтвея. Streaming-алгоритмы работают в памяти с <code>O(K)</code> потреблением RAM и <code>O(1)</code> на запрос, обеспечивая мгновенную реакцию на аномалии.</p>
+    <p><strong>Вопрос:</strong> «Зачем использовать приближённые алгоритмы вроде Space-Saving или Count-Min Sketch, если можно просто писать все ключи в ClickHouse и делать <code>SELECT ... ORDER BY count DESC LIMIT K</code>?»</p>
+<p><strong>Ответ:</strong> ClickHouse даёт точность, но с задержкой. Batch-агрегация работает за секунды или минуты. Для real-time защиты (например, блокировка IP после 100 запросов за 5 секунд) нужна реакция за миллисекунды на уровне приложения или API-гейтвея. Streaming-алгоритмы работают в памяти с <code>O(K)</code> потреблением RAM и <code>O(1)</code> на запрос, обеспечивая мгновенную реакцию на аномалии.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="1-arkhitektura-potoka-i-granitsy-tochnosti">1. Архитектура потока и границы точности</h2>
 
-<p>Стриминговые модели обработки данных накладывают фундаментальные ограничения. Мы видим каждый элемент ровно один раз, не можем хранить их все и обязаны отвечать на запрос <code>TopK()</code> в любой момент времени.</p>
+<p>Потоковая модель обработки данных накладывает жесткие математические ограничения: каждый поступающий элемент пролетает через алгоритм ровно один раз, сохранять всю историю невозможно, при этом сервис обязан в любой момент времени мгновенно вернуть срез <code>TopK()</code>.</p>
 <div class="table-container"><table>
 <thead>
 <tr>
@@ -2235,13 +2236,16 @@
 </tr>
 </tbody>
 </table></div>
-<p>В бэкенде <strong>Space-Saving</strong> де-факто стандарт для мониторинга и rate-limiting. Он гарантирует, что истинная частота любого элемента <code>f</code> оценивается как <code>count ∈ [f, f + (N-K)/K]</code>. При <code>K=1000</code> и потоке <code>N=10⁶</code> ошибка не превысит <code>1000</code>, что для выявления аномалий (счётчики в десятки тысяч) более чем достаточно.</p>
+<p>В практической инженерии бэкенда алгоритм <strong>Space-Saving</strong> стал золотым стандартом для мониторинга аномалий и интеллектуального rate-limiting. Он математически гарантирует, что истинная частота $f$ любого элемента оценивается как:<br />
+$$count \in [f, f + \frac{N-K}{K}]$$<br />
+То есть <code>count ∈ [f, f + (N-K)/K]</code>. При размере таблицы <code>K=1000</code> и общем объеме потока <code>N=10⁶</code> абсолютная погрешность не превысит 1000, что для выявления аномальных нарушителей (генерирующих десятки и сотни тысяч запросов) абсолютно пренебрежимо.</p>
+<hr />
 <h2 id="2-algoritmicheskoe-yadro-space-saving-stream-summary">2. Алгоритмическое ядро: Space-Saving (Stream-Summary)</h2>
 
-<p>Классический Misra-Gries хранит <code>K-1</code> пар <code>(ключ, счётчик)</code>. При поступлении нового элемента:<br />
-1. Если ключ в таблице: инкрементируем счётчик.<br />
-2. Если места нет: уменьшаем все счётчики на 1, удаляем нулевые.</p>
-<p>Space-Saving улучшает этот подход, сохраняя больше информации. Вместо декремента всех счётчиков мы находим элемент с <strong>минимальным</strong> счётчиком <code>min_c</code> и заменяем его новым ключом со значением <code>min_c + 1</code>. Это сохраняет «историю» частоты и даёт более жёсткую ошибку.</p>
+<p>Классический алгоритм Misra-Gries поддерживает <code>K-1</code> пар <code>(ключ, счётчик)</code>. При поступлении очередного события:<br />
+1. Если ключ уже присутствует в таблице — его счетчик инкрементируется.<br />
+2. Если места нет — счетчики всех сохраненных элементов уменьшаются на 1, а обнулившиеся удаляются.</p>
+<p>Алгоритм Space-Saving существенно улучшает эту стратегию, сберегая накопленную статистическую информацию. Вместо массового декремента всех счетчиков алгоритм выявляет элемент с <strong>минимальным</strong> текущим значением <code>min_c</code> и замещает его новым ключом со значением счетчика <code>min_c + 1</code>. Это сохраняет оценку «веса» отсеченных элементов и дает гораздо более строгую границу погрешности.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2258,27 +2262,32 @@
 flowchart TD
 Start[&quot;Поток: новый элемент X&quot;] --&gt; InTable{&quot;X в таблице?&quot;}
 InTable --&gt;|Да| Inc[&quot;X.count ++&quot;]
-InTable --&gt;|Нет| Full{&quot;Таблица полна&lt;br&gt;size &gt;= K?&quot;}
+InTable --&gt;|Нет| Full{&quot;Таблица полна&lt;br/&gt;size &gt;= K?&quot;}
 Full --&gt;|Нет| Add[&quot;Добавить X.count = 1&quot;]
 Full --&gt;|Да| FindMin[&quot;Найти элемент с min.count&quot;]
-FindMin --&gt; Replace[&quot;Заменить ключ на X&lt;br&gt;count = min.count + 1&quot;]
+FindMin --&gt; Replace[&quot;Заменить ключ на X&lt;br/&gt;count = min.count + 1&quot;]
 
 Inc --&gt; End[&quot;Продолжить поток&quot;]
 Add --&gt; End
 Replace --&gt; End
 
-style Start fill:#e3f2fd
-style Full fill:#fff3e0
-style FindMin fill:#f3e5f5
-style End fill:#e8f5e8
+style Start fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+style InTable fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+style Full fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+style Inc fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
+style Add fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
+style FindMin fill:#1e293b,stroke:#a855f7,stroke-width:2px,color:#f8fafc
+style Replace fill:#1e293b,stroke:#f43f5e,stroke-width:2px,color:#f8fafc
+style End fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
-<p>Сложность вставки: <code>O(K)</code> при наивном поиске минимума. Для <code>K ≤ 2048</code> линейный проход по массиву на 1-2 порядка быстрее операций с <code>map</code> благодаря аппаратному префетчингу и отсутствию pointer chasing. Для <code>K &gt; 10⁴</code> используют Min-Heap поверх массива, получая <code>O(log K)</code>, но в Go-бэкенде <code>K</code> редко превышает 1000.</p>
+<p>Сложность операции вставки составляет <code>O(K)</code> при линейном сканировании минимального элемента. Для практических диапазонов <code>K ≤ 2048</code> плотный линейный проход по непрерывному срезу оперативной памяти выполняется на 1–2 порядка быстрее операций с указателями и хеш-таблицами за счет аппаратного префетчинга процессора (Hardware Prefetcher) и отсутствия pointer chasing. При гигантских значениях <code>K &gt; 10⁴</code> массив организуют в двоичную кучу Min-Heap со сложностью <code>O(log K)</code>, однако в реальных микросервисах <code>K</code> редко превышает 1000.</p>
+<hr />
 <h2 id="3-production-realizatsiya-na-go-1-21">3. Production-реализация на Go 1.21+</h2>
 
-<p>Реализуем потокобезопасный, типобезопасный <code>SpaceSaving</code> с шардированием, минимальными аллокациями и современным хешированием.</p>
+<p>Ниже представлена типобезопасная, масштабируемая реализация структуры <code>SpaceSaving</code> с поддержкой дженериков, шардированием по маске и быстрым хешированием через пакет <code>hash/maphash</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2291,7 +2300,9 @@ style End fill:#e8f5e8
   <pre class="language-go"><code class="language-go">package heavyhitters
 
 import (
+    &quot;fmt&quot;
     &quot;hash/maphash&quot;
+    &quot;sort&quot;
     &quot;sync&quot;
 )
 
@@ -2412,23 +2423,27 @@ func (ss *SpaceSaving[T]) Top() []Entry[T] {
 </div>
 
 <p>Инженерные решения:<br />
-* <strong>Шардирование через <code>maphash</code></strong>: Современный стандарт Go, устойчив к коллизиям, быстро вычисляется. Маска <code>&amp; ss.mask</code> заменяет дорогое <code>%</code> на битовую операцию.<br />
-* <strong>Линейный проход <code>O(K)</code></strong>: Для <code>K ≤ 1024</code> это быстрее <code>map</code> из-за cache locality. Компилятор Go векторизует цикл сравнения <code>Key == key</code>, используя SIMD-инструкции.<br />
-* <strong><code>sync.RWMutex</code> на шард</strong>: <code>Increment</code> требует <code>Lock</code>, <code>Top</code> — <code>RLock</code> для всех шардов. Contention минимален, так как запросы распределяются равномерно.<br />
+* <strong>Шардирование через <code>maphash</code></strong>: Встроенный пакет <code>maphash</code> обеспечивает аппаратное ускорение и стойкость к коллизиям. Побитовая маска <code>&amp; ss.mask</code> заменяет тяжелую инструкцию целочисленного деления <code>DIV</code>.<br />
+* <strong>Линейный проход <code>O(K)</code></strong>: При <code>K ≤ 1024</code> компактный срез многократно превосходит <code>map</code> благодаря локальности данных в L1-кэше. Компилятор Go успешно векторизует цикл сравнения <code>Key == key</code>, задействуя SIMD-инструкции процессора.<br />
+* <strong>Изолированный <code>sync.RWMutex</code></strong>: Вызов <code>Increment</code> захватывает эксклюзивный <code>Lock</code> конкретного шарда, а <code>Top</code> накладывает разделяемый <code>RLock</code>. Конкуренция за мьютексы минимизируется.<br />
 * <strong>Отсутствие <code>sync.Pool</code></strong>: Структуры <code>Entry</code> аллоцируются один раз при <code>New</code>. <code>Top()</code> создаёт временную <code>map</code> для агрегации, но это редкая операция, вызываемая по метрическому циклу (раз в 10-60 сек), поэтому давление на GC нулевое.</p>
+<hr />
 <h2 id="4-mechanical-sympathy-kesh-linii-vetvleniya-i-rantaym">4. Mechanical Sympathy: кэш-линии, ветвления и рантайм</h2>
 
-<p>Поведение <code>SpaceSaving</code> в продакшене напрямую зависит от укладки данных в памяти.</p>
+<p>Эффективность <code>SpaceSaving</code> в боевом сервисе всецело диктуется топологией оперативной памяти.</p>
 <h3 id="prostranstvennaya-lokalnost-protiv-ukazatelnykh-struktur">Пространственная локальность против указательных структур</h3>
-<p>Альтернатива <code>[]Entry[T]</code> — <code>map[T]*Entry</code>. Карта даёт <code>O(1)</code> поиск, но:<br />
-* Хранит элементы в случайных адресах кучи → <code>cache miss</code> на каждом доступе.<br />
-* Требует аллокаций при росте → фрагментация кучи → длительные паузы GC.<br />
-* <code>map</code> итерация не детерминирована и медленнее линейного обреза массива.</p>
-<p>Массив <code>data []Entry[T]</code> компактен. Для <code>K=512</code> и <code>string</code> ключей это ~12 КБ данных, которые целиком помещаются в L1 кэш CPU. При линейном поиске процессор загружает кэш-линии пачками, а branch predictor эффективно обрабатывает условие <code>== key</code>. Разница в latency достигает 5-10x.</p>
+
+<p>Наивная альтернатива плоскому массиву <code>[]Entry[T]</code> — хеш-таблица <code>map[T]*Entry</code>. Несмотря на теоретическую сложность поиска $O(1)$, карта страдает фундаментальными недостатками:<br />
+* Рассыпает узлы по случайным адресам виртуальной памяти, порождая промахи кэша (<code>cache miss</code>) на каждое обращение.<br />
+* Требует динамических аллокаций при вставке, фрагментируя кучу и растягивая фазы сборщика мусора.<br />
+* Порядок итерации по <code>map</code> в Go рандомизирован и вычислительно тяжелее прямого среза.</p>
+<p>Массив <code>data []Entry[T]</code> монолитен. При <code>K=512</code> со строковыми ключами он укладывается всего в ~12 КБ, целиком помещаясь в L1-кэш ядра CPU. Блок аппаратного префетчинга считывает кэш-линии на опережение, а предсказатель переходов уверенно отрабатывает цикл сравнения.</p>
 <h3 id="davlenie-na-gc-i-vyravnivanie">Давление на GC и выравнивание</h3>
-<p>Если <code>T</code> содержит указатели (например, <code>string</code>), <code>Entry</code> занимает 32 байта на amd64 (<code>Key: 16, Count: 8, padding: 8</code>). При агрегации в <code>Top()</code> создаётся временная <code>map[T]uint64</code>. Компилятор Go видит, что она живёт только внутри функции, но <code>Escape Analysis</code> может вынести её в кучу при большом размере. Для оптимизации используйте <code>T = uint64</code> (хешированные ключи) или <code>[]byte</code> с пулом, чтобы уменьшить footprint и ускорить сканирование GC.</p>
+
+<p>Если тип <code>T</code> содержит указатели (как тип <code>string</code>), структура <code>Entry</code> занимает 32 байта на amd64 (<code>Key: 16, Count: 8, padding: 8</code>). Анализ побегов (<code>Escape Analysis</code>) удерживает временные структуры на стеке горутины. Для оптимизации используйте <code>T = uint64</code> (хешированные ключи) или <code>[]byte</code> с пулом, чтобы уменьшить footprint и ускорить сканирование GC.</p>
 <h3 id="atomiki-protiv-myuteksov">Атомики против мьютексов</h3>
-<p>Можно попробовать заменить <code>mu</code> на <code>atomic.Uint64</code> для счётчиков, но обновление <code>Entry.Key</code> требует чтения-модификации-записи двух полей одновременно. CAS-цикл для структуры приведёт к livelock при высокой конкуренции. <code>sync.RWMutex</code> на шард остаётся оптимальным trade-off: latency блокировки ~50-150 нс, что на порядки дешевле <code>atomic.CompareAndSwap</code> с retry в цикле.</p>
+
+<p>Идея заменить мьютексы атомарным <code>atomic.Uint64</code> для счетчиков разбивается о то, что обновление <code>Entry.Key</code> требует чтения-модификации-записи двух полей одновременно. Попытка организовать CAS-петлю на уровне всей структуры приведет к livelock и колоссальному расходу тактов процессора. Простой <code>sync.RWMutex</code> на шард отрабатывает за 50–150 нс, что надежнее и эффективнее циклов <code>atomic.CompareAndSwap</code> под конкурентной нагрузкой.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2440,15 +2455,17 @@ func (ss *SpaceSaving[T]) Top() []Entry[T] {
   </div>
 </div>
 
+<hr />
 <h2 id="5-raspredelyonnaya-agregatsiya-i-sliyanie-sketchey">5. Распределённая агрегация и слияние скетчей</h2>
 
-<p>В кластере Kubernetes каждый под хранит локальную версию <code>SpaceSaving</code>. Для получения глобального Top K необходимо объединить скетчи.</p>
-<p><strong>Алгоритм слияния (Merge):</strong><br />
-1. Собираем все <code>K</code> элементов из каждого пода.<br />
-2. Агрегируем счётчики для одинаковых ключей (суммируем).<br />
-3. Запускаем <code>SpaceSaving</code> на объединённом пуле из <code>PodsCount * K</code> элементов с целевым <code>K</code>.</p>
-<p>Гарантия ошибки при слиянии: <code>ε_global ≤ Σ ε_local</code>. Это значит, что абсолютная погрешность растёт линейно с числом подов, но относительная ошибка для тяжёлых элементов (счётчики &gt;&gt; ε) остаётся пренебрежимо малой.</p>
-<p>Для высоконагруженных систем агрегацию выносят в отдельную метрическую горутину или sidecar-контейнер, который раз в N секунд забирает локальные дампы через HTTP/gRPC и строит глобальный срез.</p>
+<p>В микросервисном кластере каждый под поддерживает независимый локальный экземпляр <code>SpaceSaving</code>. Для вычисления глобального Top K тяжелых элементов требуется алгоритмическое слияние скетчей (Merge).</p>
+<p><strong>Алгоритм распределенного слияния:</strong><br />
+1. Фоновый агрегатор вычитывает локальные дампы из $P$ подов.<br />
+2. Суммируются счетчики для совпадающих ключей.<br />
+3. Запускаем <code>SpaceSaving</code> на объединенном пуле из <code>PodsCount * K</code> элементов с целевым <code>K</code>.</p>
+<p>Математическая граница суммарной ошибки:<br />
+$$\varepsilon_{global} \le \sum \varepsilon_{local}$$<br />
+То есть <code>ε_global ≤ Σ ε_local</code>. Хотя абсолютная погрешность растет пропорционально числу нод, относительная ошибка для аномальных heavy hitters (чьи счетчики многократно превосходят $\varepsilon$) остается микроскопической.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2463,17 +2480,21 @@ func (ss *SpaceSaving[T]) Top() []Entry[T] {
   </div>
   <pre class="mermaid">
 flowchart LR
-Pod1[&quot;Pod 1&lt;br&gt;Local SS K=100&quot;] --&gt;|HTTP GET /dump| Agg[&quot;Aggregator Pod&quot;]
-Pod2[&quot;Pod 2&lt;br&gt;Local SS K=100&quot;] --&gt; Agg
-Pod3[&quot;Pod N&lt;br&gt;Local SS K=100&quot;] --&gt; Agg
+Pod1[&quot;Pod 1&lt;br/&gt;Local SS K=100&quot;] --&gt;|HTTP GET /dump| Agg[&quot;Aggregator Pod&quot;]
+Pod2[&quot;Pod 2&lt;br/&gt;Local SS K=100&quot;] --&gt; Agg
+Pod3[&quot;Pod N&lt;br/&gt;Local SS K=100&quot;] --&gt; Agg
 
-Agg --&gt; Merge[&quot;Слияние мап&lt;br&gt;Суммирование счётчиков&quot;]
-Merge --&gt; Run[&quot;Запуск SS на&lt;br&gt;объединённом пуле&quot;]
+Agg --&gt; Merge[&quot;Слияние мап&lt;br/&gt;Суммирование счётчиков&quot;]
+Merge --&gt; Run[&quot;Запуск SS на&lt;br/&gt;объединённом пуле&quot;]
 Run --&gt; Out[&quot;Глобальный Top K&quot;]
 
-style Agg fill:#e3f2fd
-style Merge fill:#fff3e0
-style Run fill:#e8f5e8
+style Pod1 fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#f8fafc
+style Pod2 fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#f8fafc
+style Pod3 fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#f8fafc
+style Agg fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+style Merge fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+style Run fill:#1e293b,stroke:#6366f1,stroke-width:2px,color:#f8fafc
+style Out fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
@@ -2491,6 +2512,7 @@ style Run fill:#e8f5e8
   </div>
 </div>
 
+<hr />
 <h2 id="6-lovushki-i-khardkor-sobesedovaniya">6. Ловушки и хардкор-собеседования</h2>
 
 <div class="callout callout-interview">
@@ -2510,16 +2532,16 @@ style Run fill:#e8f5e8
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Top K Heavy Hitters</strong> — класс задач поиска наиболее частых элементов в потоке при ограничении памяти.</li>
-<li><strong>Space-Saving</strong> — оптимальный выбор для бэкенда: детерминированная ошибка, <code>O(K)</code> память, <code>O(K)</code> вставка (быстрая из-за cache locality), простой мердж.</li>
-<li>В Go реализуется через <strong>шардированный массив <code>[]Entry</code> + <code>sync.RWMutex</code></strong>. Это устраняет pointer chasing, минимизирует GC pressure и даёт стабильную латентность.</li>
-<li><strong>Механическая симпатия</strong>: линейный проход по массиву выгоднее <code>map</code> при <code>K ≤ 2000</code> благодаря SIMD, префетчингу и отсутствию аллокаций. Атомики для счётчиков избыточны, мьютекс на шард безопаснее и дешевле.</li>
-<li><strong>Распределённая агрегация</strong> требует суммирования счётчиков и повторного прогона через алгоритм. Ошибка растёт линейно, но для тяжёлых элементов пренебрежимо мала.</li>
-<li><strong>Ограничения</strong>: удаление ключей невозможно без полной очистки, коллизии хеша требуют контроля, оконная логика требует дополнительных механизмов.</li>
-<li><strong>Интервью фокус</strong>: overcount guarantee, trade-offs с Count-Min Sketch, влияние K на ошибку, merge strategy в кластере, cache locality vs hash map.</li>
+<li><strong>Top K Heavy Hitters</strong> — фундаментальный класс задач поиска наиболее активных элементов в высокоскоростном потоке при жестких лимитах памяти.</li>
+<li><strong>Space-Saving</strong> — оптимальный выбор для Go-бэкенда: гарантированная детерминированная ошибка, минимальное потребление памяти <code>O(K)</code> и быстрая вставка за счет локальности кэша.</li>
+<li>В Go алгоритм реализуется через <strong>шардированный срез <code>[]Entry</code> + <code>sync.RWMutex</code></strong>. Это исключает pointer chasing, снимает нагрузку со сборщика мусора и гарантирует стабильную латентность P99.</li>
+<li><strong>Механическая симпатия</strong>: последовательный проход по массиву превосходит <code>map</code> при <code>K ≤ 2000</code> благодаря SIMD-векторизации, аппаратному префетчингу и отсутствию фрагментации кучи.</li>
+<li><strong>Распределенная архитектура</strong>: слияние локальных скетчей подов выполняется повторным прогоном объединенного массива через алгоритм, сохраняя точность для критических аномалий.</li>
+<li><strong>Интервью-фокус</strong>: математическая природа overcount-оценки, сравнительный анализ с Count-Min Sketch, влияние размера $K$ на погрешность, алгоритмы слияния в кластере.</li>
 </ul>
 <p>Разобравшись с выявлением тяжёлых элементов в потоке, мы переходим к более широкому классу задач: обработке данных, которые не помещаются в RAM, требуют однопроходной агрегации, фильтрации шума и статистического анализа в реальном времени. В следующей статье мы детально изучим streaming-алгоритмы: от HyperLogLog для оценки кардинальности до Count-Min Sketch для частотного анализа, их слияние в кластере и интеграцию с <a href="1-proektirovanie-keshey.html" class="wikilink">1. Проектирование кэшей</a> для защиты от memory explosion.</p>
 <p><a href="5-streaming-algoritmy.html" class="wikilink">5. Streaming алгоритмы</a></p>

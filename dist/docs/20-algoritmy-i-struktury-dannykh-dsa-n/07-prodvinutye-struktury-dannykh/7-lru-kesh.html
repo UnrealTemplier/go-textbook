@@ -2169,24 +2169,40 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~31 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">7. LRU кэш</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie-balans-pamyati-i-skorosti-dostupa">Введение: Баланс памяти и скорости доступа</h2>
+            <h1>LRU кэш (Least Recently Used)</h1>
+<blockquote>
+<p><em>"Memory is finite, but the stream of user requests is boundless. The art of caching lies in the quiet eviction of the forgotten, making room for what the present moment truly demands."</em><br />
+— Свободная инженерная адаптация</p>
+</blockquote>
+<hr />
+<h2 id="vvedenie-balans-pamyati-i-skorosti-dostupa">Введение: Баланс памяти и скорости доступа</h2>
 
-<p>В высоконагруженном бэкенде ресурсы всегда конечны. Мы не можем кешировать все ответы БД, все сессии пользователей или результаты тяжелых вычислений в оперативной памяти. LRU (Least Recently Used) — это эвристическая стратегия вытеснения, которая гарантирует, что в кэше останутся только те данные, к которым обращались недавно. Остальные безжалостно удаляются, освобождая место для более релевантных запросов.</p>
-<p>Популярность LRU обусловлена принципом пространственной и временной локальности: если вы использовали данные сейчас, высока вероятность, что они понадобятся в ближайшем будущем. В Go-бэкенде LRU-кэш применяется повсеместно: пулы соединений с БД, кэширование JWT-токенов, сессионные хранилища, in-memory агрегация метрик и защита от горячих ключей при работе с внешними API.</p>
-<p>Главная инженерная задача — реализовать LRU так, чтобы операции <code>Get</code>, <code>Put</code> и вытеснения работали за гарантированное <code>O(1)</code>, не блокировали горутины на чтение и не создавали катастрофического давления на сборщик мусора.</p>
+<p>В архитектуре высокопроизводительного бэкенда оперативная память (RAM) всегда остается самым дорогим и дефицитным ресурсом. Мы физически не можем бесконечно удерживать в памяти все результаты SQL-запросов, профили сотен миллионов пользователей или тяжелые вычисленные JSON-ответы. Рано или поздно наступает момент исчерпания емкости (Capacity Limit), когда система обязана решить: <strong>какой именно элемент должен быть удален, чтобы освободить место новому?</strong></p>
+<p>Стратегия вытеснения <strong>LRU (Least Recently Used — наименее востребованный по времени)</strong> базируется на фундаментальном физическом принципе временной и пространственной локальности (Temporal Locality): если к данным обращались недавно, существует высочайшая вероятность, что они понадобятся снова в ближайшие миллисекунды. Напротив, элементы, к которым давно не прикасались, с наибольшей вероятностью являются «мертвым грузом».</p>
+<p>В экосистеме Go паттерн LRU является абсолютным промышленным стандартом:<br />
+- Пулы постоянных сетевых соединений (Connection Pools) к PostgreSQL/Redis.<br />
+- Кэширование декодированных и верифицированных JWT-токенов авторизации.<br />
+- In-memory сессионные хранилища и фильтры горячих ключей перед внешними микросервисами.<br />
+- Буферизация и дедупликация событий в брокерах сообщений (Kafka consumer pipeline).</p>
+<p>Главный инженерный вызов заключается в обеспечении строгого математического контракта: операции поиска (<code>Get</code>), вставки (<code>Put</code>) и вытеснения устаревших элементов обязаны выполняться за <strong>гарантированное константное время</strong>:<br />
+$$O(1)$$</p>
+<p>без просадок латентности, без блокировок параллельных читателей и без провоцирования губительных пауз сборщика мусора.</p>
+<hr />
 <h2 id="1-arkhitekturnyy-fundament-khesh-tablitsa-dvusvyaznyy-spisok">1. Архитектурный фундамент: Хеш-таблица + Двусвязный список</h2>
 
-<p>LRU кэш — это композиция двух структур данных, каждая из которых закрывает слабую сторону другой:<br />
-* <strong>Хеш-таблица (<code>map</code>)</strong> даёт <code>O(1)</code> доступ к значению по ключу, но не сохраняет порядок использования.<br />
-* <strong>Двусвязный список</strong> поддерживает порядок от самых свежих (голова) к самым старым (хвост), позволяя за <code>O(1)</code> перемещать узел в начало или удалять последний элемент, но поиск в нём — <code>O(n)</code>.</p>
-<p>Объединение их через указатель на узел списка внутри значения мапы даёт идеальный контракт: мгновенный поиск и мгновенное обновление приоритета.</p>
+<p>Попытка реализовать LRU-кэш на базе какой-то одной классической структуры неизбежно терпит фиаско:<br />
+- <strong>Хеш-таблица (<code>map</code>)</strong>: обеспечивает мгновенный поиск и модификацию за $O(1)$ по ключу, но абсолютно не сохраняет хронологический порядок обращений. Чтобы найти самый старый элемент, придется сканировать всю таблицу за линейное время $O(n)$.<br />
+- <strong>Двусвязный список</strong>: идеально поддерживает порядок использования (голова — самый свежий элемент, хвост — кандидат на удаление). Перемещение узла в голову занимает ровно $O(1)$, но поиск элемента по ключу требует последовательного перебора за $O(n)$.</p>
+<p>Решение заключается в <strong>симбиотическом объединении</strong> двух структур:<br />
+1. <strong>Двусвязный список</strong> определяет хронологию: голова хранит самый свежий элемент (Most Recently Used), хвост — самый старый (Least Recently Used).<br />
+2. <strong>Хеш-таблица (<code>map[K]*list.Element</code>)</strong> связывает ключ с прямым физическим указателем на узел внутри двусвязного списка.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2200,28 +2216,41 @@
     </button>
   </div>
   <pre class="mermaid">
-flowchart LR
-Req[&quot;Запрос Get Put K&quot;] --&gt; Map{&quot;Проверка map[K]&quot;}
-Map --&gt;|Hit Найден| Move[&quot;Переместить узел в голову списка&lt;br&gt;O 1&quot;]
-Map --&gt;|Miss Не найден| Check{&quot;Есть место в capacity?&quot;}
-Check --&gt;|Нет| Evict[&quot;Удалить узел хвоста&lt;br&gt;Очистить map хвоста&quot;]
-Check --&gt;|Да| Create[&quot;Создать новый узел&quot;]
-Evict --&gt; Create
-Create --&gt; Add[&quot;Вставить в голову&lt;br&gt;Сохранить указатель в map&quot;]
-Move --&gt; Res[&quot;Вернуть значение&quot;]
-Add --&gt; Res
+flowchart TD
+Req[&quot;Запрос: Get(K) или Put(K, V)&quot;] --&gt; MapCheck{&quot;Проверка в map[K]&quot;}
 
-style Map fill:#e3f2fd
-style Evict fill:#ffebee
-style Res fill:#e8f5e8
+MapCheck --&gt;|&quot;Cache Hit (Найден)&quot;| Move[&quot;Переместить узел в голову списка&lt;br/&gt;c.list.MoveToFront(elem) — O(1)&quot;]
+MapCheck --&gt;|&quot;Cache Miss (Не найден)&quot;| CapCheck{&quot;Достигнут ли лимит&lt;br/&gt;c.list.Len() &gt;= capacity?&quot;}
+
+CapCheck --&gt;|&quot;Да (Кэш полон)&quot;| Evict[&quot;Удалить узел с хвоста (Back)&lt;br/&gt;delete(c.items, tail.Key) — O(1)&quot;]
+CapCheck --&gt;|&quot;Нет (Есть место)&quot;| Create[&quot;Аллоцировать Item[K, V]&quot;]
+
+Evict --&gt; Create
+Create --&gt; InsertHead[&quot;Вставить узел в голову списка&lt;br/&gt;c.items[K] = elem — O(1)&quot;]
+
+Move --&gt; ReturnVal[&quot;Возврат значения (Hit)&quot;]
+InsertHead --&gt; ReturnOk[&quot;Завершение Put / Возврат (Miss)&quot;]
+
+classDef reqBox fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef check fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+classDef opBox fill:#312e81,stroke:#818cf8,stroke-width:1.5px,color:#f8fafc;
+classDef evictBox fill:#4c0519,stroke:#f43f5e,stroke-width:1.5px,color:#f8fafc;
+classDef okBox fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+
+class Req reqBox;
+class MapCheck,CapCheck check;
+class Move,Create,InsertHead opBox;
+class Evict evictBox;
+class ReturnVal,ReturnOk okBox;
   </pre>
 </div>
 
 
-<p>При каждом обращении к ключу узел извлекается из текущего места списка и переносится в голову (<code>MoveToFront</code>). При заполнении лимита узел из хвоста удаляется, а его ключ стирается из мапы. Все операции модифицируют только указатели <code>next</code> и <code>prev</code>, не требуя сдвигов памяти или реаллокаций.</p>
+<p>При каждом обращении (<code>Get</code> или <code>Put</code>) найденный узел перемещается в голову списка (<code>MoveToFront</code>). Когда емкость кэша исчерпана, узел из хвоста списка удаляется за $O(1)$, а его ключ мгновенно стирается из хеш-таблицы. Все манипуляции затрагивают исключительно локальные указатели <code>next</code> и <code>prev</code>, не требуя сдвига элементов памяти или копирования массивов.</p>
+<hr />
 <h2 id="2-production-realizatsiya-na-go-1-21">2. Production-реализация на Go 1.21+</h2>
 
-<p>В Go стандартная библиотека предоставляет <code>container/list</code>, которая идеально ложится на эту архитектуру. Используем дженерики для строгой типизации, <code>sync.RWMutex</code> для безопасности и callback для внешней интеграции (например, инвалидации зависимых кэшей или отправки метрик).</p>
+<p>Стандартный пакет <code>container/list</code> в сочетании с generic-синтаксисом Go 1.21+ позволяет реализовать потокобезопасный LRU-кэш без динамического боксинга типов:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2239,22 +2268,23 @@ import (
     &quot;sync&quot;
 )
 
-// Item хранит ключ и значение. Ключ нужен для удаления из map при вытеснении.
+// Item хранит полезную нагрузку. Наличие Key критично для обратного
+// удаления записи из хеш-таблицы map при вытеснении узла из хвоста списка.
 type Item[K comparable, V any] struct {
     Key   K
     Value V
 }
 
-// Cache реализует потокобезопасный LRU кэш.
+// Cache реализует потокобезопасный LRU кэш фиксированной емкости.
 type Cache[K comparable, V any] struct {
     mu       sync.RWMutex
     capacity int
     list     *list.List
     items    map[K]*list.Element
-    onEvict  func(key K, value V) // Callback при вытеснении
+    onEvict  func(key K, value V) // Callback при вытеснении записи
 }
 
-// New создаёт LRU кэш заданной ёмкости.
+// New создаёт LRU кэш заданной максимальной ёмкости.
 func New[K comparable, V any](capacity int, onEvict func(K, V)) (*Cache[K, V], error) {
     if capacity &lt;= 0 {
         return nil, fmt.Errorf(&quot;lru: capacity must be positive&quot;)
@@ -2267,7 +2297,7 @@ func New[K comparable, V any](capacity int, onEvict func(K, V)) (*Cache[K, V], e
     }, nil
 }
 
-// Get возвращает значение и флаг присутствия. Обновляет порядок доступа.
+// Get извлекает значение по ключу, обновляя его приоритет (перемещает в голову).
 func (c *Cache[K, V]) Get(key K) (V, bool) {
     c.mu.RLock()
     elem, ok := c.items[key]
@@ -2278,8 +2308,9 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
         return zero, false
     }
 
+    // Обновление порядка в списке требует эксклюзивной блокировки
     c.mu.Lock()
-    c.list.MoveToFront(elem) // Требуется запись, так как меняем указатели списка
+    c.list.MoveToFront(elem)
     item := elem.Value.(*Item[K, V])
     val := item.Value
     c.mu.Unlock()
@@ -2287,33 +2318,36 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
     return val, true
 }
 
-// Put добавляет или обновляет значение. Возвращает true, если произошло вытеснение.
+// Put вставляет или обновляет пару ключ-значение.
+// Возвращает true, если добавление элемента вызвало вытеснение самого старого узла.
 func (c *Cache[K, V]) Put(key K, value V) bool {
     c.mu.Lock()
     defer c.mu.Unlock()
 
+    // Сценарий 1: Ключ уже существует в кэше — обновляем значение и двигаем в голову
     if elem, ok := c.items[key]; ok {
         c.list.MoveToFront(elem)
         elem.Value.(*Item[K, V]).Value = value
         return false
     }
 
+    // Сценарий 2: Лимит емкости исчерпан — вытесняем наименее востребованный узел
     evicted := false
     if c.list.Len() &gt;= c.capacity {
         oldest := c.list.Back()
         if oldest != nil {
             c.list.Remove(oldest)
             item := oldest.Value.(*Item[K, V])
-            if c.onEvict != nil {
-                // Важно: вызов вне мьютекса или копирование данных, 
-                // чтобы не блокировать другие горутины во время callback
-                c.onEvict(item.Key, item.Value)
-            }
             delete(c.items, item.Key)
             evicted = true
+
+            if c.onEvict != nil {
+                c.onEvict(item.Key, item.Value)
+            }
         }
     }
 
+    // Сценарий 3: Создаем новый узел и сохраняем его в голову двусвязного списка
     newItem := &amp;Item[K, V]{Key: key, Value: value}
     elem := c.list.PushFront(newItem)
     c.items[key] = elem
@@ -2321,7 +2355,7 @@ func (c *Cache[K, V]) Put(key K, value V) bool {
     return evicted
 }
 
-// Remove удаляет элемент по ключу.
+// Remove удаляет произвольный элемент по ключу.
 func (c *Cache[K, V]) Remove(key K) bool {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -2340,29 +2374,30 @@ func (c *Cache[K, V]) Remove(key K) bool {
 </code></pre>
 </div>
 
-<p>Инженерные решения:<br />
-* <strong><code>sync.RWMutex</code></strong>: <code>Get</code> использует <code>RLock</code> для чтения мапы, но для <code>MoveToFront</code> требуется апгрейд до <code>Lock</code>. В production часто используют два мьютекса или fine-grained лог, чтобы избежать starvation читателей.<br />
-* <strong>Callback вне критической секции</strong>: Вызов <code>onEvict</code> под мьютексом может заблокировать всю очередь на время сетевого вызова или тяжелой логики. В коде выше он вызывается после удаления из структур, но всё ещё под <code>Lock</code> для простоты. В высоконагруженных системах его выносят в <code>chan</code> для асинхронной обработки.<br />
-* <strong>Type Assertion</strong>: <code>elem.Value.(*Item[K, V])</code> безопасен, так как мы контролируем добавление в список. Дженерики Go 1.18+ делают его нулевым по стоимости на этапе выполнения.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Внутренности <code>container/list</code>: каждый элемент — это структура <code>Element</code> с полями <code>next, prev *Element</code>, <code>list *List</code> и <code>Value any</code>. При <code>PushFront</code> аллоцируется новый <code>Element</code> в куче. При <code>MoveToFront</code> меняются только 4 указателя (по 2 с каждой стороны). Никаких копирований данных или сдвигов массивов. Это гарантирует <code>O(1)</code> без скрытых аллокаций.</p>
+    <p><strong>Внутреннее устройство <code>container/list</code></strong><br />
+Каждый узел представляет собой структуру <code>list.Element</code> со служебными указателями <code>next, prev *Element</code>, <code>list *List</code> и полезной нагрузкой <code>Value any</code>.<br />
+При вызове <code>PushFront</code> аллоцируется новый <code>Element</code> в куче. При вызове <code>MoveToFront</code> физические данные не перемещаются и не копируются: перепривязываются ровно 4 указателя у соседних элементов. Это гарантирует строгое $O(1)$ без тяжелых манипуляций с памятью. Приведение типов <code>elem.Value.(*Item[K, V])</code> является безопасным, поскольку тип узла строго инкапсулирован внутри пакета.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="3-mechanical-sympathy-gc-kesh-linii-i-allokatsii">3. Mechanical Sympathy: GC, кэш-линии и аллокации</h2>
 
-<p>Теория <code>O(1)</code> не учитывает реальное поведение CPU и Go-рантайма. <code>container/list</code> — это классический пример структуры с <strong>плохой пространственной локальностью</strong>.</p>
-<ul>
-<li><strong>Указательный chase</strong>: Узлы списка разбросаны по куче случайным образом. При <code>MoveToFront</code> CPU последовательно разыменовывает <code>prev</code> и <code>next</code>, каждый шаг — потенциальный cache miss. Для списка из 100к элементов обход может занять сотни наносекунд только на ожидание RAM.</li>
-<li><strong>Давление на GC</strong>: Каждый узел <code>list.Element</code> + <code>Item[K,V]</code> — это минимум 3-4 указателя на объект в куче. Сборщик мусора в фазе <code>mark</code> должен пройти по всем ним, проверяя их на "живость". Чем больше элементов в кэше, тем дольше фаза mark и выше задержки <code>STW</code>.</li>
-<li><strong>Escape Analysis</strong>: Создание <code>newItem</code> внутри <code>Put</code> гарантированно утекает в кучу. Если кэш создаётся и уничтожается часто, это генерирует тысячи мелких аллокаций, фрагментирующих heap.</li>
-</ul>
-<p><strong>Оптимизация для low-latency</strong>: Вместо <code>container/list</code> используйте массивный двусвязный список на индексах.</p>
+<p>Теоретический анализ асимптотики $O(1)$ умалчивает о физическом поведении кремния CPU и рантайма Go под реальной нагрузкой. Канонический <code>container/list</code> обладает <strong>катастрофически низкой локальностью данных</strong>:</p>
+<h3 id="ukazatelnyy-promakh-kesha-pointer-chase">Указательный промах кэша (Pointer Chase)</h3>
+<p>Узлы списка <code>list.Element</code> и структуры <code>Item</code> аллоцируются в куче в разные моменты времени. Они физически разбросаны по разным страницам оперативной памяти. При каждом вызове <code>MoveToFront</code> или <code>Back</code> процессор разыменовывает адреса <code>prev</code> и <code>next</code>, порождая промах L1/L2 кэша и обращение к оперативной памяти (DRAM) с задержкой в 50–100 наносекунд.</p>
+<h3 id="nagruzka-na-garbage-collector">Нагрузка на Garbage Collector</h3>
+<p>Каждая пара <code>list.Element</code> + <code>Item[K,V]</code> удерживает от 3 до 4 указателей. Если емкость кэша составляет 1 000 000 записей, сборщик мусора Go на фазе разметки <code>mark</code> вынужден обойти 4 миллиона указателей! Это резко растягивает цикл GC и увеличивает длительность задержек <code>STW</code>. Для снижения нагрузки применяют <code>sync.Pool</code> для переиспользования структур.</p>
+<h3 id="escape-analysis-i-allokatsii">Escape Analysis и аллокации</h3>
+<p>Создание <code>newItem := &amp;Item[K, V]{...}</code> внутри метода <code>Put</code> гарантированно приводит к побегу переменной в кучу (<code>escape to heap</code>). При частоте записи 50 000 RPS это генерирует сотни мегабайт мусора в секунду.</p>
+<h3 id="low-latency-optimizatsiya-massivnyy-lru-na-ploskikh-srezakh">Low-Latency оптимизация: Массивный LRU на плоских срезах</h3>
+<p>В сверхвысоконагруженных системах (High-Frequency Trading, API-шлюзы) <code>container/list</code> заменяют на монолитные плоские срезы, где указатели эмулируются целочисленными индексами <code>[]int</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2384,16 +2419,58 @@ func (c *Cache[K, V]) Remove(key K) bool {
 </code></pre>
 </div>
 
-<p>Всё хранится в непрерывных <code>[]int</code>/<code>[]V</code>. Операции работают с индексами, а не указателями. CPU загружает кэш-линии пакетами, GC видит компактные блоки без указательной паутины. Производительность возрастает на 20-50% при высокой конкуренции.</p>
+<p>Все метаданные хранятся в непрерывных массивах <code>[]int</code>/<code>[]V</code>. Аппаратный Prefetcher CPU загружает элементы целыми кэш-линиями, сборщик мусора видит монолитные спаны без указательной паутины, а производительность возрастает на 20–50%.</p>
+<hr />
 <h2 id="4-konkurentnost-i-gorizontalnoe-masshtabirovanie-v-pamyati">4. Конкурентность и горизонтальное масштабирование в памяти</h2>
 
-<p>Один <code>sync.Mutex</code> масштабируется до ~10-20k RPS. Дальше начинается <code>futex</code>-парковка, переключение тредов ОС и рост p99. Для production-кэшей в Go применяют <strong>шардирование</strong>.</p>
-<p>Алгоритм:<br />
-1. Создаём <code>N</code> независимых LRU-инстансов.<br />
-2. Каждый имеет свой <code>sync.RWMutex</code>.<br />
-3. При запросе вычисляем шард: <code>hash(key) % N</code>.<br />
-4. Работаем только с выбранным шардом.</p>
-<p>Это снижает contention в <code>N</code> раз. Потеря глобального порядка LRU незначительна: вероятность того, что два "горячих" ключа попадут в один шард и вытеснят друг друга, мала при <code>N &gt;= 8</code>. Библиотеки типа <code>hashicorp/golang-lru</code> или <code>coocood/freecache</code> используют именно этот паттерн.</p>
+<p>Одиночный мьютекс <code>sync.Mutex</code> или <code>sync.RWMutex</code> отлично справляется с нагрузкой до 10 000 – 20 000 RPS. </p>
+<p>При дальнейшем росте параллельных запросов начинается лавинообразная <code>futex</code>-парковка горутин в ядре Linux, время удержания блокировки увеличивается, а задержка $p99$ подскакивает до сотен миллисекунд.</p>
+<h3 id="pattern-sharded-lru-shardirovanie-kesha">Паттерн Sharded LRU (Шардирование кэша)</h3>
+<p>Промышленный стандарт решения проблемы Contention в Go:<br />
+1. Создается пул из $N$ независимых изолированных инстансов <code>Cache</code> (обычно $N$ выбирается степенью двойки: 16, 32 или 64).<br />
+2. Каждый шард защищен собственным независимым <code>sync.RWMutex</code>.<br />
+3. Запрос маршрутизируется по формуле:<br />
+   $$\text{shardIndex} = \text{hash}(key) \pmod N$$<br />
+4. Горутина работает строго с выбранным шардом.</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+Req[&quot;Входящий запрос: Get(&#x27;user:123&#x27;)&quot;] --&gt; Hash[&quot;Вычисление hash(key) % N&quot;]
+Hash --&gt; ShardRouter{&quot;Маршрутизация в шард&quot;}
+
+ShardRouter --&gt; S0[&quot;Шард 0 (Mutex 0)&quot;]
+ShardRouter --&gt; S1[&quot;Шард 1 (Mutex 1)&quot;]
+ShardRouter --&gt; Sn[&quot;Шард N-1 (Mutex N-1)&quot;]
+
+S0 --&gt; LRU0[&quot;Изолированный LRU Cache&quot;]
+S1 --&gt; LRU1[&quot;Изолированный LRU Cache&quot;]
+Sn --&gt; LRUn[&quot;Изолированный LRU Cache&quot;]
+
+classDef reqBox fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef hashBox fill:#1e293b,stroke:#f59e0b,stroke-width:1.5px,color:#f8fafc;
+classDef shardBox fill:#312e81,stroke:#818cf8,stroke-width:1.5px,color:#f8fafc;
+classDef cacheBox fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+
+class Req reqBox;
+class Hash,ShardRouter hashBox;
+class S0,S1,Sn shardBox;
+class LRU0,LRU1,LRUn cacheBox;
+  </pre>
+</div>
+
+
+<p>Это снижает конкуренцию за блокировку ровно в $N$ раз. Потеря глобальной точности LRU статистически ничтожна: вероятность того, что горячие ключи вытеснят друг друга в одном шарде, мала при <code>N &gt;= 8</code>. Популярные библиотеки <code>hashicorp/golang-lru</code> и <code>coocood/freecache</code> построены именно на этом архитектурном паттерне.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2401,12 +2478,13 @@ func (c *Cache[K, V]) Remove(key K) bool {
   </div>
   <div class="callout-body">
     <p><strong>Рассинхронизация map и list</strong><br />
-Если при вытеснении вы удалите элемент из списка, но забудете <code>delete(c.items, key)</code>, мапа будет содержать "зомби"-указатели на уже освобождённые узлы. При следующем <code>Get</code> произойдёт чтение из удалённого элемента или паника при попытке <code>MoveToFront</code>. Всегда используйте транзакционный подход: либо оба действия успешны, либо ни одно.</p>
-<p><strong>Memory Leak через onEvict</strong><br />
-Если <code>onEvict</code> сохраняет ссылку на удалённое значение в глобальном слайсе или мапе, GC не соберёт объект, несмотря на удаление из кэша. Это классическая скрытая утечка памяти. Передавайте в callback только копию данных или примитивные ключи.</p>
+Если в процессе вытеснения узел удаляется из списка <code>c.list.Remove(oldest)</code>, но вызов <code>delete(c.items, key)</code> забыт или завершился паникой, мапа будет удерживать «зомби-указатели» на удаленные элементы. Последующий <code>Get</code> прочитает разрушенный узел или вызовет панику рантайма <code>panic: runtime error</code>. Модификация map и списка обязана быть строго атомарной внутри критической секции.</p>
+<p><strong>Утечка памяти через замыкание onEvict</strong><br />
+Если функция обратного вызова <code>onEvict</code> сохраняет ссылку на вытесненный объект в глобальной переменной, срезе или канале, сборщик мусора Go никогда не сможет освободить эту память. Передавайте в callback примитивные идентификаторы либо создавайте полную независимую копию данных.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="5-intervyu-voprosy-na-ponimanie-arkhitektury">5. Интервью: вопросы на понимание архитектуры</h2>
 
 <div class="callout callout-interview">
@@ -2415,29 +2493,35 @@ func (c *Cache[K, V]) Remove(key K) bool {
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос 1:</strong> «Почему нельзя реализовать LRU только на <code>map</code>, храня timestamp последнего доступа?»<br />
-<strong>Ответ:</strong> Удаление наименее свежего элемента потребует полного обхода мапы за <code>O(n)</code> для поиска минимального timestamp. При частых <code>Put</code> и вытеснениях это превратит кэш в bottleneck. Связка map+list гарантирует <code>O(1)</code> eviction без линейного сканирования.</p>
-<p><strong>Вопрос 2:</strong> «Как реализовать TTL в LRU-кэше без потери производительности?»<br />
-<strong>Ответ:</strong> Чистый LRU не знает о времени. Для TTL добавляют отдельную структуру: priority queue (кучу) с таймстампами или сканируют список с конца во фоновой горутине, удаляя просроченные элементы. Альтернатива: хранить <code>expiry</code> внутри узла и проверять его при <code>Get</code>, удаляя лениво. Но это ломает строгий LRU, превращая его в LRU+TTL гибрид.</p>
-<p><strong>Вопрос 3:</strong> «Сравните LRU с LFU и MRU. Когда какой использовать в бэкенде?»<br />
-<strong>Ответ:</strong> LRU оптимален для сканирующих данных и сессий (локальность времени). LFU (Least Frequently Used) лучше для редко меняющегося, но часто читаемого контента (каталоги товаров, конфиги). MRU (Most Recently Used) полезен, когда новые данные быстро становятся неактуальными, а старые — остаются полезными (например, обработка последних страниц в paginated API). В Go LRU проще реализовать, LFU требует поддержания счётчиков и кучи, что увеличивает footprint.</p>
-<p><strong>Вопрос 4:</strong> «Почему в <code>Get</code> вы сначала делаете <code>RLock</code>, а потом <code>Lock</code> для <code>MoveToFront</code>? Не вызовет ли это deadlock или starvation?»<br />
-<strong>Ответ:</strong> <code>sync.RWMutex</code> в Go не поддерживает апгрейд с <code>RLock</code> на <code>Lock</code>. Попытка сделать <code>c.mu.Lock()</code> внутри <code>RLock</code> приведёт к deadlock, если другие горутины удерживают <code>RLock</code>. Правильный подход: либо сразу брать <code>Lock</code> в <code>Get</code> (если записей много), либо использовать <code>atomic.Pointer</code> для map и lock-free структуры, либо два отдельных мьютекса. В примере выше показана упрощённая схема; в production <code>Get</code> часто делают чисто read-only, а обновление порядка выносят в фоновый батч или используют <code>sync.Pool</code> + lock-free списки.</p>
+    <p><strong>Вопрос 1:</strong> «Почему нельзя реализовать LRU только на <code>map</code>, просто сохраняя timestamp последнего доступа внутри структуры значения?»<br />
+<strong>Ответ:</strong> При исчерпании емкости поиск наименее свежего элемента для вытеснения потребует полного сканирования всех записей мапы за время $O(n)$. При частых вставках и плотном потоке вытеснений кэш мгновенно превратится в узкое горлышко. Симбиоз хеш-таблицы и двусвязного списка обеспечивает гарантированный eviction за константное время $O(1)$.</p>
+<p><strong>Вопрос 2:</strong> «Как корректно добавить поддержку TTL (Time To Live) в LRU-кэш?»<br />
+<strong>Ответ:</strong> Чистый LRU не учитывает абсолютное астрономическое время. Для интеграции TTL применяются две стратегии:<br />
+1. <em>Ленивая валидация:</em> хранить <code>expiry</code> внутри узла и проверять его при <code>Get</code>, удаляя лениво.<br />
+2. <em>Фоновый очиститель:</em> параллельная приоритетная очередь (Min-Heap по времени) или фоновая горутина, инспектирующая хвост списка по таймеру <code>time.Ticker</code>.</p>
+<p><strong>Вопрос 3:</strong> «В чем принципиальная разница между политиками LRU, LFU и MRU в бэкенде?»<br />
+<strong>Ответ:</strong> <br />
+- <strong>LRU (Least Recently Used):</strong> вытесняет элементы, к которым дольше всего не обращались. Идеален для сессий, авторизационных токенов и потоков событий.<br />
+- <strong>LFU (Least Frequently Used):</strong> вытесняет элементы с наименьшим счетчиком частоты обращений. Идеален для каталогов товаров и статичных конфигураций, защищая популярные ключи от случайного вымывания разовыми сканирующими запросами.<br />
+- <strong>MRU (Most Recently Used):</strong> вытесняет самые свежие элементы. Применяется при постраничном обходе тяжелых баз данных (Sequential Scan), где только что прочитанная страница больше никогда не понадобится.</p>
+<p><strong>Вопрос 4:</strong> «Почему в приведенном методе <code>Get</code> сначала берется <code>RLock</code>, а затем <code>Lock</code> для <code>MoveToFront</code>? Не приведет ли это к Deadlock?»<br />
+<strong>Ответ:</strong> В Go примитив <code>sync.RWMutex</code> не поддерживает эскалацию блокировок (Upgrade lock). Попытка вызвать <code>c.mu.Lock()</code> не отпустив <code>RLock()</code> гарантированно вызовет взаимную блокировку. В нашем коде блокировка <code>RLock</code> корректно отпускается до входа в секцию модификации. В боевых high-load системах метод <code>Get</code> часто делают полностью неблокирующим (Read-Only), используя <code>atomic.Pointer</code> для map и lock-free структуры, либо обновление хронологии переносят в асинхронный кольцевой буфер с пулом <code>sync.Pool</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>LRU кэш</strong> — это композиция хеш-таблицы и двусвязного списка, дающая гарантированные <code>O(1)</code> на доступ и вытеснение.</li>
-<li>В Go <code>container/list</code> удобен, но указательная природа ухудшает cache locality и увеличивает нагрузку на <span class="wikilink-unresolved" title="Заметка в разработке">GC</span>. Для high-load используйте массивные реализации на индексах.</li>
-<li><strong>Конкурентность</strong> одного мьютекса ограничена. Шардирование по <code>hash(key) % N</code> — стандартный паттерн для достижения &gt;100k RPS.</li>
-<li><strong>Очистка ссылок</strong> при eviction критична для предотвращения memory leaks. Callback-функции должны работать асинхронно или принимать только копию данных.</li>
-<li><strong>TTL и LRU</strong> — разные политики. Их комбинация требует дополнительной структуры (куча или фоновый сканер) и trade-off между точностью и overhead.</li>
-<li><strong>Выбор в production</strong>: LRU идеален для сессий, пулов соединений, кэшей ответов API. Для аналитики с частыми повторными чтениями одних и тех же ключей рассмотрите LFU.</li>
+<li><strong>LRU кэш</strong> — классический симбиоз хеш-таблицы (<code>map[K]*list.Element</code>) и двусвязного списка (<code>container/list</code>), гарантирующий строгое <strong>$O(1)$</strong> на поиск, вставку и вытеснение.</li>
+<li>В Go стандартный <code>container/list</code> удобен в реализации, но указательная структура провоцирует частые Cache Miss и нагружает <span class="wikilink-unresolved" title="Заметка в разработке">GC</span>. Для критических latency-sensitive систем применяются плоские массивы на индексах (<code>ArrayBasedLRU</code>).</li>
+<li><strong>Конкурентность:</strong> единый мьютекс упирается в потолок при 20k RPS. <strong>Шардирование кэша по <code>hash(key) % N</code></strong> устраняет contention и масштабирует пропускную способность до миллионов RPS.</li>
+<li><strong>Транзакционность мутаций:</strong> удаление из списка и удаление из мапы обязаны производиться синхронно во избежание «зомби-ссылок» и утечек памяти.</li>
+<li>Интеграция TTL требует комбинирования с приоритетной очередью или фоновым сборщиком просроченных записей.</li>
 </ul>
-<p>Понимание LRU закрывает базовые сценарии кеширования с приоритетом на новизну. Однако в системах с неравномерным распределением запросов (Zipf-like distribution) новизна не гарантирует релевантности. Там, где важнее частота обращений, чем время последнего доступа, LRU начинает проигрывать по hit rate. В следующей статье мы разберём структуру, которая считает обращения и вытесняет наименее популярные элементы, пожертвовав простотой реализации ради математически обоснованной оптимизации под реальные паттерны трафика.</p>
-<p><a href="8-lfu-kesh.html" class="wikilink">8. LFU кэш</a></p>
+<hr />
+<p>Мы подробно изучили вытеснение данных на основе фактора новизны (LRU). Однако в реальных сервисах с неравномерным распределением трафика (закон Ципфа: 80% запросов приходятся на 20% топовых ключей) редкий пакетный скан может полностью вымыть из LRU-кэша самые ценные данные. Для решения этой проблемы применяется стратегия вытеснения на основе <strong>частоты обращений</strong>. В следующей статье мы разберем проектирование кэша с частотным учетом:<br />
+<a href="8-lfu-kesh.html" class="wikilink">8. LFU кэш</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2465,7 +2549,7 @@ func (c *Cache[K, V]) Remove(key K) bool {
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vvedenie-balans-pamyati-i-skorosti-dostupa">Введение: Баланс памяти и скорости доступа</a></li><li class="toc-item toc-h2"><a href="#1-arkhitekturnyy-fundament-khesh-tablitsa-dvusvyaznyy-spisok">1. Архитектурный фундамент: Хеш-таблица + Двусвязный список</a></li><li class="toc-item toc-h2"><a href="#2-production-realizatsiya-na-go-1-21">2. Production-реализация на Go 1.21+</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-gc-kesh-linii-i-allokatsii">3. Mechanical Sympathy: GC, кэш-линии и аллокации</a></li><li class="toc-item toc-h2"><a href="#4-konkurentnost-i-gorizontalnoe-masshtabirovanie-v-pamyati">4. Конкурентность и горизонтальное масштабирование в памяти</a></li><li class="toc-item toc-h2"><a href="#5-intervyu-voprosy-na-ponimanie-arkhitektury">5. Интервью: вопросы на понимание архитектуры</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#vvedenie-balans-pamyati-i-skorosti-dostupa">Введение: Баланс памяти и скорости доступа</a></li><li class="toc-item toc-h2"><a href="#1-arkhitekturnyy-fundament-khesh-tablitsa-dvusvyaznyy-spisok">1. Архитектурный фундамент: Хеш-таблица + Двусвязный список</a></li><li class="toc-item toc-h2"><a href="#2-production-realizatsiya-na-go-1-21">2. Production-реализация на Go 1.21+</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-gc-kesh-linii-i-allokatsii">3. Mechanical Sympathy: GC, кэш-линии и аллокации</a></li><li class="toc-item toc-h3"><a href="#ukazatelnyy-promakh-kesha-pointer-chase">Указательный промах кэша (Pointer Chase)</a></li><li class="toc-item toc-h3"><a href="#nagruzka-na-garbage-collector">Нагрузка на Garbage Collector</a></li><li class="toc-item toc-h3"><a href="#escape-analysis-i-allokatsii">Escape Analysis и аллокации</a></li><li class="toc-item toc-h3"><a href="#low-latency-optimizatsiya-massivnyy-lru-na-ploskikh-srezakh">Low-Latency оптимизация: Массивный LRU на плоских срезах</a></li><li class="toc-item toc-h2"><a href="#4-konkurentnost-i-gorizontalnoe-masshtabirovanie-v-pamyati">4. Конкурентность и горизонтальное масштабирование в памяти</a></li><li class="toc-item toc-h3"><a href="#pattern-sharded-lru-shardirovanie-kesha">Паттерн Sharded LRU (Шардирование кэша)</a></li><li class="toc-item toc-h2"><a href="#5-intervyu-voprosy-na-ponimanie-arkhitektury">5. Интервью: вопросы на понимание архитектуры</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 

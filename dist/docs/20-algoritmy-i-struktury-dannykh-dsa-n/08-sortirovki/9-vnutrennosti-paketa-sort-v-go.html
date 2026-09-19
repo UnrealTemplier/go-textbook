@@ -2169,19 +2169,24 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~19 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~24 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">9. Внутренности пакета sort в Go</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы разбирали алгоритмы сортировки в вакууме: изучали их математическую сложность, паттерны работы с кэшем процессора и слабости. Но когда вы вызываете <code>slices.Sort(arr)</code> в вашем production-коде, вы не запускаете чистый Quick Sort или Merge Sort. Вы запускаете промышленный шедевр, который вобрал в себя десятилетия исследований.</p>
-<p>Пакет <code>sort</code> (и его современный дженерик-аналог <code>slices</code>) в Go пережил две фундаментальные революции: алгоритмическую (переход на <code>pdqsort</code> в Go 1.19) и архитектурную (переход на Generics в Go 1.21).</p>
-<p>Для Senior-бэкендера понимание этих внутренностей — это не просто эрудиция, это ключ к написанию Zero-Allocation кода и пониманию того, как компилятор оптимизирует работу с памятью.</p>
+            <h2 id="vvedenie-ot-teorii-k-industrialnomu-sovershenstvu">Введение: От теории к индустриальному совершенству</h2>
+
+<p>В предшествующих главах мы исследовали алгоритмы сортировки в изолированной теоретической среде: изучали их асимптотические границы, паттерны взаимодействия с процессорными кэшами и потенциальные ловушки. Однако когда в реальном производственном коде на Go вы вызываете <code>slices.Sort(arr)</code>, под капотом запускается отнюдь не наивный Quick Sort или прямолинейный Merge Sort. Вы активируете сложнейший инженерный гибрид, вобравший в себя десятилетия практических исследований в области алгоритмики и низкоуровневой оптимизации железа.</p>
+<p>Стандартный инструментарий сортировки в Go — классический пакет <code>sort</code> и современный обобщенный модуль <code>slices</code> — пережил две фундаментальные технические революции:<br />
+1. <strong>Алгоритмическую революцию (Go 1.19):</strong> Полный отказ от устаревшего IntroSort и переход на адаптивный алгоритм <strong>pdqsort (Pattern-Defeating Quicksort)</strong>.<br />
+2. <strong>Архитектурную революцию (Go 1.21):</strong> Переход на обобщенные типы (<code>Generics</code>) и мономорфизацию машинного кода, устранившую паразитные накладные расходы динамической диспетчеризации.</p>
+<p>Для Senior-инженера глубокое понимание этих внутренних механизмов — это ключ к проектированию Zero-Allocation сервисов и полному контролю над поведением компилятора.</p>
+<hr />
 <h2 id="arkhitekturnaya-revolyutsiya-interfeysy-vs-dzheneriki">Архитектурная революция: Интерфейсы vs Дженерики</h2>
 
-<p>До появления Go 1.21, если вы хотели отсортировать массив кастомных структур, вы обязаны были реализовать <code>sort.Interface</code>:</p>
+<p>До релиза Go 1.21 для сортировки любого пользовательского среза требовалось явно реализовать классический интерфейс <code>sort.Interface</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2191,7 +2196,7 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Как это было до Go 1.21 (Пакет sort)
+  <pre class="language-go"><code class="language-go">// Паттерн до появления Go 1.21 (Пакет sort)
 type Users []User
 
 func (a Users) Len() int           { return len(a) }
@@ -2205,13 +2210,17 @@ sort.Sort(Users(myUsers))
 
 <h3 id="mechanical-sympathy-nalog-na-interfeysy">Mechanical Sympathy: Налог на интерфейсы</h3>
 
-<p>С точки зрения математики алгоритм был быстрым ($O(N \log N)$). Но с точки зрения железа (Hardware) этот код страдал от огромных накладных расходов.</p>
-<p>Алгоритм внутри пакета <code>sort</code> не знал, с какими данными он работает. Он общался с вашим срезом через <code>interface</code>.</p>
-<p>Каждое сравнение (<code>Less</code>) и каждая перестановка (<code>Swap</code>) требовали <strong>Динамической диспетчеризации (Dynamic Dispatch)</strong>. Процессор не мог просто выполнить инструкцию сравнения двух чисел. Он должен был пойти в таблицу виртуальных методов (itab), найти адрес вашей функции <code>Less</code>, выполнить прыжок (Jump) по указателю, создать фрейм на стеке, выполнить сравнение, вернуть результат и очистить стек.</p>
-<p>В Quick Sort для массива из миллиона элементов совершаются миллионы таких сравнений и свапов. Вызовы функций через интерфейс полностью убивали возможность компилятора сделать <strong>Inlining</strong> (встраивание кода) и ломали предсказание ветвлений (Branch Prediction).</p>
+<p>С точки зрения математической теории асимптотика алгоритма выглядела безупречно — $O(N \log N)$. Однако на физическом кремнии микропроцессора этот код страдал от колоссального инфраструктурного налога.</p>
+<p>Внутренний механизм пакета <code>sort</code> не имел представления о структуре лежащих в памяти данных: он взаимодействовал с массивом исключительно через интерфейсный контракт <code>sort.Interface</code>.</p>
+<p>В результате каждая операция сравнения (<code>Less</code>) и каждая перестановка (<code>Swap</code>) требовали <strong>динамической диспетчеризации (Dynamic Dispatch)</strong>. Процессор не мог просто выполнить базовую машинную инструкцию сравнения двух регистров. Вместо этого он был вынужден:<br />
+* Обратиться к таблице виртуальных методов (<code>itab</code>).<br />
+* Разыменовать указатель на тело функции <code>Less</code>.<br />
+* Совершить косвенный переход (<code>Jump</code>), сбросив конвейер предсказания ветвлений (<code>Branch Prediction</code>).<br />
+* Сформировать стек-фрейм, выполнить операцию, вернуть значение и восстановить регистры.</p>
+<p>При сортировке массива на 1 миллион записей совершаются десятки миллионов подобных интерфейсных вызовов! Косвенные вызовы полностью блокировали фундаментальную оптимизацию компилятора — инлайнинг функций (<strong>Inlining</strong>), превращая высокоскоростной алгоритм в череду холостых обращений к памяти.</p>
 <h3 id="era-generics-i-monomorfizatsiya-slices-sort">Эра Generics и Мономорфизация (`slices.Sort`)</h3>
 
-<p>С появлением пакета <code>slices</code> всё изменилось:</p>
+<p>С появлением пакета <code>slices</code> в Go 1.21 архитектура изменилась кардинально:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2221,49 +2230,50 @@ sort.Sort(Users(myUsers))
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">// Как это работает сейчас (Go 1.21+)
+  <pre class="language-go"><code class="language-go">// Современный идиоматичный подход (Go 1.21+)
 slices.SortFunc(myUsers, func(a, b User) int {
     return cmp.Compare(a.Age, b.Age)
 })
 </code></pre>
 </div>
 
-<p>Вместо динамического интерфейса компилятор Go делает <strong>Мономорфизацию (Monomorphization)</strong>. Во время компиляции он берет обобщенный код алгоритма и генерирует его точную, типизированную копию специально для вашего <code>[]User</code>.</p>
-<p>Нет никаких интерфейсов. Нет <code>itab</code>. Функция сравнения <code>cmp.Compare</code> инлайнится прямо в тело алгоритма сортировки. Инструкции превращаются в прямые машинные коды сравнения регистров (<code>CMP</code>).</p>
+<p>Вместо упаковки в интерфейсы компилятор Go осуществляет <strong>мономорфизацию (Monomorphization)</strong>. В процессе компиляции рантайм компилирует специализированную версию алгоритма сортировки, жестко привязанную к конкретному типу <code>[]User</code>.</p>
+<p>Исчезли таблицы <code>itab</code> и косвенные переходы. Функция <code>cmp.Compare</code> прозрачно встраивается (<code>Inlining</code>) непосредственно в тело цикла сортировки, а вся логика сравнения вырождается в одиночные процессорные инструкции <code>CMP</code>.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Переход от <code>sort</code> к <code>slices</code> ускорил сортировку базовых типов (int, string) в Go на <strong>20-40%</strong>, а сортировку сложных структур — <strong>в 2 раза</strong>, просто за счет устранения накладных расходов на вызовы методов интерфейса. Всегда используйте пакет <code>slices</code> в новом коде.</p>
+    <p>Миграция со старого пакета <code>sort</code> на современный <code>slices</code> ускорила сортировку примитивных типов (<code>int</code>, <code>string</code>) на <strong>20–40%</strong>, а сортировку срезов структур — более чем <strong>в 2 раза</strong> исключительно за счет устранения интерфейсного оверхеда. Во всех современных проектах следует использовать исключительно пакет <code>slices</code>.</p>
   </div>
 </div>
 
 <hr />
 <h2 id="algoritmicheskaya-revolyutsiya-pattern-defeating-quicksort-pdqsort">Алгоритмическая революция: Pattern-Defeating Quicksort (pdqsort)</h2>
 
-<p>До версии 1.19 Go использовал алгоритм <strong>IntroSort</strong> (гибрид Quick Sort, Heap Sort и Insertion Sort). Но у него была слабость: он не умел адаптироваться к "реальным" данным (например, к массивам, где много одинаковых элементов или массивам, которые уже частично отсортированы).</p>
-<p>В Go 1.19 разработчики внедрили алгоритм <strong>pdqsort (Pattern-Defeating Quicksort)</strong>, созданный Орсоном Петерсом.</p>
-<p>Это алгоритм, который "побеждает паттерны". Он берет лучшее от Timsort (см. <a href="8-tim-sort-kontseptsiya.html" class="wikilink">8. Tim sort концепция</a>), но при этом остается In-Place алгоритмом, не требующим выделения памяти (O(1) дополнительной памяти).</p>
+<p>Вплоть до версии Go 1.18 стандартная библиотека опиралась на алгоритм <strong>IntroSort</strong> (триаду Quick Sort, Heap Sort и Insertion Sort). Однако у IntroSort была принципиальная слабость: он оставался слеп к внутренней структуре реальных данных (например, к массивам с большим числом дубликатов или частично упорядоченным срезам).</p>
+<p>В релизе Go 1.19 команда рантайма внедрила передовой алгоритм <strong>pdqsort (Pattern-Defeating Quicksort)</strong>, созданный исследователем Орсоном Петерсом (Orson Peters).</p>
+<p>Название алгоритма буквально означает «быстрая сортировка, побеждающая паттерны». Он объединяет адаптивную мощь Timsort (<a href="8-tim-sort-kontseptsiya.html" class="wikilink">8. Tim sort концепция</a>), сохраняя при этом строгое требование нулевых аллокаций памяти — работа strictly <code>In-place</code> с константной памятью $O(1)$.</p>
 <h3 id="tri-stolpa-pdqsort-v-go">Три столпа `pdqsort` в Go</h3>
 
 <ol>
-<li><strong>База: Quick Sort (Схема Хоара).</strong> В отличие от схемы Ломуто (которую мы писали в <a href="4-quick-sort.html" class="wikilink">4. Quick sort</a>), схема Хоара использует два указателя, идущих навстречу друг другу. Она делает в 3 раза меньше операций записи (swaps), что критически важно для экономии Memory Bandwidth.</li>
-<li><strong>Финиш: Insertion Sort.</strong> Если подмассив становится короче 12 элементов, <code>pdqsort</code> переключается на <a href="2-insertion-sort.html" class="wikilink">2. Insertion sort</a>. Мы уже знаем, что на микро-дистанциях он обгоняет всех.</li>
-<li><strong>Запасной парашют: Heap Sort.</strong> Алгоритм ведет счетчик "плохих разбиений" (<code>limit = log2(N)</code>). Если <code>limit</code> падает до нуля, значит, Quick Sort буксует и деградирует в $O(N^2)$. В этот момент <code>pdqsort</code> безжалостно обрывает рекурсию и вызывает <a href="5-heap-sort.html" class="wikilink">5. Heap sort</a>, жестко гарантируя $O(N \log N)$.</li>
+<li><strong>Фундамент: Quick Sort (Схема Хоара).</strong> В отличие от схемы Ломуто (<a href="4-quick-sort.html" class="wikilink">4. Quick sort</a>), схема Хоара задействует два встречных указателя. Она производит в среднем втрое меньше операций физической записи (<code>swaps</code>), колоссально экономя пропускную способность шины памяти (<code>Memory Bandwidth</code>).</li>
+<li><strong>Локальный финиш: Insertion Sort.</strong> Как только размер подмассива сокращается до границы $\le 12$ элементов, <code>pdqsort</code> переключается на <a href="2-insertion-sort.html" class="wikilink">2. Insertion sort</a>. На ультракоротких дистанциях сортировка вставками опережает любые рекурсивные алгоритмы благодаря идеальной кэш-локальности.</li>
+<li><strong>Запасной парашют: Heap Sort.</strong> Алгоритм интроспективно ведет счетчик допустимых неудачных разбиений (<code>limit = log2(N)</code>). Если <code>limit</code> обнуляется (сигнализируя о риске квадратичной деградации в $O(N^2)$), <code>pdqsort</code> немедленно прерывает рекурсию и передает сегмент в <a href="5-heap-sort.html" class="wikilink">5. Heap sort</a>, жестко гарантируя верхнюю границу $O(N \log N)$.</li>
 </ol>
 <h3 id="kak-pdqsort-pobezhdaet-patterny">Как `pdqsort` побеждает паттерны?</h3>
 
-<p>Алгоритм делает несколько гениальных эвристических проверок на каждом шаге рекурсии:</p>
+<p>На каждом шаге рекурсивного разделения алгоритм выполняет эвристический анализ сегмента:</p>
 <ul>
-<li><strong>Паттерн: "Уже отсортировано".</strong> При выборе Pivot (опорного элемента) <code>pdqsort</code> заодно проверяет, не отсортированы ли элементы вокруг него. Если алгоритм замечает, что массив "слишком правильный", он делает оптимистичный проход вставками (Partial Insertion Sort). Если массив действительно уже отсортирован, сортировка завершается за $O(N)$!</li>
-<li><strong>Паттерн: "Отсортировано в обратном порядке".</strong> Если <code>pdqsort</code> видит строгое убывание, он просто переворачивает массив (Reverse) за $O(N)$ машинных тактов, вместо того чтобы мучительно сортировать его.</li>
-<li><strong>Паттерн: "Много дубликатов".</strong> В классическом Quick Sort массив из миллиона нулей приведет к квадратичной сложности $O(N^2)$. <code>pdqsort</code> отслеживает ситуацию, когда после разбиения множество элементов оказываются равны Pivot. Он изолирует эти дубликаты в центре и не включает их в следующие рекурсивные вызовы, отбрасывая целые блоки за одну операцию.</li>
+<li><strong>Паттерн «Уже отсортировано»:</strong> Выбирая опорный элемент (<code>Pivot</code>), алгоритм проверяет взаимное расположение соседних ключей. Если отрезок демонстрирует высокую степень упорядоченности, запускается оптимистичный локальный проход вставками (<strong>Partial Insertion Sort</strong>). Если срез действительно упорядочен, процедура триумфально завершается за строго линейное время $O(N)$!</li>
+<li><strong>Паттерн «Обратный порядок»:</strong> Если эвристика фиксирует строгое монотонное убывание элементов, <code>pdqsort</code> выполняет мгновенный разворот среза на месте (<strong>Reverse</strong>) за линейное количество процессорных инструкций, полностью исключая бессмысленные рекурсивные шаги.</li>
+<li><strong>Паттерн «Множественные дубликаты»:</strong> В классическом Quick Sort срез из миллиона одинаковых чисел способен спровоцировать худший случай $O(N^2)$. Алгоритм <code>pdqsort</code> после процедуры Partition проверяет равенство элементов опорному значению, изолирует весь блок дубликатов в центре и полностью исключает их из дальнейшей рекурсивной обработки.</li>
 </ul>
+<hr />
 <h2 id="anatomiya-rantayma-derevo-prinyatiya-resheniy">Анатомия рантайма: Дерево принятия решений</h2>
 
-<p>Давайте визуализируем, как работает функция <code>sort</code> внутри пакета <code>slices</code> для каждого переданного ей подмассива.</p>
+<p>Логика работы функции сортировки внутри пакета <code>slices</code> для каждого независимого сегмента данных наглядно представлена на схеме:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2278,33 +2288,40 @@ slices.SortFunc(myUsers, func(a, b User) int {
   </div>
   <pre class="mermaid">
 flowchart TD
-Start[&quot;pdqsort&lt;br&gt;arr, limit&quot;] --&gt; IsSmall{&quot;len(arr) &lt;= 12 ?&quot;}
+Start[&quot;pdqsort(arr, limit)&quot;] --&gt; IsSmall{&quot;len(arr) &lt;= 12 ?&quot;}
 
-IsSmall --&gt;|&quot;Да&quot;| DoInsertion[&quot;Insertion Sort&lt;br&gt;-Быстрый финиш-&quot;]
+IsSmall --&gt;|&quot;Да&quot;| DoInsertion[&quot;Insertion Sort&lt;br/&gt;(быстрый финиш в L1)&quot;]
 
 IsSmall --&gt;|&quot;Нет&quot;| CheckLimit{&quot;limit == 0 ?&quot;}
 
-CheckLimit --&gt;|&quot;Да&quot;| DoHeap[&quot;Heap Sort&lt;br&gt;-Запасной парашют-&quot;]
+CheckLimit --&gt;|&quot;Да&quot;| DoHeap[&quot;Heap Sort&lt;br/&gt;(запасной парашют O_N_log_N)&quot;]
 
-CheckLimit --&gt;|&quot;Нет&quot;| ChoosePivot[&quot;Выбор Pivot&lt;br&gt;-Медиана 3 или 9-&quot;]
+CheckLimit --&gt;|&quot;Нет&quot;| ChoosePivot[&quot;Выбор Pivot&lt;br/&gt;(Медиана трех / девяти)&quot;]
 
-ChoosePivot --&gt; CheckSorted{&quot;Паттерн:&lt;br&gt;Уже отсортировано?&quot;}
+ChoosePivot --&gt; CheckSorted{&quot;Паттерн:&lt;br/&gt;Уже отсортировано?&quot;}
 
-CheckSorted --&gt;|&quot;Да&quot;| PartialInsert[&quot;Partial Insertion Sort&lt;br&gt;-Попытка завершить за O_N_-&quot;]
+CheckSorted --&gt;|&quot;Да&quot;| PartialInsert[&quot;Partial Insertion Sort&lt;br/&gt;(завершение за O_N)&quot;]
 
-CheckSorted --&gt;|&quot;Нет&quot;| Partition[&quot;Partition-Хоар-&lt;br&gt;Разделение массива&quot;]
+CheckSorted --&gt;|&quot;Нет&quot;| Partition[&quot;Partition (схема Хоара)&lt;br/&gt;Встречное разделение&quot;]
 
-Partition --&gt; CheckBad{&quot;Разбиение&lt;br&gt;сильно неравномерно?&quot;}
+Partition --&gt; CheckBad{&quot;Разбиение&lt;br/&gt;сильно дисбалансно?&quot;}
 
-CheckBad --&gt;|&quot;Да&quot;| DecLimit[&quot;limit = limit - 1&lt;br&gt;Перемешиваем элементы&quot;]
-CheckBad --&gt;|&quot;Нет&quot;| Recursion[&quot;Рекурсивный вызов&lt;br&gt;pdqsort для левой и правой части&quot;]
+CheckBad --&gt;|&quot;Да&quot;| DecLimit[&quot;limit = limit - 1&lt;br/&gt;Перемешивание элементов&quot;]
+CheckBad --&gt;|&quot;Нет&quot;| Recursion[&quot;Рекурсивный вызов:&lt;br/&gt;pdqsort для левой и правой части&quot;]
 
 DecLimit --&gt; Recursion
 
-style Start fill:#2b2b2b,stroke:#a0a0a0,stroke-width:2px,color:#fff
-style DoInsertion fill:#1e4a28,stroke:#00ff55,stroke-width:2px,color:#fff
-style DoHeap fill:#4a1515,stroke:#ff5555,stroke-width:2px,color:#fff
-style Recursion fill:#2b2b2b,stroke:#00aaff,stroke-width:2px,color:#fff
+classDef default fill:#0f172a,stroke:#334155,color:#f8fafc
+classDef decision fill:#1e293b,stroke:#818cf8,color:#f8fafc
+classDef step fill:#1e293b,stroke:#38bdf8,color:#38bdf8
+classDef success fill:#1e293b,stroke:#10b981,color:#10b981
+classDef warning fill:#1e293b,stroke:#f59e0b,color:#f59e0b
+
+class Start default
+class IsSmall,CheckLimit,CheckSorted,CheckBad decision
+class ChoosePivot,Partition,DecLimit,Recursion step
+class DoInsertion,PartialInsert success
+class DoHeap warning
   </pre>
 </div>
 
@@ -2315,12 +2332,13 @@ style Recursion fill:#2b2b2b,stroke:#00aaff,stroke-width:2px,color:#fff
     <span class="callout-title">Ловушка / Gotcha (Стабильность)</span>
   </div>
   <div class="callout-body">
-    <p>Стандартный <code>slices.Sort</code> (или <code>sort.Slice</code>) использует <code>pdqsort</code>, который <strong>НЕ ЯВЛЯЕТСЯ стабильной сортировкой</strong>. Порядок одинаковых элементов может перемешаться.</p>
-<p>Если вам нужна стабильность (сохранение изначального порядка равных элементов), вы обязаны использовать <code>slices.SortStableFunc</code>.</p>
-<p>Внутри <code>SortStableFunc</code> Go использует совершенно другой алгоритм — вариацию <strong>Сортировки слиянием (SymMerge)</strong> с оптимизациями In-Place ротаций. Он работает медленнее <code>pdqsort</code> и выделяет дополнительную память, но гарантирует стабильность.</p>
+    <p>Стандартные функции <code>slices.Sort</code> и <code>sort.Slice</code> опираются на <code>pdqsort</code>, который <strong>НЕ ЯВЛЯЕТСЯ стабильной сортировкой</strong>. Относительный порядок эквивалентных записей гарантированно не сохраняется.<br />
+Если вашей архитектуре критически необходима стабильность, вы обязаны явно вызывать специализированную функцию <code>slices.SortStableFunc</code>.<br />
+Внутри <code>SortStableFunc</code> рантайм Go задействует принципиально иной алгоритм — адаптивную модификацию <strong>Сортировки слиянием (SymMerge)</strong> с блочными ротациями памяти. Она работает несколько медленнее <code>pdqsort</code> и требует вспомогательной памяти, но обеспечивает стопроцентную стабильность.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="voprosy-s-sobesedovaniy-urovnya-senior">Вопросы с собеседований уровня Senior</h2>
 
 <div class="callout callout-interview">
@@ -2329,24 +2347,24 @@ style Recursion fill:#2b2b2b,stroke:#00aaff,stroke-width:2px,color:#fff
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос 1:</strong> В пакете <code>sort</code> есть функция <code>sort.Search</code> (которую заменил <code>slices.BinarySearch</code>). Как <code>sort.Search</code> работает под капотом, если мы передаем ей функцию <code>func(i int) bool</code>, а не значение?</p>
-<p><strong>Ответ:</strong> Это паттерн для обобщенного бинарного поиска (см. следующую главу). <code>sort.Search</code> ничего не знает о данных, она просто генерирует индексы от <code>0</code> до <code>N</code> и вызывает вашу функцию-предикат. Функция должна вернуть <code>true</code>, если условие выполнено, и алгоритм сдвигает правую границу. Это позволяет использовать бинарный поиск не только для массивов, но и для математических вычислений (например, найти минимальное время выполнения процесса).</p>
-<p><strong>Вопрос 2:</strong> Если <code>pdqsort</code> такой умный и работает In-Place, зачем Python и Java продолжают использовать Timsort?</p>
-<p><strong>Ответ:</strong> Timsort изначально проектировался как <strong>строго стабильная</strong> сортировка. Для Python и Java стабильность сортировки объектов — это стандарт языка, заложенный в спецификацию. Go же сделал прагматичный выбор: по умолчанию предоставить максимально быструю нестабильную сортировку In-Place, а стабильную вынести в отдельную функцию для тех редких случаев, когда она действительно нужна, не заставляя всех платить налог на память Timsort-а.</p>
+    <p><strong>Вопрос 1:</strong> В пакете <code>sort</code> существует функция <code>sort.Search</code> (в современном <code>slices</code> замененная на <code>slices.BinarySearch</code> и <code>slices.BinarySearchFunc</code>). Как устроен <code>sort.Search</code> под капотом, если мы передаем в него предикат <code>func(i int) bool</code>, а не конкретное искомое значение?<br />
+<strong>Ответ:</strong> Это классический паттерн абстрактного бинарного поиска (Discrete Binary Search). Функция <code>sort.Search</code> не взаимодействует с физическим срезом: она генерирует индексы диапазона $[0, N)$ и передает их в пользовательскую функцию-предикат. Функция возвращает <code>true</code>, если условие соблюдено, после чего алгоритм сужает правую границу. Это позволяет применять двоичный поиск не только к массивам данных, но и к непрерывным математическим функциям (например, для нахождения минимальной пропускной способности канала или оптимального тайм-аута).</p>
+<p><strong>Вопрос 2:</strong> Если алгоритм <code>pdqsort</code> настолько быстр, адаптивен и работает strictly In-Place, почему языки Python и Java сохраняют верность Timsort?<br />
+<strong>Ответ:</strong> Timsort изначально проектировался со строгой гарантией <strong>стабильности</strong>. В экосистемах Python и Java стабильность сортировки объектов заложена непосредственно в языковую спецификацию. Разработчики Go приняли более прагматичное инженерное решение: предоставить пользователю по умолчанию максимально быстродействующую нестабильную сортировку <code>In-place</code>, а стабильный вариант вынести в отдельный метод <code>slices.SortStableFunc</code>, не заставляя миллионы сервисов безусловно платить налог на дополнительную память Timsort.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog-razdela-sortirovok">Итог раздела Сортировок</h2>
 
-<p>Мы завершили огромный путь по алгоритмам упорядочивания данных:</p>
-<ol>
-<li>Мы поняли, что алгоритмы $O(N^2)$ (Insertion Sort) не мусор, а важнейший винтик оптимизации L1-кэша.</li>
-<li>Мы изучили мощь и слабость In-Place сортировок (Quick Sort) и прожорливость к памяти стабильных сортировок (Merge Sort).</li>
-<li>Мы взломали $O(N \log N)$ лимит с помощью линейных алгоритмов (Counting Sort).</li>
-<li>Мы посмотрели на промышленный код <code>pdqsort</code> в Go, который побеждает предсказатель ветвлений и объединяет лучшее из трех миров.</li>
-</ol>
-<p>Но данные сортируются не просто так. Они сортируются для того, чтобы в них можно было <strong>мгновенно искать информацию</strong>.</p>
-<p>Мы переходим к следующему фундаментальному разделу бэкенд-инженерии. Мы начнем с самого базового, но крайне важного для понимания кэш-промахов алгоритма. В следующей статье: <a href="../09-poisk-i-bazovye-algoritmy/1-lineynyy-poisk.html" class="wikilink">1. Линейный поиск</a>.</p>
+<p>Мы завершили масштабное погружение в фундаментальный мир алгоритмов упорядочивания данных:<br />
+1. Мы убедились, что простые квадратичные алгоритмы $O(N^2)$ (Insertion Sort) — это не музейные экспонаты, а незаменимый инструмент низкоуровневой оптимизации микропроцессорного L1-кэша.<br />
+2. Мы исследовали баланс между скоростными сортировками «на месте» (<code>Quick Sort</code>) и стабильными, но требовательными к оперативной памяти алгоритмами слияния (<code>Merge Sort</code>).<br />
+3. Мы преодолели фундаментальный предел сравнений $O(N \log N)$ с помощью поразрядных целочисленных преобразований (<code>Counting Sort</code>, <code>Radix Sort</code>).<br />
+4. Мы изучили устройство современного промышленного движка <code>pdqsort</code> в Go, объединившего аппаратную кэш-локальность, защиту от вырождения через <code>Heap Sort</code> и адаптивную победу над паттернами.</p>
+<p>Однако в распределенных системах данные сортируются не ради самого процесса: упорядочивание служит фундаментом для <strong>мгновенного поиска информации</strong>.</p>
+<p>Мы переходим к следующему фундаментальному разделу бэкенд-инженерии — алгоритмам поиска. И начнем мы с базового, но чрезвычайно поучительного с точки зрения механического сочувствия алгоритма.</p>
+<p>В следующей статье: <a href="../09-poisk-i-bazovye-algoritmy/1-lineynyy-poisk.html" class="wikilink">1. Линейный поиск</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2374,7 +2392,7 @@ style Recursion fill:#2b2b2b,stroke:#00aaff,stroke-width:2px,color:#fff
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#arkhitekturnaya-revolyutsiya-interfeysy-vs-dzheneriki">Архитектурная революция: Интерфейсы vs Дженерики</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-nalog-na-interfeysy">Mechanical Sympathy: Налог на интерфейсы</a></li><li class="toc-item toc-h3"><a href="#era-generics-i-monomorfizatsiya-slices-sort">Эра Generics и Мономорфизация (slices.Sort)</a></li><li class="toc-item toc-h2"><a href="#algoritmicheskaya-revolyutsiya-pattern-defeating-quicksort-pdqsort">Алгоритмическая революция: Pattern-Defeating Quicksort (pdqsort)</a></li><li class="toc-item toc-h3"><a href="#tri-stolpa-pdqsort-v-go">Три столпа pdqsort в Go</a></li><li class="toc-item toc-h3"><a href="#kak-pdqsort-pobezhdaet-patterny">Как pdqsort побеждает паттерны?</a></li><li class="toc-item toc-h2"><a href="#anatomiya-rantayma-derevo-prinyatiya-resheniy">Анатомия рантайма: Дерево принятия решений</a></li><li class="toc-item toc-h2"><a href="#voprosy-s-sobesedovaniy-urovnya-senior">Вопросы с собеседований уровня Senior</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-sortirovok">Итог раздела Сортировок</a></li>
+    <li class="toc-item toc-h2"><a href="#vvedenie-ot-teorii-k-industrialnomu-sovershenstvu">Введение: От теории к индустриальному совершенству</a></li><li class="toc-item toc-h2"><a href="#arkhitekturnaya-revolyutsiya-interfeysy-vs-dzheneriki">Архитектурная революция: Интерфейсы vs Дженерики</a></li><li class="toc-item toc-h3"><a href="#mechanical-sympathy-nalog-na-interfeysy">Mechanical Sympathy: Налог на интерфейсы</a></li><li class="toc-item toc-h3"><a href="#era-generics-i-monomorfizatsiya-slices-sort">Эра Generics и Мономорфизация (slices.Sort)</a></li><li class="toc-item toc-h2"><a href="#algoritmicheskaya-revolyutsiya-pattern-defeating-quicksort-pdqsort">Алгоритмическая революция: Pattern-Defeating Quicksort (pdqsort)</a></li><li class="toc-item toc-h3"><a href="#tri-stolpa-pdqsort-v-go">Три столпа pdqsort в Go</a></li><li class="toc-item toc-h3"><a href="#kak-pdqsort-pobezhdaet-patterny">Как pdqsort побеждает паттерны?</a></li><li class="toc-item toc-h2"><a href="#anatomiya-rantayma-derevo-prinyatiya-resheniy">Анатомия рантайма: Дерево принятия решений</a></li><li class="toc-item toc-h2"><a href="#voprosy-s-sobesedovaniy-urovnya-senior">Вопросы с собеседований уровня Senior</a></li><li class="toc-item toc-h2"><a href="#itog-razdela-sortirovok">Итог раздела Сортировок</a></li>
   </ul>
 </aside>
 

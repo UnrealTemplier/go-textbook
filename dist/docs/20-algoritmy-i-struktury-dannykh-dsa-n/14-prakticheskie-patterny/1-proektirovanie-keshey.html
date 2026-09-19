@@ -2169,7 +2169,7 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~25 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~29 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">1. Проектирование кэшей</h1>
@@ -2178,22 +2178,23 @@
           <div class="article-markdown">
             <h2 id="vvedenie-kesh-kak-arkhitekturnyy-kompromiss">Введение: Кэш как архитектурный компромисс</h2>
 
-<p>В проектировании высоконагруженного бэкенда кэш — это не просто быстрая <code>map</code> в памяти. Это сложный инженерный компромисс между согласованностью данных, потреблением RAM, задержками IO и стабильностью кластера при отказе. Ошибка в выборе стратегии инвалидации или игнорирование паттернов конкурентного доступа превращают кэш из ускорителя в источник <code>cache avalanche</code> и деградации p99.</p>
-<p>Эта статья агрегирует практические паттерны проектирования кэширующих систем в Go. Мы разберём, как сочетать структуры данных из <a href="../07-prodvinutye-struktury-dannykh/7-lru-kesh.html" class="wikilink">7. LRU кэш</a>, <a href="../07-prodvinutye-struktury-dannykh/8-lfu-kesh.html" class="wikilink">8. LFU кэш</a> и <a href="../03-kheshirovanie/6-bloom-filter-veroyatnostnaya-struktura-dannykh.html" class="wikilink">6. Bloom filter - вероятностная структура данных</a> с примитивами синхронизации рантайма, чтобы строить отказоустойчивые, масштабируемые и предсказуемые по памяти решения.</p>
+<p>В инженерной практике проектирования высоконагруженного бэкенда кэш — это не просто тривиальная быстрая <code>map</code> в оперативной памяти. Это глубокий, многофакторный компромисс между строгой или слабой согласованностью данных, потреблением RAM, сетевыми задержками дискового и межнодового IO, а также выживаемостью кластера в момент пиковых нагрузок и аварий. Ошибка в выборе алгоритма инвалидации или игнорирование паттернов конкурентного доступа превращают кэширующий слой из спасительного ускорителя в первопричину лавинообразных отказов (<code>cache avalanche</code>), деградации таймингов P99 и падения баз данных.</p>
+<p>Эта статья систематизирует фундаментальные инженерные паттерны проектирования кэширующих систем на Go. Мы исследуем, как объединять специализированные структуры данных из <a href="../07-prodvinutye-struktury-dannykh/7-lru-kesh.html" class="wikilink">7. LRU кэш</a>, <a href="../07-prodvinutye-struktury-dannykh/8-lfu-kesh.html" class="wikilink">8. LFU кэш</a> и <a href="../03-kheshirovanie/6-bloom-filter-veroyatnostnaya-struktura-dannykh.html" class="wikilink">6. Bloom filter - вероятностная структура данных</a> с примитивами синхронизации рантайма, строя отказоустойчивые, линейно масштабируемые и предсказуемые по потреблению памяти решения.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> «Почему 90% микросервисов используют паттерн Cache-Aside, а не Read-Through или Write-Through?»<br />
-<strong>Ответ:</strong> Cache-Aside (Lazy Loading) даёт разработчику полный контроль над жизненным циклом данных. Сервис сам решает, когда кэшировать, когда инвалидировать и как обрабатывать ошибки БД. Read/Write-Through требует сложной абстракции провайдера кэша, который становится единой точкой отказа. В микросервисной архитектуре, где данные распределены и схемы чтения/записи различаются, явное управление в коде надёжнее скрытой логики фреймворка.</p>
+    <p><strong>Вопрос:</strong> «Почему 90% микросервисов используют паттерн Cache-Aside, а не Read-Through или Write-Through?»</p>
+<p><strong>Ответ:</strong> Cache-Aside (Lazy Loading) даёт разработчику полный контроль над жизненным циклом данных. Сервис сам решает, когда кэшировать, когда инвалидировать и как обрабатывать ошибки БД. Read/Write-Through требует сложной абстракции провайдера кэша, который становится единой точкой отказа. В микросервисной архитектуре, где данные распределены и схемы чтения/записи различаются, явное управление в коде надёжнее скрытой логики фреймворка.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="1-patterny-vzaimodeystviya-s-istochnikom-dannykh">1. Паттерны взаимодействия с источником данных</h2>
 
-<p>Выбор паттерна определяет, кто ответственен за согласованность и как система реагирует на изменения.</p>
+<p>Выбор архитектурного паттерна определяет границы ответственности: кто управляет согласованностью и как система реагирует на мутации данных.</p>
 <div class="table-container"><table>
 <thead>
 <tr>
@@ -2212,25 +2213,25 @@
 </tr>
 <tr>
 <td><strong>Read-Through</strong></td>
-<td>Кэш сам запрашивает БД при промахе</td>
+<td>Кэш сам запрашивает БД при промахе через коллбек</td>
 <td>Зависит от реализации callback провайдера</td>
 <td>Средняя</td>
 </tr>
 <tr>
 <td><strong>Write-Through</strong></td>
-<td>Запись идёт в кэш и синхронно в БД</td>
+<td>Запись идёт в кэш и синхронно фиксируется в БД</td>
 <td>Сильная, но задержка равна sum(kэш + БД)</td>
 <td>Высокая</td>
 </tr>
 <tr>
 <td><strong>Write-Behind</strong></td>
-<td>Запись в кэш, асинхронный батчинг в БД</td>
-<td>Высокий риск потери данных при crash</td>
+<td>Запись в кэш, асинхронный батчинг изменений в БД</td>
+<td>Высокий риск потери данных при crash сервиса</td>
 <td>Очень высокая</td>
 </tr>
 </tbody>
 </table></div>
-<p>В Go Cache-Aside реализуется максимально идиоматично. Кэш остаётся простой структурой данных, а бизнес-логика контролирует потоки.</p>
+<p>В Go паттерн Cache-Aside реализуется наиболее естественно и прозрачно. Кэш остается компактной структурой данных, а бизнес-логика оркестрирует потоки:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2240,7 +2241,14 @@
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">func GetUser(ctx context.Context, id string) (*User, error) {
+  <pre class="language-go"><code class="language-go">package cache
+
+import (
+    &quot;context&quot;
+    &quot;time&quot;
+)
+
+func GetUser(ctx context.Context, id string) (*User, error) {
     if u, ok := localCache.Get(id); ok {
         return u, nil
     }
@@ -2263,13 +2271,14 @@
   </div>
   <div class="callout-body">
     <p><strong>Гонка инвалидации в Cache-Aside</strong><br />
-При параллельном обновлении и чтении возможен сценарий: Горутина A читает БД (v1) → Горутина B пишет БД (v2) и инвалидирует кэш → Горутина A сохраняет v1 в кэш. Кэш теперь содержит устаревшую версию v2. Решение: использовать versioning в значении, atomic compare-and-swap при <code>Set</code>, либо короткие TTL с фоновым обновлением.</p>
+При конкурентном обновлении и параллельном чтении возможен классический рассинхрон: Горутина A читает БД (v1) → Горутина B пишет БД (v2) и инвалидирует кэш → Горутина A сохраняет v1 в кэш. В результате кэш навечно фиксирует устаревшую версию данных v2. Решение: версионирование записей (versioning), атомарный compare-and-swap при вызове <code>Set</code>, либо укороченный <code>TTL</code> с фоновым обновлением.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="2-ierarkhiya-lokalnosti-i-granitsy-otvetstvennosti">2. Иерархия локальности и границы ответственности</h2>
 
-<p>Эффективный кэш в Go строится поверх понимания аппаратной и сетевой иерархии. Данные движутся от быстрых, но маленьких хранилищ к медленным, но ёмким.</p>
+<p>Эффективная архитектура кэширования в Go проектируется с оглядкой на физическую пирамиду задержек. Данные мигрируют от сверхбыстрых, но минимальных объемов памяти ядра к емким, но инерционным сетевым хранилищам.</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2284,31 +2293,33 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-CPU[&quot;CPU Регистры и L1/L2/L3 кэши&quot;] --&gt;|Наносекунды| App[&quot;Приложение In-Memory Кэш &lt;br&gt; map, LRU, массивы&quot;]
-App --&gt;|Микросекунды| OS[&quot;ОС Page Cache &lt;br&gt; Буферизация файловых IO&quot;]
-OS --&gt;|Миллисекунды| Net[&quot;Сетевой Кэш &lt;br&gt; Redis, Memcached, CDN&quot;]
-Net --&gt;|Сотни миллисекунд| DB[&quot;Холодное хранилище &lt;br&gt; PostgreSQL, S3, Disk&quot;]
+CPU[&quot;CPU Регистры и L1/L2/L3 кэши&quot;] --&gt;|Наносекунды| App[&quot;Приложение In-Memory Кэш&lt;br/&gt;map, LRU, массивы&quot;]
+App --&gt;|Микросекунды| OS[&quot;ОС Page Cache&lt;br/&gt;Буферизация файловых IO&quot;]
+OS --&gt;|Миллисекунды| Net[&quot;Сетевой Кэш&lt;br/&gt;Redis, Memcached, CDN&quot;]
+Net --&gt;|Сотни миллисекунд| DB[&quot;Холодное хранилище&lt;br/&gt;PostgreSQL, S3, Disk&quot;]
 
-style CPU fill:#e8f5e8
-style App fill:#e3f2fd
-style Net fill:#fff3e0
-style DB fill:#ffebee
+style CPU fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
+style App fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+style OS fill:#1e293b,stroke:#6366f1,stroke-width:2px,color:#f8fafc
+style Net fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+style DB fill:#1e293b,stroke:#ef4444,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
-<p><strong>Архитектурный принцип:</strong> Кэш должен находиться максимально близко к потребителю, но не дублировать функции нижних уровней.<br />
-* Если данные читаются чаще, чем обновляются, и помещаются в RAM инстанса — используйте <strong>локальный in-memory кэш</strong>. Сетевой RTT в Redis (0.5-2 мс) в 10-50 раз дороже локального вызова (10-100 нс).<br />
-* Если данные должны быть консистентны между подками, или объём превышает RAM одного узла — используйте <strong>распределённый кэш</strong>.<br />
-* Комбинированный паттерн (L1 Local + L2 Remote) даёт максимум производительности: сначала проверям локальную <code>map</code>, при промахе идём в Redis, заполняем оба уровня.</p>
+<p><strong>Фундаментальный принцип:</strong> Кэш обязан располагаться как можно ближе к потребителю, не дублируя функционал нижележащих ступеней.<br />
+* Если частота чтения доминирует над записью и рабочий набор (working set) целиком помещается в память хоста — выбирайте <strong>локальный in-memory кэш</strong>. Сетевой RTT в Redis (0.5–2 мс) на 4–5 порядков медленнее прямого локального разыменования указателя (10–100 нс).<br />
+* Если данные должны оставаться строго консистентными между десятками реплик пода или их объем превосходит емкость RAM отдельного узла — незаменим <strong>распределённый кэш</strong>.<br />
+* Двухуровневый гибрид (L1 Local In-Memory + L2 Remote Redis) сочетает достоинства обоих подходов: горячие ключи обслуживаются мгновенно, а промахи первого уровня поглощаются общим кэш-кластером.</p>
+<hr />
 <h2 id="3-konkurentnost-v-go-keshakh">3. Конкурентность в Go-кэшах</h2>
 
-<p>Одиночный <code>sync.RWMutex</code> масштабируется до ~10-20 тысяч RPS. Дальше начинается contention: горутины уходят в <code>futex</code>-парковку, планировщик переключает треды ОС, p99 растёт экспоненциально. Для production-кэшей применяют <strong>шардирование</strong>.</p>
-<p>Алгоритм шардирования кэша:<br />
-1.  Разделяем хранилище на <code>N</code> независимых сегментов (обычно <code>N = 16, 32, 64</code> или <code>nextPow2(runtime.NumCPU() * 2)</code>).<br />
-2.  Каждый сегмент имеет свой <code>sync.RWMutex</code> и локальную мапу/LRU.<br />
-3.  Запрос маршрутизируется по <code>hash(key) % N</code>.</p>
-<p>Это снижает contention в <code>N</code> раз. Потеря глобального порядка или точного учёта memory limit незначительна по сравнению с выигрышем в пропускной способности.</p>
+<p>Одиночный глобальный мьютекс <code>sync.RWMutex</code> отлично держит нагрузку до 10 000–20 000 RPS. Однако при дальнейшем росте трафика система упирается в lock contention: горутины массово засыпают в системном вызове <code>futex</code>, планировщик Go тратит драгоценное время на переключение тредов ОС, а латентность P99 стремительно уходит в небеса. Промышленным стандартом решения этой проблемы является <strong>шардирование кэша</strong> (Cache Sharding).</p>
+<p>Архитектура шардированного кэша:<br />
+1. Хранилище разбивается на $N$ независимых сегментов (обычно $N = 16, 32, 64$ или вычисляется как <code>nextPow2(runtime.NumCPU() * 2)</code>).<br />
+2. Каждый сегмент изолирован собственным <code>sync.RWMutex</code> и персональной хеш-таблицей/LRU-очередью.<br />
+3. Входящий ключ направляется в сегмент по формуле <code>hash(key) % N</code>.</p>
+<p>Такой шардинг снижает конкуренцию за блокировку ровно в $N$ раз:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2318,7 +2329,13 @@ style DB fill:#ffebee
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">type ShardedCache[K comparable, V any] struct {
+  <pre class="language-go"><code class="language-go">package cache
+
+type shard[K comparable, V any] struct {
+    // локальный мьютекс и хранилище
+}
+
+type ShardedCache[K comparable, V any] struct {
     shards []*shard[K, V]
     mask   uint32 // N-1 для быстрого hash % N через AND
     hash   func(K) uint32
@@ -2331,7 +2348,7 @@ func (c *ShardedCache[K, V]) Get(key K) (V, bool) {
 </code></pre>
 </div>
 
-<p>Для обработки <strong>Cache Stampede</strong> (одновременный запрос тысяч горутин за одним отсутствующим ключом) используйте пакет <code>golang.org/x/sync/singleflight</code>. Он гарантирует, что тяжелый запрос к БД выполнится только один раз, а остальные горутины дождутся результата.</p>
+<p>Для защиты от явления <strong>Cache Stampede</strong> (или Thundering Herd, когда тысячи параллельных горутин при промахе по популярному ключу одновременно бросаются в базу данных) применяется пакет <code>golang.org/x/sync/singleflight</code>. Он объединяет однотипные конкурентные вызовы в единую операцию, возвращая общий результат всем ожидающим горутинам.</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2342,24 +2359,29 @@ func (c *ShardedCache[K, V]) Get(key K) (V, bool) {
   </div>
 </div>
 
+<hr />
 <h2 id="4-mekhanicheskaya-simpatiya-i-upravlenie-pamyatyu">4. Механическая симпатия и управление памятью</h2>
 
-<p>Проектирование кэша без учёта <span class="wikilink-unresolved" title="Заметка в разработке">сборщика мусора</span> и архитектуры CPU ведёт к скрытым проблемам производительности.</p>
+<p>Проектирование кэша без оглядки на <span class="wikilink-unresolved" title="Заметка в разработке">сборщика мусора</span> и архитектуру кэшей процессора приводит к деградации сервиса при длительном аптайме.</p>
 <h3 id="davlenie-na-gc-i-allokatsii">Давление на GC и аллокации</h3>
-<p>Каждый <code>cache.Set</code> создаёт объект значения. Если кэш активно обновляется (высокий churn rate), GC тратит циклы на маркировку и удаление старых элементов. <br />
-<strong>Оптимизация:</strong> Используйте <code>&lt;span class="wikilink-unresolved" title="Заметка в разработке"&gt;sync.Pool&lt;/span&gt;</code> для переиспользования буферов и структур кэша. При <code>Evict</code> или <code>Expire</code> не просто удаляйте из <code>map</code>, а возвращайте объекты в пул: <code>cache.pool.Put(item)</code>. Это радикально снижает <code>mallocgc</code> и делает паузы STW предсказуемыми.</p>
+
+<p>Каждый вызов <code>cache.Set</code> аллоцирует запись. При высоком темпе обновления (churn rate) сборщик мусора тратит колоссальные ресурсы на фазу mark-and-sweep.<br />
+<strong>Оптимизация:</strong> Применяйте <code>&lt;span class="wikilink-unresolved" title="Заметка в разработке"&gt;sync.Pool&lt;/span&gt;</code> для повторного использования контейнеров и буферов. При операциях вытеснения (<code>Evict</code>) или устаревания (<code>Expire</code>) не бросайте объект на растерзание GC, а возвращайте его в пул: <code>cache.pool.Put(item)</code>. Это минимизирует системные вызовы <code>mallocgc</code> и удерживает паузы STW около нуля.</p>
 <h3 id="false-sharing-v-shardirovannykh-keshakh">False Sharing в шардированных кэшах</h3>
-<p>Если массив шардов лежит компактно, а разные ядра CPU одновременно обращаются к разным шардам, лежащим в одной кэш-линии (64 байта), возникает <strong>False Sharing</strong>. Протокол когерентности кэшей (MESI) будет постоянно инвалидировать линию, хотя данные не пересекаются. <br />
-<strong>Решение:</strong> Выравнивать структуры шардов до 64 байт (<code>_ [56]byte</code> padding между полями) или распределять шарды по разным страницам памяти через арену. На Go 1.21+ это часто нивелируется размером <code>sync.Mutex</code>, но для lock-free структур padding остаётся обязательным.</p>
+
+<p>Если массив структур шардов размещен в непрерывном блоке памяти, а ядра процессора параллельно модифицируют смежные шарды, попадающие в одну 64-байтную кэш-линию, возникает губительный эффект <strong>False Sharing</strong>. Протокол аппаратной когерентности кэшей (MESI) будет непрерывно сбрасывать кэш-линию на всех ядрах, разрушая параллелизм.<br />
+<strong>Решение:</strong> Выравнивать структуры шардов по границе 64 байт с помощью паддинга: <code>_ [56]byte</code> между критическими полями структуры. На Go 1.21+ это часто нивелируется размером <code>sync.Mutex</code>, но для кастомных и lock-free структур padding остаётся обязательным.</p>
 <h3 id="escape-analysis-i-upakovka-znacheniy">Escape Analysis и упаковка значений</h3>
-<p>Хранение <code>any</code> (interface{}) в кэше создаёт 16-байтовый дескриптор и аллокацию самого значения в кучу. Для примитивных или компактных типов используйте дженерики <code>Cache[K comparable, V any]</code>. Если <code>V</code> — маленький <code>struct</code>, компилятор разместит его inline в куче, уменьшая косвенность доступа и улучшая cache locality.</p>
+
+<p>Использование нетипизированного интерфейса <code>any</code> (или <code>interface{}</code>) влечет за собой создание 16-байтового интерфейсного дескриптора и принудительную аллокацию полезной нагрузки в куче. В современном Go опирайтесь на дженерики: <code>Cache[K comparable, V any]</code>. Если тип <code>V</code> представляет собой компактную структуру без указателей, компилятор разместит ее плоско, улучшая пространственную локальность и кэширование CPU.</p>
+<hr />
 <h2 id="5-zashchita-ot-kaskadnykh-otkazov">5. Защита от каскадных отказов</h2>
 
-<p>Кэш должен защищать БД, а не усугублять её нагрузку при деградации.</p>
+<p>Надежный кэш спроектирован так, чтобы защищать базу данных от перегрузок, а не усугублять кризис при сбоях.</p>
 <ol>
-<li><strong>Circuit Breaker</strong>: При серии ошибок подключения к кэшу или БД, временно отключаем кэширование, чтобы не тратить ресурсы на failed-запросы.</li>
-<li><strong>Probabilistic Early Expiration</strong>: Вместо жёсткого TTL (все ключи истекают одновременно), добавляем случайный джиттер: <code>TTL + rand(-10%, +10%)</code>. Это распределяет нагрузку по обновлению ключей во времени, предотвращая <code>cache avalanche</code>.</li>
-<li><strong>Background Refresh</strong>: При TTL 80% запускаем фоновую горутину для предзагрузки ключа. Клиент получает старые данные, пока новые грузятся асинхронно. Гарантирует нулевую латентность, но допускает eventual consistency.</li>
+<li><strong>Circuit Breaker</strong>: При каскадном росте ошибок соединения к распределенному кэшу или основной БД цепь размыкается, предотвращая напрасный расход потоков на заведомо провальные попытки.</li>
+<li><strong>Probabilistic Early Expiration (Jitter)</strong>: Вместо жестко фиксированного времени жизни (<code>TTL</code>), приводящего к лавинообразному одновременному протуханию миллионов ключей, добавляется стохастический разброс: <code>TTL + rand(-10%, +10%)</code>. Это равномерно размазывает нагрузку на инвалидацию по временной шкале, предотвращая <code>cache avalanche</code>.</li>
+<li><strong>Background Refresh</strong>: При достижении 80% от времени <code>TTL</code> асинхронная горутина инициирует фоновый прогрев ключа. Читающие клиенты продолжают получать данные с нулевой латентностью, пока свежая версия подтягивается в фоне.</li>
 </ol>
 
 <div class="mermaid-wrapper">
@@ -2375,24 +2397,28 @@ func (c *ShardedCache[K, V]) Get(key K) (V, bool) {
   </div>
   <pre class="mermaid">
 flowchart LR
-Req[&quot;Запрос ключа&quot;] --&gt; Check{&quot;Ключ есть&lt;br&gt;и не expired?&quot;}
+Req[&quot;Запрос ключа&quot;] --&gt; Check{&quot;Ключ есть&lt;br/&gt;и не expired?&quot;}
 Check --&gt;|Да| Ret[&quot;Возврат значения&quot;]
-Check --&gt;|Нет| Single{&quot;singleflight&lt;br&gt;активен?&quot;}
+Check --&gt;|Нет| Single{&quot;singleflight&lt;br/&gt;активен?&quot;}
 Single --&gt;|Да| Wait[&quot;Ожидание результата&quot;]
 Single --&gt;|Нет| Fetch[&quot;Запрос к БД&quot;]
 Fetch --&gt;|Успех| Set[&quot;Обновление кэша&quot;]
-Fetch --&gt;|Ошибка| Fallback[&quot;Возврат ошибки&lt;br&gt;или stale данных&quot;]
+Fetch --&gt;|Ошибка| Fallback[&quot;Возврат ошибки&lt;br/&gt;или stale данных&quot;]
 Wait --&gt;|Получено| Ret
 Set --&gt; Ret
 
-style Check fill:#e3f2fd
-style Single fill:#fff3e0
-style Fetch fill:#ffebee
-style Ret fill:#e8f5e8
+style Check fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+style Single fill:#1e293b,stroke:#f59e0b,stroke-width:2px,color:#f8fafc
+style Fetch fill:#1e293b,stroke:#ef4444,stroke-width:2px,color:#f8fafc
+style Ret fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
+style Set fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc
+style Wait fill:#1e293b,stroke:#6366f1,stroke-width:2px,color:#f8fafc
+style Fallback fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#f8fafc
   </pre>
 </div>
 
 
+<hr />
 <h2 id="6-lovushki-production-i-khardkor-sobesedovaniya">6. Ловушки production и хардкор-собеседования</h2>
 
 <div class="callout callout-interview">
@@ -2402,11 +2428,11 @@ style Ret fill:#e8f5e8
   </div>
   <div class="callout-body">
     <p><strong>Вопрос 1:</strong> «Как решить проблему Cache Penetration, когда злоумышленник запрашивает несуществующие ключи?»<br />
-<strong>Ответ:</strong> Кэш всегда будет miss, запросы пойдут в БД. Решения: 1. Валидация ввода на уровне API. 2. Кэширование <code>null</code> для отсутствующих ключей с очень коротким TTL. 3. Использование <a href="../03-kheshirovanie/6-bloom-filter-veroyatnostnaya-struktura-dannykh.html" class="wikilink">6. Bloom filter - вероятностная структура данных</a> перед проверкой кэша. Bloom filter за O 1 определит, что ключа точно нет в БД, и отсечёт запрос без IO.</p>
+<strong>Ответ:</strong> Кэш всегда будет miss, запросы пойдут в БД. Решения: 1. Валидация ввода на уровне API. 2. Кэширование <code>null</code> для отсутствующих ключей с очень коротким TTL. 3. Использование <a href="../03-kheshirovanie/6-bloom-filter-veroyatnostnaya-struktura-dannykh.html" class="wikilink">6. Bloom filter - вероятностная структура данных</a> перед проверкой кэша. Bloom filter за <code>O 1</code> определит, что ключа точно нет в БД, и отсечёт запрос без IO.</p>
 <p><strong>Вопрос 2:</strong> «Что произойдёт, если Redis упадёт, а приложение продолжит писать в кэш?»<br />
 <strong>Ответ:</strong> Если не настроен fallback или circuit breaker, горутины будут получать ошибки записи, тратить ресурсы на retries и блокироваться. Приложение начнёт деградировать. Правильная архитектура: при недоступности кэша переключаться в режим «только чтение из БД» или использовать локальный fallback-кэш с меньшим TTL.</p>
 <p><strong>Вопрос 3:</strong> «Почему не стоит использовать <code>sync.Map</code> для реализации LRU-кэша?»<br />
-<strong>Ответ:</strong> <code>sync.Map</code> оптимизирован под сценарии «много чтений, редкие записи» или «только добавление». Для кэша с частым удалением (eviction) и обновлением приоритетов он будет постоянно создавать <code>dirty</code> массив, что приведёт к O n аллокациям и падению производительности. Для кэшей всегда используйте шардированные <code>sync.RWMutex</code> или lock-free очереди.</p>
+<strong>Ответ:</strong> <code>sync.Map</code> оптимизирован под сценарии «много чтений, редкие записи» или «только добавление». Для кэша с частым удалением (eviction) и обновлением приоритетов он будет постоянно создавать <code>dirty</code> массив, что приведёт к <code>O n</code> аллокациям и падению производительности. Для кэшей всегда используйте шардированные <code>sync.RWMutex</code> или lock-free очереди.</p>
 <p><strong>Вопрос 4:</strong> «Как обеспечить сильную согласованность между кэшем и транзакционной БД?»<br />
 <strong>Ответ:</strong> Строго говоря, это невозможно без распределённых транзакций. На практике используют: 1. Outbox Pattern: пишем событие обновления в БД в той же транзакции, фоновый процесс шлёт его в кэш. 2. CDC: слушаем binlog/postgres logical replication и инвалидируем кэш. 3. Короткие TTL + Cache-Aside как fallback для остаточных рассинхронизаций.</p>
   </div>
@@ -2419,21 +2445,22 @@ style Ret fill:#e8f5e8
   </div>
   <div class="callout-body">
     <p><strong>Сериализация и десериализация</strong><br />
-Если вы сохраняете в кэше <code>[]byte</code> (например, JSON), убедитесь, что не делаете <code>json.Unmarshal</code> при каждом чтении. Парсинг JSON в Go дорогой. Лучше кэшировать уже распарсенную Go-структуру или использовать бинарные протоколы (MsgPack, FlatBuffers, Protobuf). Для локального кэша сериализация избыточна и только добавляет аллокации.</p>
+Если вы сохраняете в кэше срез <code>[]byte</code> (например, JSON-пейлоад), убедитесь, что не выполняете <code>json.Unmarshal</code> на каждое чтение. Парсинг текстовых форматов в Go сопряжен с множественными аллокациями. Кэшируйте уже десериализованные Go-структуры либо переходите на бинарные форматы (<code>MsgPack</code>, <code>Protobuf</code>, <code>FlatBuffers</code>).</p>
 <p><strong>Утечка памяти через замыкания</strong><br />
-Если коллбек <code>onEvict</code> или фоновая задача захватывает ссылки на большие структуры, GC не соберёт их, даже после удаления из мапы. Всегда передавайте в коллбеки примитивы или копии данных, либо используйте <code>weak references</code> паттерны через финализаторы (но в Go это сложно и не рекомендуется для hot-path).</p>
+Если коллбек <code>onEvict</code> захватывает контекст объемных структур данных, сборщик мусора не сможет освободить их даже после удаления ключа из кэша. Передавайте в замыкания только примитивные идентификаторы или используйте паттерны с <code>weak references</code>.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Проектирование кэша</strong> — это баланс между согласованностью, задержкой, потреблением памяти и устойчивостью к отказам.</li>
-<li>В Go <strong>Cache-Aside + singleflight</strong> покрывает 80% сценариев. Шардирование (<code>hash(key) &amp; (N-1)</code>) устраняет contention мьютексов.</li>
-<li><strong>Механическая симпатия</strong>: используйте <code>sync.Pool</code> для переиспользования объектов, избегайте <code>any</code> для компактных структур, контролируйте False Sharing и учитывайте давление на [[7. Глубокий Go (Внутреннее устройство)|GC].</li>
-<li><strong>Защита от отказов</strong>: джиттер TTL, Circuit Breaker, Bloom Filter для pen-тестирования ключей, асинхронный background refresh для zero-latency fallback.</li>
-<li><strong>Сильная согласованность</strong> достигается через CDC или Outbox Pattern, но обычно достаточно eventual consistency с коротким TTL и грамотной инвалидацией по ключам.</li>
-<li><strong>Интервью фокус</strong>: thundering herd, cache avalanche vs penetration, trade-offs локального vs распределённого кэша, реализация eviction под нагрузкой.</li>
+<li><strong>Проектирование кэша</strong> — это инженерный поиск баланса между согласованностью, задержкой, объемом памяти и устойчивостью кластера при авариях.</li>
+<li>В Go связка <strong>Cache-Aside + singleflight</strong> решает 80% типовых задач. Шардирование хранилища по маске <code>hash(key) &amp; (N-1)</code> снимает взаимную блокировку горутин.</li>
+<li><strong>Механическая симпатия</strong>: задействуйте <code>sync.Pool</code> для переиспользования буферов, избегайте оверхеда типа <code>any</code>, защищайте структуры от False Sharing и учитывайте нагрузку на <span class="wikilink-unresolved" title="Заметка в разработке">GC</span>.</li>
+<li><strong>Защита от отказов</strong>: вероятностный джиттер TTL, Circuit Breaker, фильтры Блума от атак Cache Penetration и фоновый асинхронный прогрев данных.</li>
+<li><strong>Сильная согласованность</strong> достигается через связку CDC или Outbox Pattern, однако в большинстве случаев достаточна eventual consistency с коротким TTL и детерминированной инвалидацией.</li>
+<li><strong>Интервью-фокус</strong>: глубокое понимание Cache Stampede / Avalanche / Penetration, компромиссы между локальным и распределенным слоями, реализация алгоритмов вытеснения под конкурентной нагрузкой.</li>
 </ul>
 <p>Понимание паттернов кэширования позволяет проектировать устойчивые к высокой нагрузке сервисы. Однако кэш и очередь — это лишь часть системы управления потоком данных. Когда трафик превышает пропускную способность, нам нужны алгоритмы, которые детерминированно ограничивают запросы, защищая инфраструктуру от перегрузки. В следующей статье мы детально разберём Token Bucket, Leaky Bucket, Sliding Window и их реализацию на атомиках и кольцевых буферах.</p>
 <p><a href="2-rate-limiting-algoritmy.html" class="wikilink">2. Rate limiting алгоритмы</a></p>

@@ -2169,19 +2169,20 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~16 мин чтения</span>
-              <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
+              <span class="meta-tag read-time">⏱ ~23 мин чтения</span>
+              <span class="meta-tag mermaid-tag">📐 2 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">5. Внутреннее устройство map в Go</h1>
           </header>
 
           <div class="article-markdown">
-            <p>В предыдущих статьях мы разобрали теорию: хеш-функции, битовые маски для индексов и способы разрешения коллизий (<a href="4-otkrytaya-adresatsiya-i-metod-tsepochek.html" class="wikilink">4. Открытая адресация и метод цепочек</a>). Теперь мы спустимся на уровень исходного кода языка Go (пакет <code>runtime</code>, файл <code>map.go</code>) и посмотрим, как эти концепции воплощены в одной из самых используемых и оптимизированных структур бэкендера — встроенной <code>map</code>.</p>
-<p>В Go <code>map</code> — это классическая хеш-таблица, но она скрывает в себе гениальные инженерные решения, направленные на идеальное взаимодействие с кэшем процессора (Mechanical Sympathy), минимизацию аллокаций и плавную дефрагментацию памяти.</p>
+            <p>В предыдущих статьях мы подробно разобрали фундаментальную теорию: устройство хеш-функций, битовые маски для мгновенного взятия индекса и способы разрешения неизбежных коллизий (<a href="4-otkrytaya-adresatsiya-i-metod-tsepochek.html" class="wikilink">4. Открытая адресация и метод цепочек</a>). Теперь мы спустимся в машинное отделение языка Go — пакет <code>runtime</code>, файл <code>map.go</code> — и посмотрим, как эти абстрактные математические концепции воплощены в одной из самых востребованных и оптимизированных структур данных бэкендера — встроенной <code>map</code>.</p>
+<p>В Go <code>map</code> — это классическая хеш-таблица, но она скрывает под капотом филигранные инженерные решения, направленные на идеальное взаимодействие с кэшем процессора (Mechanical Sympathy), минимизацию лишних аллокаций памяти и плавную дефрагментацию под нагрузкой.</p>
+<hr />
 <h2 id="struktura-hmap-zagolovok-slovarya">Структура hmap: Заголовок словаря</h2>
 
-<p>Когда вы пишете <code>m := make(map[string]int)</code>, рантайм Go не возвращает вам саму мапу. Он возвращает <strong>указатель</strong> на структуру <code>hmap</code> (Header of map). Именно поэтому <code>map</code> в Go передается по ссылке, и изменение мапы внутри функции отразится на оригинале.</p>
-<p>Вот как выглядит структура <code>hmap</code> в рантайме (упрощенно):</p>
+<p>Когда вы пишете <code>m := make(map[string]int)</code>, рантайм Go возвращает вам вовсе не саму хеш-таблицу как значение на стеке. Он возвращает <strong>указатель</strong> на заголовочную структуру <code>hmap</code> (Header of map). Именно по этой причине <code>map</code> в Go передается в функции по значению указателя (по ссылке на данные): любые мутации мапы внутри функции немедленно отражаются на оригинале.</p>
+<p>Вот как выглядит структура <code>hmap</code> в рантайме Go (упрощенная выжимка из исходного кода):</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2193,24 +2194,26 @@
   </div>
   <pre class="language-go"><code class="language-go">// runtime/map.go
 type hmap struct {
-    count     int // Количество элементов в мапе (выдается при len(m))
-    flags     uint8 // Флаги состояния -например, флаг конкурентной записи-
-    B         uint8 // Логарифм от количества бакетов -capacity = 2^B-
-    noverflow uint16 // Примерное число бакетов переполнения
-    hash0     uint32 // Рандомный seed для хеш-функции -защита от Hash DoS-
+    count     int            // Количество элементов в мапе (возвращается функцией len(m))
+    flags     uint8          // Битовые флаги состояния (например, флаг конкурентной записи)
+    B         uint8          // Двоичный логарифм количества бакетов (capacity = 2^B бакетов)
+    noverflow uint16         // Приблизительное число бакетов переполнения (overflow)
+    hash0     uint32         // Случайный seed для хеш-функции (защита от Hash DoS атак)
 
-    buckets    unsafe.Pointer // Указатель на массив из 2^B бакетов -bmap-
-    oldbuckets unsafe.Pointer // Указатель на старый массив при ресайзе
+    buckets    unsafe.Pointer // Указатель на непрерывный массив из 2^B бакетов (bmap)
+    oldbuckets unsafe.Pointer // Указатель на старый массив при ресайзе (эвакуации)
     nevacuate  uintptr        // Индекс бакета, который эвакуируется прямо сейчас
 }
 </code></pre>
 </div>
 
-<p>Ключевой параметр здесь — <code>B</code>. Go всегда держит размер массива бакетов равным степени двойки ($2^B$). Это, как мы помним из статьи <a href="2-khesh-tablitsa-realizatsiya.html" class="wikilink">2. Хеш таблица. Реализация</a>, позволяет использовать побитовое И (<code>&amp;</code>) вместо медленного деления для вычисления индекса.</p>
+<p>Ключевой параметр в заголовке — поле <code>B</code>. Рантайм Go всегда поддерживает общее количество бакетов равным степени двойки ($2^B$). Это позволяет вместо тяжелой операции деления <code>hash % capacity</code> применять сверхбыстрое побитовое И (<code>&amp;</code>):<br />
+$$\text{bucket_index} = \text{hash} \ \&amp; \ ((1 \ll B) - 1)$$</p>
+<hr />
 <h2 id="struktura-bmap-iskusstvo-upakovki-pamyati">Структура bmap: Искусство упаковки памяти</h2>
 
-<p>Поле <code>buckets</code> в <code>hmap</code> указывает на массив структур <code>bmap</code> (Bucket map). И вот здесь начинается магия оптимизации.</p>
-<p>В исходниках рантайма <code>bmap</code> описан крайне просто:</p>
+<p>Поле <code>buckets</code> в структуре <code>hmap</code> указывает на массив структур <code>bmap</code> (Bucket map). И именно здесь начинается подлинное торжество низкоуровневой оптимизации.</p>
+<p>В исходном коде <code>runtime/map.go</code> структура <code>bmap</code> намеренно описана лаконично:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2221,13 +2224,13 @@ type hmap struct {
     </button>
   </div>
   <pre class="language-go"><code class="language-go">type bmap struct {
-    tophash [8]uint8 // Массив из 8 байт
+    tophash [8]uint8 // Массив из 8 байт для быстрых проверок
 }
 </code></pre>
 </div>
 
-<p>Кажется, что здесь ничего нет, кроме 8 байт. Но это иллюзия, созданная для компилятора. На самом деле во время компиляции Go динамически генерирует реальную структуру бакета под конкретные типы ключа и значения.</p>
-<p>В памяти реальный <code>bmap</code> выглядит так:</p>
+<p>Кажется, что в бакете нет ничего, кроме 8 байт. Но это лишь синтаксическая иллюзия для компилятора: размер ключа и значения неизвестен до момента компиляции конкретной программы. На этапе компиляции Go динамически генерирует реальную структуру бакета в памяти под конкретные типы ключа и значения.</p>
+<p>В оперативной памяти реальный <code>bmap</code> всегда строго вмещает <strong>8 пар ключ-значение</strong> и имеет следующий вид:</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2242,35 +2245,89 @@ type hmap struct {
   </div>
   <pre class="mermaid">
 flowchart TD
-B[&quot;bmap - Bucket&quot;] --&gt; T[&quot;tophash&lt;br&gt;8 байт&quot;]
-B --&gt; K[&quot;Ключи&lt;br&gt;K1, K2, ..., K8&quot;]
-B --&gt; V[&quot;Значения&lt;br&gt;V1, V2, ..., V8&quot;]
-B --&gt; O[&quot;overflow&lt;br&gt;Указатель на следующий bmap&quot;]
+subgraph Bucket[&quot;bmap - Физический Bucket (8 слотов)&quot;]
+T[&quot;tophash: [8]uint8&lt;br/&gt;Старшие 8 бит хешей для 8 слотов&quot;]
+K[&quot;keys: [8]KeyType&lt;br/&gt;K1 | K2 | K3 | K4 | K5 | K6 | K7 | K8&quot;]
+V[&quot;elems: [8]ElemType&lt;br/&gt;V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8&quot;]
+O[&quot;overflow: *bmap&lt;br/&gt;Указатель на следующий бакет переполнения&quot;]
+end
 
-style B fill:#2b2b2b,stroke:#00aaff,stroke-width:2px,color:#fff
-style T fill:#4a1515,stroke:#ff5555,stroke-width:2px,color:#fff
+T --&gt; K
+K --&gt; V
+V --&gt; O
+
+classDef head fill:#1e293b,stroke:#38bdf8,stroke-width:1.5px,color:#f8fafc;
+classDef keys fill:#1e3a8a,stroke:#60a5fa,stroke-width:1.5px,color:#f8fafc;
+classDef vals fill:#14532d,stroke:#4ade80,stroke-width:1.5px,color:#f8fafc;
+classDef over fill:#4c0519,stroke:#f43f5e,stroke-width:1.5px,color:#f8fafc;
+
+class T head;
+class K keys;
+class V vals;
+class O over;
   </pre>
 </div>
 
 
-<p>Каждый бакет строго вмещает <strong>8 пар ключ-значение</strong>. </p>
+<p>Каждый бакет всегда вмещает ровно <strong>8 пар ключ-значение</strong>.</p>
 <h3 id="umnoe-vyravnivanie-memory-alignment">Умное выравнивание (Memory Alignment)</h3>
 
-<p>Обратите внимание на порядок полей: сначала идут <strong>все ключи</strong>, а потом <strong>все значения</strong>. Почему не парами: ключ 1, значение 1, ключ 2, значение 2?</p>
-<p>Это блестящий пример Mechanical Sympathy. Если ключ и значение имеют разный размер (например, ключ <code>int64</code> — 8 байт, а значение <code>int8</code> — 1 байт), чередование привело бы к огромным потерям памяти из-за паддинга (Memory Padding) — процессор требует выравнивания адресов.</p>
-<p>Если хранить как <code>K V K V</code>:<br />
-<code>8 байт (K)</code> + <code>1 байт (V)</code> + <code>7 байт (Padding)</code> + <code>8 байт (K)</code> ... <br />
-Мы тратим 7 байт впустую на каждую пару.</p>
-<p>Если хранить <code>K K K K ... V V V V</code>:<br />
-<code>8+8+8+8 (Ключи)</code> + <code>1+1+1+1 (Значения)</code> + <code>4 байта (Padding в самом конце)</code>. <br />
-Мы экономим десятки байт на каждом бакете и делаем структуру максимально плотной для L1-кэша!</p>
-<h2 id="kak-rabotaet-poisk-read-path">Как работает поиск (Read Path)</h2>
+<p>Обратите внимание на последовательность расположения полей в памяти: сначала идут подряд <strong>все ключи</strong>, а затем подряд <strong>все значения</strong>. Почему не парами: ключ 1, значение 1, ключ 2, значение 2?</p>
+<p>Это блестящий пример Mechanical Sympathy и учета требований процессорной шины. Если ключ и значение обладают разным размером (например, ключ <code>int64</code> занимает 8 байт, а значение <code>int8</code> — всего 1 байт), чередование привело бы к колоссальным потерям памяти из-за аппаратного выравнивания адресов (Memory Padding).</p>
+<p>Сравните два подхода:<br />
+- При чередовании <code>K V K V</code>:<br />
+<code>8 байт (K)</code> + <code>1 байт (V)</code> + <code>7 байт (Padding)</code> + <code>8 байт (K)</code> ...<br />
+  Мы бы впустую теряли 7 байт на каждом элементе (56 байт на бакет!).<br />
+- При группировке <code>K K K K ... V V V V</code>:<br />
+<code>8+8+8+8 (Ключи)</code> + <code>1+1+1+1 (Значения)</code> + <code>4 байта (Padding в самом конце)</code>.<br />
+  Мы экономим десятки байт на каждом бакете и делаем данные максимально компактными для процессорного L1-кэша.</p>
+<hr />
+<h2 id="kak-rabotaet-chtenie-read-path">Как работает чтение (Read Path)</h2>
 
-<p>Когда вы делаете <code>val := m["my_key"]</code>, происходит следующая цепочка:</p>
+<p>Когда в программе выполняется операция поиска <code>val := m["my_key"]</code>, рантайм Go запускает следующую цепочку действий:</p>
+
+<div class="mermaid-wrapper">
+  <div class="mermaid-header">
+    <div class="mermaid-title">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="3" y1="9" x2="21" y2="9"></line><line x1="9" y1="21" x2="9" y2="9"></line></svg>
+      <span>Архитектурная схема</span>
+    </div>
+    <button class="btn-mermaid-fullscreen" onclick="toggleMermaidModal(this)" title="Развернуть на весь экран">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>
+      <span>На весь экран</span>
+    </button>
+  </div>
+  <pre class="mermaid">
+flowchart TD
+A[&quot;Ключ &#x27;my_key&#x27; + hmap.hash0&quot;] --&gt; B[&quot;Аппаратный AES / memhash (64 бита)&quot;]
+B --&gt; C[&quot;Младшие B бит: выбор бакета buckets[i]&quot;]
+C --&gt; D[&quot;Старшие 8 бит: поиск в tophash[8]&quot;]
+D --&gt;|&quot;Совпадение байта&quot;| E[&quot;Полное сравнение ключа: K == &#x27;my_key&#x27;&quot;]
+D --&gt;|&quot;Байт не найден&quot;| F[&quot;Следующий слот в бакете&quot;]
+E --&gt;|&quot;Равны&quot;| G[&quot;Возврат значения V&quot;]
+E --&gt;|&quot;Не равны (коллизия tophash)&quot;| F
+F --&gt;|&quot;Все 8 проверены&quot;| H{&quot;Есть overflow?&quot;}
+H --&gt;|&quot;Да&quot;| I[&quot;Переход по указателю в следующий bmap&quot;]
+H --&gt;|&quot;Нет&quot;| J[&quot;Ключ отсутствует (zero value)&quot;]
+I --&gt; D
+
+classDef process fill:#1e293b,stroke:#38bdf8,stroke-width:1.5px,color:#f8fafc;
+classDef check fill:#334155,stroke:#f59e0b,stroke-width:1.5px,color:#f8fafc;
+classDef match fill:#14532d,stroke:#10b981,stroke-width:1.5px,color:#f8fafc;
+classDef miss fill:#4c0519,stroke:#f43f5e,stroke-width:1.5px,color:#f8fafc;
+
+class A,B,C,D process;
+class H check;
+class E,G match;
+class F,J,I miss;
+  </pre>
+</div>
+
+
 <ol>
-<li><strong>Вычисление хеша</strong>: Рантайм берет ключ <code>"my_key"</code>, добавляет к нему <code>hmap.hash0</code> и прогоняет через AES-акселератор процессора. На выходе получается 64-битное число.</li>
-<li><strong>Поиск бакета (Low bits)</strong>: Берутся младшие <code>B</code> бит хеша. Если <code>B=3</code>, мы берем 3 младших бита (например, <code>101</code> — это 5). Значит, наш бакет — <code>buckets[5]</code>.</li>
-<li><strong>Поиск внутри бакета (High bits и tophash)</strong>: Процессор не бежит сразу сравнивать тяжелые строки-ключи. Он берет <strong>старшие 8 бит</strong> нашего 64-битного хеша. Затем он сравнивает этот байт с массивом <code>tophash</code> в бакете.</li>
+<li><strong>Вычисление хеша</strong>: Рантайм берет ключ <code>"my_key"</code>, подмешивает случайную затравку <code>hmap.hash0</code> и вычисляет 64-битный хеш с помощью аппаратных инструкций AES-NI процессора или алгоритма Wyhash (<code>runtime.memhash</code>).</li>
+<li><strong>Выбор бакета (Low bits)</strong>: Из 64-битного хеша берутся младшие <code>B</code> бит. Например, если <code>B=3</code>, мы берем 3 младших бита (комбинация <code>101</code> дает индекс 5). Значит, целевой бакет — <code>buckets[5]</code>.</li>
+<li><strong>Поиск внутри бакета (High bits и tophash)</strong>: Процессор не выполняет сразу тяжелое сравнение строк или структур. Он извлекает <strong>старшие 8 бит</strong> того же 64-битного хеша и сравнивает этот единственный байт с массивом <code>tophash</code> в бакете.</li>
 </ol>
 <div class="callout callout-info">
   <div class="callout-header">
@@ -2278,32 +2335,33 @@ style T fill:#4a1515,stroke:#ff5555,stroke-width:2px,color:#fff
     <span class="callout-title">Под капотом</span>
   </div>
   <div class="callout-body">
-    <p>Массив <code>tophash</code> из 8 байт идеально помещается в один регистр процессора. Сравнение старшего байта хеша со всеми 8 элементами <code>tophash</code> происходит за <strong>1 такт CPU</strong> без промахов кэша.<br />
-И только если байты совпали (что случается редко), Go идет в память и делает дорогое сравнение самих ключей (<code>K1 == "my_key"</code>).</p>
+    <p>Массив <code>tophash</code> из 8 байт целиком помещается в один 64-битный машинный регистр процессора. Сравнение старшего байта хеша со всеми 8 ячейками <code>tophash</code> выполняется за <strong>1 такт CPU</strong> без единого промаха кэша.<br />
+И только в том редком случае, когда байты <code>tophash</code> совпали, Go обращается к памяти ключа и производит точное сравнение (<code>K1 == "my_key"</code>).</p>
   </div>
 </div>
 
 <ol start="4">
-<li><strong>Коллизии (Overflow)</strong>: Если в бакете все 8 слотов заняты, а нашего ключа там нет, мы идем по указателю <code>overflow</code> в следующий бакет (гибридный метод цепочек).</li>
+<li><strong>Разрешение переполнения (Overflow)</strong>: Если все 8 слотов бакета проверены, а искомый ключ не найден, рантайм следует по указателю <code>overflow</code> в следующий бакет переполнения (гибридный метод цепочек).</li>
 </ol>
+<hr />
 <h2 id="inkrementalnaya-evakuatsiya-incremental-resizing">Инкрементальная эвакуация (Incremental Resizing)</h2>
 
-<p>Когда Load Factor (отношение числа элементов к числу бакетов) превышает порог <strong>6.5</strong> (в среднем 6.5 элементов в каждом бакете), <code>map</code> инициирует ресайз.</p>
-<p>Массив <code>buckets</code> увеличивается ровно в 2 раза. Но здесь кроется главная проблема: если в мапе миллион элементов, перенос их всех разом остановит выполнение программы на десятки миллисекунд.</p>
-<p>Поэтому Go использует <strong>инкрементальную эвакуацию</strong>:<br />
-1. Старый массив бакетов сохраняется в указатель <code>oldbuckets</code>.<br />
-2. Выделяется память под новый массив <code>buckets</code> (в 2 раза больше).<br />
-3. Мапа продолжает работать. Но теперь <strong>при каждой операции записи или удаления</strong> (<code>m[k] = v</code> или <code>delete(m, k)</code>) рантайм берет ровно <strong>2 бакета</strong> из <code>oldbuckets</code> и переносит их в новый массив.<br />
-4. Поле <code>nevacuate</code> сдвигается, отмечая прогресс.</p>
-<p>Это размазывает тяжелую операцию во времени ($O(1)$ амортизированное). </p>
+<p>Когда средняя загрузка таблицы (Load Factor — отношение общего количества элементов к числу бакетов) превышает критический порог <strong>6.5</strong> (в среднем больше 6.5 элементов на бакет), либо в мапе скапливается слишком много полупустых <code>overflow</code>-бакетов, <code>map</code> инициирует процедуру ресайза.</p>
+<p>Количество бакетов удваивается ($B \to B+1$, массив <code>buckets</code> вырастает ровно в 2 раза). Однако если в таблице хранятся миллионы записей, мгновенный перенос всех элементов вызвал бы многомиллисекундную заморозку программы (Stop-the-World лаг).</p>
+<p>Чтобы избежать деградации latency, Go применяет <strong>инкрементальную эвакуацию (Incremental Evacuation)</strong>:<br />
+1. Текущий массив бакетов сохраняется по ссылке <code>oldbuckets</code>.<br />
+2. В куче выделяется новый массив <code>buckets</code> удвоенного объема.<br />
+3. Мапа продолжает непрерывно обслуживать запросы. При этом <strong>при каждой последующей операции записи или удаления</strong> (<code>m[k] = v</code> или <code>delete(m, k)</code>) рантайм берет ровно <strong>2 бакета</strong> из <code>oldbuckets</code> и переносит их данные в новый массив <code>buckets</code>.<br />
+4. Специальный счетчик <code>nevacuate</code> сдвигается вперед, фиксируя завершенный прогресс.</p>
+<p>Такой подход элегантно распределяет тяжелую нагрузку по времени, гарантируя амортизированную сложность $O(1)$ для всех мутирующих операций.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
     <span class="callout-title">Ловушка / Gotcha</span>
   </div>
   <div class="callout-body">
-    <p>Во время эвакуации <code>map</code> потребляет в 3 раза больше памяти, чем до начала ресайза (старый массив + новый массив х2). Если вы начнете массово заливать данные в мапу без указания <code>capacity</code>, вы вызовете серию ресайзов, что нагрузит CPU и GC. <br />
-<strong>Всегда используйте <code>make(map[K]V, capacity)</code></strong>, если размер известен заранее!</p>
+    <p>Во время процесса эвакуации <code>map</code> временно удерживает в памяти как старый массив, так и новый удвоенный (суммарно примерно в 3 раза больше памяти, чем до ресайза). Серия непрерывных неконтролируемых ресайзов способна мгновенно вызвать резкий скачок потребления RAM и перегрузить сборщик мусора.<br />
+<strong>Всегда задавайте начальную емкость через <code>make(map[K]V, capacity)</code></strong>, если примерное количество элементов известно заранее!</p>
   </div>
 </div>
 
@@ -2313,20 +2371,21 @@ style T fill:#4a1515,stroke:#ff5555,stroke-width:2px,color:#fff
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос:</strong> Почему итерация по <code>map</code> в Go (через <code>for k, v := range m</code>) не гарантирует порядок элементов, а при каждом запуске он разный?<br />
-<strong>Ответ:</strong> Во-первых, хеш-таблица по своей природе не упорядочена — индекс зависит от хеша, а не от времени вставки. Во-вторых, защита от Hash DoS подмешивает рандомный <code>seed</code> при создании <code>map</code>, поэтому хеши меняются от запуска к запуску. В-третьих, рантайм Go <strong>намеренно</strong> начинает итерацию со случайного бакета и случайного смещения внутри него. Это сделано специально, чтобы разработчики не полагались на случайный порядок (который мог бы сохраниться, если не было ресайзов) и писали надежный код.</p>
+    <p><strong>Вопрос:</strong> Почему обход <code>map</code> в Go (через конструкцию <code>for k, v := range m</code>) не гарантирует стабильного порядка элементов, и при каждом запуске программы порядок оказывается другим?<br />
+<strong>Ответ:</strong> Во-первых, хеш-таблица по своей природе неупорядочена: индекс элемента определяется хешем, а не хронологией вставки. Во-вторых, защита от Hash DoS использует уникальный случайный <code>seed</code> (<code>hash0</code>) при каждом создании таблицы, из-за чего хеши одних и тех же ключей различаются между запусками. В-третьих, рантайм Go <strong>намеренно рандомизирует</strong> точку старта обхода: итерация всегда начинается со случайного бакета и случайного смещения внутри него. Это сделано намеренно разработчиками языка, чтобы программисты не вырабатывали скрытую зависимость от псевдослучайного порядка обхода.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="potokobezopasnost-concurrency">Потокобезопасность (Concurrency)</h2>
 
-<p>Встроенная <code>map</code> в Go <strong>не является потокобезопасной (thread-safe)</strong>. </p>
-<p>Если одна горутина читает из <code>map</code>, а другая в этот же момент в нее пишет, рантайм Go моментально выбросит фатальную ошибку <code>fatal error. concurrent map read and map write</code> и уронит весь процесс (никакой <code>recover</code> не спасет).</p>
-<p>Почему разработчики Go не встроили <code>Mutex</code> прямо в <code>hmap</code>? <br />
-Ответ — <strong>Mechanical Sympathy</strong>. Мьютексы дороги. Блокировка всей хеш-таблицы на каждую операцию чтения убила бы производительность языка. В 95% случаев мапы используются локально внутри одной горутины, где синхронизация не нужна.</p>
-<p>Защита от конкурентной записи реализована через поле <code>flags</code> в <code>hmap</code>. Когда горутина начинает запись, она выставляет бит <code>hashWriting</code>. Любая другая горутина (читающая или пишущая), зайдя в мапу и увидев этот бит, немедленно вызывает панику.</p>
-<p>Для конкурентной работы следует использовать <code>sync.RWMutex</code> в обертке над вашей мапой, либо специализированную <code>sync.Map</code> (о которой мы поговорим в будущем).</p>
-<p>Разобравшись с сердцем хеш-таблиц, мы завершаем тему точного поиска. В следующей статье мы перейдем к вероятностным структурам данных, которые позволяют за копейки памяти отвечать на вопрос "есть ли элемент в базе?", жертвуя 100% точностью: <a href="6-bloom-filter-veroyatnostnaya-struktura-dannykh.html" class="wikilink">6. Bloom filter - вероятностная структура данных</a>.</p>
+<p>Встроенная структура <code>map</code> в Go <strong>не является потокобезопасной (thread-safe)</strong>.</p>
+<p>Если одна горутина читает данные из <code>map</code>, а другая в этот же момент производит запись, рантайм Go мгновенно детектирует гонку данных, выбрасывает фатальную системную ошибку <code>fatal error: concurrent map read and map write</code> (или <code>fatal error. concurrent map read and map write</code>) и немедленно завершает весь процесс аварийно — перехватить эту ошибку через <code>recover</code> невозможно.</p>
+<p>Почему создатели языка не встроили мьютекс прямо в заголовок <code>hmap</code>?<br />
+Ответ снова кроется в <strong>Mechanical Sympathy</strong>. Захват и освобождение системных блокировок (Mutex) требуют сотен тактов процессора и атомарных инструкций шины памяти. Блокировка всей таблицы на каждую элементарную операцию чтения обрушила бы производительность языка. В подавляющем большинстве сценариев мапы используются локально внутри одной горутины, где накладные расходы на синхронизацию были бы чистой тратой ресурсов.</p>
+<p>Аппаратная защита от конкурентной записи реализована через битовое поле <code>flags</code> в заголовке <code>hmap</code>. Когда горутина приступает к мутации таблицы, она устанавливает служебный бит <code>hashWriting</code>. Любая параллельная горутина, обратившаяся к мапе и обнаружившая активный флаг <code>hashWriting</code>, немедленно паникует на уровне рантайма.</p>
+<p>Для многопоточной работы следует защищать стандартную мапу с помощью мьютекса <code>sync.RWMutex</code>, либо применять специализированную структуру <code>sync.Map</code> из стандартной библиотеки (к детальному анализу которой мы еще вернемся).</p>
+<p>Разобравшись с глубинным устройством хеш-таблиц, мы завершаем тему точного ассоциативного поиска. В следующей статье мы познакомимся с удивительным миром вероятностных структур данных, позволяющих ценой минимального расхода памяти отвечать на вопрос о наличии элемента в гигантских массивах: <a href="6-bloom-filter-veroyatnostnaya-struktura-dannykh.html" class="wikilink">6. Bloom filter - вероятностная структура данных</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2354,7 +2413,7 @@ style T fill:#4a1515,stroke:#ff5555,stroke-width:2px,color:#fff
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#struktura-hmap-zagolovok-slovarya">Структура hmap: Заголовок словаря</a></li><li class="toc-item toc-h2"><a href="#struktura-bmap-iskusstvo-upakovki-pamyati">Структура bmap: Искусство упаковки памяти</a></li><li class="toc-item toc-h3"><a href="#umnoe-vyravnivanie-memory-alignment">Умное выравнивание (Memory Alignment)</a></li><li class="toc-item toc-h2"><a href="#kak-rabotaet-poisk-read-path">Как работает поиск (Read Path)</a></li><li class="toc-item toc-h2"><a href="#inkrementalnaya-evakuatsiya-incremental-resizing">Инкрементальная эвакуация (Incremental Resizing)</a></li><li class="toc-item toc-h2"><a href="#potokobezopasnost-concurrency">Потокобезопасность (Concurrency)</a></li>
+    <li class="toc-item toc-h2"><a href="#struktura-hmap-zagolovok-slovarya">Структура hmap: Заголовок словаря</a></li><li class="toc-item toc-h2"><a href="#struktura-bmap-iskusstvo-upakovki-pamyati">Структура bmap: Искусство упаковки памяти</a></li><li class="toc-item toc-h3"><a href="#umnoe-vyravnivanie-memory-alignment">Умное выравнивание (Memory Alignment)</a></li><li class="toc-item toc-h2"><a href="#kak-rabotaet-chtenie-read-path">Как работает чтение (Read Path)</a></li><li class="toc-item toc-h2"><a href="#inkrementalnaya-evakuatsiya-incremental-resizing">Инкрементальная эвакуация (Incremental Resizing)</a></li><li class="toc-item toc-h2"><a href="#potokobezopasnost-concurrency">Потокобезопасность (Concurrency)</a></li>
   </ul>
 </aside>
 

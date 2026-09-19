@@ -2169,17 +2169,30 @@
           <header class="article-header">
             <div class="article-meta-tags">
               <span class="meta-tag module-tag">Модуль 20</span>
-              <span class="meta-tag read-time">⏱ ~22 мин чтения</span>
+              <span class="meta-tag read-time">⏱ ~28 мин чтения</span>
               <span class="meta-tag mermaid-tag">📐 1 Mermaid диаграмм</span>
             </div>
             <h1 class="article-title">3. Sparse table</h1>
           </header>
 
           <div class="article-markdown">
-            <h2 id="vvedenie-o1-tsenoy-pamyati-i-statichnosti">Введение: O(1) ценой памяти и статичности</h2>
+            <h1>Разреженная таблица (Sparse Table)</h1>
+<blockquote>
+<p><em>"When your data is etched in stone, calculating anything at runtime is a concession to laziness. Precalculate powers of two, cover the interval with two overlapping hands, and answer queries in a single memory cycle."</em><br />
+— Свободная инженерная адаптация</p>
+</blockquote>
+<hr />
+<h2 id="vvedenie-o1-tsenoy-pamyati-i-statichnosti">Введение: O(1) ценой памяти и статичности</h2>
 
-<p>В предыдущих статьях мы изучили динамические структуры для диапазонных запросов: <a href="1-segment-tree-derevo-otrezkov.html" class="wikilink">1. Segment tree - дерево отрезков</a> и <a href="2-fenwick-tree-binarnoe-indeksnoe-derevo.html" class="wikilink">2. Fenwick tree - бинарное индексное дерево</a>. Обе гарантируют <code>O(log n)</code> на запрос и обновление, что отлично для изменяемых данных. Но в бэкенде часто встречается сценарий, где данные <strong>статичны</strong> или меняются крайне редко, а количество чтений превышает записи на порядки: исторические логи, предрассчитанные метрики, неизменяемые конфигурации маршрутизации, геопространственные индексы или кэшированные отчёты.</p>
-<p>В таких условиях <code>O(log n)</code> превращается в избыточную трату циклов CPU. Нам нужно <code>O(1)</code>. Именно эту нишу закрывает <strong>Sparse Table</strong> (Разреженная таблица). Она жертвует памятью (<code>O(n log n)</code>) и временем построения (<code>O(n log n)</code>) ради гарантированного константного времени отклика на запрос. В системах с жёсткими SLA по p99 латентности, где каждый лишний такт конвейера или непредсказуемое ветвление может выбить сервис из бюджета, Sparse Table становится архитектурным выбором №1.</p>
+<p>В предыдущих главах мы подробно исследовали структуры для динамических диапазонных запросов: универсальное <a href="1-segment-tree-derevo-otrezkov.html" class="wikilink">1. Segment tree - дерево отрезков</a> и компактное <a href="2-fenwick-tree-binarnoe-indeksnoe-derevo.html" class="wikilink">2. Fenwick tree - бинарное индексное дерево</a>. Обе структуры обеспечивают строгое время $O(\log n)$ как на чтение, так и на модификацию данных, что превосходно подходит для постоянно мутирующих коллекций.</p>
+<p>Однако в реальной практике высоконагруженного бэкенда колоссальный объем данных носит неизменяемый (<strong>статический</strong>) характер:<br />
+- Исторические логи временных рядов (TSDB, ClickHouse, Prometheus blocks).<br />
+- Неизменяемые таблицы маршрутизации и топологии распределенных кластеров.<br />
+- Геопространственные индексы и полигоны доставки.<br />
+- Предрассчитанные финансовые котировки, квантили и аналитические витрины за закрытые отчетные периоды.</p>
+<p>В подобных сценариях, когда соотношение чтений к записям составляет миллионы к одному ($R/W \gg 10^6$), даже микросекундная логарифмическая задержка $O(\log n)$ с ветвлениями конвейера CPU становится расточительством. Промышленной системе требуется гарантированный константный отклик:<br />
+$$O(1)$$</p>
+<p>Именно эту архитектурную нишу закрывает <strong>Sparse Table</strong> (Разреженная таблица). Она идет на осознанный прагматичный компромисс: жертвует дополнительной оперативной памятью ($O(n \log n)$) и требует предварительного построения за $O(n \log n)$, взамен предоставляя математически строгую гарантию ответа на запрос за $O(1)$ без единого цикла и ветвления.</p>
 <div class="callout callout-interview">
   <div class="callout-header">
     <span class="callout-icon">🎯</span>
@@ -2191,13 +2204,15 @@
   </div>
 </div>
 
+<hr />
 <h2 id="1-matematicheskaya-osnova-idempotentnosti">1. Математическая основа идемпотентности</h2>
 
-<p>Ключевая идея: вместо хранения ответа для каждого возможного отрезка <code>O(n²)</code>, мы храним только отрезки, длина которых является степенью двойки. Для массива длины <code>n</code> существует <code>n * log₂n</code> таких диапазонов.</p>
-<p>Запрос к произвольному отрезку <code>[L, R]</code> длины <code>len = R - L + 1</code> разбивается на два предвычисленных блока размера <code>2^k</code>, где <code>k = floor(log₂(len))</code>:<br />
+<p>Хранить предрассчитанные ответы для каждого возможного отрезка <code>O(n²)</code> памяти для миллиона элементов потребовало бы терабайты данных. </p>
+<p>Идея Sparse Table элегантна: мы вычисляем и сохраняем результаты <strong>только для отрезков, чья длина является точной степенью двойки</strong>: $2^0, 2^1, 2^2, \dots, 2^{\lfloor \log_2 n \rfloor}$. Для массива длины <code>n</code> существует <code>n * log₂n</code> таких диапазонов.</p>
+<p>Запрос к произвольному отрезку <code>[L, R]</code> длины <code>len = R - L + 1</code> разбивается на два предвычисленных блока размера $2^k$, где <code>k = floor(log₂(len))</code> (используется логарифм <code>log₂</code>):<br />
 - Первый блок начинается в <code>L</code>.<br />
 - Второй блок заканчивается в <code>R</code>.</p>
-<p>Блоки гарантированно перекрываются, но не выходят за границы <code>[L, R]</code>. Поскольку операция идемпотентна, дублирование элементов в пересечении не искажает результат.</p>
+<p>Так как $2^k &gt; \text{len} / 2$, эти два блока гарантированно соприкасаются или <strong>перекрываются</strong> в середине отрезка, при этом ни на один элемент не выходя за его внешние границы <code>[L, R]</code>!</p>
 
 <div class="mermaid-wrapper">
   <div class="mermaid-header">
@@ -2212,21 +2227,34 @@
   </div>
   <pre class="mermaid">
 flowchart TD
-Range[&quot;Исходный запрос L R&lt;br&gt;длина len&quot;] --&gt; Calc[&quot;k = log2 len&quot;]
-Calc --&gt; B1[&quot;Блок A: начало L&lt;br&gt;длина 2 в степени k&quot;]
-Calc --&gt; B2[&quot;Блок B: конец R&lt;br&gt;длина 2 в степени k&quot;]
-B1 --&gt; Overlap[&quot;Пересечение блоков&lt;br&gt;допустимо для идемпотентности&quot;]
-B2 --&gt; Overlap
-Overlap --&gt; Merge[&quot;merge A B за O 1&quot;]
-Merge --&gt; Res[&quot;Результат запроса&quot;]
+Range[&quot;Исходный запрос [L..R]&lt;br/&gt;Длина len = R - L + 1&quot;] --&gt; Calc[&quot;Вычисление k = floor(log2(len)) за 1 такт CPU&quot;]
 
-style Range fill:#e3f2fd
-style Overlap fill:#fff3e0
-style Res fill:#e8f5e8
+Calc --&gt; B1[&quot;Блок A: начало в L&lt;br/&gt;Длина 2^k&quot;]
+Calc --&gt; B2[&quot;Блок B: конец в R&lt;br/&gt;Длина 2^k&quot;]
+
+B1 --&gt; Overlap[&quot;Пересечение блоков&lt;br/&gt;f(x, x) = x (Идемпотентность)&quot;]
+B2 --&gt; Overlap
+
+Overlap --&gt; Merge[&quot;Результат: merge(A, B)&lt;br/&gt;O(1) без циклов&quot;]
+Merge --&gt; Res[&quot;Итоговое значение RMQ&quot;]
+
+classDef queryBox fill:#0f172a,stroke:#38bdf8,stroke-width:2px,color:#f8fafc;
+classDef calcBox fill:#1e293b,stroke:#f59e0b,stroke-width:1.5px,color:#f8fafc;
+classDef blockBox fill:#312e81,stroke:#818cf8,stroke-width:1.5px,color:#f8fafc;
+classDef overlapBox fill:#1e293b,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+classDef resBox fill:#064e3b,stroke:#34d399,stroke-width:2px,color:#f8fafc;
+
+class Range queryBox;
+class Calc calcBox;
+class B1,B2 blockBox;
+class Overlap overlapBox;
+class Merge,Res resBox;
   </pre>
 </div>
 
 
+<p>Поскольку операция идемпотентна ($x \oplus x = x$), учет элементов из зоны пересечения дважды абсолютно не искажает финальный результат:<br />
+$$\min([a, b, c, d]) = \min(\min([a, b, c]), \, \min([b, c, d]))$$</p>
 <div class="callout callout-info">
   <div class="callout-header">
     <span class="callout-icon">⚙️</span>
@@ -2234,13 +2262,17 @@ style Res fill:#e8f5e8
   </div>
   <div class="callout-body">
     <p><strong>Вычисление k за O(1) на уровне CPU</strong><br />
-В наивных реализациях <code>log₂</code> вычисляется циклом или массивом поиска. В современном Go мы используем пакет <code>math/bits</code>. Функция <code>bits.Len64(uint64(len)) - 1</code> транслируется в одну машинную инструкцию <code>LZCNT</code> (Leading Zero Count) на x86-64 или <code>CLZ</code> на ARM64. Это аппаратная операция, выполняющаяся за 1 такт без ветвлений и доступа к памяти.</p>
+В наивных реализациях $\log_2$ вычисляется циклом со сдвигами или через вещественные числа. В современном Go мы используем пакет <code>math/bits</code>. <br />
+Выражение <code>bits.Len64(uint64(len)) - 1</code> компилятор транслирует напрямую в аппаратный интринзик <code>LZCNT</code> (Count Leading Zeros) или <code>BSR</code> на архитектуре x86-64, либо <code>CLZ</code> на ARM64. <br />
+Эта машинная инструкция выполняется за <strong>ровно 1 такт процессора</strong>, исключая ветвления и обращения к кэшу.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="2-production-realizatsiya-na-go-1-21">2. Production-реализация на Go 1.21+</h2>
 
-<p>Для бэкенда важно минимизировать накладные расходы. Стандартная реализация через <code>[][]T</code> создаёт <code>logN</code> отдельных аллокаций и массив указателей на строки. Это ухудшает пространственную локальность и усложняет работу сборщика мусора. В production-коде для high-load систем предпочтительнее <strong>плоский массив</strong> <code>[]T</code> с ручным вычислением индексов. Это гарантирует непрерывный блок памяти, идеальный для аппаратного префетчинга.</p>
+<p>В академических учебниках Sparse Table часто оформляют как двумерный срез <code>[][]T</code>. В высоконагруженном бэкенде это архитектурная ошибка: <code>logN</code> независимых срезов порождают <code>logN</code> отдельных аллокаций в куче, фрагментируют память и превращают чтение в двойное разыменование указателей (<code>table[k][i]</code>).</p>
+<p>В промышленном коде мы применяем <strong>монолитный плоский массив <code>[]T</code></strong> с плотной упаковкой уровней по смещению <code>offset = n * k</code>:</p>
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2254,9 +2286,9 @@ style Res fill:#e8f5e8
 
 import &quot;math/bits&quot;
 
-// SparseTable реализует статический диапазонный запрос за O(1).
-// Требует идемпотентную функцию merge (например, min, max, gcd).
-// Использует плоский массив для максимальной кэш-локальности.
+// SparseTable реализует статический диапазонный запрос (RMQ) за строгое O(1).
+// Требует идемпотентную функцию merge (min, max, gcd, bitwise AND/OR).
+// Хранит данные в плоском монолитном массиве для максимальной кэш-локальности.
 type SparseTable[T comparable] struct {
     data  []T
     n     int
@@ -2264,7 +2296,7 @@ type SparseTable[T comparable] struct {
     merge func(a, b T) T
 }
 
-// New строит таблицу за O(n log n).
+// New строит разреженную таблицу за O(n log n).
 func New[T comparable](arr []T, merge func(a, b T) T) *SparseTable[T] {
     n := len(arr)
     if n == 0 {
@@ -2274,16 +2306,16 @@ func New[T comparable](arr []T, merge func(a, b T) T) *SparseTable[T] {
     // logN = floor(log2(n)) + 1
     logN := bits.Len64(uint64(n))
 
-    // Плоский массив размера n * (logN + 1)
-    // Уровень k хранится в смещении n * k
+    // Выделяем единый плоский непрерывный массив n * (logN + 1)
+    // Уровень k хранится со смещением n * k
     table := make([]T, n*(logN+1))
 
-    // Базовый уровень k=0: сами элементы
+    // Базовый уровень k = 0: исходные элементы массива
     for i, v := range arr {
         table[i] = v
     }
 
-    // Заполняем уровни k=1..logN
+    // Заполняем уровни k = 1..logN методом динамического программирования
     for k := 1; k &lt; logN+1; k++ {
         half := 1 &lt;&lt; (k - 1)
         limit := n - (1 &lt;&lt; k) + 1
@@ -2305,7 +2337,7 @@ func New[T comparable](arr []T, merge func(a, b T) T) *SparseTable[T] {
     }
 }
 
-// Query возвращает результат на отрезке [l, r] за O(1).
+// Query возвращает результат на закрытом интервале [l, r] за безусловное O(1).
 func (st *SparseTable[T]) Query(l, r int) T {
     if l &gt; r || r &gt;= st.n {
         var zero T
@@ -2315,7 +2347,7 @@ func (st *SparseTable[T]) Query(l, r int) T {
     length := r - l + 1
     k := bits.Len64(uint64(length)) - 1
 
-    // Индексы в плоском массиве
+    // Вычисление смещений в плоском массиве без ветвлений
     offset := st.n * k
     val1 := st.data[offset+l]
     val2 := st.data[offset+(r-(1&lt;&lt;k)+1)]
@@ -2325,7 +2357,8 @@ func (st *SparseTable[T]) Query(l, r int) T {
 </code></pre>
 </div>
 
-<p>Пример использования для анализа задержек:</p>
+<h3 id="primer-ispolzovaniya-monitoring-minimalnoy-zaderzhki">Пример использования: Мониторинг минимальной задержки</h3>
+
 
 <div class="code-block" data-lang="go">
   <div class="code-header">
@@ -2335,25 +2368,43 @@ func (st *SparseTable[T]) Query(l, r int) T {
       <span>Копировать</span>
     </button>
   </div>
-  <pre class="language-go"><code class="language-go">latencies := []int{120, 45, 800, 12, 300, 90}
-st := sparse.New(latencies, func(a, b int) int {
-    if a &lt; b { return a }
-    return b
-})
+  <pre class="language-go"><code class="language-go">func ExampleSparseTable() {
+    // Исторический массив задержек сетевых пакетов (мс)
+    latencies := []int{120, 45, 800, 12, 300, 90}
 
-minVal := st.Query(1, 4) // min из [45, 800, 12, 300] -&gt; 12
+    st := sparse.New(latencies, func(a, b int) int {
+        if a &lt; b {
+            return a
+        }
+        return b
+    })
+
+    // Поиск минимума на отрезке индексов [1, 4] -&gt; min(45, 800, 12, 300) = 12
+    minVal := st.Query(1, 4)
+    _ = minVal
+}
 </code></pre>
 </div>
 
+<hr />
 <h2 id="3-mechanical-sympathy-kesh-cpu-i-gc">3. Mechanical Sympathy: кэш, CPU и GC</h2>
 
-<p>Понимание того, как этот код взаимодействует с железом, отделяет Senior-архитектора от разработчика среднего уровня.</p>
+<p>То, как структура данных взаимодействует с процессорным конвейером и многоуровневым кэшем памяти, определяет реальную задержку под нагрузкой.</p>
 <h3 id="plotnost-pamyati-i-cache-locality">Плотность памяти и Cache Locality</h3>
-<p>Плоский <code>[]T</code> размещает все уровни таблицы в одном непрерывном блоке RAM. При запросе <code>Query</code> CPU загружает кэш-линии для <code>val1</code> и <code>val2</code>. Поскольку <code>k</code> обычно мало (для <code>n=10⁶</code>, <code>k ≤ 19</code>), уровни находятся в начале массива. Если таблица помещается в L3 кэш (для <code>int32</code> и <code>n=10⁶</code> это ~76 МБ, что типично для современных серверных CPU), доступ занимает ~15-30 нс. В реализации <code>[][]T</code> каждый уровень <code>table[k]</code> мог бы лежать в разном месте кучи, вызывая 2-3 дополнительных cache miss на каждый запрос.</p>
+<p>Плоский срез <code>[]T</code> гарантирует размещение всех уровней таблицы в монолитном блоке RAM. При вызове <code>Query</code> ядро процессора вычисляет два индекса и подгружает данные для <code>val1</code> и <code>val2</code> в кэш-линию. </p>
+<p>Поскольку для <code>n=10⁶</code> глубина <code>k ≤ 19</code>, для компактных типов данных (<code>int32</code>):<br />
+$$10^6 \times 19 \times 4\text{ байта} \approx 76\text{ МБ}$$</p>
+<p>Это полностью умещается в разделяемый кэш третьего уровня (L3) современных серверных процессоров (AMD EPYC с 3D V-Cache до 768 МБ или Intel Xeon с 100+ МБ L3). Обращение к данным обслуживается за 15–30 нс. Если бы мы использовали фрагментированный <code>[][]T</code>, каждый уровень <code>table[k]</code> располагался бы в случайной странице кучи, провоцируя промахи TLB и задержки DRAM в 80–120 нс на каждый запрос. Уровни с малым <code>k</code> находятся в начале массива.</p>
 <h3 id="vetvleniya-i-konveyer">Ветвления и конвейер</h3>
-<p>Код <code>Query</code> полностью линейный. Нет циклов, нет рекурсии, нет проверок внутри тела функции после валидации границ. Современный CPU выполняет предвыборку инструкций (instruction fetch) и предсказывает ветвления на 100%. Pipeline stall практически отсутствует. Это даёт стабильную латентность 2-5 нс на саму логику запроса, не считая latency памяти.</p>
+<p>Код функции <code>Query</code> абсолютно прямолинеен:<br />
+- Нет циклов <code>for</code>.<br />
+- Нет рекурсивных вызовов со стековыми фреймами.<br />
+- Нет условий <code>if</code>, кроме начальной защиты от выхода за границы среза.</p>
+<p>Конвейер CPU работает на максимальной пропускной способности, предвыборка инструкций не сбрасывается, а Branch Predictor угадывает переходы со 100% точностью. Сама логика выборки занимает всего <strong>2–5 наносекунд</strong> процессорного времени!</p>
 <h3 id="escape-analysis-i-davlenie-na-gc">Escape Analysis и давление на GC</h3>
-<p>При создании таблицы <code>make([]T, n*(logN+1))</code> аллоцируется в куче. Но это <strong>одна</strong> крупная аллокация. Сборщик мусора Go маркирует её как один span. При сканировании кучи GC проходит по ней последовательно, используя векторизованные инструкции. В отличие от дерева отрезков, где GC вынужден разыменовывать тысячи указателей, Sparse Table практически не замедляет фазу <code>mark</code>. После построения таблица только читается, что делает её идеальным кандидатом для размещения в read-only сегментах или кэширования в <code>sync.Map</code> без мьютексов.</p>
+<p>При инициализации таблицы вызов <code>make([]T, n*(logN+1))</code> создает <strong>ровно одну крупную аллокацию в куче</strong>. </p>
+<p>Сборщик мусора Go аллоцирует для нее непрерывный спан страниц памяти. На фазе разметки <code>mark</code> GC сканирует этот блок за один последовательный проход с применением векторизованных инструкций, а при использовании примитивных типов (<code>int</code>, <code>float64</code>) срез помечается флагом <code>noscan</code> и вовсе игнорируется трассировщиком. </p>
+<p>После инициализации таблица работает исключительно в режиме чтения, что позволяет безопасно разделять ее между сотнями горутин через <code>sync.Map</code> или обычный указатель без каких-либо блокировок и мьютексов.</p>
 <div class="callout callout-warning">
   <div class="callout-header">
     <span class="callout-icon">⚠️</span>
@@ -2361,64 +2412,70 @@ minVal := st.Query(1, 4) // min из [45, 800, 12, 300] -&gt; 12
   </div>
   <div class="callout-body">
     <p><strong>32-битные архитектуры и переполнение индексов</strong><br />
-На <code>amd64</code> и <code>arm64</code> <code>int</code> имеет 64 бита, и смещение <code>n * k</code> безопасно для <code>n</code> до ~10⁷. Но если вы деплоите на <code>386</code> или <code>arm/v7</code>, <code>int</code> будет 32-битным. При <code>n=50000</code> и <code>logN=16</code>, <code>n*logN</code> превысит <code>2³¹</code>, вызывая панику index out of range. В production-микросервисах всегда используйте <code>uint64</code> для расчёта смещений или ограничивайте <code>n</code> конфигурацией.</p>
+На архитектурах <code>amd64</code> и <code>arm64</code> базовый тип <code>int</code> является 64-битным, поэтому смещение <code>n * k</code> гарантированно защищено от переполнения. <br />
+Однако при компиляции под целевые платформы <code>386</code> или <code>arm/v7</code> размер <code>int</code> составляет 32 бита. При <code>n=50000</code> и <code>logN=16</code> произведение <code>n*logN</code> превысит <code>2³¹</code> (<code>2^31</code>), вызвав аварийную панику рантайма <code>panic: runtime error: index out of range</code>. <br />
+В переносимом коде используйте приведение смещений к типу <code>uint64</code> либо валидируйте ограничения размера <code>n</code> конфигурацией.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="4-ogranicheniya-i-arkhitekturnye-kompromissy">4. Ограничения и архитектурные компромиссы</h2>
 
-<p>Sparse Table не является серебряной пулей. Её применение оправдано только при соблюдении строгого контракта:</p>
+<p>Разреженная таблица не является универсальным решением. Ее применение строго ограничено фундаментальными свойствами операции:</p>
 <div class="table-container"><table>
 <thead>
 <tr>
-<th>Параметр</th>
-<th>Sparse Table</th>
-<th>Segment Tree</th>
-<th>Массив + линейный проход</th>
+<th style="text-align: left;">Параметр</th>
+<th style="text-align: center;">Sparse Table</th>
+<th style="text-align: center;">Segment Tree</th>
+<th style="text-align: center;">Массив + линейный проход</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>Запрос</td>
-<td>O(1)</td>
-<td>O(log n)</td>
-<td>O(n)</td>
+<td style="text-align: left;"><strong>Запрос</strong></td>
+<td style="text-align: center;">$O(1)$</td>
+<td style="text-align: center;">$O(\log n)$</td>
+<td style="text-align: center;">$O(n)$</td>
 </tr>
 <tr>
-<td>Обновление</td>
-<td>O(n log n) перестройка</td>
-<td>O(log n)</td>
-<td>O(1) замена</td>
+<td style="text-align: left;"><strong>Обновление</strong></td>
+<td style="text-align: center;">$O(n \log n)$ полная перестройка</td>
+<td style="text-align: center;">$O(\log n)$</td>
+<td style="text-align: center;">$O(1)$ точечная замена</td>
 </tr>
 <tr>
-<td>Память</td>
-<td>O(n log n)</td>
-<td>O(2 * nextPow2(n))</td>
-<td>O(n)</td>
+<td style="text-align: left;"><strong>Расход памяти</strong></td>
+<td style="text-align: center;">$O(n \log n)$</td>
+<td style="text-align: center;">$O(2 \cdot \text{nextPow2}(n))$</td>
+<td style="text-align: center;">$O(n)$</td>
 </tr>
 <tr>
-<td>Операции</td>
-<td>Только идемпотентные</td>
-<td>Любые моноиды</td>
-<td>Любые</td>
+<td style="text-align: left;"><strong>Поддерживаемые операции</strong></td>
+<td style="text-align: center;">Только идемпотентные</td>
+<td style="text-align: center;">Любые моноиды</td>
+<td style="text-align: center;">Любые</td>
 </tr>
 <tr>
-<td>Сложность кода</td>
-<td>Низкая</td>
-<td>Средняя</td>
-<td>Нулевая</td>
+<td style="text-align: left;"><strong>Сложность кода</strong></td>
+<td style="text-align: center;">Низкая (линейный код)</td>
+<td style="text-align: center;">Средняя (дерево)</td>
+<td style="text-align: center;">Минимальная</td>
 </tr>
 </tbody>
 </table></div>
-<p><strong>Когда НЕ использовать:</strong><br />
-1.  Частые обновления данных. Перестройка таблицы убьёт латентность.<br />
-2.  Операции без идемпотентности: сумма, произведение, конкатенация строк. Дублирование элементов в пересечении изменит результат.<br />
-3.  Ограниченная память. Для <code>n=10⁷</code> и <code>int64</code> таблица займёт ~1.6 ГБ RAM. На инстансах с 2-4 ГБ это критично.<br />
-4.  Динамические диапазоны. Если <code>n</code> меняется, таблица требует полного пересоздания.</p>
+<h3 id="kogda-sparse-table-kategoricheski-ne-podkhodit">Когда Sparse Table категорически НЕ подходит:</h3>
+<ol>
+<li><strong>Часто изменяемые данные:</strong> Любая точечная модификация требует полной пересборки структуры за $O(n \log n)$, что заблокирует сервис при записи.</li>
+<li><strong>Неидемпотентные операции:</strong> Сумма, произведение, среднее арифметическое. Если сложить два перекрывающихся блока, элементы пересечения будут учтены дважды, разрушив математическую корректность.</li>
+<li><strong>Ограниченная оперативная память:</strong> Для <code>n=10⁷</code> и <code>int64</code> таблица займет $\sim 1.6\text{ ГБ}$ RAM.</li>
+<li><strong>Динамический размер:</strong> Добавление элементов в конец требует полного пересоздания буфера.</li>
+</ol>
 <p><strong>Альтернативы в Go-бэкенде:</strong><br />
 - Для сумм и изменяемых данных: <a href="2-fenwick-tree-binarnoe-indeksnoe-derevo.html" class="wikilink">2. Fenwick tree - бинарное индексное дерево</a>.<br />
-- Для min/max с обновлениями: <a href="1-segment-tree-derevo-otrezkov.html" class="wikilink">1. Segment tree - дерево отрезков</a>.<br />
-- Для статических сумм: массив префиксных сумм <code>P[i] = P[i-1] + arr[i]</code>. Запрос <code>P[r] - P[l-1]</code> за O(1), память O(n).</p>
+- Для <code>min/max</code> с частыми обновлениями: <a href="1-segment-tree-derevo-otrezkov.html" class="wikilink">1. Segment tree - дерево отрезков</a>.<br />
+- Для статических сумм: массив префиксных сумм <code>P[i] = P[i-1] + arr[i]</code>, где диапазонный запрос вычисляется за $O(1)$ как <code>P[r] - P[l-1]</code> при расходе памяти $O(n)$.</p>
+<hr />
 <h2 id="5-lovushki-i-khardkor-sobesedovaniya">5. Ловушки и хардкор-собеседования</h2>
 
 <div class="callout callout-interview">
@@ -2427,26 +2484,31 @@ minVal := st.Query(1, 4) // min из [45, 800, 12, 300] -&gt; 12
     <span class="callout-title">Собеседование</span>
   </div>
   <div class="callout-body">
-    <p><strong>Вопрос 1:</strong> «Как заставить Sparse Table работать с суммами, если идеальнопотентность нарушена?»<br />
+    <p><strong>Вопрос 1:</strong> «Как заставить Sparse Table работать с суммами, если свойство идемпотентности нарушено?»<br />
 <strong>Ответ:</strong> Математически невозможно сохранить O(1) и O(n log n) память для сумм с перекрывающимися блоками. Нужно либо использовать два Sparse Table: один для префиксов, другой для суффиксов, и комбинировать их, либо смириться с Segment Tree. На практике для сумм всегда выбирают префиксные массивы или Fenwick.</p>
-<p><strong>Вопрос 2:</strong> «Почему в Go <code>bits.Len64</code> быстрее цикла <code>for</code> или поиска в массиве?»<br />
-<strong>Ответ:</strong> <code>bits.Len64</code> вызывает интринзик компилятора, который транслируется в CPU-инструкцию <code>LZCNT</code>/<code>BSR</code>. Это 1 такт выполнения без ветвлений. Цикл выполняет сравнения и сдвиги в софте, что занимает <code>O(log len)</code> тактов. Массив поиска требует доступа к RAM/L1, что добавляет latency и может вызвать cache miss.</p>
-<p><strong>Вопрос 3:</strong> «Как оптимизировать память Sparse Table в Go, если n очень велико, а k мало на практике?»<br />
-<strong>Ответ:</strong> 1. Использовать <code>int32</code> вместо <code>int</code>, если значения помещаются. Это сократит footprint на 50%. 2. Хранить таблицу в виде <code>[]int32</code> и использовать <code>unsafe</code> или <code>encoding/binary</code> для маппинга, если нужна сериализация. 3. Отказаться от хранения уровней <code>k &gt; 10</code>, если запросы всегда короткие, и fallback-ить на линейный проход для длинных отрезков.</p>
+<p><strong>Вопрос 2:</strong> «Почему в Go <code>bits.Len64</code> быстрее цикла <code>for</code> или поиска в предварительно сгенерированном массиве логарифмов?»<br />
+<strong>Ответ:</strong> Пакет <code>math/bits</code> распознается компилятором как интринзик и компилируется в одну процессорную инструкцию <code>LZCNT</code>/<code>BSR</code> (или <code>CLZ</code>), выполняющуюся за 1 такт CPU без обращения к памяти. Программный цикл <code>for</code> выполняет сдвиги за <code>O(log len)</code> тактов. Таблица предподсчитанных логарифмов в памяти требует загрузки по адресу, что создает риск Cache Miss и занимает драгоценные строки в L1-кэше данных.</p>
+<p><strong>Вопрос 3:</strong> «Как оптимизировать память Sparse Table в Go, если n велико, а k на практике ограничено?»<br />
+<strong>Ответ:</strong> <br />
+1. Использовать <code>int32</code> вместо <code>int</code>, сокращая footprint памяти вдвое.<br />
+2. Хранить таблицу в виде <code>[]int32</code> и использовать <code>unsafe</code> или <code>encoding/binary</code> для маппинга, если нужна сериализация.<br />
+3. Отказаться от хранения уровней <code>k &gt; 10</code>, если запросы всегда короткие, и fallback-ить на линейный проход для длинных отрезков.</p>
   </div>
 </div>
 
+<hr />
 <h2 id="itog">Итог</h2>
 
 <ul>
-<li><strong>Sparse Table</strong> — оптимальный выбор для статических данных и идемпотентных операций (<code>min</code>, <code>max</code>, <code>gcd</code>, <code>bitwise AND/OR</code>), дающий гарантированное <code>O(1)</code> на запрос.</li>
-<li><strong>Плоский массив</strong> <code>[]T</code> в Go предпочтительнее <code>[][]T</code> из-за лучшей кэш-локальности, снижения фрагментации кучи и ускорения сканирования GC.</li>
-<li><strong>Аппаратная поддержка</strong>: <code>math/bits.Len64</code> использует инструкции <code>LZCNT/CLZ</code>, вычисляя логарифм за 1 такт CPU без ветвлений.</li>
-<li><strong>Жёсткие ограничения</strong>: не поддерживает обновление без перестройки <code>O(n log n)</code> и неприменим для сумм/произведений из-за требования идемпотентности.</li>
-<li><strong>Архитектурный trade-off</strong>: память против латентности. Используйте для read-heavy сервисов, аналитических витрин и кэшированных метрик. Для mutable данных выбирайте деревья.</li>
+<li><strong>Sparse Table</strong> — бескомпромиссный выбор для статических неизменяемых массивов и идемпотентных операций (<code>min</code>, <code>max</code>, <code>gcd</code>, <code>bitwise AND/OR</code>), обеспечивающий строгий отклик <strong>$O(1)$</strong> на диапазонные запросы.</li>
+<li><strong>Плоский срез <code>[]T</code></strong> в Go устраняет разыменование указателей, снижает фрагментацию кучи и гарантирует идеальное аппаратное попадание в L3 кэш процессора.</li>
+<li><strong>Аппаратные интринзики:</strong> вызов <code>math/bits.Len64</code> компилируется в инструкции <code>LZCNT/CLZ</code>, вычисляя логарифм за 1 такт конвейера.</li>
+<li><strong>Архитектурный компромисс:</strong> структура непригодна для частых записей ($O(n \log n)$ на перестройку) и не поддерживает неидемпотентные агрегации (суммы).</li>
+<li>Для неизменяемых наборов данных разреженная таблица не требует мьютексов и обеспечивает линейное масштабирование параллельного чтения на любых многоядерных серверах.</li>
 </ul>
-<p>Разобравшись с быстрыми запросами к статическим диапазонам, мы переходим к структуре, которая решает совершенно другую, но не менее важную задачу: эффективное управление динамическими множествами и их слияниями. В бэкенде это фундамент для систем обнаружения связности, маршрутизации в кластерах, обработки транзакционных блокировок и анализа социальных графов. В следующей статье мы детально изучим структуру с практически константным временем операций и её оптимизацию на уровне рантайма Go.</p>
-<p><a href="4-disjoint-set-union-dsu-union-find.html" class="wikilink">4. Disjoint set union DSU, Union Find</a></p>
+<hr />
+<p>Освоив сверхбыструю статическую агрегацию, мы переходим к фундаментальной задаче управления динамическими связными множествами и компонентами связности в распределенных графах и транзакционных системах. В следующей статье мы изучим структуру, время работы которой на практике неотличимо от чистой константы:<br />
+<a href="4-disjoint-set-union-dsu-union-find.html" class="wikilink">4. Disjoint set union DSU, Union Find</a>.</p>
           </div>
 
           <!-- Навигация Предыдущая / Следующая статья -->
@@ -2474,7 +2536,7 @@ minVal := st.Query(1, 4) // min из [45, 800, 12, 300] -&gt; 12
     <span>На этой странице</span>
   </div>
   <ul class="toc-list">
-    <li class="toc-item toc-h2"><a href="#vvedenie-o1-tsenoy-pamyati-i-statichnosti">Введение: O(1) ценой памяти и статичности</a></li><li class="toc-item toc-h2"><a href="#1-matematicheskaya-osnova-idempotentnosti">1. Математическая основа идемпотентности</a></li><li class="toc-item toc-h2"><a href="#2-production-realizatsiya-na-go-1-21">2. Production-реализация на Go 1.21+</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-kesh-cpu-i-gc">3. Mechanical Sympathy: кэш, CPU и GC</a></li><li class="toc-item toc-h3"><a href="#plotnost-pamyati-i-cache-locality">Плотность памяти и Cache Locality</a></li><li class="toc-item toc-h3"><a href="#vetvleniya-i-konveyer">Ветвления и конвейер</a></li><li class="toc-item toc-h3"><a href="#escape-analysis-i-davlenie-na-gc">Escape Analysis и давление на GC</a></li><li class="toc-item toc-h2"><a href="#4-ogranicheniya-i-arkhitekturnye-kompromissy">4. Ограничения и архитектурные компромиссы</a></li><li class="toc-item toc-h2"><a href="#5-lovushki-i-khardkor-sobesedovaniya">5. Ловушки и хардкор-собеседования</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
+    <li class="toc-item toc-h2"><a href="#vvedenie-o1-tsenoy-pamyati-i-statichnosti">Введение: O(1) ценой памяти и статичности</a></li><li class="toc-item toc-h2"><a href="#1-matematicheskaya-osnova-idempotentnosti">1. Математическая основа идемпотентности</a></li><li class="toc-item toc-h2"><a href="#2-production-realizatsiya-na-go-1-21">2. Production-реализация на Go 1.21+</a></li><li class="toc-item toc-h3"><a href="#primer-ispolzovaniya-monitoring-minimalnoy-zaderzhki">Пример использования: Мониторинг минимальной задержки</a></li><li class="toc-item toc-h2"><a href="#3-mechanical-sympathy-kesh-cpu-i-gc">3. Mechanical Sympathy: кэш, CPU и GC</a></li><li class="toc-item toc-h3"><a href="#plotnost-pamyati-i-cache-locality">Плотность памяти и Cache Locality</a></li><li class="toc-item toc-h3"><a href="#vetvleniya-i-konveyer">Ветвления и конвейер</a></li><li class="toc-item toc-h3"><a href="#escape-analysis-i-davlenie-na-gc">Escape Analysis и давление на GC</a></li><li class="toc-item toc-h2"><a href="#4-ogranicheniya-i-arkhitekturnye-kompromissy">4. Ограничения и архитектурные компромиссы</a></li><li class="toc-item toc-h3"><a href="#kogda-sparse-table-kategoricheski-ne-podkhodit">Когда Sparse Table категорически НЕ подходит:</a></li><li class="toc-item toc-h2"><a href="#5-lovushki-i-khardkor-sobesedovaniya">5. Ловушки и хардкор-собеседования</a></li><li class="toc-item toc-h2"><a href="#itog">Итог</a></li>
   </ul>
 </aside>
 
