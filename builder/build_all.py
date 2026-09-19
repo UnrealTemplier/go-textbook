@@ -94,7 +94,15 @@ def build(
     dist_assets = os.path.join(dist_dir, "assets")
     copy_assets(builder_assets, dist_assets)
     generate_search_data_js(all_articles, dist_dir)
-    print("      Ассеты и файл search-data.js успешно развернуты.")
+    
+    # Копирование favicon в корень dist/ и в dist/assets/
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    for fav in ["favicon.svg", "favicon.ico"]:
+        src_fav = os.path.join(repo_root, fav)
+        if os.path.exists(src_fav):
+            shutil.copy2(src_fav, os.path.join(dist_dir, fav))
+            shutil.copy2(src_fav, os.path.join(dist_assets, fav))
+    print("      Ассеты, иконки favicon и файл search-data.js успешно развернуты.")
 
     # 3. Конвертация Markdown и генерация HTML страниц
     print(f"\n[3/4] ⚙️ Конвертация {len(articles_to_build)} статей в HTML...")
