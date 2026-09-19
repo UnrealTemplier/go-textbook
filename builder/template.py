@@ -353,8 +353,8 @@ def render_index_page(
       <div class="hero-badge">Энциклопедия Computer Science & Backend</div>
       <h1 class="hero-title">Фундаментальный бэкенд на Go: от кремния до распределенных систем</h1>
       <p class="hero-quote">
-        <em>«Controlling complexity is the essence of computer programming.»</em>  
-        <span class="quote-author">— Brian W. Kernighan</span>
+        <em>«Управление сложностью — вот суть программирования».</em>  
+        <span class="quote-author">— Брайан Керниган</span>
       </p>
 
       <!-- Полнотекстовый живой поиск -->
