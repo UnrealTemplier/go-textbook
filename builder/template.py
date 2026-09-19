@@ -173,8 +173,8 @@ def render_article_page(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{html.escape(article.title)} | Инженерная энциклопедия бэкенда</title>
   <meta name="description" content="Полное руководство: {html.escape(article.title)}. Go, архитектура систем, computer science.">
-  <link rel="icon" type="image/svg+xml" href="{rel_root}favicon.svg">
-  <link rel="alternate icon" href="{rel_root}favicon.ico">
+  <link rel="icon" href="{rel_root}favicon.ico" sizes="32x32">
+  <link rel="icon" type="image/svg+xml" href="{rel_root}favicon.svg" sizes="any">
   <link rel="stylesheet" href="{rel_root}assets/style.css">
   <link rel="stylesheet" href="{rel_root}assets/vendor/prism-tomorrow.min.css">
   <link rel="stylesheet" href="{rel_root}assets/vendor/katex/katex.min.css">
@@ -341,8 +341,8 @@ def render_index_page(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Инженерная веб-энциклопедия бэкенда (Go & Computer Science)</title>
   <meta name="description" content="Фундаментальная энциклопедия бэкенда, распределенных систем и языка Go от Брайана Кернигана. 1 400+ статей, 1 400+ схем Mermaid.">
-  <link rel="icon" type="image/svg+xml" href="{rel_root}favicon.svg">
-  <link rel="alternate icon" href="{rel_root}favicon.ico">
+  <link rel="icon" href="{rel_root}favicon.ico" sizes="32x32">
+  <link rel="icon" type="image/svg+xml" href="{rel_root}favicon.svg" sizes="any">
   <link rel="stylesheet" href="{rel_root}assets/style.css">
   <link rel="stylesheet" href="{rel_root}assets/vendor/prism-tomorrow.min.css">
 </head>
